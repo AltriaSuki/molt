@@ -4,12 +4,23 @@
 //! directory inside `root` or `scratch`, and every path inside a request must
 //! stay inside its workspace. Forks are created in `scratch`.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+mod error;
+mod files;
+mod fork;
+mod paths;
+mod shell;
+mod walk;
 
-use molt_proto::RemoteError;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use molt_proto::{Envelope, RemoteError, Target};
 use molt_sdk::Service;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::Value;
+
+use crate::error::{failed, invalid};
 
 /// Where the services may work.
 #[derive(Clone, Debug)]
@@ -23,49 +34,115 @@ pub struct Roots {
 
 /// Serves `fs.*`.
 pub struct Fs {
-    _roots: Roots,
+    roots: Arc<Roots>,
+    /// Held by merge and drop, so two merges into one workspace cannot
+    /// interleave their conflict checks and writes.
+    forks: Arc<Mutex<()>>,
 }
 
 impl Fs {
     /// Canonicalizes the roots; `scratch` is created if missing.
     pub fn new(roots: Roots) -> anyhow::Result<Self> {
-        let _ = roots;
-        todo!()
+        Ok(Self { roots: Arc::new(roots.canonical()?), forks: Arc::default() })
     }
 
     /// Handle one `fs` method (`read`, `write`, ...) with its request payload.
     pub async fn handle(&self, method: &str, payload: Value) -> Result<Value, RemoteError> {
-        let _ = (method, payload);
-        todo!()
+        let method = method.strip_prefix("fs.").unwrap_or(method);
+        let roots = self.roots.clone();
+        let forks = self.forks.clone();
+        match method {
+            "read" => blocking(method, payload, move |req| files::read(&roots, req)).await,
+            "write" => blocking(method, payload, move |req| files::write(&roots, req)).await,
+            "edit" => blocking(method, payload, move |req| files::edit(&roots, req)).await,
+            "list" => blocking(method, payload, move |req| files::list(&roots, req)).await,
+            "search" => blocking(method, payload, move |req| files::search(&roots, req)).await,
+            "fork" => blocking(method, payload, move |req| fork::fork(&roots, req)).await,
+            "diff" => blocking(method, payload, move |req| fork::diff(&roots, req)).await,
+            "merge" => blocking(method, payload, move |req| fork::merge(&roots, &forks, req)).await,
+            "drop" => blocking(method, payload, move |req| fork::drop_fork(&roots, &forks, req)).await,
+            _ => Err(invalid(format!("unknown method fs.{method}"))),
+        }
     }
 }
 
 /// Serves `shell.*`.
 pub struct Shell {
-    _roots: Roots,
+    roots: Arc<Roots>,
+    /// `bash`, or `sh` when there is no bash on `PATH`.
+    program: PathBuf,
+    running: Arc<shell::Groups>,
 }
 
 impl Shell {
+    /// Canonicalizes the roots (`scratch` is created if missing) and finds the shell to run commands with.
     pub fn new(roots: Roots) -> anyhow::Result<Self> {
-        let _ = roots;
-        todo!()
+        Ok(Self { roots: Arc::new(roots.canonical()?), program: shell::find_shell(), running: Arc::default() })
+    }
+
+    /// Kill every command still running, with everything it started. Call
+    /// it before the service exits: each command has a process group of its
+    /// own, which neither a signal to the service nor its exit reaches.
+    pub fn kill_all(&self) {
+        self.running.kill_all();
     }
 
     /// Handle one `shell` method (`run`) with its request payload.
     pub async fn handle(&self, method: &str, payload: Value) -> Result<Value, RemoteError> {
-        let _ = (method, payload);
-        todo!()
+        let method = method.strip_prefix("shell.").unwrap_or(method);
+        match method {
+            "run" => {
+                let req = parse("shell", method, payload)?;
+                let reply = shell::run(&self.roots, &self.program, &self.running, req).await?;
+                serde_json::to_value(reply).map_err(|e| failed(e.to_string()))
+            }
+            _ => Err(invalid(format!("unknown method shell.{method}"))),
+        }
     }
 }
 
 /// Serve `fs.*` on `svc` until its link closes.
 pub async fn serve_fs(svc: Arc<Service>, fs: Arc<Fs>) {
-    let _ = (svc, fs);
-    todo!()
+    svc.serve_concurrent(16, move |req| {
+        let fs = fs.clone();
+        async move { fs.handle(&method_of(&req)?, req.payload).await }
+    })
+    .await
 }
 
 /// Serve `shell.*` on `svc` until its link closes.
 pub async fn serve_shell(svc: Arc<Service>, shell: Arc<Shell>) {
-    let _ = (svc, shell);
-    todo!()
+    svc.serve_concurrent(8, move |req| {
+        let shell = shell.clone();
+        async move { shell.handle(&method_of(&req)?, req.payload).await }
+    })
+    .await
+}
+
+fn method_of(req: &Envelope) -> Result<String, RemoteError> {
+    match &req.to {
+        Target::Method { method, .. } => Ok(method.clone()),
+        other => Err(invalid(format!("{other} is not a method"))),
+    }
+}
+
+fn parse<T: DeserializeOwned>(service: &str, method: &str, payload: Value) -> Result<T, RemoteError> {
+    serde_json::from_value(payload).map_err(|e| invalid(format!("bad {service}.{method} request: {e}")))
+}
+
+/// Decode the request, run `work` on the blocking pool and encode its reply.
+async fn blocking<Req, Rep>(
+    method: &str,
+    payload: Value,
+    work: impl FnOnce(Req) -> Result<Rep, RemoteError> + Send + 'static,
+) -> Result<Value, RemoteError>
+where
+    Req: DeserializeOwned + Send + 'static,
+    Rep: Serialize + Send + 'static,
+{
+    let req = parse("fs", method, payload)?;
+    let reply = tokio::task::spawn_blocking(move || work(req))
+        .await
+        .map_err(|e| failed(format!("fs.{method} failed: {e}")))??;
+    serde_json::to_value(reply).map_err(|e| failed(e.to_string()))
 }

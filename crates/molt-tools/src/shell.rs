@@ -1,0 +1,261 @@
+//! `shell.run`: one command under `bash -c` in a workspace.
+//!
+//! The command gets its own process group, so the whole tree it starts can
+//! be killed at once: on timeout, and again as soon as the command itself
+//! exits, so a background child cannot hold the output pipes open and hang
+//! the call. A group of its own also means that nothing else stops it, so
+//! the service keeps a list of them and kills them all when it is stopped.
+
+use std::collections::{HashSet, VecDeque};
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use molt_api::shell::{RunRequest, RunResponse};
+use molt_proto::RemoteError;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
+
+use crate::error::failed;
+use crate::Roots;
+
+const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+const MAX_TIMEOUT_MS: u64 = 3_600_000;
+const HEAD_BYTES: usize = 8 * 1024;
+const TAIL_BYTES: usize = 24 * 1024;
+/// How long output may keep arriving after the command exited and its group was killed.
+const GRACE: Duration = Duration::from_millis(500);
+/// Removed from the command's environment: the service's bus secret and API keys.
+const HIDDEN_PREFIXES: [&[u8]; 2] = [b"MOLT_", b"ANTHROPIC_"];
+/// Keep tools from paging, prompting or printing colour codes.
+const FIXED_ENV: [(&str, &str); 6] = [
+    ("TERM", "dumb"),
+    ("NO_COLOR", "1"),
+    ("CI", "1"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+];
+
+/// `bash` from `PATH`, else `sh`.
+pub(crate) fn find_shell() -> PathBuf {
+    find_in_path("bash").or_else(|| find_in_path("sh")).unwrap_or_else(|| PathBuf::from("/bin/sh"))
+}
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+
+/// The process groups of the commands running now.
+#[derive(Default)]
+pub(crate) struct Groups(Mutex<HashSet<libc::pid_t>>);
+
+impl Groups {
+    pub fn kill_all(&self) {
+        for &pgid in lock(&self.0).iter() {
+            killpg(pgid);
+        }
+    }
+}
+
+pub(crate) async fn run(
+    roots: &Arc<Roots>,
+    program: &Path,
+    groups: &Arc<Groups>,
+    req: RunRequest,
+) -> Result<RunResponse, RemoteError> {
+    let ws = {
+        let (roots, ws) = (roots.clone(), req.workspace.clone());
+        tokio::task::spawn_blocking(move || roots.workspace(&ws))
+            .await
+            .map_err(|e| failed(format!("shell.run failed: {e}")))??
+    };
+    let limit = Duration::from_millis(req.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1, MAX_TIMEOUT_MS));
+
+    let mut cmd = Command::new(program);
+    cmd.arg("-c")
+        .arg(&req.command)
+        .current_dir(&ws)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .env_clear()
+        .envs(child_env());
+    let started = Instant::now();
+    let mut child = cmd.spawn().map_err(|e| failed(format!("could not start {}: {e}", program.display())))?;
+    let group = Group::new(child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()), groups);
+
+    let stdout = Arc::new(Mutex::new(Capture::default()));
+    let stderr = Arc::new(Mutex::new(Capture::default()));
+    let mut readers = [
+        tokio::spawn(drain(child.stdout.take(), stdout.clone())),
+        tokio::spawn(drain(child.stderr.take(), stderr.clone())),
+    ];
+
+    let (status, timed_out) = match tokio::time::timeout(limit, child.wait()).await {
+        Ok(status) => (status, false),
+        Err(_) => {
+            group.kill();
+            (child.wait().await, true)
+        }
+    };
+    let duration = started.elapsed();
+    group.kill();
+    let status = status.map_err(|e| failed(format!("waiting for the command: {e}")))?;
+    let _ = tokio::time::timeout(GRACE, async {
+        for reader in &mut readers {
+            let _ = reader.await;
+        }
+    })
+    .await;
+    // Whatever escaped the group (a daemon that called setsid) may still hold a pipe.
+    for reader in &readers {
+        reader.abort();
+    }
+
+    let (stdout, out_cut) = take(&stdout).finish();
+    let (stderr, err_cut) = take(&stderr).finish();
+    Ok(RunResponse {
+        exit_code: status.code(),
+        signal: status.signal(),
+        timed_out,
+        stdout,
+        stderr,
+        truncated: out_cut || err_cut,
+        duration_ms: duration.as_millis() as u64,
+    })
+}
+
+/// The service's environment without its secrets, plus [`FIXED_ENV`].
+fn child_env() -> Vec<(OsString, OsString)> {
+    let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
+        .filter(|(name, _)| !HIDDEN_PREFIXES.iter().any(|p| name.as_bytes().starts_with(p)))
+        .collect();
+    env.extend(FIXED_ENV.iter().map(|(k, v)| (OsString::from(k), OsString::from(v))));
+    env
+}
+
+/// A command's process group, listed in [`Groups`] while it lives. Killed
+/// when dropped too, so a cancelled request does not leave its command running.
+struct Group {
+    // A pgid of 0 would mean our own group.
+    pgid: Option<libc::pid_t>,
+    groups: Arc<Groups>,
+}
+
+impl Group {
+    fn new(pgid: Option<libc::pid_t>, groups: &Arc<Groups>) -> Self {
+        let pgid = pgid.filter(|&p| p > 0);
+        if let Some(pgid) = pgid {
+            lock(&groups.0).insert(pgid);
+        }
+        Self { pgid, groups: groups.clone() }
+    }
+
+    fn kill(&self) {
+        if let Some(pgid) = self.pgid {
+            killpg(pgid);
+        }
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        self.kill();
+        if let Some(pgid) = self.pgid {
+            lock(&self.groups.0).remove(&pgid);
+        }
+    }
+}
+
+fn killpg(pgid: libc::pid_t) {
+    // SAFETY: killpg only sends a signal; an empty group yields ESRCH, which is fine.
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+}
+
+async fn drain(pipe: Option<impl AsyncRead + Unpin>, into: Arc<Mutex<Capture>>) {
+    let Some(mut pipe) = pipe else { return };
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => lock(&into).push(&buf[..n]),
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn take(capture: &Mutex<Capture>) -> Capture {
+    std::mem::take(&mut *lock(capture))
+}
+
+/// The first [`HEAD_BYTES`] and last [`TAIL_BYTES`] of a stream.
+#[derive(Default)]
+struct Capture {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    total: u64,
+}
+
+impl Capture {
+    fn push(&mut self, mut data: &[u8]) {
+        self.total += data.len() as u64;
+        if self.head.len() < HEAD_BYTES {
+            let n = (HEAD_BYTES - self.head.len()).min(data.len());
+            self.head.extend_from_slice(&data[..n]);
+            data = &data[n..];
+        }
+        self.tail.extend(data);
+        let excess = self.tail.len().saturating_sub(TAIL_BYTES);
+        self.tail.drain(..excess);
+    }
+
+    /// The text, with a marker where bytes were dropped, and whether any were.
+    fn finish(self) -> (String, bool) {
+        let omitted = self.total - (self.head.len() + self.tail.len()) as u64;
+        let mut bytes = self.head;
+        if omitted > 0 {
+            bytes.extend_from_slice(format!("\n[... {omitted} bytes omitted ...]\n").as_bytes());
+        }
+        bytes.extend(self.tail);
+        (String::from_utf8_lossy(&bytes).into_owned(), omitted > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_keeps_head_and_tail() {
+        let mut c = Capture::default();
+        c.push(b"short");
+        assert_eq!(c.finish(), ("short".to_owned(), false));
+
+        let mut c = Capture::default();
+        c.push(&vec![b'h'; HEAD_BYTES]);
+        for _ in 0..10 {
+            c.push(&vec![b'm'; 10_000]);
+        }
+        c.push(&vec![b't'; TAIL_BYTES]);
+        let (text, cut) = c.finish();
+        assert!(cut);
+        assert!(text.starts_with(&"h".repeat(HEAD_BYTES)));
+        assert!(text.ends_with(&"t".repeat(TAIL_BYTES)));
+        assert!(text.contains("[... 100000 bytes omitted ...]"));
+    }
+}
