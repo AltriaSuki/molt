@@ -1,0 +1,21 @@
+[package]
+name = "molt-planner"
+description = "Molt's planner: check-first, parallel verified attempts over the model and tool services"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+molt-api.workspace = true
+molt-proto.workspace = true
+molt-sdk.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

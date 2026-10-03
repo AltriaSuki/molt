@@ -43,10 +43,57 @@ impl Default for RestartPolicy {
     }
 }
 
+/// Variables a service inherits from the kernel's environment. Everything
+/// else is dropped, so a secret such as an API key reaches only the services
+/// configured to receive it (through [`Spec::env`]).
+pub const BASELINE_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "TZ",
+    "TMPDIR",
+    "TERM",
+    "RUST_LOG",
+    "RUST_BACKTRACE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "all_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    // Toolchains, so builds and tests run by the shell service work as they do for the user.
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "GOPATH",
+    "GOROOT",
+    "GOCACHE",
+    "GOMODCACHE",
+    "JAVA_HOME",
+    "NODE_PATH",
+    "NVM_DIR",
+    "PYTHONPATH",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+];
+
 #[derive(Clone, Debug)]
 pub struct Spec {
     pub id: ServiceId,
     pub exec: Exec,
+    /// Set on top of [`BASELINE_ENV`]; later entries win.
     pub env: Vec<(String, String)>,
     pub limits: Limits,
     pub restart: RestartPolicy,
@@ -104,6 +151,12 @@ impl Supervisor {
 
 fn command(spec: &Spec) -> Command {
     let mut cmd = Command::new(&spec.exec.command);
+    cmd.env_clear();
+    for key in BASELINE_ENV {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
     cmd.args(&spec.exec.args).envs(spec.env.iter().cloned()).kill_on_drop(true).stdin(std::process::Stdio::null());
     #[cfg(unix)]
     {

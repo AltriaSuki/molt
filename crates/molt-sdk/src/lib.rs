@@ -221,18 +221,50 @@ impl Service {
         Fut: Future<Output = Result<Value, RemoteError>>,
     {
         while let Some(msg) = self.next().await {
-            let is_request = msg.kind == Kind::Request;
             let result = handler(msg.clone()).await;
-            if !is_request {
-                continue;
-            }
-            let sent = match result {
-                Ok(v) => self.reply(&msg, v).await,
-                Err(e) => self.reply_error(&msg, e.code, &e.message).await,
-            };
-            if let Err(e) = sent {
-                tracing::warn!(error = %e, "could not send a reply");
-            }
+            self.answer(&msg, result).await;
+        }
+    }
+
+    /// Handle up to `max_in_flight` requests at once until the link closes.
+    /// Each runs in its own task, so replies may go out in a different order
+    /// than the requests came in. A handler that panics answers `failed`.
+    /// Events are passed to the handler too; their result is discarded.
+    pub async fn serve_concurrent<F, Fut>(self: &Arc<Self>, max_in_flight: usize, handler: F)
+    where
+        F: Fn(Envelope) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value, RemoteError>> + Send + 'static,
+    {
+        let slots = Arc::new(tokio::sync::Semaphore::new(max_in_flight.max(1)));
+        let handler = Arc::new(handler);
+        let mut tasks = tokio::task::JoinSet::new();
+        while let Some(msg) = self.next().await {
+            let Ok(slot) = slots.clone().acquire_owned().await else { break };
+            let (svc, handler) = (self.clone(), handler.clone());
+            tasks.spawn(async move {
+                let _slot = slot;
+                let work = tokio::spawn(handler(msg.clone()));
+                let result = match work.await {
+                    Ok(r) => r,
+                    Err(e) => Err(RemoteError { code: ErrorCode::Failed, message: format!("the handler failed: {e}") }),
+                };
+                svc.answer(&msg, result).await;
+            });
+            while tasks.try_join_next().is_some() {}
+        }
+    }
+
+    /// Send the reply for a handled message; events get none.
+    async fn answer(&self, msg: &Envelope, result: Result<Value, RemoteError>) {
+        if msg.kind != Kind::Request {
+            return;
+        }
+        let sent = match result {
+            Ok(v) => self.reply(msg, v).await,
+            Err(e) => self.reply_error(msg, e.code, &e.message).await,
+        };
+        if let Err(e) = sent {
+            tracing::warn!(error = %e, "could not send a reply");
         }
     }
 }

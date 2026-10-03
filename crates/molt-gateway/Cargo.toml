@@ -1,0 +1,21 @@
+[package]
+name = "molt-gateway"
+description = "Molt's model gateway: the only service that holds the Anthropic API key"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+molt-api.workspace = true
+molt-proto.workspace = true
+molt-sdk.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true

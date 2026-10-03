@@ -238,6 +238,20 @@ impl Kernel {
         limits: Limits,
         restart: RestartPolicy,
     ) -> Result<Launched, KernelError> {
+        self.launch_with_env(service, secret, limits, restart, Vec::new()).await
+    }
+
+    /// [`Kernel::launch`] with extra environment variables for the process,
+    /// such as an API key only this service may hold. They cannot override
+    /// the bus address, identity, secret or capabilities.
+    pub async fn launch_with_env(
+        &self,
+        service: &ServiceId,
+        secret: Option<Secret>,
+        limits: Limits,
+        restart: RestartPolicy,
+        extra_env: Vec<(String, String)>,
+    ) -> Result<Launched, KernelError> {
         let version = self.inner.registry.live(service).ok_or_else(|| KernelError::NoLiveVersion(service.clone()))?;
         let manifest =
             self.inner.registry.manifest(&version).ok_or_else(|| KernelError::NoLiveVersion(service.clone()))?;
@@ -252,12 +266,13 @@ impl Kernel {
             caps.insert(req.target.to_string(), cap);
         }
         if let Some(exec) = manifest.exec.clone() {
-            let env = vec![
+            let mut env = extra_env;
+            env.extend([
                 (molt_transport::ENV_ADDRESS.to_owned(), self.inner.transport.address()),
                 (molt_transport::ENV_SERVICE_ID.to_owned(), service.to_string()),
                 (molt_transport::ENV_SECRET.to_owned(), secret.expose().to_owned()),
                 (ENV_CAPS.to_owned(), serde_json::to_string(&caps).unwrap()),
-            ];
+            ]);
             self.inner.supervisor.start(supervisor::Spec { id: service.clone(), exec, env, limits, restart });
         }
         Ok(Launched { version, caps })

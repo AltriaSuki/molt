@@ -12,6 +12,10 @@ molt-proto = { path = "crates/molt-proto" }
 molt-transport = { path = "crates/molt-transport" }
 molt-sdk = { path = "crates/molt-sdk" }
 molt-kernel = { path = "crates/molt-kernel" }
+molt-api = { path = "crates/molt-api" }
+molt-gateway = { path = "crates/molt-gateway" }
+molt-tools = { path = "crates/molt-tools" }
+molt-planner = { path = "crates/molt-planner" }
 
 anyhow = "1"
 arc-swap = "1"
@@ -20,12 +24,17 @@ async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
+globset = "0.4"
 hex = "0.4"
+ignore = "0.4"
 libc = "0.2"
 rand = "0.9"
+regex = "1"
+reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+similar = "3"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
@@ -33,3 +42,4 @@ tokio-util = { version = "0.7", features = ["codec"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wiremock = "0.6"
