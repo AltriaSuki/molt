@@ -47,10 +47,14 @@ pub struct RunRequest {
     /// Model turns per attempt. Default set by the planner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
-    /// Failed checks an attempt may get as feedback before it gives up.
+    /// Check runs per attempt. Each failed run but the last goes back to the
+    /// attempt as feedback; when the last fails, the attempt has failed.
+    /// Default set by the planner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_check_rounds: Option<u32>,
-    /// Spending limit for the whole run in US dollars. Default set by the planner.
+    /// Spending limit for the whole run in US dollars. Default set by the
+    /// planner. Calls to a model whose prices the gateway does not know are
+    /// not counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_usd: Option<f64>,
     /// Merge the winning attempt into the workspace. When false, the winner's
@@ -102,6 +106,7 @@ pub struct CheckSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptStatus {
+    /// Passed the done-check, or finished a run that has no check.
     Passed,
     /// Finished without passing the check, or ran out of turns or check rounds.
     Failed,
@@ -137,6 +142,9 @@ pub struct RunResponse {
     pub changes: Vec<Change>,
     /// Unified diff of the winner's changes.
     pub patch: String,
+    /// `patch` was cut to the fs service's size limit; `changes` is complete.
+    #[serde(default)]
+    pub patch_truncated: bool,
     /// The changes were merged into the workspace.
     pub applied: bool,
     /// Where the winner's files are when they were not merged.
@@ -146,6 +154,10 @@ pub struct RunResponse {
     /// Totals over the designer and every attempt.
     pub usage: Usage,
     pub cost_usd: f64,
+    /// Model calls of cancelled attempts still unanswered when the run
+    /// ended. They are billed but not in `usage` or `cost_usd`.
+    #[serde(default)]
+    pub uncounted_calls: u32,
 }
 
 /// Names and inputs of the tools the planner offers the model. Each maps to

@@ -62,17 +62,22 @@ pub struct CompleteRequest {
     pub output_schema: Option<Value>,
 }
 
-/// Token counts as the Messages API reports them.
+/// Token counts as the Messages API reports them. A count the API sends as
+/// `null` or leaves out reads as zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "zero_if_null")]
     pub input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "zero_if_null")]
     pub output_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "zero_if_null")]
     pub cache_creation_input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "zero_if_null")]
     pub cache_read_input_tokens: u64,
+}
+
+fn zero_if_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    Ok(Option::<u64>::deserialize(d)?.unwrap_or(0))
 }
 
 impl Usage {
@@ -218,6 +223,15 @@ mod tests {
         // The thinking block survives untouched.
         assert_eq!(resp.as_turn()["content"][0]["signature"], "sig");
         assert_eq!(resp.usage.total(), 15);
+    }
+
+    #[test]
+    fn null_usage_counts_read_as_zero() {
+        let u: Usage = serde_json::from_value(json!({
+            "input_tokens": 3, "output_tokens": 4, "cache_creation_input_tokens": null
+        }))
+        .unwrap();
+        assert_eq!(u, Usage { input_tokens: 3, output_tokens: 4, ..Default::default() });
     }
 
     #[test]

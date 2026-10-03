@@ -439,11 +439,13 @@ mod tests {
             summary: "Fixed the parser.\n".into(),
             changes: vec![Change { path: "src/lib.rs".into(), kind: ChangeKind::Modified }],
             patch: String::new(),
+            patch_truncated: false,
             applied: true,
             fork: None,
             attempts: vec![],
             usage: Usage { input_tokens: 1000, output_tokens: 200, ..Usage::default() },
             cost_usd: 0.012,
+            uncounted_calls: 0,
         };
         assert_eq!(
             report(&resp),

@@ -125,11 +125,13 @@ async fn conclude(
         summary: String::new(),
         changes: Vec::new(),
         patch: String::new(),
+        patch_truncated: false,
         applied: false,
         fork: None,
         attempts: finished.iter().map(|f| f.report.clone()).collect(),
         usage: Default::default(),
         cost_usd: 0.0,
+        uncounted_calls: 0,
     };
 
     match won {
@@ -222,11 +224,13 @@ fn not_designed(ctx: &Ctx, reason: &str) -> RunResponse {
         summary: format!("Could not design a done-check: {reason}."),
         changes: Vec::new(),
         patch: String::new(),
+        patch_truncated: false,
         applied: false,
         fork: None,
         attempts: Vec::new(),
         usage: spent.usage,
         cost_usd: spent.cost_usd,
+        uncounted_calls: 0,
     }
 }
 

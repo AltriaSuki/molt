@@ -47,7 +47,7 @@ pub struct ReadResponse {
     pub lines: u64,
     /// Lines in the whole file.
     pub total_lines: u64,
-    /// True when the file has more lines than were returned.
+    /// More lines follow the returned ones.
     pub truncated: bool,
 }
 
@@ -199,7 +199,8 @@ pub struct DiffResponse {
 /// Copy a fork's changes back into its original workspace. Fails with a
 /// `failed` error starting with `conflict:` and naming the paths if the
 /// original changed any of the same files since the fork; nothing is
-/// written in that case.
+/// written in that case. If writing fails partway, the `failed` error starts
+/// with `partial:` and names the paths already written.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeRequest {
     pub fork: String,
