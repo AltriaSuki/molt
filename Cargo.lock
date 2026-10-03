@@ -1201,17 +1201,26 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
+ "libc",
+ "molt-api",
+ "molt-gateway",
  "molt-kernel",
+ "molt-planner",
  "molt-proto",
  "molt-sdk",
+ "molt-tools",
  "molt-transport",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
+ "thiserror",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]
@@ -1291,6 +1300,7 @@ dependencies = [
 name = "molt-sdk"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "molt-proto",
  "molt-transport",
  "serde_json",

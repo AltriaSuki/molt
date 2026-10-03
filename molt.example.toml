@@ -1,4 +1,7 @@
 # Copy to molt.toml and run `molt run`.
+#
+# `molt do` uses this file too when it exists. Without one it starts the agent
+# services below with its own defaults (state and forks under ~/.cache/molt).
 
 [kernel]
 data_dir = ".molt"        # audit.jsonl, registry/, sockets, secrets
@@ -12,3 +15,49 @@ tier = "mutable"
 exec = { command = "molt-echo" }   # `cargo install --path crates/molt` puts it on PATH
 memory_mb = 256
 max_restarts = 5
+
+# The agent. Services start with a scrubbed environment: `pass_env` names the
+# variables copied from molt's own, and `env = { NAME = "value" }` sets more.
+
+# The model gateway, the only service that sees the API key.
+[[service]]
+name = "model"
+tier = "protected"
+exec = { command = "molt-gateway" }
+provides = ["model.*"]
+pass_env = [
+  "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "MOLT_MODEL", "MOLT_EFFORT", "MOLT_MAX_TOKENS",
+  "MOLT_MODEL_TIMEOUT_S", "MOLT_MODEL_RETRIES", "MOLT_MODEL_CONCURRENCY", "MOLT_FALLBACKS",
+]
+
+# Files and commands, confined to --root. Forks go to --scratch, which must be
+# outside the project (and any repository or cargo workspace around it), or
+# tools run in a fork find the original's Cargo.toml and .git above them.
+[[service]]
+name = "fs"
+tier = "mutable"
+exec = { command = "molt-tools", args = ["fs", "--root", ".", "--scratch", "/tmp/molt-work"] }
+provides = ["fs.*"]
+
+[[service]]
+name = "shell"
+tier = "mutable"
+exec = { command = "molt-tools", args = ["shell", "--root", ".", "--scratch", "/tmp/molt-work"] }
+provides = ["shell.*"]
+
+# Calls 0 would refuse every call; ms 0 leaves deadlines to each request.
+[[service]]
+name = "planner"
+tier = "mutable"
+exec = { command = "molt-planner" }
+provides = ["planner.*"]
+pass_env = [
+  "MOLT_PLANNER_MODEL", "MOLT_MAX_TURNS", "MOLT_MAX_CHECK_ROUNDS", "MOLT_BUDGET_USD", "MOLT_MAX_TOKENS",
+  "MOLT_MODEL_TIMEOUT_S", "MOLT_CHECK_TIMEOUT_S",
+]
+requests = [
+  { target = "model.complete", budget = { tokens = 4000000000, calls = 1000000 } },
+  { target = "fs.*", budget = { calls = 10000000 } },
+  { target = "shell.run", budget = { calls = 1000000 } },
+  { target = "topic:progress", budget = { calls = 10000000 } },
+]

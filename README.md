@@ -58,8 +58,8 @@ molt audit tail -n 20
 ```
 
 To run across hosts on NATS, set `transport = "nats"`, run `molt nats-config`
-to generate per-service credentials, put the printed `authorization` block in
-your nats-server config, and start `molt run`.
+to generate per-service credentials, put the printed `authorization` block and
+`max_payload` setting in your nats-server config, and start `molt run`.
 
 ## Tests
 

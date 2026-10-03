@@ -294,6 +294,12 @@ impl Kernel {
         self.inner.audit.path()
     }
 
+    /// The address services connect to (see `molt_transport::connect`), for
+    /// a client that joins the bus from inside this process.
+    pub fn address(&self) -> String {
+        self.inner.transport.address()
+    }
+
     /// Requests still waiting for a reply.
     pub fn pending_count(&self) -> usize {
         self.inner.pending.lock().unwrap().len()
