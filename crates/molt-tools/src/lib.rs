@@ -2,7 +2,9 @@
 //!
 //! Both confine every request to their [`Roots`]: a workspace must be a
 //! directory inside `root` or `scratch`, and every path inside a request must
-//! stay inside its workspace. Forks are created in `scratch`.
+//! stay inside its workspace. Nothing inside a `.molt` directory may be used,
+//! since Molt's data directory may live in `root`; only forks may sit below
+//! one, when `scratch` does. Forks are created in `scratch`.
 
 mod error;
 mod files;
@@ -11,6 +13,7 @@ mod paths;
 mod shell;
 mod walk;
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -19,6 +22,7 @@ use molt_sdk::Service;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::signal::unix::{signal, SignalKind};
 
 use crate::error::{failed, invalid};
 
@@ -29,6 +33,8 @@ pub struct Roots {
     pub root: PathBuf,
     /// Forks are created here. Keep it outside `root`'s projects, so tools
     /// that search parent directories (cargo, git) do not find the original.
+    /// It must be private to this user: it is created with mode 0700, and a
+    /// symlink, another user's directory or one others can write to is refused.
     pub scratch: PathBuf,
 }
 
@@ -41,7 +47,7 @@ pub struct Fs {
 }
 
 impl Fs {
-    /// Canonicalizes the roots; `scratch` is created if missing.
+    /// Canonicalizes the roots; `scratch` is created if missing, and checked.
     pub fn new(roots: Roots) -> anyhow::Result<Self> {
         Ok(Self { roots: Arc::new(roots.canonical()?), forks: Arc::default() })
     }
@@ -75,7 +81,7 @@ pub struct Shell {
 }
 
 impl Shell {
-    /// Canonicalizes the roots (`scratch` is created if missing) and finds the shell to run commands with.
+    /// Canonicalizes the roots (`scratch` is created if missing, and checked) and finds the shell to run commands with.
     pub fn new(roots: Roots) -> anyhow::Result<Self> {
         Ok(Self { roots: Arc::new(roots.canonical()?), program: shell::find_shell(), running: Arc::default() })
     }
@@ -99,6 +105,25 @@ impl Shell {
             _ => Err(invalid(format!("unknown method shell.{method}"))),
         }
     }
+}
+
+/// Resolves on the first signal that should stop the shell service, which
+/// must then [`Shell::kill_all`]: SIGTERM (the supervisor), SIGINT (Ctrl-C),
+/// SIGHUP (the terminal closed) or SIGQUIT (`Ctrl-\`). Each of them would
+/// end the process at once otherwise. Listening starts when this is called.
+pub fn stop_signal() -> std::io::Result<impl Future<Output = ()>> {
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    let mut hup = signal(SignalKind::hangup())?;
+    let mut quit = signal(SignalKind::quit())?;
+    Ok(async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+            _ = hup.recv() => {}
+            _ = quit.recv() => {}
+        }
+    })
 }
 
 /// Serve `fs.*` on `svc` until its link closes.

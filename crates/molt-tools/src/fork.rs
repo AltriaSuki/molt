@@ -3,12 +3,14 @@
 //! A fork is `scratch/fork-<id>`, with its metadata in
 //! `scratch/fork-<id>.json`: the workspace it was copied from and a hash of
 //! every copied file. Diff and merge compare three states of each path: the
-//! hash at fork time, the fork now and the original now.
+//! hash at fork time, the fork now and the original now. Forks and their
+//! metadata are private to the service's user: they copy private source, and
+//! merge trusts them.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs::{self, File};
+use std::fs::{self, DirBuilder, File, Permissions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -53,10 +55,11 @@ pub(crate) fn fork(roots: &Roots, req: ForkRequest) -> Result<ForkResponse, Remo
     let base = roots.workspace(&req.workspace)?;
     let name = format!("fork-{:012x}", rand::random::<u64>() >> 16);
     let dir = roots.scratch.join(&name);
-    fs::create_dir(&dir).map_err(|e| failed(format!("creating {}: {e}", dir.display())))?;
+    DirBuilder::new().mode(0o700).create(&dir).map_err(|e| failed(format!("creating {}: {e}", dir.display())))?;
     let made = copy_tree(&base, &dir, &roots.scratch).and_then(|meta| {
         let json = serde_json::to_vec_pretty(&meta).map_err(|e| failed(e.to_string()))?;
-        atomic_write(&meta_path(&dir), &json, None).map_err(|e| failed(format!("writing fork metadata: {e}")))?;
+        atomic_write(&meta_path(&dir), &json, Some(Permissions::from_mode(0o600)))
+            .map_err(|e| failed(format!("writing fork metadata: {e}")))?;
         Ok(meta.files.len() as u64)
     });
     match made {
@@ -74,7 +77,9 @@ fn copy_tree(base: &Path, dest: &Path, scratch: &Path) -> Result<ForkMeta, Remot
     let err = |path: &Path, e: io::Error| failed(format!("fork: {}: {e}", path.display()));
     let mut files = BTreeMap::new();
     let mut included = HashSet::new();
-    let mut dirs = vec![(PathBuf::new(), fs::metadata(base).map_err(|e| err(base, e))?.permissions())];
+    // The fork itself keeps only the owner's bits of the workspace's mode.
+    let top = fs::metadata(base).map_err(|e| err(base, e))?.permissions().mode() & 0o700;
+    let mut dirs = vec![(PathBuf::new(), Permissions::from_mode(top))];
     for item in walk::walk(base, base, None, scratch) {
         let entry = item.map_err(|e| failed(format!("fork: {e}")))?;
         let from = entry.path();
@@ -428,13 +433,30 @@ pub(crate) fn merge(roots: &Roots, lock: &Mutex<()>, req: MergeRequest) -> Resul
             conflicts.join(", ")
         )));
     }
-    for change in work {
-        apply(&fork, change).map_err(|e| failed(format!("merging {}: {e}", change.path)))?;
-    }
+    apply_all(&work, |change| apply(&fork, change))?;
     if req.drop {
         remove(&fork.dir).map_err(|e| failed(format!("the merge succeeded, but dropping the fork failed: {e}")))?;
     }
     Ok(MergeResponse { changes })
+}
+
+/// Run `apply` on each change in turn. A failure after the first write is
+/// reported as `partial:` with the paths already written, since the
+/// original then holds some of the fork's changes.
+fn apply_all(work: &[&Change], mut apply: impl FnMut(&Change) -> io::Result<()>) -> Result<(), RemoteError> {
+    let mut written: Vec<&str> = Vec::new();
+    for change in work {
+        if let Err(e) = apply(change) {
+            let path = &change.path;
+            return Err(failed(if written.is_empty() {
+                format!("merging {path}: {e}")
+            } else {
+                format!("partial: merging {path} failed ({e}) after these files were written: {}", written.join(", "))
+            }));
+        }
+        written.push(&change.path);
+    }
+    Ok(())
 }
 
 /// Make the original's `change.path` what it is in the fork.
@@ -517,6 +539,22 @@ mod tests {
         assert!(!is_fork_name("fork-0123456789a"));
         assert!(!is_fork_name("fork-0123456789abc"));
         assert!(!is_fork_name("spoon-0123456789ab"));
+    }
+
+    #[test]
+    fn a_merge_that_stops_after_a_write_names_what_was_written() {
+        let change = |path: &str| Change { path: path.into(), kind: ChangeKind::Modified };
+        let work = [change("a.txt"), change("b.txt"), change("c.txt")];
+        let work: Vec<&Change> = work.iter().collect();
+        let failing =
+            |at: &'static str| move |c: &Change| if c.path == at { Err(io::Error::other("disk full")) } else { Ok(()) };
+
+        let e = apply_all(&work, failing("c.txt")).unwrap_err();
+        assert_eq!(e.code, molt_proto::ErrorCode::Failed);
+        assert_eq!(e.message, "partial: merging c.txt failed (disk full) after these files were written: a.txt, b.txt");
+        let e = apply_all(&work, failing("a.txt")).unwrap_err();
+        assert_eq!(e.message, "merging a.txt: disk full", "nothing was written yet");
+        assert!(apply_all(&work, failing("z.txt")).is_ok());
     }
 
     #[test]

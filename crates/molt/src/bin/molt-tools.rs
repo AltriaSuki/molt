@@ -3,8 +3,9 @@
 //! `molt-tools shell --root DIR --scratch DIR` serves `shell.*`.
 //!
 //! The shell service kills the commands it is running before it exits on
-//! SIGTERM (the supervisor stopping it) or SIGINT (Ctrl-C in the terminal
-//! molt runs in); they would outlive it otherwise.
+//! SIGTERM (the supervisor stopping it), SIGINT (Ctrl-C in the terminal molt
+//! runs in), SIGHUP (that terminal closing) or SIGQUIT (`Ctrl-\`); they would
+//! outlive it otherwise.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,7 +13,6 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use molt_sdk::Service;
 use molt_tools::{Fs, Roots, Shell};
-use tokio::signal::unix::{signal, SignalKind};
 
 #[derive(Parser)]
 #[command(name = "molt-tools", version, about = "Molt's file and shell services")]
@@ -34,7 +34,9 @@ struct RootArgs {
     /// Workspaces must be inside this directory.
     #[arg(long)]
     root: PathBuf,
-    /// Forks are created here. Keep it outside the projects under `root`.
+    /// Forks are created here. Keep it outside the projects under `root`. It
+    /// must be private: it is created with mode 0700 if missing, and refused
+    /// if it is a symlink, another user's, or writable by others.
     #[arg(long)]
     scratch: PathBuf,
 }
@@ -56,13 +58,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Shell(args) => {
             let shell = Arc::new(Shell::new(args.roots())?);
-            let mut term = signal(SignalKind::terminate())?;
-            let mut interrupt = signal(SignalKind::interrupt())?;
+            let stop = molt_tools::stop_signal()?;
             let svc = Arc::new(Service::connect_from_env().await?);
             tokio::select! {
                 () = molt_tools::serve_shell(svc, shell.clone()) => {}
-                _ = term.recv() => {}
-                _ = interrupt.recv() => {}
+                () = stop => {}
             }
             shell.kill_all();
         }

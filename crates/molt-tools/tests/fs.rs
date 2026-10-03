@@ -2,8 +2,9 @@
 //! fork / diff / merge / drop cycle.
 
 use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use molt_api::fs::{ChangeKind, DiffResponse, ForkResponse, ListResponse, ReadResponse, SearchResponse};
 use molt_proto::{ErrorCode, RemoteError};
@@ -227,6 +228,28 @@ async fn edit_needs_one_match_unless_replace_all() {
 
     assert_eq!(env.ok("edit", edit("= 1;", "= 2;", true)).await, json!({ "replacements": 3 }));
     assert_eq!(fs::read_to_string(env.ws.join("f.rs")).unwrap(), "let a = 2;\nlet bee = 2;\nlet c = 2;\n");
+}
+
+/// The process's peak resident memory, in bytes.
+fn peak_rss() -> u64 {
+    let status = fs::read_to_string("/proc/self/status").unwrap();
+    let kb = status.lines().find_map(|l| l.strip_prefix("VmHWM:")).unwrap();
+    kb.trim().trim_end_matches("kB").trim().parse::<u64>().unwrap() * 1024
+}
+
+#[tokio::test]
+async fn an_edit_over_the_size_limit_is_refused_before_it_is_built() {
+    let env = Env::new();
+    // Each of a million bytes becomes a thousand: a 1 GB result.
+    fs::write(env.ws.join("big.txt"), "a".repeat(1_000_000)).unwrap();
+    let before = peak_rss();
+    let edit =
+        json!({ "workspace": "ws", "path": "big.txt", "old": "a", "new": "b".repeat(1000), "replace_all": true });
+    let msg = env.invalid("edit", edit).await;
+    assert!(msg.contains("would be 1000000000 bytes"), "{msg}");
+    let grew = peak_rss().saturating_sub(before);
+    assert!(grew < 256 << 20, "refusing the edit took {} MB", grew >> 20);
+    assert_eq!(fs::metadata(env.ws.join("big.txt")).unwrap().len(), 1_000_000);
 }
 
 #[tokio::test]
@@ -493,11 +516,106 @@ async fn special_files_never_block() {
     assert!(msg.contains("not a regular file"), "{msg}");
     env.invalid("edit", json!({ "workspace": "ws", "path": "pipe", "old": "a", "new": "b" })).await;
     assert!(found(env.ok("search", json!({ "workspace": "ws", "pattern": "a" })).await).len() == 1);
+    let search = env.call("search", json!({ "workspace": "ws", "pattern": "a", "path": "pipe" }));
+    match tokio::time::timeout(Duration::from_secs(5), search).await {
+        Ok(reply) => assert!(found(reply.unwrap()).is_empty()),
+        Err(_) => {
+            // Give the blocked read a writer, so the runtime can shut down.
+            drop(fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(env.ws.join("pipe")));
+            panic!("fs.search on a FIFO blocked");
+        }
+    }
     assert_eq!(listed(env.ok("list", json!({ "workspace": "ws" })).await), ["a.txt", "pipe"]);
     let fork = env.fork().await;
     assert!(fs::symlink_metadata(fork.join("pipe")).unwrap().file_type().is_symlink());
     let diff: DiffResponse = serde_json::from_value(env.ok("diff", json!({ "fork": fork })).await).unwrap();
     assert!(diff.changes.is_empty());
+}
+
+#[tokio::test]
+async fn molt_data_directories_are_off_limits() {
+    let env = Env::new();
+    let root = env.ws.parent().unwrap().to_path_buf();
+    Env::put(&root, &[(".molt/secrets/fs", "bus secret\n")]);
+    Env::put(&env.ws, &[("a.txt", "a\n"), (".molt/state", "secret\n"), ("sub/.molt/state", "secret\n")]);
+    symlink(".molt", env.ws.join("data")).unwrap();
+
+    for path in [".molt/state", "./.molt/state", "sub/.molt/state", "data/state"] {
+        let msg = env.invalid("read", json!({ "workspace": "ws", "path": path })).await;
+        assert!(msg.contains(".molt is Molt's own data directory"), "{msg}");
+        env.invalid("write", json!({ "workspace": "ws", "path": path, "content": "x" })).await;
+        env.invalid("edit", json!({ "workspace": "ws", "path": path, "old": "secret", "new": "x" })).await;
+    }
+    for path in [".molt", "sub/.molt", "data"] {
+        env.invalid("list", json!({ "workspace": "ws", "path": path })).await;
+        env.invalid("search", json!({ "workspace": "ws", "pattern": "secret", "path": path })).await;
+    }
+    for path in [".molt/new.txt", ".molt/new/deeper.txt", "data/new.txt", "data/new/deeper.txt"] {
+        env.invalid("write", json!({ "workspace": "ws", "path": path, "content": "x" })).await;
+    }
+    assert_eq!(fs::read_to_string(env.ws.join(".molt/state")).unwrap(), "secret\n");
+    assert!(!env.ws.join(".molt/new.txt").exists() && !env.ws.join(".molt/new").exists());
+    for ws in [".molt", ".molt/secrets", "ws/.molt", "ws/data", "ws/sub/.molt"] {
+        let msg = env.invalid("list", json!({ "workspace": ws })).await;
+        assert!(msg.contains("inside .molt"), "{ws}: {msg}");
+    }
+    // Only the name `.molt` is refused.
+    env.ok("write", json!({ "workspace": "ws", "path": ".molt.toml", "content": "x" })).await;
+
+    // When scratch is inside a data directory, its forks may be used; the rest of it may not.
+    let fs = Fs::new(Roots { root: root.clone(), scratch: root.join(".molt/work") }).unwrap();
+    let reply: ForkResponse =
+        serde_json::from_value(fs.handle("fork", json!({ "workspace": "ws" })).await.unwrap()).unwrap();
+    let read = fs.handle("read", json!({ "workspace": reply.fork, "path": "a.txt" })).await.unwrap();
+    assert_eq!(read_reply(read).content, "a\n");
+    let e = fs.handle("list", json!({ "workspace": ".molt" })).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e}");
+}
+
+#[tokio::test]
+async fn scratch_and_forks_are_private() {
+    let env = Env::new();
+    project(&env);
+    let mode = |p: &Path| fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode(&env.scratch), 0o700, "scratch is created private");
+    let fork = env.fork().await;
+    assert_eq!(mode(&fork), 0o700);
+    assert_eq!(mode(&fork.with_extension("json")), 0o600);
+
+    // Another user who can rename what is in scratch could swap a fork's files before the merge.
+    let tmp = env.tmp.path();
+    let roots = |scratch: &Path| Roots { root: tmp.join("root"), scratch: scratch.to_path_buf() };
+    let refused = |scratch: &Path| match Fs::new(roots(scratch)) {
+        Ok(_) => panic!("{} was accepted as scratch", scratch.display()),
+        Err(e) => e.to_string(),
+    };
+    for bits in [0o777, 0o1777, 0o770, 0o702] {
+        let dir = tmp.join(format!("open-{bits:o}"));
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(bits)).unwrap();
+        let msg = refused(&dir);
+        assert!(msg.contains("written by other users"), "{msg}");
+    }
+    let own = tmp.join("own");
+    fs::create_dir(&own).unwrap();
+    fs::set_permissions(&own, fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&own, tmp.join("link")).unwrap();
+    for link in [tmp.join("link"), tmp.join("link/")] {
+        let msg = refused(&link);
+        assert!(msg.contains("symlink"), "{msg}");
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let theirs = if unsafe { libc::geteuid() } == 0 {
+        let dir = tmp.join("theirs");
+        fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::chown(&dir, Some(65534), Some(65534)).unwrap();
+        dir
+    } else {
+        PathBuf::from("/")
+    };
+    let msg = refused(&theirs);
+    assert!(msg.contains("another user"), "{msg}");
+    assert!(Fs::new(roots(&own)).is_ok(), "a directory of our own that only we can write to is fine");
 }
 
 #[tokio::test]

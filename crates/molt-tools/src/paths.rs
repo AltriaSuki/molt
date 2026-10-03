@@ -2,25 +2,47 @@
 //! a workspace it may touch.
 //!
 //! Checks are made on canonical paths, so symlinks are resolved before the
-//! "is it inside" question is asked.
+//! "is it inside" question is asked. Nothing inside a directory named
+//! [`DATA_DIR`] may be used, since Molt's data directory may live in the root.
 
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, DirBuilder};
 use std::io;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use molt_proto::RemoteError;
 
 use crate::error::{failed, invalid};
 use crate::Roots;
 
+/// The name of Molt's data directory, which holds the audit log, sockets and secrets.
+pub(crate) const DATA_DIR: &str = ".molt";
+
 impl Roots {
-    /// Both roots canonicalized; `scratch` is created first if missing.
+    /// Both roots canonicalized. `scratch` is created private (0700) if
+    /// missing, and refused if it is a symlink, belongs to another user or
+    /// others may write to it: whoever can rename what is in it can swap a
+    /// fork's files before they are merged.
     pub(crate) fn canonical(&self) -> anyhow::Result<Roots> {
-        fs::create_dir_all(&self.scratch).with_context(|| format!("creating {}", self.scratch.display()))?;
+        // Without a trailing `/`, so a symlink is seen rather than followed.
+        let given: PathBuf = self.scratch.components().collect();
+        let shown = given.display();
+        DirBuilder::new().recursive(true).mode(0o700).create(&given).with_context(|| format!("creating {shown}"))?;
+        let meta = fs::symlink_metadata(&given).with_context(|| format!("scratch {shown}"))?;
+        if meta.file_type().is_symlink() {
+            bail!("scratch {shown} is a symlink; name a private directory of your own");
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            bail!("scratch {shown} belongs to another user; name a private directory of your own");
+        }
+        if meta.mode() & 0o022 != 0 {
+            bail!("scratch {shown} can be written by other users; make it private (chmod 700) or name another");
+        }
         let root = self.root.canonicalize().with_context(|| format!("root {}", self.root.display()))?;
-        let scratch = self.scratch.canonicalize().with_context(|| format!("scratch {}", self.scratch.display()))?;
+        let scratch = given.canonicalize().with_context(|| format!("scratch {shown}"))?;
         Ok(Roots { root, scratch })
     }
 
@@ -45,6 +67,11 @@ impl Roots {
         if !self.contains(&path) {
             return Err(invalid(format!("workspace {workspace} is outside the directories this service may use")));
         }
+        // Forks may live in a data directory (scratch under `.molt`), but nothing else there may be used.
+        let base = if path.starts_with(&self.scratch) { &self.scratch } else { &self.root };
+        if path.strip_prefix(base).is_ok_and(through_data_dir) {
+            return Err(invalid(format!("workspace {workspace} is inside {DATA_DIR}, Molt's own data directory")));
+        }
         if !path.is_dir() {
             return Err(invalid(format!("workspace {workspace} is not a directory")));
         }
@@ -53,7 +80,7 @@ impl Roots {
 }
 
 /// Check a request's path without touching the disk: relative, no `..`, no
-/// NUL. `""` and `.` name the workspace itself.
+/// [`DATA_DIR`], no NUL. `""` and `.` name the workspace itself.
 pub(crate) fn relative(path: &str) -> Result<PathBuf, RemoteError> {
     if path.contains('\0') {
         return Err(invalid("path contains a NUL byte"));
@@ -61,6 +88,7 @@ pub(crate) fn relative(path: &str) -> Result<PathBuf, RemoteError> {
     let mut out = PathBuf::new();
     for part in Path::new(path).components() {
         match part {
+            Component::Normal(name) if name == DATA_DIR => return Err(data_dir(path)),
             Component::Normal(name) => out.push(name),
             Component::CurDir => {}
             Component::ParentDir => {
@@ -85,13 +113,29 @@ pub(crate) fn shown(path: &str) -> &str {
     }
 }
 
+fn data_dir(shown: &str) -> RemoteError {
+    invalid(format!("{shown}: {DATA_DIR} is Molt's own data directory and cannot be used"))
+}
+
+fn through_data_dir(rel: &Path) -> bool {
+    rel.components().any(|c| c.as_os_str() == DATA_DIR)
+}
+
+/// Check that the canonical `path` is inside the canonical workspace `ws`,
+/// and not inside a [`DATA_DIR`] in it.
+pub(crate) fn confine(ws: &Path, path: &Path, shown: &str) -> Result<(), RemoteError> {
+    match path.strip_prefix(ws) {
+        Err(_) => Err(invalid(format!("{shown} leads outside the workspace"))),
+        Ok(rel) if through_data_dir(rel) => Err(data_dir(shown)),
+        Ok(_) => Ok(()),
+    }
+}
+
 /// The canonical path of the existing `rel` inside the canonical workspace
 /// `ws`. Symlinks are followed, but may not lead out of the workspace.
 pub(crate) fn existing(ws: &Path, rel: &Path, shown: &str) -> Result<PathBuf, RemoteError> {
     let path = ws.join(rel).canonicalize().map_err(|e| crate::error::io(shown, e))?;
-    if !path.starts_with(ws) {
-        return Err(invalid(format!("{shown} leads outside the workspace")));
-    }
+    confine(ws, &path, shown)?;
     Ok(path)
 }
 
@@ -118,9 +162,7 @@ pub(crate) fn writable(ws: &Path, rel: &Path, shown: &str) -> Result<PathBuf, Re
                     }
                 }
                 let real = at.canonicalize().map_err(|e| crate::error::io(shown, e))?;
-                if !real.starts_with(ws) {
-                    return Err(invalid(format!("{shown} leads outside the workspace")));
-                }
+                confine(ws, &real, shown)?;
                 return Ok(missing.into_iter().rev().fold(real, |path, name| path.join(name)));
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -155,5 +197,8 @@ mod tests {
         assert!(relative("..").is_err());
         assert!(relative("/etc/passwd").is_err());
         assert!(relative("a\0b").is_err());
+        assert!(relative(".molt").is_err());
+        assert!(relative("a/.molt/b").is_err());
+        assert_eq!(relative("a/.molty/.molt.toml").unwrap(), PathBuf::from("a/.molty/.molt.toml"));
     }
 }

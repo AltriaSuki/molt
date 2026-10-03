@@ -2,6 +2,7 @@
 
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use globset::GlobBuilder;
@@ -124,9 +125,7 @@ pub(crate) fn write(roots: &Roots, req: WriteRequest) -> Result<WriteResponse, R
         fs::create_dir_all(parent).map_err(io)?;
         // The missing directories were just created; make sure nothing
         // swapped one for a link out in the meantime.
-        if !parent.canonicalize().map_err(io)?.starts_with(&ws) {
-            return Err(invalid(format!("{name} leads outside the workspace")));
-        }
+        paths::confine(&ws, &parent.canonicalize().map_err(io)?, name)?;
     }
     let created = mode.is_none();
     atomic_write(&dest, req.content.as_bytes(), mode).map_err(io)?;
@@ -164,10 +163,14 @@ pub(crate) fn edit(roots: &Roots, req: EditRequest) -> Result<EditResponse, Remo
         }
         _ => {}
     }
-    let new = if req.replace_all { old.replace(&req.old, &req.new) } else { old.replacen(&req.old, &req.new, 1) };
-    if new.len() > MAX_WRITE_BYTES {
-        return Err(invalid(format!("the edited {name} would be {} bytes; the limit is {MAX_WRITE_BYTES}", new.len())));
+    // Sized before it is built, so an edit far over the limit costs no memory.
+    // Matches do not overlap, so they cover at most the whole file.
+    let edits = if req.replace_all { count } else { 1 };
+    let size = (old.len() - edits * req.old.len()).saturating_add(edits.saturating_mul(req.new.len()));
+    if size > MAX_WRITE_BYTES {
+        return Err(invalid(format!("the edited {name} would be {size} bytes; the limit is {MAX_WRITE_BYTES}")));
     }
+    let new = if req.replace_all { old.replace(&req.old, &req.new) } else { old.replacen(&req.old, &req.new, 1) };
     atomic_write(&path, new.as_bytes(), Some(meta.permissions())).map_err(io)?;
     Ok(EditResponse { replacements: count as u64 })
 }
@@ -296,13 +299,21 @@ pub(crate) fn search(roots: &Roots, req: SearchRequest) -> Result<SearchResponse
     Ok(SearchResponse { matches, truncated: false })
 }
 
-/// The text of a file worth searching: not too large, not binary.
+/// The text of a file worth searching: a regular file, not too large, not
+/// binary. Opening a FIFO would block until a writer came, so the file is
+/// opened without blocking and checked through the handle, which a swap
+/// after the first check cannot fool.
 fn searchable(path: &Path) -> Option<String> {
-    let meta = fs::metadata(path).ok()?;
-    if meta.len() > MAX_SEARCH_FILE {
+    if !fs::metadata(path).ok()?.is_file() {
         return None;
     }
-    let bytes = fs::read(path).ok()?;
+    let file = OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MAX_SEARCH_FILE {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SEARCH_FILE).read_to_end(&mut bytes).ok()?;
     if is_binary(&bytes) {
         return None;
     }

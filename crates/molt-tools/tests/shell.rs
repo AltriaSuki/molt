@@ -155,7 +155,8 @@ async fn long_output_keeps_its_head_and_tail() {
 #[tokio::test]
 async fn workspaces_are_confined() {
     let env = Env::new();
-    for ws in ["..", "/", "/tmp", "missing"] {
+    fs::create_dir(env.ws.parent().unwrap().join(".molt")).unwrap();
+    for ws in ["..", "/", "/tmp", "missing", ".molt"] {
         let err = env.call(json!({ "workspace": ws, "command": "true" })).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Invalid, "{ws}: {err}");
     }
@@ -168,4 +169,14 @@ async fn workspaces_are_confined() {
     )
     .unwrap();
     assert!(r.success());
+}
+
+#[tokio::test]
+async fn hangup_and_quit_stop_the_service_too() {
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+        let stop = molt_tools::stop_signal().unwrap();
+        // SAFETY: kill only sends a signal, which stop_signal now handles.
+        assert_eq!(unsafe { libc::kill(libc::getpid(), sig) }, 0);
+        tokio::time::timeout(Duration::from_secs(5), stop).await.unwrap_or_else(|_| panic!("signal {sig} was missed"));
+    }
 }
