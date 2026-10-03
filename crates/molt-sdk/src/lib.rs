@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use molt_proto::{Budget, CapId, Envelope, ErrorCode, Kind, MsgId, RemoteError, ServiceId, Target, TraceId};
 use molt_transport::{Link, TransportError};
@@ -25,6 +25,10 @@ use tokio::task::JoinHandle;
 
 /// Same as `molt_kernel::ENV_CAPS`; duplicated so services need not depend on the kernel.
 pub const ENV_CAPS: &str = "MOLT_CAPS";
+
+/// Requests and events a service holds for [`Service::next`] before more
+/// requests are answered `busy` and more events are dropped.
+pub const QUEUE: usize = 256;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SdkError {
@@ -74,7 +78,8 @@ pub struct Service {
     link: Arc<dyn Link>,
     caps: Mutex<HashMap<String, CapId>>,
     waiters: Waiters,
-    incoming: tokio::sync::Mutex<mpsc::Receiver<Envelope>>,
+    /// Requests and events, with when each arrived.
+    incoming: tokio::sync::Mutex<mpsc::Receiver<(Envelope, Instant)>>,
     reader: JoinHandle<()>,
 }
 
@@ -99,7 +104,7 @@ impl Service {
     pub fn new(id: ServiceId, link: Box<dyn Link>, caps: HashMap<String, CapId>) -> Self {
         let link: Arc<dyn Link> = Arc::from(link);
         let waiters: Waiters = Arc::default();
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::channel(QUEUE);
         let reader = tokio::spawn(read_loop(link.clone(), waiters.clone(), tx));
         Self { id, link, caps: Mutex::new(caps), waiters, incoming: tokio::sync::Mutex::new(rx), reader }
     }
@@ -200,9 +205,29 @@ impl Service {
         Ok(self.link.send(&msg).await?)
     }
 
-    /// Next request or event addressed to this service.
+    /// Next request or event addressed to this service. Up to [`QUEUE`] wait
+    /// here; a request that finds the queue full is answered `busy`, and an
+    /// event is dropped. The time a request waited here is taken off its
+    /// `budget.ms`, so a handler sees what is left of its caller's deadline;
+    /// one whose deadline passed while it waited is answered `timeout`
+    /// instead of returned.
     pub async fn next(&self) -> Option<Envelope> {
-        self.incoming.lock().await.recv().await
+        let mut incoming = self.incoming.lock().await;
+        loop {
+            let (mut msg, arrived) = incoming.recv().await?;
+            if msg.kind != Kind::Request || msg.budget.ms == 0 {
+                return Some(msg);
+            }
+            let waited = u64::try_from(arrived.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if waited < msg.budget.ms {
+                msg.budget.ms -= waited;
+                return Some(msg);
+            }
+            let reason = format!("the request waited {waited} ms for the service, past its deadline");
+            if let Err(e) = self.reply_error(&msg, ErrorCode::Timeout, &reason).await {
+                tracing::debug!(error = %e, "could not answer a request that timed out in the queue");
+            }
+        }
     }
 
     pub async fn reply(&self, req: &Envelope, payload: Value) -> Result<(), SdkError> {
@@ -228,8 +253,11 @@ impl Service {
 
     /// Handle up to `max_in_flight` requests at once until the link closes.
     /// Each runs in its own task, so replies may go out in a different order
-    /// than the requests came in. A handler that panics answers `failed`.
-    /// Events are passed to the handler too; their result is discarded.
+    /// than the requests came in. More requests wait in the service's queue
+    /// until a slot is free, and that wait counts against their deadlines
+    /// (see [`Service::next`]). A handler that panics, even before its future
+    /// starts, answers `failed`. Events are passed to the handler too; their
+    /// result is discarded.
     pub async fn serve_concurrent<F, Fut>(self: &Arc<Self>, max_in_flight: usize, handler: F)
     where
         F: Fn(Envelope) -> Fut + Send + Sync + 'static,
@@ -238,12 +266,14 @@ impl Service {
         let slots = Arc::new(tokio::sync::Semaphore::new(max_in_flight.max(1)));
         let handler = Arc::new(handler);
         let mut tasks = tokio::task::JoinSet::new();
-        while let Some(msg) = self.next().await {
+        loop {
             let Ok(slot) = slots.clone().acquire_owned().await else { break };
+            let Some(msg) = self.next().await else { break };
             let (svc, handler) = (self.clone(), handler.clone());
             tasks.spawn(async move {
                 let _slot = slot;
-                let work = tokio::spawn(handler(msg.clone()));
+                let request = msg.clone();
+                let work = tokio::spawn(async move { handler(request).await });
                 let result = match work.await {
                     Ok(r) => r,
                     Err(e) => Err(RemoteError { code: ErrorCode::Failed, message: format!("the handler failed: {e}") }),
@@ -277,7 +307,10 @@ impl Service {
     }
 }
 
-async fn read_loop(link: Arc<dyn Link>, waiters: Waiters, incoming: mpsc::Sender<Envelope>) {
+/// Route replies to their calls and queue everything else for [`Service::next`].
+/// It never waits for queue space: a request handler waiting on a call would
+/// then never see its reply, which arrives behind the queued requests.
+async fn read_loop(link: Arc<dyn Link>, waiters: Waiters, incoming: mpsc::Sender<(Envelope, Instant)>) {
     while let Some(msg) = link.recv().await {
         if msg.kind == Kind::Reply {
             let waiter = msg.reply_to.as_ref().and_then(|id| waiters.lock().unwrap().remove(id));
@@ -287,8 +320,21 @@ async fn read_loop(link: Arc<dyn Link>, waiters: Waiters, incoming: mpsc::Sender
                 }
                 None => tracing::debug!(reply_to = ?msg.reply_to, "reply with no waiting call"),
             }
-        } else if incoming.send(msg).await.is_err() {
-            break;
+            continue;
+        }
+        match incoming.try_send((msg, Instant::now())) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full((msg, _))) if msg.kind == Kind::Request => {
+                let busy = msg
+                    .error_reply(ErrorCode::Busy, format!("the service is busy: {QUEUE} requests are already waiting"));
+                if let Err(e) = link.send(&busy).await {
+                    tracing::warn!(error = %e, "could not answer a request the queue had no room for");
+                }
+            }
+            Err(mpsc::error::TrySendError::Full((msg, _))) => {
+                tracing::debug!(to = %msg.to, "dropped an event: the queue is full");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => break,
         }
     }
     // The link closed: wake every waiting call with an error.

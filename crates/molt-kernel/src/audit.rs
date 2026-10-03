@@ -11,6 +11,10 @@
 //! `hash = sha256(prev || seq || ts_ms || event bytes)`, computed over the exact
 //! event bytes written, so [`verify`] detects any edit, deletion or reorder.
 //! Nothing in the kernel exposes a way to rewrite or delete entries.
+//!
+//! The log holds every message, file contents and model conversations
+//! included, so a new log, and a directory created for it, is readable by
+//! its owner only.
 
 use std::path::{Path, PathBuf};
 
@@ -129,7 +133,11 @@ pub enum AuditError {
     Corrupt { line: usize, reason: String },
 }
 
-type Job = (AuditEvent, oneshot::Sender<u64>);
+enum Job {
+    Append(Box<AuditEvent>, oneshot::Sender<u64>),
+    /// Write everything queued before it, then stop the writer.
+    Close(oneshot::Sender<()>),
+}
 
 /// Handle to the single audit writer. Cheap to clone.
 #[derive(Clone)]
@@ -153,7 +161,11 @@ impl AuditLog {
     pub async fn open(path: impl Into<PathBuf>, fsync: bool) -> Result<Self, AuditError> {
         let path = path.into();
         if let Some(dir) = path.parent() {
-            tokio::fs::create_dir_all(dir).await?;
+            let mut dirs = tokio::fs::DirBuilder::new();
+            dirs.recursive(true);
+            #[cfg(unix)]
+            dirs.mode(0o700);
+            dirs.create(dir).await?;
         }
         let (mut seq, mut prev) = (0u64, GENESIS.to_owned());
         if tokio::fs::try_exists(&path).await? {
@@ -164,7 +176,11 @@ impl AuditLog {
             }
             tracing::info!(entries = n, "continuing audit log");
         }
-        let file = tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(&path).await?;
         let (tx, rx) = mpsc::channel(4096);
         tokio::spawn(writer(file, rx, seq, prev, fsync));
         Ok(Self { tx, path })
@@ -178,7 +194,7 @@ impl AuditLog {
     /// receipt to know it is durable.
     pub async fn submit(&self, event: AuditEvent) -> Result<Receipt, AuditError> {
         let (ack, rx) = oneshot::channel();
-        self.tx.send((event, ack)).await.map_err(|_| AuditError::Stopped)?;
+        self.tx.send(Job::Append(Box::new(event), ack)).await.map_err(|_| AuditError::Stopped)?;
         Ok(Receipt(rx))
     }
 
@@ -186,14 +202,33 @@ impl AuditLog {
     pub async fn append(&self, event: AuditEvent) -> Result<u64, AuditError> {
         self.submit(event).await?.durable().await
     }
+
+    /// Write every entry submitted so far, then stop the writer. That closes
+    /// every clone of this handle: later submits fail with
+    /// [`AuditError::Stopped`]. Await it before the runtime shuts down, which
+    /// would otherwise cut off the last batch mid-write.
+    pub async fn close(&self) {
+        let (done, rx) = oneshot::channel();
+        if self.tx.send(Job::Close(done)).await.is_ok() {
+            let _ = rx.await;
+        }
+    }
 }
 
 async fn writer(mut file: tokio::fs::File, mut rx: mpsc::Receiver<Job>, mut seq: u64, mut prev: String, fsync: bool) {
     let mut buf = Vec::new();
     let mut acks = Vec::new();
+    let mut closed = None;
     while let Some(first) = rx.recv().await {
         let mut job = Some(first);
-        while let Some((event, ack)) = job.take() {
+        while let Some(next) = job.take() {
+            let (event, ack) = match next {
+                Job::Append(event, ack) => (event, ack),
+                Job::Close(done) => {
+                    closed = Some(done);
+                    break;
+                }
+            };
             seq += 1;
             let ts_ms = now_ms();
             let raw = serde_json::value::to_raw_value(&event).expect("audit events always serialize");
@@ -208,6 +243,9 @@ async fn writer(mut file: tokio::fs::File, mut rx: mpsc::Receiver<Job>, mut seq:
             }
         }
         let written = async {
+            if buf.is_empty() {
+                return Ok(());
+            }
             file.write_all(&buf).await?;
             file.flush().await?;
             if fsync {
@@ -225,6 +263,10 @@ async fn writer(mut file: tokio::fs::File, mut rx: mpsc::Receiver<Job>, mut seq:
         }
         for (s, ack) in acks.drain(..) {
             let _ = ack.send(s);
+        }
+        if let Some(done) = closed.take() {
+            let _ = done.send(());
+            return;
         }
     }
 }
@@ -295,6 +337,36 @@ mod tests {
         let log = AuditLog::open(&path, false).await.unwrap();
         assert_eq!(log.append(ev(99)).await.unwrap(), 11);
         assert_eq!(verify(&path).await.unwrap(), 11);
+    }
+
+    #[tokio::test]
+    async fn close_writes_everything_submitted_then_stops_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open(&path, false).await.unwrap();
+        let mut receipts = Vec::new();
+        for n in 0..100 {
+            receipts.push(log.submit(ev(n)).await.unwrap());
+        }
+        log.clone().close().await;
+        assert_eq!(verify(&path).await.unwrap(), 100, "every entry is on disk once close returns");
+        for (i, r) in receipts.into_iter().enumerate() {
+            assert_eq!(r.durable().await.unwrap(), i as u64 + 1);
+        }
+        assert!(matches!(log.append(ev(100)).await, Err(AuditError::Stopped)));
+        log.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_log_and_its_directory_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data").join("audit.jsonl");
+        AuditLog::open(&path, false).await.unwrap().append(ev(0)).await.unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&dir.path().join("data")), 0o700);
     }
 
     #[tokio::test]

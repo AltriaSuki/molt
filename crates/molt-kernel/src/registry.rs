@@ -14,6 +14,7 @@
 //!   Anything else that widens capabilities needs a human.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -78,10 +79,15 @@ struct State {
 }
 
 impl Registry {
-    /// A registry persisted under `dir` (created if missing).
+    /// A registry persisted under `dir` (created if missing, readable by its
+    /// owner only, as is the file the registry writes there).
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, RegistryError> {
         let dir = dir.into();
-        std::fs::create_dir_all(&dir).map_err(|e| RegistryError::Io(e.to_string()))?;
+        let mut dirs = std::fs::DirBuilder::new();
+        dirs.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut dirs, 0o700);
+        dirs.create(&dir).map_err(|e| RegistryError::Io(e.to_string()))?;
         let file = dir.join("registry.json");
         let state = match std::fs::read(&file) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| RegistryError::Io(e.to_string()))?,
@@ -100,7 +106,12 @@ impl Registry {
         let Some(dir) = &self.dir else { return Ok(()) };
         let io = |e: std::io::Error| RegistryError::Io(e.to_string());
         let tmp = dir.join("registry.json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(state).unwrap()).map_err(io)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let bytes = serde_json::to_vec_pretty(state).map_err(|e| RegistryError::Io(e.to_string()))?;
+        options.open(&tmp).and_then(|mut f| f.write_all(&bytes)).map_err(io)?;
         std::fs::rename(&tmp, dir.join("registry.json")).map_err(io)
     }
 
@@ -235,5 +246,17 @@ mod tests {
             v
         };
         assert_eq!(Registry::open(dir.path()).unwrap().live(&p), Some(v));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_registry_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let reg_dir = dir.path().join("registry");
+        Registry::open(&reg_dir).unwrap().store(manifest("p", Tier::Mutable, &[])).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&reg_dir), 0o700);
+        assert_eq!(mode(&reg_dir.join("registry.json")), 0o600);
     }
 }
