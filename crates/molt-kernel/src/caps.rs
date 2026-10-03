@@ -70,7 +70,16 @@ impl Capability {
 
 /// Atomically take `amount` from `counter`, failing if it would go below zero.
 fn take(counter: &AtomicU64, amount: u64) -> bool {
-    counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| left.checked_sub(amount)).is_ok()
+    // A plain compare-and-swap loop: `fetch_update` is deprecated on newer
+    // toolchains in favour of `try_update`, which older ones lack.
+    let mut left = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = left.checked_sub(amount) else { return false };
+        match counter.compare_exchange_weak(left, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(actual) => left = actual,
+        }
+    }
 }
 
 #[derive(Default)]

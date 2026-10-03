@@ -20,6 +20,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
+          cache: false
       - name: Install nats-server for the NATS conformance and end-to-end tests
         run: |
           go install github.com/nats-io/nats-server/v2@latest
