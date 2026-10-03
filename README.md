@@ -17,7 +17,7 @@ to rewrite the services around it.
                  \                          /
                   every message, checked and logged
                                |
- ┌───────────────────────── kernel ─────────────────────────┐
+ ┌───────────────────────── kernel ───────────────────────────┐
  │ message bus · capabilities · supervisor · registry · audit │
  └────────────────────────────────────────────────────────────┘
 ```
@@ -84,5 +84,6 @@ a notice and pass; CI always runs them.
 ## Not in this milestone
 
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
-- Cancellation tokens, deadlock (call-cycle) checks at the gate and the `audit.read` endpoint for the evaluator arrive with the services that need them.
+- Cancellation tokens, call-cycle checks at the gate and an `audit.read` endpoint for the evaluator arrive with the services that need them.
 - A topic capability currently allows both publishing and subscribing.
+- No license has been chosen yet.
