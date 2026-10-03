@@ -38,6 +38,10 @@ pub struct Config {
     pub check_timeout: Duration,
     /// Runs handled at once.
     pub max_concurrent_runs: usize,
+    /// How long a finished run waits, while it applies the winner, for the
+    /// replies to model calls that cancelled attempts left running, so their
+    /// cost is counted. Calls still unanswered are reported as uncounted.
+    pub late_reply_wait: Duration,
 }
 
 impl Default for Config {
@@ -51,6 +55,7 @@ impl Default for Config {
             model_timeout: Duration::from_secs(1200),
             check_timeout: Duration::from_secs(900),
             max_concurrent_runs: 4,
+            late_reply_wait: Duration::from_secs(2),
         }
     }
 }
@@ -70,7 +75,8 @@ impl Config {
     /// | `MOLT_MODEL_TIMEOUT_S` | `1200` |
     /// | `MOLT_CHECK_TIMEOUT_S` | `900` |
     ///
-    /// An empty variable counts as unset; a value that does not parse is an error.
+    /// An empty variable counts as unset. A value that does not parse is an
+    /// error, and so is a zero: none of these limits has a "no limit" value.
     pub fn from_env() -> anyhow::Result<Self> {
         Self::from_vars(|name| std::env::var(name).ok())
     }
@@ -78,7 +84,10 @@ impl Config {
     fn from_vars(var: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
         let get = |name: &str| var(name).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
         let number = |name: &str, default: u64| -> anyhow::Result<u64> {
-            get(name).map_or(Ok(default), |v| v.parse().with_context(|| format!("{name}={v:?} is not a number")))
+            let Some(v) = get(name) else { return Ok(default) };
+            let n: u64 = v.parse().with_context(|| format!("{name}={v:?} is not a number"))?;
+            ensure!(n > 0, "{name}={v:?} must be at least 1");
+            Ok(n)
         };
         let small = |name: &str, default: u32| -> anyhow::Result<u32> {
             u32::try_from(number(name, default.into())?).with_context(|| format!("{name} is too large"))
@@ -92,17 +101,16 @@ impl Config {
             }
             None => d.budget_usd,
         };
-        let max_turns = small("MOLT_MAX_TURNS", d.max_turns)?;
-        ensure!(max_turns > 0, "MOLT_MAX_TURNS must be at least 1");
         Ok(Self {
             default_model: get("MOLT_PLANNER_MODEL"),
-            max_turns,
+            max_turns: small("MOLT_MAX_TURNS", d.max_turns)?,
             max_check_rounds: small("MOLT_MAX_CHECK_ROUNDS", d.max_check_rounds)?,
             budget_usd,
             max_tokens: small("MOLT_MAX_TOKENS", d.max_tokens)?,
             model_timeout: Duration::from_secs(number("MOLT_MODEL_TIMEOUT_S", d.model_timeout.as_secs())?),
             check_timeout: Duration::from_secs(number("MOLT_CHECK_TIMEOUT_S", d.check_timeout.as_secs())?),
             max_concurrent_runs: d.max_concurrent_runs,
+            late_reply_wait: d.late_reply_wait,
         })
     }
 }
@@ -211,7 +219,7 @@ mod tests {
         let cfg = from(&[
             ("MOLT_PLANNER_MODEL", "sonnet"),
             ("MOLT_MAX_TURNS", "7"),
-            ("MOLT_MAX_CHECK_ROUNDS", "0"),
+            ("MOLT_MAX_CHECK_ROUNDS", "4"),
             ("MOLT_BUDGET_USD", "2.5"),
             ("MOLT_MAX_TOKENS", "1000"),
             ("MOLT_MODEL_TIMEOUT_S", "5"),
@@ -220,7 +228,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.default_model.as_deref(), Some("sonnet"));
         assert_eq!(cfg.max_turns, 7);
-        assert_eq!(cfg.max_check_rounds, 0);
+        assert_eq!(cfg.max_check_rounds, 4);
         assert_eq!(cfg.budget_usd, 2.5);
         assert_eq!(cfg.max_tokens, 1000);
         assert_eq!(cfg.model_timeout, Duration::from_secs(5));
@@ -230,7 +238,17 @@ mod tests {
     #[test]
     fn env_errors() {
         assert!(from(&[("MOLT_MAX_TURNS", "many")]).is_err());
-        assert!(from(&[("MOLT_MAX_TURNS", "0")]).is_err());
+        // Zero is never "no limit": it would fail every run.
+        for name in [
+            "MOLT_MAX_TURNS",
+            "MOLT_MAX_CHECK_ROUNDS",
+            "MOLT_MAX_TOKENS",
+            "MOLT_MODEL_TIMEOUT_S",
+            "MOLT_CHECK_TIMEOUT_S",
+        ] {
+            let err = from(&[(name, "0")]).unwrap_err().to_string();
+            assert!(err.contains(name), "{err}");
+        }
         assert!(from(&[("MOLT_MAX_TOKENS", "99999999999")]).is_err());
         assert!(from(&[("MOLT_BUDGET_USD", "cheap")]).is_err());
         assert!(from(&[("MOLT_BUDGET_USD", "-1")]).is_err());

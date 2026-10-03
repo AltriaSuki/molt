@@ -1,5 +1,7 @@
 //! The model step shared by the designer's and the attempts' agent loops.
 
+use std::sync::Arc;
+
 use molt_api::model::{CompleteResponse, STOP_MAX_TOKENS};
 use molt_proto::RemoteError;
 use tokio_util::sync::CancellationToken;
@@ -27,10 +29,11 @@ pub(crate) struct Meter {
 
 /// Ask the model for its next turn and append that turn to `conv`. Stops
 /// early, without calling the model, when the loop is cancelled, out of
-/// turns or the run is over budget; a cancellation during the call stops
-/// waiting for it.
+/// turns or the run is over budget. A cancellation during the call stops
+/// waiting for it; the call runs on and its reply still counts against the
+/// run (see [`Ctx::complete`]).
 pub(crate) async fn turn(
-    ctx: &Ctx,
+    ctx: &Arc<Ctx>,
     conv: &mut Conversation,
     max_turns: u32,
     meter: &mut Meter,
@@ -46,7 +49,7 @@ pub(crate) async fn turn(
         return Err(Stop::Budget);
     }
     let resp = tokio::select! {
-        // A reply that is already in has been paid for, so it wins a tie and gets counted.
+        // A reply that is already in wins a tie, so the loop's meter counts it too.
         biased;
         resp = ctx.complete(conv) => resp,
         _ = cancel.cancelled() => return Err(Stop::Cancelled),

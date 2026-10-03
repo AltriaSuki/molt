@@ -49,12 +49,15 @@ How to design the check:
 - Find out how the project builds and runs its tests, and what the task touches.
 - Prefer the project's existing build and test commands, narrowed to what matters for the task \
 (for example one package or one test file).
-- When the task adds or changes behavior, write a focused new test or script that exercises exactly that \
-behavior, where the project keeps its tests, and make the command run it. Test what the task asks for, \
-not details it leaves open.
+- When the task adds or changes behavior, write a focused test or script that exercises exactly that \
+behavior, in a new file where the project keeps its tests, and make the command run it. Test what the task \
+asks for, not details it leaves open.
+- Put everything the check needs in new files. Never change an existing file for the check, and do not put \
+tests inside existing source files (for a Rust crate, write an integration test under tests/): the check's files \
+are restored before every check run, so an existing file among them would undo the other agents' work on it.
 - Run the check. If the task is not done yet, confirm that the check fails, and fails for the right reason.
 - The check must not need network access, and must be deterministic and reasonably fast.
-- Do not implement the task itself. Only the files you list in submit_check reach the other agents; \
+- Do not implement the task itself. Only the new files you list in submit_check reach the other agents; \
 any other change you make is thrown away.
 - If no automated check fits the task (a question to answer, prose to write), call submit_check with command null.
 
@@ -109,6 +112,9 @@ Write big files in smaller pieces: several smaller files, or a first part follow
 
 pub(crate) const CUT_OFF: &str = "This call was cut off because your reply reached the output length limit, \
 so it was not run. Write big files in smaller pieces and try again.";
+
+pub(crate) const FINAL_REPLY: &str = "Your reply was empty. If you are done, give your final reply now: the answer, \
+or a short summary of what you changed. Otherwise, carry on.";
 
 pub(crate) const NUDGE: &str = "You have not called submit_check. Call it now with the done-check command and the \
 files it depends on, or with command null if no automated check fits this task.";
@@ -297,8 +303,9 @@ pub(crate) fn designer_tools() -> Vec<Value> {
             "files": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Every file you wrote that the check depends on, relative to the workspace root. \
-                                Empty when the check uses only existing files.",
+                "description": "Every new file you wrote that the check depends on, relative to the workspace \
+                                root. Only files that did not exist before; empty when the check uses only existing \
+                                files.",
             },
             "rationale": { "type": "string", "description": "Briefly, why this check shows the task is done." },
         }),

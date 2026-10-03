@@ -48,6 +48,10 @@ struct State {
     /// Lines `fs.read` returns when the request sets no limit.
     page: u64,
     merge_conflict: bool,
+    /// `fs.merge` writes the first change, then fails with a `partial:` error.
+    merge_partial: bool,
+    drop_fails: bool,
+    patch_truncated: bool,
     calls: Vec<Call>,
     requests: Vec<CompleteRequest>,
     events: Vec<Progress>,
@@ -101,6 +105,9 @@ impl Fake {
             forked: 0,
             page: 2000,
             merge_conflict: false,
+            merge_partial: false,
+            drop_fails: false,
+            patch_truncated: false,
             calls: Vec::new(),
             requests: Vec::new(),
             events: Vec::new(),
@@ -226,7 +233,7 @@ impl Fake {
                         format!("--- a/{0}\n+++ b/{0}\n{body}", c.path)
                     })
                     .collect();
-                json!(fs::DiffResponse { changes, patch, truncated: false })
+                json!(fs::DiffResponse { changes, patch, truncated: st.patch_truncated })
             }
             fs::MERGE => {
                 let m: fs::MergeRequest = parse(payload);
@@ -239,11 +246,26 @@ impl Fake {
                         message: format!("conflict: {}", paths.join(", ")),
                     });
                 }
-                for c in &changes {
+                for (i, c) in changes.iter().enumerate() {
+                    if st.merge_partial && i > 0 {
+                        let written: Vec<&str> = changes[..i].iter().map(|c| c.path.as_str()).collect();
+                        return Err(RemoteError {
+                            code: ErrorCode::Failed,
+                            message: format!(
+                                "partial: could not write {}: disk full; written: {}",
+                                c.path,
+                                written.join(", ")
+                            ),
+                        });
+                    }
                     match now.get(&c.path) {
                         Some(content) => st.workspace.insert(c.path.clone(), content.clone()),
                         None => st.workspace.remove(&c.path),
                     };
+                }
+                if m.drop && st.drop_fails {
+                    let message = "the merge succeeded, but dropping the fork failed".to_owned();
+                    return Err(RemoteError { code: ErrorCode::Failed, message });
                 }
                 if m.drop {
                     st.forks.remove(&m.fork);
@@ -252,6 +274,9 @@ impl Fake {
             }
             fs::DROP => {
                 let d: fs::DropRequest = parse(payload);
+                if st.drop_fails {
+                    return Err(RemoteError { code: ErrorCode::Failed, message: "could not delete the fork".into() });
+                }
                 json!(fs::DropResponse { dropped: st.forks.remove(&d.fork).is_some() })
             }
             other => return Err(RemoteError { code: ErrorCode::Unavailable, message: format!("no {other}") }),
@@ -360,6 +385,7 @@ fn config() -> Config {
         max_tokens: 1000,
         model_timeout: Duration::from_secs(5),
         check_timeout: Duration::from_secs(7),
+        late_reply_wait: Duration::from_millis(200),
         ..Config::default()
     }
 }
@@ -413,7 +439,7 @@ async fn an_explicit_check_passes_and_the_winner_is_merged() {
     assert_eq!((resp.winner, resp.applied, resp.fork.as_deref()), (Some(0), true, None));
     assert_eq!(resp.summary, "Wrote hello.txt.");
     assert_eq!(resp.changes, vec![Change { path: "hello.txt".into(), kind: ChangeKind::Added }]);
-    assert!(resp.patch.contains("+hi"), "{}", resp.patch);
+    assert!(resp.patch.contains("+hi") && !resp.patch_truncated, "{}", resp.patch);
     assert_eq!(fake.workspace()["hello.txt"], "hi\n");
     assert!(fake.forks_alive().is_empty());
 
@@ -421,7 +447,7 @@ async fn an_explicit_check_passes_and_the_winner_is_merged() {
     assert_eq!((a.status, a.turns, a.check_runs), (AttemptStatus::Passed, 2, 1));
     assert_eq!(a.usage.input_tokens, 200);
     assert!(close(a.cost_usd, 0.25) && close(resp.cost_usd, 0.25));
-    assert_eq!(resp.usage, a.usage);
+    assert_eq!((resp.usage, resp.uncounted_calls), (a.usage, 0));
 
     // Every call goes to the attempt's fork, with the deadlines the contract sets.
     let fork = fake.calls_to("fs.fork")[0].clone();
@@ -435,7 +461,20 @@ async fn an_explicit_check_passes_and_the_winner_is_merged() {
     let check = &fake.calls_to("shell.run")[0];
     assert_eq!(check.payload, json!({ "workspace": "/scratch/fork-0", "command": "check", "timeout_ms": 7000 }));
     assert_eq!(check.budget.ms, 37_000);
-    assert_eq!(fake.calls_to("fs.merge")[0].payload, json!({ "fork": "/scratch/fork-0", "drop": true }));
+    // The fork is dropped by its own call, so a failed drop cannot fail the merge.
+    let ends: Vec<(String, Value)> = fake
+        .calls()
+        .into_iter()
+        .filter(|c| c.target == "fs.merge" || c.target == "fs.drop")
+        .map(|c| (c.target, c.payload))
+        .collect();
+    assert_eq!(
+        ends,
+        [
+            ("fs.merge".to_owned(), json!({ "fork": "/scratch/fork-0", "drop": false })),
+            ("fs.drop".to_owned(), json!({ "fork": "/scratch/fork-0" })),
+        ]
+    );
 
     let run = "trace_test".to_owned();
     assert_eq!(
@@ -508,7 +547,8 @@ async fn check_rounds_are_limited() {
 async fn the_first_attempt_to_pass_wins_and_the_others_are_cancelled() {
     let fake = Fake::new(
         |req| match (attempt_of(req), turn(req)) {
-            (0, 1) => write_hello(req, "hi\n"),
+            // Slow enough that the others are in their model call when it passes.
+            (0, 1) => Reply { delay: Duration::from_millis(50), ..write_hello(req, "hi\n") },
             (0, _) => done("Mine passed."),
             // The others are stuck in a long model call when the winner cancels them.
             _ => Reply { delay: Duration::from_secs(60), ..done("Too late.") },
@@ -525,6 +565,33 @@ async fn the_first_attempt_to_pass_wins_and_the_others_are_cancelled() {
     assert_eq!(fake.calls_to("fs.fork").len(), 3);
     assert!(fake.forks_alive().is_empty());
     assert_eq!(fake.workspace()["hello.txt"], "hi\n");
+    // The cancelled calls were sent and will be billed, but their replies did not come in time to be counted.
+    assert_eq!(fake.requests().len(), 4);
+    assert!(close(resp.cost_usd, 0.25), "{}", resp.cost_usd);
+    assert_eq!(resp.uncounted_calls, 2);
+}
+
+#[tokio::test]
+async fn replies_to_cancelled_attempts_that_land_soon_are_counted() {
+    let fake = Fake::new(
+        |req| match (attempt_of(req), turn(req)) {
+            (0, 1) => Reply { delay: Duration::from_millis(50), ..write_hello(req, "hi\n") },
+            (0, _) => done("Mine passed."),
+            _ => Reply { delay: Duration::from_millis(300), ..done("Too late.") },
+        },
+        hello_check,
+    );
+    let wait = Duration::from_secs(3);
+    let started = tokio::time::Instant::now();
+    let resp = run_with(&fake, Config { late_reply_wait: wait, ..config() }, request(Some("check"), 3)).await;
+
+    assert_eq!((resp.outcome, resp.applied), (Outcome::Passed, true));
+    assert_eq!(resp.attempts[1].status, AttemptStatus::Cancelled);
+    assert_eq!(resp.uncounted_calls, 0);
+    assert!(close(resp.cost_usd, 0.5), "{}", resp.cost_usd);
+    assert_eq!(resp.usage.input_tokens, 400);
+    // The run waited for the replies, not for the whole grace period.
+    assert!(started.elapsed() < wait, "{:?}", started.elapsed());
 }
 
 /// The designer's check: `sh check.sh` runs check.sh, which the attempt may tamper with.
@@ -689,7 +756,7 @@ async fn when_no_check_fits_one_unverified_attempt_runs() {
 }
 
 #[tokio::test]
-async fn a_designer_that_never_submits_is_nudged_once_then_the_run_is_unverified() {
+async fn a_designer_that_never_submits_is_nudged_once_then_the_run_fails() {
     let fake = Fake::new(
         |req| match (is_designer(req), turn(req)) {
             (true, _) => done("Looks fine to me."),
@@ -700,12 +767,30 @@ async fn a_designer_that_never_submits_is_nudged_once_then_the_run_is_unverified
     );
     let resp = run(&fake, request(None, 2)).await;
 
-    let designer: Vec<CompleteRequest> = fake.requests().into_iter().filter(is_designer).collect();
-    assert_eq!(designer.len(), 2);
-    assert!(last_text(&designer[1]).contains("You have not called submit_check"));
-    // An unverified attempt that changed files is still merged.
-    assert_eq!((resp.outcome, resp.applied), (Outcome::Unverified, true));
-    assert_eq!(fake.workspace()["hello.txt"], "hi\n");
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(is_designer));
+    assert!(last_text(&requests[1]).contains("You have not called submit_check"));
+    // A designer that gave up is not a task without a check: nothing runs unverified.
+    assert_eq!((resp.outcome, resp.applied, resp.attempts.len()), (Outcome::Failed, false, 0));
+    assert!(
+        resp.summary.contains("Could not design a done-check: the check designer stopped without submitting"),
+        "{}",
+        resp.summary
+    );
+    assert!(!fake.workspace().contains_key("hello.txt"));
+    assert!(fake.forks_alive().is_empty());
+}
+
+#[tokio::test]
+async fn a_designer_out_of_turns_fails_the_run_whatever_the_attempts_turn_limit() {
+    let fake = Fake::new(|req| use_tools(req, &[("list_files", json!({}))]), |_, _| exit(0, ""));
+    let resp = run(&fake, RunRequest { max_turns: Some(3), ..request(None, 2) }).await;
+
+    // max_turns limits each attempt; the designer has its own limit.
+    assert_eq!(fake.requests().len(), 25);
+    assert_eq!((resp.outcome, resp.attempts.len()), (Outcome::Failed, 0));
+    assert!(resp.summary.contains("ran out of turns without submitting a check"), "{}", resp.summary);
     assert!(fake.forks_alive().is_empty());
 }
 
@@ -912,4 +997,190 @@ async fn an_unforkable_workspace_is_an_error_reply() {
     let err = molt_planner::run(bus, Arc::new(config()), req, TraceId::random()).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Invalid);
     assert!(fake.requests().is_empty());
+}
+
+/// The designer of a run with no check: it submits none.
+fn no_check(req: &CompleteRequest) -> Reply {
+    use_tools(req, &[("submit_check", json!({ "command": null, "files": [], "rationale": "A question." }))])
+}
+
+fn text(t: &str) -> Value {
+    json!({ "type": "text", "text": t })
+}
+
+#[tokio::test]
+async fn a_reply_split_by_the_output_limit_is_returned_whole() {
+    let fake = Fake::new(
+        |req| match (is_designer(req), turn(req)) {
+            (true, _) => no_check(req),
+            (false, 1) => {
+                let call = json!({ "type": "tool_use", "id": "t1", "name": "list_files", "input": {} });
+                response(vec![text("Let me look."), call], "tool_use").into()
+            }
+            (false, 2) => response(vec![text("PART ONE of the answer,")], "max_tokens").into(),
+            (false, _) => done("PART TWO of the answer."),
+        },
+        |_, _| panic!("no command should run"),
+    );
+    let resp = run(&fake, RunRequest { task: "What is the answer?".into(), ..request(None, 1) }).await;
+
+    assert_eq!(resp.outcome, Outcome::Unverified);
+    // Text before a tool call is not part of the reply; text cut off by the limit is.
+    assert_eq!(resp.summary, "PART ONE of the answer,\n\nPART TWO of the answer.");
+}
+
+#[tokio::test]
+async fn an_empty_final_reply_is_asked_for_once() {
+    let script = |answer: bool| {
+        move |req: &CompleteRequest| -> Reply {
+            if is_designer(req) {
+                return no_check(req);
+            }
+            if last_text(req).contains("Your reply was empty") {
+                return if answer { done("The answer is 42.") } else { response(vec![], "end_turn").into() };
+            }
+            match turn(req) {
+                1 => {
+                    let input = json!({ "path": "README.md" });
+                    let call = json!({ "type": "tool_use", "id": "t1", "name": "read_file", "input": input });
+                    response(vec![text("The answer is 42. Let me confirm in the README."), call], "tool_use").into()
+                }
+                // Models may end their turn with no content after a tool result.
+                _ => response(vec![], "end_turn").into(),
+            }
+        }
+    };
+    let question = RunRequest { task: "What is the answer?".into(), ..request(None, 1) };
+
+    let fake = Fake::new(script(true), |_, _| panic!("no command should run"));
+    let resp = run(&fake, question.clone()).await;
+    assert_eq!((resp.outcome, resp.summary.as_str()), (Outcome::Unverified, "The answer is 42."));
+    assert_eq!(resp.attempts[0].turns, 3);
+    let asked = fake.requests().iter().filter(|r| last_text(r).contains("Your reply was empty")).count();
+    assert_eq!(asked, 1);
+
+    // A second empty reply is accepted rather than asked for again.
+    let fake = Fake::new(script(false), |_, _| panic!("no command should run"));
+    let resp = run(&fake, question).await;
+    assert_eq!(resp.summary, "The attempt finished without a summary.");
+    assert_eq!(resp.attempts[0].turns, 3);
+}
+
+#[tokio::test]
+async fn only_new_files_can_be_check_files() {
+    let fake = Fake::new(
+        |req| {
+            if !is_designer(req) {
+                return match turn(req) {
+                    1 => write_hello(req, "hi\n"),
+                    _ => done("Wrote hello.txt."),
+                };
+            }
+            let submit = |files: &[&str]| {
+                use_tools(
+                    req,
+                    &[("submit_check", json!({ "command": "sh tests/check.sh", "files": files, "rationale": "r" }))],
+                )
+            };
+            match turn(req) {
+                // A test added to an existing file, which every check run would reset to this copy.
+                1 => use_tools(
+                    req,
+                    &[
+                        ("write_file", json!({ "path": "README.md", "content": "# project\ntest\n" })),
+                        ("write_file", json!({ "path": "tests/check.sh", "content": "test -f hello.txt\n" })),
+                    ],
+                ),
+                2 => submit(&["tests/check.sh", "README.md"]),
+                3 => submit(&["Cargo.toml"]),
+                _ => submit(&["tests/check.sh"]),
+            }
+        },
+        |command, files| match command {
+            "sh tests/check.sh" if files.get("hello.txt").map(String::as_str) == Some("hi\n") => exit(0, ""),
+            _ => exit(1, "no hello\n"),
+        },
+    );
+    fake.set(|st| {
+        st.workspace.insert("Cargo.toml".into(), "[package]\n".into());
+    });
+    let resp = run(&fake, request(None, 1)).await;
+
+    let designer: Vec<CompleteRequest> = fake.requests().into_iter().filter(is_designer).collect();
+    assert_eq!(designer.len(), 4);
+    for (req, problem) in [
+        (&designer[2], "README.md as a check file: it already exists"),
+        (&designer[3], "Cargo.toml as a check file: it is not a file you created"),
+    ] {
+        let result = &req.messages.last().unwrap()["content"][0];
+        assert_eq!(result["is_error"], true);
+        let message = result["content"].as_str().unwrap();
+        assert!(message.contains(problem) && message.contains("tests/"), "{message}");
+    }
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert_eq!(resp.check.unwrap().files, ["tests/check.sh"]);
+    assert_eq!(fake.workspace()["README.md"], "# project\n");
+}
+
+#[tokio::test]
+async fn a_fork_that_cannot_be_dropped_after_the_merge_still_counts_as_applied() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        },
+        hello_check,
+    );
+    fake.set(|st| st.drop_fails = true);
+    let resp = run(&fake, request(Some("check"), 1)).await;
+
+    assert_eq!((resp.outcome, resp.applied, resp.fork.as_deref()), (Outcome::Passed, true, None));
+    assert_eq!(resp.summary, "Wrote hello.txt.");
+    assert_eq!(fake.workspace()["hello.txt"], "hi\n");
+    assert_eq!(fake.calls_to("fs.drop").len(), 1);
+}
+
+#[tokio::test]
+async fn a_merge_that_stops_partway_is_reported_as_partial() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => use_tools(
+                req,
+                &[
+                    ("write_file", json!({ "path": "a.txt", "content": "a\n" })),
+                    ("write_file", json!({ "path": "hello.txt", "content": "hi\n" })),
+                ],
+            ),
+            _ => done("Wrote a.txt and hello.txt."),
+        },
+        hello_check,
+    );
+    fake.set(|st| st.merge_partial = true);
+    let resp = run(&fake, request(Some("check"), 1)).await;
+
+    assert_eq!((resp.outcome, resp.applied), (Outcome::Passed, false));
+    assert_eq!(resp.fork.as_deref(), Some("/scratch/fork-0"));
+    assert!(
+        resp.summary.contains("The merge stopped partway, so the workspace has only some of the changes: partial:")
+            && resp.summary.contains("written: a.txt")
+            && resp.summary.contains("/scratch/fork-0"),
+        "{}",
+        resp.summary
+    );
+    assert_eq!(fake.workspace().get("a.txt").map(String::as_str), Some("a\n"));
+    assert_eq!(fake.forks_alive(), ["/scratch/fork-0"]);
+}
+
+#[tokio::test]
+async fn a_truncated_patch_is_flagged() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        },
+        hello_check,
+    );
+    fake.set(|st| st.patch_truncated = true);
+    let resp = run(&fake, request(Some("check"), 1)).await;
+    assert_eq!((resp.outcome, resp.patch_truncated, resp.changes.len()), (Outcome::Passed, true, 1));
 }

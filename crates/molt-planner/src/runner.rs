@@ -54,8 +54,20 @@ pub(crate) async fn run(
     // Without a check there is nothing to pick a winner by, so one attempt is enough.
     let count = if check.is_some() { req.attempts } else { 1 };
     let (finished, winner) = race(&ctx, count, check.map(Arc::new)).await;
-    let resp = conclude(&ctx, &req, spec, finished, winner).await;
-    tracing::info!(run = %ctx.trace, outcome = ?resp.outcome, cost_usd = resp.cost_usd, "run finished");
+    // Cancelled attempts may have left model calls running, which are billed: give their replies a moment
+    // to land and be counted, while the winner is applied.
+    let (mut resp, tally) =
+        tokio::join!(conclude(&ctx, &req, spec, finished, winner), ctx.settle(ctx.cfg.late_reply_wait));
+    resp.usage = tally.spend.usage;
+    resp.cost_usd = tally.spend.cost_usd;
+    resp.uncounted_calls = tally.pending;
+    tracing::info!(
+        run = %ctx.trace,
+        outcome = ?resp.outcome,
+        cost_usd = resp.cost_usd,
+        uncounted_calls = resp.uncounted_calls,
+        "run finished"
+    );
     Ok(resp)
 }
 
@@ -70,6 +82,8 @@ fn validate(req: &RunRequest) -> Result<(), RemoteError> {
         "check is empty: leave it out to have one designed".to_owned()
     } else if req.max_turns == Some(0) {
         "max_turns must be at least 1".to_owned()
+    } else if req.max_check_rounds == Some(0) {
+        "max_check_rounds must be at least 1".to_owned()
     } else if req.budget_usd.is_some_and(|b| !(b.is_finite() && b > 0.0)) {
         "budget_usd must be a positive amount".to_owned()
     } else {
@@ -109,6 +123,7 @@ async fn race(ctx: &Arc<Ctx>, count: u32, check: Option<Arc<Check>>) -> (Vec<Fin
     (finished, winner)
 }
 
+/// The response, without the run's totals.
 async fn conclude(
     ctx: &Ctx,
     req: &RunRequest,
@@ -153,15 +168,19 @@ async fn conclude(
                 Ok(diff) => {
                     resp.changes = diff.changes;
                     resp.patch = diff.patch;
+                    resp.patch_truncated = diff.truncated;
                     // An unverified attempt that changed nothing (it answered a question) has nothing to merge.
                     if req.apply && (spec.is_some() || !resp.changes.is_empty()) {
                         match ctx.merge(&fork).await {
                             Ok(_) => resp.applied = true,
                             Err(e) => {
-                                resp.summary.push_str(&format!(
-                                    "\n\nThe changes were not applied: {}. They are kept in {fork}.",
-                                    e.message
-                                ));
+                                let what = if e.message.starts_with("partial:") {
+                                    "The merge stopped partway, so the workspace has only some of the changes"
+                                } else {
+                                    "The changes were not applied"
+                                };
+                                resp.summary
+                                    .push_str(&format!("\n\n{what}: {}. They are all kept in {fork}.", e.message));
                                 keep = true;
                             }
                         }
@@ -185,9 +204,6 @@ async fn conclude(
             }
         }
     }
-    let spent = ctx.spent();
-    resp.usage = spent.usage;
-    resp.cost_usd = spent.cost_usd;
     resp
 }
 
@@ -216,7 +232,7 @@ fn status_name(status: AttemptStatus) -> &'static str {
 
 /// The response when the designer could not produce a check and no attempt ran.
 fn not_designed(ctx: &Ctx, reason: &str) -> RunResponse {
-    let spent = ctx.spent();
+    let tally = ctx.tally();
     RunResponse {
         outcome: Outcome::Failed,
         check: None,
@@ -228,9 +244,9 @@ fn not_designed(ctx: &Ctx, reason: &str) -> RunResponse {
         applied: false,
         fork: None,
         attempts: Vec::new(),
-        usage: spent.usage,
-        cost_usd: spent.cost_usd,
-        uncounted_calls: 0,
+        usage: tally.spend.usage,
+        cost_usd: tally.spend.cost_usd,
+        uncounted_calls: tally.pending,
     }
 }
 
@@ -249,6 +265,7 @@ mod tests {
             RunRequest { attempts: 9, ..ok.clone() },
             RunRequest { check: Some(" ".into()), ..ok.clone() },
             RunRequest { max_turns: Some(0), ..ok.clone() },
+            RunRequest { max_check_rounds: Some(0), ..ok.clone() },
             RunRequest { budget_usd: Some(0.0), ..ok.clone() },
             RunRequest { budget_usd: Some(f64::INFINITY), ..ok.clone() },
         ];

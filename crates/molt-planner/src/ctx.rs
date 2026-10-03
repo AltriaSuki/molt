@@ -2,6 +2,7 @@
 //! the forks still alive, and typed helpers for the calls a run makes.
 
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use molt_api::fs;
 use molt_api::model::{self, CompleteRequest, CompleteResponse, Effort, Usage};
@@ -11,6 +12,7 @@ use molt_proto::{Budget, ErrorCode, RemoteError, TraceId};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::watch;
 
 use crate::{Bus, Config};
 
@@ -36,6 +38,14 @@ impl Spend {
     }
 }
 
+/// The run's spend and its model calls still unanswered, kept together so a
+/// reply is always counted in exactly one of them.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Tally {
+    pub spend: Spend,
+    pub pending: u32,
+}
+
 pub(crate) struct Ctx {
     bus: Arc<dyn Bus>,
     pub cfg: Arc<Config>,
@@ -47,7 +57,7 @@ pub(crate) struct Ctx {
     pub max_turns: u32,
     pub max_check_rounds: u32,
     pub budget_usd: f64,
-    spend: Mutex<Spend>,
+    tally: watch::Sender<Tally>,
     /// Forks created and not yet dropped or merged, so none outlives the run by accident.
     forks: Mutex<Vec<String>>,
 }
@@ -86,7 +96,7 @@ impl Ctx {
             max_check_rounds: req.max_check_rounds.unwrap_or(cfg.max_check_rounds),
             budget_usd: req.budget_usd.unwrap_or(cfg.budget_usd),
             cfg,
-            spend: Mutex::default(),
+            tally: watch::Sender::new(Tally::default()),
             forks: Mutex::default(),
         }
     }
@@ -121,17 +131,27 @@ impl Ctx {
         self.progress(Progress::Note { run: self.run_id(), message: message.into() }).await;
     }
 
-    /// Run totals over the designer and every attempt.
-    pub fn spent(&self) -> Spend {
-        *self.spend.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Run totals over the designer and every attempt, and the model calls not answered yet.
+    pub fn tally(&self) -> Tally {
+        *self.tally.borrow()
     }
 
     pub fn over_budget(&self) -> bool {
-        self.spent().cost_usd >= self.budget_usd
+        self.tally().spend.cost_usd >= self.budget_usd
     }
 
-    /// One model call; its usage counts against the run.
-    pub async fn complete(&self, conv: &Conversation) -> Result<CompleteResponse, RemoteError> {
+    /// [`Ctx::tally`] once every model call is answered, or after `limit`.
+    pub async fn settle(&self, limit: Duration) -> Tally {
+        let mut tally = self.tally.subscribe();
+        // A timeout leaves the calls still pending in the tally.
+        let _ = tokio::time::timeout(limit, tally.wait_for(|t| t.pending == 0)).await;
+        self.tally()
+    }
+
+    /// One model call; its usage counts against the run. The call runs in its
+    /// own task: the gateway bills it whether or not the caller still waits,
+    /// so a caller that stops waiting leaves it pending until the reply lands.
+    pub async fn complete(self: &Arc<Self>, conv: &Conversation) -> Result<CompleteResponse, RemoteError> {
         let req = CompleteRequest {
             model: self.model.clone(),
             system: Some(conv.system.to_owned()),
@@ -142,10 +162,22 @@ impl Ctx {
             output_schema: None,
         };
         let ms = u64::try_from(self.cfg.model_timeout.as_millis()).unwrap_or(u64::MAX);
-        let resp: CompleteResponse =
-            self.call(model::COMPLETE, req, Budget::new(self.cfg.max_tokens.into(), ms, 0)).await?;
-        self.spend.lock().unwrap_or_else(PoisonError::into_inner).add(&resp);
-        Ok(resp)
+        let budget = Budget::new(self.cfg.max_tokens.into(), ms, 0);
+        self.tally.send_modify(|t| t.pending += 1);
+        let ctx = self.clone();
+        let call = tokio::spawn(async move {
+            let resp = ctx.call::<CompleteResponse>(model::COMPLETE, req, budget).await;
+            ctx.tally.send_modify(|t| {
+                t.pending -= 1;
+                if let Ok(resp) = &resp {
+                    t.spend.add(resp);
+                }
+            });
+            resp
+        });
+        call.await.unwrap_or_else(|e| {
+            Err(RemoteError { code: ErrorCode::Failed, message: format!("the model call's task failed: {e}") })
+        })
     }
 
     pub async fn fork(&self) -> Result<String, RemoteError> {
@@ -181,11 +213,13 @@ impl Ctx {
         self.call(fs::DIFF, fs::DiffRequest { fork: fork.to_owned() }, Budget::new(0, TREE_MS, 0)).await
     }
 
-    /// Merge a fork into the workspace and drop it.
+    /// Merge a fork into the workspace, then drop it. The drop is a separate
+    /// best-effort call, so a fork that cannot be deleted does not make a
+    /// merge that succeeded look failed.
     pub async fn merge(&self, fork: &str) -> Result<fs::MergeResponse, RemoteError> {
-        let req = fs::MergeRequest { fork: fork.to_owned(), drop: true };
+        let req = fs::MergeRequest { fork: fork.to_owned(), drop: false };
         let resp = self.call(fs::MERGE, req, Budget::new(0, TREE_MS, 0)).await?;
-        self.forget_fork(fork);
+        self.drop_fork(fork).await;
         Ok(resp)
     }
 

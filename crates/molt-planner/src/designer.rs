@@ -2,8 +2,10 @@
 //! done-check, possibly writing new test files for it, before any attempt
 //! starts.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use molt_api::fs::ChangeKind;
 use molt_api::model::{tool_result, user_blocks, user_text, ToolUse, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{SubmitCheck, SUBMIT_CHECK};
 use molt_proto::RemoteError;
@@ -15,7 +17,8 @@ use crate::ctx::{Conversation, Ctx};
 use crate::prompts;
 use crate::tools::{self, Actor};
 
-/// The designer never needs as many turns as an attempt.
+/// The designer's turn limit. The run's `max_turns` counts an attempt's
+/// turns; a small one must not starve the designer.
 const MAX_TURNS: u32 = 25;
 
 pub(crate) enum Design {
@@ -24,9 +27,10 @@ pub(crate) enum Design {
         /// Path and full contents of each file the check depends on.
         files: Vec<(String, String)>,
     },
-    /// No automated check fits the task, or the designer did not settle on one.
+    /// No automated check fits the task: the designer submitted none.
     Unverified(String),
-    /// The designer could not do its work (model error, refusal, budget).
+    /// The designer could not do its work (model error, refusal, budget), or
+    /// ran out of turns or stopped without submitting a check.
     Failed(String),
 }
 
@@ -45,10 +49,10 @@ async fn work(ctx: &Arc<Ctx>, fork: &str) -> Design {
     let never = CancellationToken::new();
     let mut nudged = false;
     loop {
-        let resp = match agent::turn(ctx, &mut conv, ctx.max_turns.min(MAX_TURNS), &mut meter, &never).await {
+        let resp = match agent::turn(ctx, &mut conv, MAX_TURNS, &mut meter, &never).await {
             Ok(resp) => resp,
             Err(Stop::OutOfTurns) => {
-                return Design::Unverified("the check designer ran out of turns without submitting a check".into())
+                return Design::Failed("the check designer ran out of turns without submitting a check".into())
             }
             Err(Stop::Budget) => return Design::Failed("budget exhausted".into()),
             Err(Stop::Model(e)) => return Design::Failed(format!("model call failed: {e}")),
@@ -60,7 +64,7 @@ async fn work(ctx: &Arc<Ctx>, fork: &str) -> Design {
             if resp.stop_reason.as_deref() == Some(STOP_MAX_TOKENS) {
                 conv.push(user_text(prompts::CONTINUE));
             } else if nudged {
-                return Design::Unverified("the check designer stopped without submitting a check".into());
+                return Design::Failed("the check designer stopped without submitting a check".into());
             } else {
                 nudged = true;
                 conv.push(user_text(prompts::NUDGE));
@@ -105,11 +109,33 @@ async fn submitted(ctx: &Ctx, fork: &str, call: &ToolUse) -> Result<Design, Stri
     if command.trim().is_empty() {
         return Err("The command is empty. Give the done-check command, or null if no automated check fits.".into());
     }
+    // Check files are restored before every check run, which would undo an attempt's work on an existing file.
+    let changed: HashMap<String, ChangeKind> = if submit.files.is_empty() {
+        HashMap::new()
+    } else {
+        let diff = ctx
+            .diff(fork)
+            .await
+            .map_err(|e| format!("Could not list the files you created: {}. Try again.", e.message))?;
+        diff.changes.into_iter().map(|c| (c.path, c.kind)).collect()
+    };
     let mut files: Vec<(String, String)> = Vec::new();
     for path in &submit.files {
         let path = path.trim().trim_start_matches("./");
         if path.is_empty() || files.iter().any(|(p, _)| p == path) {
             continue;
+        }
+        let problem = match changed.get(path) {
+            Some(ChangeKind::Added) => None,
+            Some(_) => Some("it already exists in the workspace"),
+            None => Some("it is not a file you created"),
+        };
+        if let Some(problem) = problem {
+            return Err(format!(
+                "Cannot use {path} as a check file: {problem}. Check files are restored before every check run, \
+                 so an existing file among them would undo the other agents' work on it. Put what the check needs \
+                 in new files (for a Rust crate, an integration test under tests/) and list only those."
+            ));
         }
         let content = ctx.read_all(fork, path).await.map_err(|e| {
             format!(

@@ -145,21 +145,36 @@ impl Attempt {
             self.index,
         );
         let mut conv = Conversation::new(prompts::ATTEMPT_SYSTEM, Arc::new(prompts::attempt_tools()), first);
+        // The final reply so far. The output limit can split it over several turns.
+        let mut reply: Vec<String> = Vec::new();
+        // An empty final reply gets one request for a real one before it is accepted.
+        let mut asked = false;
         loop {
             let resp = agent::turn(&ctx, &mut conv, ctx.max_turns, &mut self.meter, &self.cancel).await?;
             let calls = resp.tool_uses();
             if !calls.is_empty() {
+                reply.clear();
+                asked = false;
                 let actor = Actor::Attempt { index: self.index, turn: self.meter.turns };
                 let results = self.or_cancel(tools::execute(&ctx, &fork, &calls, agent::cut_off(&resp), actor)).await?;
                 conv.push(user_blocks(results));
                 continue;
             }
+            let text = resp.text();
+            if !text.is_empty() {
+                reply.push(text);
+            }
             if resp.stop_reason.as_deref() == Some(STOP_MAX_TOKENS) {
                 conv.push(user_text(prompts::CONTINUE));
                 continue;
             }
+            if reply.is_empty() && !asked {
+                asked = true;
+                conv.push(user_text(prompts::FINAL_REPLY));
+                continue;
+            }
 
-            let summary = resp.text();
+            let summary = std::mem::take(&mut reply).join("\n\n");
             let Some(check) = self.check.clone() else { return Ok(summary) };
             let ran = self.or_cancel(self.run_check(&fork, &check)).await??;
             self.check_runs += 1;
@@ -182,6 +197,7 @@ impl Attempt {
                 );
                 return Err(End::new(AttemptStatus::Failed, note));
             }
+            asked = false;
             conv.push(user_text(prompts::check_failed(&check.command, &ran)));
         }
     }
