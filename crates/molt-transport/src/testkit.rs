@@ -179,8 +179,25 @@ pub async fn full_inbox_is_bounded<H: Harness>() {
     panic!("100k sends to a service that never reads were all accepted: the inbox is unbounded");
 }
 
+/// Envelopes of several megabytes pass both ways: an agent's conversation
+/// with the model, or a patch, gets that big.
+pub async fn large_messages_pass<H: Harness>() {
+    let h = H::setup().await;
+    let mut inbound = h.transport().inbound().unwrap();
+    let (a, link) = open(&h, "a").await;
+    let mut big = numbered(0);
+    big.payload = serde_json::json!("x".repeat(crate::MAX_FRAME / 2));
+    link.send(&big).await.expect("a service sends a large message");
+    let m = tokio::time::timeout(Duration::from_secs(5), inbound.next()).await.expect("inbound").unwrap();
+    assert_eq!(m.msg.payload, big.payload);
+    send_eventually(h.transport(), &a, &big).await;
+    let got = tokio::time::timeout(Duration::from_secs(5), link.recv()).await.expect("recv").unwrap();
+    assert_eq!(got.payload, big.payload);
+}
+
 pub async fn run_all<H: Harness>() {
     ordered_both_ways::<H>().await;
+    large_messages_pass::<H>().await;
     sender_is_stamped_by_transport::<H>().await;
     wrong_secret_is_rejected::<H>().await;
     cannot_write_into_another_endpoint::<H>().await;

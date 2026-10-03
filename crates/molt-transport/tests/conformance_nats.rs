@@ -145,3 +145,4 @@ nats_test!(nats_wrong_secret_rejected, wrong_secret_is_rejected);
 nats_test!(nats_cannot_write_into_another_endpoint, cannot_write_into_another_endpoint);
 nats_test!(nats_cannot_read_another_inbox, cannot_read_another_inbox);
 nats_test!(nats_unconnected_service, unconnected_service);
+nats_test!(nats_large_messages_pass, large_messages_pass);

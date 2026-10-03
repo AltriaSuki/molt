@@ -260,7 +260,15 @@ impl Service {
             return;
         }
         let sent = match result {
-            Ok(v) => self.reply(msg, v).await,
+            // A reply the transport refuses (too big, say) would leave the
+            // caller waiting out its whole deadline; a short error reaches it.
+            Ok(v) => match self.reply(msg, v).await {
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not send a reply; sending an error instead");
+                    self.reply_error(msg, ErrorCode::Failed, &format!("the reply could not be sent: {e}")).await
+                }
+                sent => sent,
+            },
             Err(e) => self.reply_error(msg, e.code, &e.message).await,
         };
         if let Err(e) = sent {
@@ -285,4 +293,53 @@ async fn read_loop(link: Arc<dyn Link>, waiters: Waiters, incoming: mpsc::Sender
     }
     // The link closed: wake every waiting call with an error.
     waiters.lock().unwrap().clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    use super::*;
+
+    /// A link that refuses to send envelopes over `max` bytes, as a transport does.
+    struct SmallLink {
+        max: usize,
+        inbox: tokio::sync::Mutex<mpsc::Receiver<Envelope>>,
+        sent: mpsc::Sender<Envelope>,
+    }
+
+    #[async_trait]
+    impl Link for SmallLink {
+        async fn send(&self, msg: &Envelope) -> Result<(), TransportError> {
+            let size = serde_json::to_vec(msg)?.len();
+            if size > self.max {
+                return Err(TransportError::Other(format!("{size} bytes is too big")));
+            }
+            self.sent.send(msg.clone()).await.map_err(|_| TransportError::Closed)
+        }
+
+        async fn recv(&self) -> Option<Envelope> {
+            self.inbox.lock().await.recv().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_too_big_to_send_becomes_an_error_reply() {
+        let (to_service, inbox) = mpsc::channel(4);
+        let (sent, mut from_service) = mpsc::channel(4);
+        let link = SmallLink { max: 1024, inbox: tokio::sync::Mutex::new(inbox), sent };
+        let svc = Service::new(ServiceId::new("svc").unwrap(), Box::new(link), HashMap::new());
+        let req = Envelope::request(TraceId::random(), "svc.big".parse().unwrap(), CapId::random(), Value::Null);
+        to_service.send(req.clone()).await.unwrap();
+        drop(to_service);
+        svc.serve(|_| async { Ok(json!("x".repeat(4096))) }).await;
+        drop(svc);
+
+        let reply = from_service.recv().await.expect("a reply");
+        assert_eq!(reply.reply_to.as_ref(), Some(&req.id));
+        let err = reply.error().expect("an error reply");
+        assert_eq!(err.code, ErrorCode::Failed);
+        assert!(err.message.contains("too big"), "{}", err.message);
+    }
 }
