@@ -1,0 +1,14 @@
+# Copy to molt.toml and run `molt run`.
+
+[kernel]
+data_dir = ".molt"        # audit.jsonl, registry/, sockets, secrets
+transport = "unix"        # "unix" for one host, "nats" for many
+nats_url = "nats://127.0.0.1:4222"
+fsync = true
+
+[[service]]
+name = "echo"
+tier = "mutable"
+exec = { command = "molt-echo" }   # `cargo install --path crates/molt` puts it on PATH
+memory_mb = 256
+max_restarts = 5

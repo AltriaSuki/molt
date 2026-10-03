@@ -1,0 +1,25 @@
+[package]
+name = "molt-kernel"
+description = "The Molt microkernel: bus, capabilities, supervisor, registry and audit log"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+molt-proto.workspace = true
+molt-transport.workspace = true
+arc-swap.workspace = true
+futures.workspace = true
+hex.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+molt-sdk.workspace = true
+tempfile.workspace = true
+tokio-util.workspace = true

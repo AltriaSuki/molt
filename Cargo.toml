@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/AltriaSuki/molt"
+
+[workspace.dependencies]
+molt-proto = { path = "crates/molt-proto" }
+molt-transport = { path = "crates/molt-transport" }
+molt-sdk = { path = "crates/molt-sdk" }
+molt-kernel = { path = "crates/molt-kernel" }
+
+anyhow = "1"
+arc-swap = "1"
+async-nats = "0.50"
+async-trait = "0.1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+hex = "0.4"
+libc = "0.2"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

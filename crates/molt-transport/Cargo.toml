@@ -1,0 +1,32 @@
+[package]
+name = "molt-transport"
+description = "Pluggable transports for the Molt bus: Unix sockets and NATS"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[features]
+default = ["nats"]
+nats = ["dep:async-nats"]
+# Exposes the transport conformance suite to other crates' tests.
+testkit = []
+
+[dependencies]
+molt-proto.workspace = true
+async-nats = { workspace = true, optional = true }
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+async-nats.workspace = true
+tempfile.workspace = true
+molt-transport = { path = ".", features = ["testkit"] }
