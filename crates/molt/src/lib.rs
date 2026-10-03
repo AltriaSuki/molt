@@ -6,20 +6,43 @@ pub mod agent;
 pub mod config;
 mod lock;
 
+use std::future::Future;
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use molt_kernel::supervisor::{Limits, RestartPolicy};
 use molt_kernel::{Config as KernelConfig, Kernel};
 use molt_transport::{Secret, Transport};
+use tokio::signal::unix::{signal, SignalKind};
 
 pub use config::{Config, Secrets, ServiceSection, TransportKind};
 pub use lock::{DataDirLock, LOCK_FILE};
+
+/// The longest path a Unix socket address holds (`sun_path` less its NUL).
+pub(crate) const MAX_SOCKET_PATH: usize = if cfg!(target_os = "linux") { 107 } else { 103 };
 
 /// Log to stderr, filtered by `RUST_LOG` or else `default` (e.g. `info`).
 pub fn init_tracing(default: &str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| default.into());
     tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+}
+
+/// Resolves to the number of the first signal that should stop molt and the
+/// services it started: SIGINT (Ctrl-C), SIGTERM (`kill`, `timeout`, a
+/// service manager) or SIGHUP (the terminal closed). Each would end molt at
+/// once otherwise, and on NATS its services would live on. Listening starts
+/// when this is called.
+pub fn stop_signal() -> std::io::Result<impl Future<Output = i32>> {
+    let (int, term, hup) = (SignalKind::interrupt(), SignalKind::terminate(), SignalKind::hangup());
+    let (mut on_int, mut on_term, mut on_hup) = (signal(int)?, signal(term)?, signal(hup)?);
+    Ok(async move {
+        let kind = tokio::select! {
+            _ = on_int.recv() => int,
+            _ = on_term.recv() => term,
+            _ = on_hup.recv() => hup,
+        };
+        kind.as_raw_value()
+    })
 }
 
 /// A kernel started by [`start`], its services, and the lock on its data dir.
@@ -47,6 +70,9 @@ impl Running {
 
 /// Lock the data dir, start the kernel and launch every configured service.
 pub async fn start(cfg: &Config) -> anyhow::Result<Running> {
+    if cfg.kernel.transport == TransportKind::Unix {
+        check_socket_paths(cfg)?;
+    }
     let lock = DataDirLock::acquire(&cfg.kernel.data_dir)?;
     let mut kcfg = KernelConfig::new(&cfg.kernel.data_dir);
     kcfg.fsync = cfg.kernel.fsync;
@@ -71,6 +97,23 @@ pub async fn start(cfg: &Config) -> anyhow::Result<Running> {
         return Err(e);
     }
     Ok(Running { kernel, secrets, _lock: lock })
+}
+
+/// Refuse a data dir whose socket paths would be too long, before anything
+/// is created in it.
+fn check_socket_paths(cfg: &Config) -> anyhow::Result<()> {
+    let names = cfg.services.iter().map(|s| s.name.as_str()).chain([agent::CLI]);
+    let Some(longest) = names.max_by_key(|name| name.len()) else { return Ok(()) };
+    let path = cfg.socket_dir().join(format!("{longest}.sock"));
+    let len = path.as_os_str().len();
+    if len > MAX_SOCKET_PATH {
+        bail!(
+            "the socket path {} would be {len} bytes, more than the {MAX_SOCKET_PATH} Unix sockets allow; \
+             use a data dir with a shorter path (--data-dir for molt do)",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 async fn launch_all(kernel: &Kernel, cfg: &Config, secrets: Option<&Secrets>) -> anyhow::Result<()> {
@@ -108,5 +151,15 @@ mod tests {
         assert!(err.contains("already running"), "{err}");
         running.shutdown().await;
         start(&cfg).await.unwrap().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_data_dir_too_long_for_sockets_is_refused_before_anything_is_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.kernel.data_dir = dir.path().join("d".repeat(MAX_SOCKET_PATH));
+        let err = start(&cfg).await.err().unwrap().to_string();
+        assert!(err.contains("use a data dir with a shorter path"), "{err}");
+        assert!(!cfg.kernel.data_dir.exists());
     }
 }

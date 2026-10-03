@@ -282,7 +282,7 @@ impl Secrets {
             services: s.services.iter().map(|(k, v)| (k.clone(), v.expose().to_owned())).collect(),
         };
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            crate::lock::create_private_dir(dir)?;
         }
         std::fs::write(path, serde_json::to_vec_pretty(&file)?)?;
         #[cfg(unix)]

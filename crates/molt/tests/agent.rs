@@ -35,6 +35,8 @@ const CHECK: &str = "grep -q hello greeting.txt";
 const LONG_GREETING: usize = 1536 * 1024;
 /// Far more than a run needs; only a hang should ever hit it.
 const RUN_LIMIT: Duration = Duration::from_secs(120);
+/// The `--scratch` placeholder in molt.example.toml.
+const EXAMPLE_SCRATCH: &str = "/home/you/.cache/molt/work";
 
 #[derive(Clone)]
 enum Fake {
@@ -348,7 +350,7 @@ fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) ->
         .args(args)
         .arg("--data-dir")
         .arg(data)
-        // No molt.toml here, and `--workspace` defaults to the current directory.
+        // `--workspace` defaults to the current directory.
         .current_dir(workspace)
         .env("ANTHROPIC_BASE_URL", server.uri())
         .env("ANTHROPIC_API_KEY", API_KEY)
@@ -515,6 +517,67 @@ async fn stopping_a_run_kills_the_commands_it_started() {
     let pid = read_pid(&pidfile).unwrap();
     assert!(exits(pid).await, "the command's child {pid} outlived the run");
     assert_requests_valid(&server).await;
+    // The planner was stopped before it could drop the attempt's fork.
+    setup.assert_forks_dropped();
+}
+
+/// The pid of the latest start of `service` in the audit log at `path`.
+async fn started_pid(path: &Path, service: &str) -> i32 {
+    loop {
+        let entries = molt_kernel::audit::read_all(path).await.unwrap_or_default();
+        let pid = entries.iter().rev().find_map(|e| match &e.event {
+            AuditEvent::ServiceStarted { service: s, pid: Some(pid) } if s.as_str() == service => Some(*pid),
+            _ => None,
+        });
+        if let Some(pid) = pid {
+            return pid as i32;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_planner_that_dies_mid_run_ends_the_run_rather_than_starting_it_again() {
+    let pids = tempfile::tempdir().unwrap();
+    let pidfile = pids.path().join("sleep.pid");
+    let server = fake_api(Fake::Hangs(pidfile.clone())).await;
+    let setup = Setup::new(&server);
+    let kill_planner = async {
+        let sleep = wait_for_pid(&pidfile).await;
+        let planner = started_pid(&setup.data.path().join("audit.jsonl"), "planner").await;
+        // SAFETY: plain syscall.
+        assert_eq!(unsafe { libc::kill(planner, libc::SIGKILL) }, 0);
+        sleep
+    };
+    let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), |_| {}, std::future::pending());
+    // Sent again, planner.run would start the hanging task over on the restarted planner.
+    let (result, sleep) = tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(run, kill_planner) })
+        .await
+        .expect("the run went on after its planner died");
+    let err = result.unwrap_err();
+    assert!(format!("{err:#}").contains("planner.run failed"), "{err:#}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1, "one model call, from the only run");
+    assert!(exits(sleep).await, "the command's child {sleep} outlived the run");
+    setup.assert_forks_dropped();
+}
+
+#[tokio::test]
+async fn a_service_that_cannot_start_ends_the_run_at_once_and_says_why() {
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    let model = setup.cfg.service_mut("model").unwrap();
+    let exec = model.exec.as_mut().unwrap();
+    exec.command = format!("{}/missing-gateway", bin_dir().display());
+    model.max_restarts = 1;
+    let started = Instant::now();
+    let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), |_| {}, std::future::pending());
+    let err = tokio::time::timeout(RUN_LIMIT, run).await.expect("the run hung").unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("the model service did not come up: gave up after 1 restarts"), "{err}");
+    assert!(err.contains("spawn failed: No such file or directory"), "{err}");
+    // Not the whole startup wait.
+    assert!(started.elapsed() < Duration::from_secs(10), "took {:?}: {err}", started.elapsed());
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -522,19 +585,75 @@ async fn the_cli_carries_out_a_task() {
     let server = fake_api(Fake::Greets).await;
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
-    // The check also fails if the API key reached the commands the agent runs.
-    let check = format!("test -z \"${{ANTHROPIC_API_KEY-}}\" && {CHECK}");
-    let cmd = molt_do(&server, workspace.path(), data.path(), &["--check", &check, "--attempts", "1"]).output();
+    // A project's own molt.toml is never read unless asked for: it could run anything with the user's key.
+    std::fs::write(workspace.path().join("molt.toml"), "[[service]]\nname = \"model\"\nexec = 'not toml\n").unwrap();
+    // The check fails if the API key reached the commands the agent runs, or the passed variable did not.
+    let check = format!("test -z \"${{ANTHROPIC_API_KEY-}}\" && test \"$PROJECT_SETTING\" = on && {CHECK}");
+    let args = ["--check", &check, "--attempts", "1", "--pass-env", "PROJECT_SETTING"];
+    let cmd = molt_do(&server, workspace.path(), data.path(), &args).env("PROJECT_SETTING", "on").output();
     let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success(), "status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}", out.status);
     assert!(stdout.contains("outcome: passed"), "{stdout}");
     assert!(stdout.contains("added    greeting.txt"), "{stdout}");
     assert!(stderr.contains("check passed"), "{stderr}");
+    assert!(!stderr.contains("config:"), "{stderr}");
     assert_eq!(std::fs::read_to_string(workspace.path().join("greeting.txt")).unwrap(), "hello\n");
     assert!(data.path().join("audit.jsonl").exists());
     assert_requests_valid(&server).await;
     assert_forks_dropped(data.path());
+}
+
+#[tokio::test]
+async fn the_cli_runs_the_example_config_when_given_one() {
+    let server = fake_api(Fake::Greets).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let example = include_str!("../../../molt.example.toml");
+    assert!(example.contains(EXAMPLE_SCRATCH));
+    let config = example
+        .replace("command = \"molt-", &format!("command = \"{}/molt-", bin_dir().display()))
+        .replace(EXAMPLE_SCRATCH, data.path().join("work").to_str().unwrap());
+    let path = dir.path().join("molt.toml");
+    std::fs::write(&path, config).unwrap();
+    let args = ["--check", CHECK, "--attempts", "1", "--config", path.to_str().unwrap()];
+    let out = tokio::time::timeout(RUN_LIMIT, molt_do(&server, workspace.path(), data.path(), &args).output())
+        .await
+        .expect("molt do hung")
+        .unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}", out.status);
+    assert!(stderr.contains(&format!("config: {}\n", path.display())), "{stderr}");
+    assert!(stdout.contains("applied to the workspace"), "{stdout}");
+    assert_eq!(std::fs::read_to_string(workspace.path().join("greeting.txt")).unwrap(), "hello\n");
+    assert_requests_valid(&server).await;
+    assert_forks_dropped(data.path());
+}
+
+#[tokio::test]
+async fn a_result_that_cannot_be_applied_exits_3_and_is_kept() {
+    let server = fake_api(Fake::Greets).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    // The check changes the original's greeting.txt during the run, as a user editing it would.
+    let original = workspace.path().canonicalize().unwrap().join("greeting.txt");
+    let check = format!("echo theirs > '{}' && {CHECK}", original.display());
+    let args = ["--check", &check, "--attempts", "1", "--json"];
+    let out = tokio::time::timeout(RUN_LIMIT, molt_do(&server, workspace.path(), data.path(), &args).output())
+        .await
+        .expect("molt do hung")
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    let resp: RunResponse = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
+    assert!(!resp.applied);
+    assert!(resp.summary.contains("not applied"), "{}", resp.summary);
+    let fork = PathBuf::from(resp.fork.expect("the result is kept"));
+    assert_eq!(std::fs::read_to_string(fork.join("greeting.txt")).unwrap(), "hello\n");
+    assert_eq!(std::fs::read_to_string(&original).unwrap(), "theirs\n");
+    assert_requests_valid(&server).await;
 }
 
 #[tokio::test]
@@ -560,6 +679,32 @@ async fn ctrl_c_stops_molt_do_and_the_commands_it_started() {
     assert_eq!(out.status.code(), Some(130), "{stderr}");
     assert!(stderr.contains("interrupted"), "{stderr}");
     assert!(exits(pid).await, "the command's child {pid} outlived molt do");
+    assert_forks_dropped(data.path());
+}
+
+#[tokio::test]
+async fn sigterm_and_sighup_stop_molt_do_like_ctrl_c() {
+    for signal in [libc::SIGTERM, libc::SIGHUP] {
+        let pids = tempfile::tempdir().unwrap();
+        let pidfile = pids.path().join("sleep.pid");
+        let server = fake_api(Fake::Hangs(pidfile.clone())).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let child =
+            molt_do(&server, workspace.path(), data.path(), &["--check", CHECK, "--attempts", "1"]).spawn().unwrap();
+        let molt = child.id().unwrap() as i32;
+        let pid = tokio::time::timeout(RUN_LIMIT, wait_for_pid(&pidfile)).await.expect("the command never started");
+
+        // To molt alone, as `kill`, `timeout` or a CI runner sends it.
+        // SAFETY: plain syscall.
+        assert_eq!(unsafe { libc::kill(molt, signal) }, 0);
+        let out = tokio::time::timeout(RUN_LIMIT, child.wait_with_output()).await.expect("molt do hung").unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(128 + signal), "signal {signal}: {stderr}");
+        assert!(stderr.contains("interrupted"), "{stderr}");
+        assert!(exits(pid).await, "the command's child {pid} outlived molt do");
+        assert_forks_dropped(data.path());
+    }
 }
 
 fn nats_server() -> Option<PathBuf> {
@@ -620,9 +765,9 @@ async fn a_task_runs_over_nats_with_provisioned_secrets() {
 fn the_cli_refuses_a_bad_setup_before_starting_anything() {
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
-    let molt_do = |data_dir: &Path, key: Option<&str>| {
+    let molt_do = |data_dir: &Path, key: Option<&str>, args: &[&str]| {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_molt"));
-        cmd.args(["do", "anything", "--data-dir"]).arg(data_dir).current_dir(workspace.path());
+        cmd.args(["do", "anything", "--data-dir"]).arg(data_dir).args(args).current_dir(workspace.path());
         match key {
             Some(key) => cmd.env("ANTHROPIC_API_KEY", key),
             None => cmd.env_remove("ANTHROPIC_API_KEY"),
@@ -631,11 +776,22 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
         assert!(!out.status.success());
         String::from_utf8_lossy(&out.stderr).into_owned()
     };
-    let err = molt_do(data.path(), None);
+    let err = molt_do(data.path(), None, &[]);
     assert!(err.contains("ANTHROPIC_API_KEY is not set"), "{err}");
-    let inside = workspace.path().canonicalize().unwrap().join("state");
-    let err = molt_do(&inside, Some("test"));
+    let ws = workspace.path().canonicalize().unwrap();
+    let inside = ws.join("state");
+    let err = molt_do(&inside, Some("test"), &[]);
     assert!(err.contains("inside the workspace"), "{err}");
     assert!(!inside.exists());
+    // The same, reached through `..`: refused before anything is created.
+    let roundabout = data.path().join("missing/..").join("..").join(ws.file_name().unwrap()).join("state");
+    let err = molt_do(&roundabout, Some("test"), &[]);
+    assert!(err.contains("inside the workspace"), "{err}");
+    assert!(!inside.exists());
+    // Limits the planner would refuse only once everything is running.
+    for args in [["--max-turns", "0"], ["--budget-usd", "0"], ["--budget-usd", "NaN"]] {
+        let err = molt_do(data.path(), Some("test"), &args);
+        assert!(err.contains(args[0]), "{err}");
+    }
     assert!(std::fs::read_dir(data.path()).unwrap().next().is_none(), "nothing was started");
 }

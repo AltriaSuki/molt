@@ -1,8 +1,9 @@
 //! One kernel per data directory: two kernels on one audit log, registry
 //! and socket directory would corrupt each other.
 
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{bail, Context};
@@ -16,16 +17,25 @@ pub struct DataDirLock {
 }
 
 impl DataDirLock {
-    /// Take the lock, creating the directory if needed. Fails at once when
-    /// another kernel holds it.
+    /// Take the lock, creating the directory if needed (see
+    /// [`create_private_dir`]). Fails at once when another kernel holds it.
     pub fn acquire(data_dir: &Path) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
+        create_private_dir(data_dir)?;
+        if let Ok(Some(mode)) = open_to_others(data_dir) {
+            tracing::warn!(
+                "{} is open to other users (mode {mode:o}), and the audit log in it records file contents and \
+                 model conversations; make it private with chmod 700",
+                data_dir.display()
+            );
+        }
         let path = data_dir.join(LOCK_FILE);
+        // Private, so no one else can take the lock and keep molt from starting.
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(0o600)
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         match file.try_lock() {
@@ -50,6 +60,19 @@ impl DataDirLock {
     }
 }
 
+/// Create `dir`, and any missing parent, with mode 0700. A data dir holds
+/// the audit log and forks of the project, which are for this user only. An
+/// existing directory keeps its mode.
+pub(crate) fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
+    DirBuilder::new().recursive(true).mode(0o700).create(dir).with_context(|| format!("creating {}", dir.display()))
+}
+
+/// The mode of `dir` when its group or others have any access to it.
+fn open_to_others(dir: &Path) -> std::io::Result<Option<u32>> {
+    let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+    Ok((mode & 0o077 != 0).then_some(mode))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,5 +87,22 @@ mod tests {
         assert!(err.contains(&format!("pid {}", std::process::id())), "{err}");
         drop(first);
         DataDirLock::acquire(&data).unwrap();
+    }
+
+    #[test]
+    fn the_data_dir_and_the_lock_are_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("cache/molt/data");
+        let _lock = DataDirLock::acquire(&data).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&data), 0o700);
+        assert_eq!(mode(&dir.path().join("cache")), 0o700, "parents molt creates are private too");
+        assert_eq!(mode(&data.join(LOCK_FILE)), 0o600);
+        assert_eq!(open_to_others(&data).unwrap(), None);
+
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(open_to_others(&data).unwrap(), Some(0o755));
+        create_private_dir(&data).unwrap();
+        assert_eq!(mode(&data), 0o755, "an existing directory is left as it is");
     }
 }

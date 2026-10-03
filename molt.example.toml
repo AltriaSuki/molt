@@ -1,7 +1,8 @@
-# Copy to molt.toml and run `molt run`.
+# Copy to molt.toml, set the --scratch paths below, and run `molt run`.
 #
-# `molt do` uses this file too when it exists. Without one it starts the agent
-# services below with its own defaults (state and forks under ~/.cache/molt).
+# `molt do` reads a config only when given one with --config; without it, it
+# starts the agent services below with its own defaults (state and forks under
+# ~/.cache/molt).
 
 [kernel]
 data_dir = ".molt"        # audit.jsonl, registry/, sockets, secrets
@@ -30,19 +31,28 @@ pass_env = [
   "MOLT_MODEL_TIMEOUT_S", "MOLT_MODEL_RETRIES", "MOLT_MODEL_CONCURRENCY", "MOLT_FALLBACKS",
 ]
 
-# Files and commands, confined to --root. Forks go to --scratch, which must be
-# outside the project (and any repository or cargo workspace around it), or
-# tools run in a fork find the original's Cargo.toml and .git above them.
+# Files and commands, confined to --root. Forks go to --scratch: replace
+# /home/you/.cache/molt/work with a directory that is
+# - absolute (nothing here expands ~),
+# - private to you: it is created 0700, and a symlink, another user's directory
+#   or one others can write to is refused, as they could swap a fork's files
+#   before it is merged; so not a shared path like /tmp/molt-work,
+# - outside the project and any repository or cargo workspace around it, or
+#   tools run in a fork find the original's Cargo.toml and .git above them;
+#   so not under data_dir while that is inside the project, as .molt is.
 [[service]]
 name = "fs"
 tier = "mutable"
-exec = { command = "molt-tools", args = ["fs", "--root", ".", "--scratch", "/tmp/molt-work"] }
+exec = { command = "molt-tools", args = ["fs", "--root", ".", "--scratch", "/home/you/.cache/molt/work"] }
 provides = ["fs.*"]
 
+# Commands run as you, unsandboxed, with a scrubbed environment; add what
+# your builds and tests need with pass_env (`molt do --pass-env NAME` does the
+# same for the default setup). MOLT_* and ANTHROPIC_* never reach them.
 [[service]]
 name = "shell"
 tier = "mutable"
-exec = { command = "molt-tools", args = ["shell", "--root", ".", "--scratch", "/tmp/molt-work"] }
+exec = { command = "molt-tools", args = ["shell", "--root", ".", "--scratch", "/home/you/.cache/molt/work"] }
 provides = ["shell.*"]
 
 # Calls 0 would refuse every call; ms 0 leaves deadlines to each request.
