@@ -304,6 +304,96 @@ async fn a_rejected_key_is_denied() {
 }
 
 #[tokio::test]
+async fn statuses_map_to_codes_and_only_transient_ones_are_retried() {
+    for (status, code, attempts) in [
+        (408, ErrorCode::Timeout, 3),
+        (409, ErrorCode::Busy, 3),
+        (403, ErrorCode::Denied, 1),
+        (404, ErrorCode::Invalid, 1),
+        (413, ErrorCode::Invalid, 1),
+        (422, ErrorCode::Invalid, 1),
+    ] {
+        let server = MockServer::start().await;
+        answer_with(&server, ResponseTemplate::new(status).set_body_json(api_error("some_error", "no"))).await;
+        let gw = Gateway::new(config(&server)).unwrap();
+        let err = gw.complete(request()).await.unwrap_err();
+        assert_eq!(err.code, code, "{status}: {}", err.message);
+        assert_eq!(sent(&server).await.len(), attempts, "{status}");
+    }
+}
+
+#[tokio::test]
+async fn redirects_are_not_followed_and_the_key_stays_put() {
+    let elsewhere = MockServer::start().await;
+    answer_with(&elsewhere, ok(message("claude-opus-5-5"))).await;
+    let server = MockServer::start().await;
+    let to = format!("{}/v1/messages", elsewhere.uri());
+    answer_with(&server, ResponseTemplate::new(307).insert_header("location", to.as_str())).await;
+    let gw = Gateway::new(config(&server)).unwrap();
+
+    let err = gw.complete(request()).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Failed, "{}", err.message);
+    assert!(err.message.contains("307") && err.message.contains(&to), "{}", err.message);
+    assert_eq!(sent(&server).await.len(), 1, "a redirect is not retried");
+    assert!(sent(&elsewhere).await.is_empty(), "the redirect was followed");
+}
+
+#[tokio::test]
+async fn a_deadline_cuts_an_attempt_short_and_stops_retries() {
+    let server = MockServer::start().await;
+    answer_with(&server, ok(message("claude-opus-5-5")).set_delay(Duration::from_secs(3))).await;
+    let gw = Gateway::new(config(&server)).unwrap();
+
+    let start = Instant::now();
+    let call = gw.complete_within(request(), Some(Duration::from_millis(300)));
+    let err = tokio::time::timeout(Duration::from_secs(2), call).await.unwrap().unwrap_err();
+    assert_eq!(err.code, ErrorCode::Timeout);
+    assert!(err.message.contains("deadline"), "{}", err.message);
+    assert!(start.elapsed() >= Duration::from_millis(300), "{:?}", start.elapsed());
+    assert_eq!(sent(&server).await.len(), 1, "no retry once the time is up");
+
+    let err = gw.complete_within(request(), Some(Duration::ZERO)).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Timeout);
+    assert_eq!(sent(&server).await.len(), 1, "nothing is sent after the deadline");
+}
+
+#[tokio::test]
+async fn a_retry_that_cannot_finish_before_the_deadline_is_not_started() {
+    let server = MockServer::start().await;
+    let overloaded = ResponseTemplate::new(529).insert_header("retry-after", "1");
+    answer_with(&server, overloaded.set_body_json(api_error("overloaded_error", "Overloaded"))).await;
+    let gw = Gateway::new(config(&server)).unwrap();
+
+    // The 1 s wait the API asks for leaves too little of 1.5 s for another attempt.
+    let start = Instant::now();
+    let err = gw.complete_within(request(), Some(Duration::from_millis(1500))).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Busy, "the last failure comes back: {}", err.message);
+    assert!(start.elapsed() < Duration::from_secs(1), "slept for a retry: {:?}", start.elapsed());
+    assert_eq!(sent(&server).await.len(), 1);
+
+    // The same goes for the gateway's own backoff.
+    let server = MockServer::start().await;
+    answer_with(&server, ResponseTemplate::new(500)).await;
+    let gw = Gateway::new(Config { retry_base: Duration::from_secs(1), ..config(&server) }).unwrap();
+    let start = Instant::now();
+    let err = gw.complete_within(request(), Some(Duration::from_millis(1500))).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unavailable);
+    assert!(start.elapsed() < Duration::from_millis(750), "slept for a retry: {:?}", start.elapsed());
+    assert_eq!(sent(&server).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_retry_that_fits_before_the_deadline_is_made() {
+    let server = MockServer::start().await;
+    answer_once_with(&server, ResponseTemplate::new(529).insert_header("retry-after", "0")).await;
+    answer_with(&server, ok(message("claude-opus-5-5"))).await;
+    let gw = Gateway::new(config(&server)).unwrap();
+    let resp = gw.complete_within(request(), Some(Duration::from_secs(5))).await.unwrap();
+    assert_eq!(resp.id, "msg_01");
+    assert_eq!(sent(&server).await.len(), 2);
+}
+
+#[tokio::test]
 async fn an_unreadable_success_body_is_failed() {
     let server = MockServer::start().await;
     answer_with(&server, ResponseTemplate::new(200).set_body_string("<html>gateway</html>")).await;

@@ -14,9 +14,9 @@ mod profile;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{anyhow, bail, ensure, Context};
 use molt_api::model::{CompleteRequest, CompleteResponse, Effort, Usage, STOP_REFUSAL};
 use molt_proto::{Envelope, ErrorCode, RemoteError, Target};
 use molt_sdk::Service;
@@ -25,6 +25,9 @@ use serde_json::Value;
 use crate::profile::profile;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+/// Kept back from a caller's deadline so the reply reaches it before the
+/// kernel answers `timeout` in its place; at most a tenth of the deadline.
+const REPLY_MARGIN: Duration = Duration::from_millis(500);
 
 /// Gateway settings. [`Config::from_env`] documents the variables.
 #[derive(Clone)]
@@ -38,7 +41,7 @@ pub struct Config {
     pub max_tokens: u32,
     /// Effort when a request sets none; `None` uses each model's own default.
     pub effort: Option<Effort>,
-    /// Per HTTP attempt.
+    /// Per HTTP attempt; a caller's nearer deadline shortens it.
     pub timeout: Duration,
     /// Retries after the first attempt for 408, 409, 429, 5xx and network errors.
     pub max_retries: u32,
@@ -84,7 +87,9 @@ impl Config {
     /// | `MOLT_MODEL_CONCURRENCY` | `16` |
     /// | `MOLT_FALLBACKS` | `1` (`0` turns them off) |
     ///
-    /// An empty variable counts as unset.
+    /// An empty variable counts as unset. `MOLT_MAX_TOKENS`,
+    /// `MOLT_MODEL_TIMEOUT_S` and `MOLT_MODEL_CONCURRENCY` must be above 0:
+    /// a 0 there would fail every call, not lift the limit.
     pub fn from_env() -> anyhow::Result<Self> {
         Self::from_vars(|name| std::env::var(name).ok())
     }
@@ -105,15 +110,20 @@ impl Config {
             Some("0" | "false" | "no" | "off") => false,
             Some(other) => bail!("MOLT_FALLBACKS={other:?}: use 1 or 0"),
         };
+        let positive = |name: &str, default: u64| -> anyhow::Result<u64> {
+            let v = parse(name, default)?;
+            ensure!(v > 0, "{name} must be above 0");
+            Ok(v)
+        };
         Ok(Self {
             api_key,
             base_url: base_url.trim_end_matches('/').to_owned(),
             default_model: get("MOLT_MODEL").unwrap_or_else(|| "opus".into()),
-            max_tokens: u32::try_from(parse("MOLT_MAX_TOKENS", 32_000)?).context("MOLT_MAX_TOKENS is too large")?,
+            max_tokens: u32::try_from(positive("MOLT_MAX_TOKENS", 32_000)?).context("MOLT_MAX_TOKENS is too large")?,
             effort,
-            timeout: Duration::from_secs(parse("MOLT_MODEL_TIMEOUT_S", 1200)?),
+            timeout: Duration::from_secs(positive("MOLT_MODEL_TIMEOUT_S", 1200)?),
             max_retries: u32::try_from(parse("MOLT_MODEL_RETRIES", 4)?).context("MOLT_MODEL_RETRIES is too large")?,
-            max_in_flight: usize::try_from(parse("MOLT_MODEL_CONCURRENCY", 16)?)
+            max_in_flight: usize::try_from(positive("MOLT_MODEL_CONCURRENCY", 16)?)
                 .context("MOLT_MODEL_CONCURRENCY is too large")?,
             fallbacks,
             retry_base: Duration::from_secs(1),
@@ -146,6 +156,20 @@ impl Gateway {
 
     /// One Messages API call, with retries.
     pub async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse, RemoteError> {
+        self.complete_within(req, None).await
+    }
+
+    /// [`Gateway::complete`] for a caller that waits at most `within`. Each
+    /// attempt gets no more than the time left and no retry starts that could
+    /// not finish in it; the last failure comes back instead, or `timeout`
+    /// when the time ran out.
+    pub async fn complete_within(
+        &self,
+        req: CompleteRequest,
+        within: Option<Duration>,
+    ) -> Result<CompleteResponse, RemoteError> {
+        // A deadline too far off to represent is no deadline.
+        let deadline = within.and_then(|d| Instant::now().checked_add(d));
         let named = req.model.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or(&self.cfg.default_model);
         let model = resolve_model(named);
         let messages = req.messages.len();
@@ -158,7 +182,7 @@ impl Gateway {
             "calling the Messages API"
         );
 
-        let msg = self.api.create(&call.body, call.fallbacks).await?;
+        let msg = self.api.create(&call.body, call.fallbacks, deadline).await?;
         let usage = Usage::from(msg.usage);
         // After a fallback another model answered, and its prices apply.
         let cost_usd = profile(&msg.model).prices.or(profile(&model).prices).map(|p| p.cost(&usage));
@@ -189,7 +213,9 @@ impl Gateway {
     }
 }
 
-/// Serve `model.complete` on `svc` until its link closes.
+/// Serve `model.complete` on `svc` until its link closes. A request's
+/// `budget.ms` is how long its caller waits (0: no deadline), and the call
+/// stops in time to answer within it.
 pub async fn serve(svc: Arc<Service>, gateway: Arc<Gateway>) {
     let max_in_flight = gateway.cfg.max_in_flight;
     svc.serve_concurrent(max_in_flight, move |req| {
@@ -206,11 +232,12 @@ async fn handle(gateway: &Gateway, req: Envelope) -> Result<Value, RemoteError> 
     };
     match method {
         "complete" => {
+            let within = reply_window(req.budget.ms);
             let request: CompleteRequest = serde_json::from_value(req.payload).map_err(|e| RemoteError {
                 code: ErrorCode::Invalid,
                 message: format!("bad model.complete request: {e}"),
             })?;
-            let response = gateway.complete(request).await?;
+            let response = gateway.complete_within(request, within).await?;
             serde_json::to_value(response)
                 .map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("encoding the response: {e}") })
         }
@@ -218,12 +245,21 @@ async fn handle(gateway: &Gateway, req: Envelope) -> Result<Value, RemoteError> 
     }
 }
 
+/// How long to work on a request whose caller waits `ms` (0: no deadline).
+fn reply_window(ms: u64) -> Option<Duration> {
+    let wait = Duration::from_millis(ms);
+    (ms > 0).then(|| wait - REPLY_MARGIN.min(wait / 10))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use molt_proto::{CapId, TraceId};
+    use molt_api::model::user_text;
+    use molt_proto::{Budget, CapId, TraceId};
     use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
 
@@ -278,6 +314,10 @@ mod tests {
         assert!(from(&[("ANTHROPIC_API_KEY", "k"), ("MOLT_EFFORT", "huge")]).is_err());
         assert!(from(&[("ANTHROPIC_API_KEY", "k"), ("MOLT_MAX_TOKENS", "lots")]).is_err());
         assert!(from(&[("ANTHROPIC_API_KEY", "k"), ("MOLT_FALLBACKS", "maybe")]).is_err());
+        for name in ["MOLT_MAX_TOKENS", "MOLT_MODEL_TIMEOUT_S", "MOLT_MODEL_CONCURRENCY"] {
+            let err = from(&[("ANTHROPIC_API_KEY", "k"), (name, "0")]).unwrap_err();
+            assert!(err.to_string().contains(name), "{err}");
+        }
         // Empty means unset.
         assert_eq!(from(&[("ANTHROPIC_API_KEY", "k"), ("MOLT_EFFORT", "")]).unwrap().effort, None);
     }
@@ -319,6 +359,37 @@ mod tests {
 
         let err = handle(&gw, envelope("model.complete", json!({ "messages": [] }))).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Invalid);
+    }
+
+    #[test]
+    fn the_reply_window_keeps_a_margin_before_the_callers_deadline() {
+        assert_eq!(reply_window(0), None);
+        assert_eq!(reply_window(1), Some(Duration::from_micros(900)));
+        assert_eq!(reply_window(2_000), Some(Duration::from_millis(1_800)));
+        assert_eq!(reply_window(1_200_000), Some(Duration::from_millis(1_199_500)));
+        assert!(reply_window(u64::MAX).is_some());
+    }
+
+    #[tokio::test]
+    async fn the_callers_deadline_bounds_the_call() {
+        let server = MockServer::start().await;
+        let slow = ResponseTemplate::new(200).set_delay(Duration::from_secs(3)).set_body_json(json!({
+            "id": "msg_01",
+            "model": "claude-opus-5-5",
+            "content": [],
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        }));
+        Mock::given(method("POST")).and(path("/v1/messages")).respond_with(slow).mount(&server).await;
+        let mut cfg = from(&[("ANTHROPIC_API_KEY", "k"), ("MOLT_MODEL_RETRIES", "2")]).unwrap();
+        cfg.base_url = server.uri();
+        let gw = Gateway::new(cfg).unwrap();
+
+        let payload = serde_json::to_value(CompleteRequest { messages: vec![user_text("hi")], ..Default::default() });
+        let req = envelope("model.complete", payload.unwrap()).with_budget(Budget::new(0, 300, 0));
+        // Without the deadline the call would wait out the 3 s answer and succeed.
+        let err = tokio::time::timeout(Duration::from_secs(2), handle(&gw, req)).await.unwrap().unwrap_err();
+        assert_eq!(err.code, ErrorCode::Timeout, "{}", err.message);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "no retry past the deadline");
     }
 
     #[test]

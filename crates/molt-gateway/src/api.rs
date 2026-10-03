@@ -3,7 +3,7 @@
 
 use std::error::Error as _;
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use molt_api::model::Usage;
@@ -21,6 +21,9 @@ const API_VERSION: &str = "2023-06-01";
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// The least time a retry needs before the caller's deadline; a Messages API
+/// call rarely answers sooner, and one cut short is wasted.
+const MIN_ATTEMPT: Duration = Duration::from_secs(1);
 /// How much of an unparseable error body goes into the error message.
 const DETAIL_CHARS: usize = 300;
 
@@ -98,7 +101,8 @@ impl Failure {
         }
     }
 
-    fn into_error(self, attempts: u32, timeout: Duration) -> RemoteError {
+    /// `timeout` is the last attempt's; `cut` says the caller's deadline set it.
+    fn into_error(self, attempts: u32, timeout: Duration, cut: bool) -> RemoteError {
         let tries = if attempts > 1 { format!(" ({attempts} attempts)") } else { String::new() };
         let (code, message) = match self {
             Failure::Status { status, detail, .. } => {
@@ -111,6 +115,9 @@ impl Failure {
                     _ => ErrorCode::Failed,
                 };
                 (code, format!("the Messages API returned {}{detail}{tries}", status.as_u16()))
+            }
+            Failure::Timeout if cut => {
+                (ErrorCode::Timeout, format!("the Messages API did not answer before the caller's deadline{tries}"))
             }
             Failure::Timeout => {
                 (ErrorCode::Timeout, format!("the Messages API did not answer within {timeout:?}{tries}"))
@@ -139,8 +146,10 @@ impl Api {
         let url: Url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'))
             .parse()
             .with_context(|| format!("bad base URL {:?}", cfg.base_url))?;
+        // No redirects: reqwest would re-send x-api-key to whatever host a 307 names.
         let mut builder = reqwest::Client::builder()
             .timeout(cfg.timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .tcp_keepalive(Duration::from_secs(30))
             .user_agent(concat!("molt-gateway/", env!("CARGO_PKG_VERSION")));
         // Tests point the gateway at a local mock server, and a configured HTTPS_PROXY must not swallow that.
@@ -158,38 +167,63 @@ impl Api {
         Ok(Self { http, url, headers, timeout: cfg.timeout, max_retries: cfg.max_retries, retry_base: cfg.retry_base })
     }
 
-    /// Send `body`, retrying transient failures.
-    pub async fn create(&self, body: &Value, fallbacks: bool) -> Result<Message, RemoteError> {
+    /// Send `body`, retrying transient failures. Before `deadline`, when there
+    /// is one: each attempt gets at most the time left, and a retry that could
+    /// not finish in time is not started, since the caller has stopped waiting
+    /// by then and the API bills a call whether or not anyone reads it.
+    pub async fn create(
+        &self,
+        body: &Value,
+        fallbacks: bool,
+        deadline: Option<Instant>,
+    ) -> Result<Message, RemoteError> {
         let bytes = serde_json::to_vec(body)
             .map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("encoding the request: {e}") })?;
+        let left = || deadline.map(|d| d.saturating_duration_since(Instant::now()));
         let mut retries = 0;
         loop {
-            let failure = match self.attempt(bytes.clone(), fallbacks).await {
+            let timeout = left().map_or(self.timeout, |left| left.min(self.timeout));
+            if timeout.is_zero() {
+                let message = "the caller's deadline passed before the Messages API was called".to_owned();
+                return Err(RemoteError { code: ErrorCode::Timeout, message });
+            }
+            let failure = match self.attempt(bytes.clone(), fallbacks, timeout).await {
                 Ok(msg) => return Ok(msg),
                 Err(f) => f,
             };
+            let cut = timeout < self.timeout;
             if !failure.retryable() || retries >= self.max_retries {
-                return Err(failure.into_error(retries + 1, self.timeout));
+                return Err(failure.into_error(retries + 1, timeout, cut));
             }
             let delay = match &failure {
                 Failure::Status { retry_after: Some(d), .. } => *d,
                 _ => backoff(self.retry_base, retries),
             };
+            if left().is_some_and(|left| left < delay + MIN_ATTEMPT) {
+                tracing::warn!(
+                    ?failure,
+                    ?delay,
+                    "Messages API call failed; no time to retry before the caller's deadline"
+                );
+                return Err(failure.into_error(retries + 1, timeout, cut));
+            }
             tracing::warn!(?failure, retry = retries + 1, ?delay, "Messages API call failed; retrying");
             tokio::time::sleep(delay).await;
             retries += 1;
         }
     }
 
-    async fn attempt(&self, body: Vec<u8>, fallbacks: bool) -> Result<Message, Failure> {
-        let mut req = self.http.post(self.url.clone()).headers(self.headers.clone()).body(body);
+    async fn attempt(&self, body: Vec<u8>, fallbacks: bool, timeout: Duration) -> Result<Message, Failure> {
+        let mut req = self.http.post(self.url.clone()).headers(self.headers.clone()).timeout(timeout).body(body);
         if fallbacks {
             req = req.header("anthropic-beta", FALLBACK_BETA);
         }
         let resp = req.send().await.map_err(transport)?;
         let status = resp.status();
         let retry_after = retry_after(resp.headers());
-        let request_id = resp.headers().get("request-id").and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let header = |name| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let request_id = header("request-id");
+        let location = header("location").filter(|_| status.is_redirection());
         let bytes = resp.bytes().await.map_err(transport)?;
         if status.is_success() {
             return serde_json::from_slice(&bytes).map_err(|e| Failure::BadBody(e.to_string()));
@@ -199,6 +233,9 @@ impl Api {
             Err(_) if bytes.is_empty() => String::new(),
             Err(_) => format!(": {}", String::from_utf8_lossy(&bytes).chars().take(DETAIL_CHARS).collect::<String>()),
         };
+        if let Some(to) = location {
+            detail.push_str(&format!(" [redirect to {to} not followed]"));
+        }
         if let Some(id) = request_id {
             detail.push_str(&format!(" [request-id {id}]"));
         }
@@ -269,6 +306,11 @@ mod tests {
         }
         assert!(backoff(base, 10) <= MAX_BACKOFF);
         assert!(backoff(base, u32::MAX) <= MAX_BACKOFF);
+
+        // The jitter is real: draws land on both sides of the nominal delay.
+        let draws: Vec<f64> = (0..200).map(|_| backoff(base, 2).as_secs_f64()).collect();
+        assert!(draws.iter().all(|d| (3.0..=5.0).contains(d)), "{draws:?}");
+        assert!(draws.iter().any(|&d| d < 4.0) && draws.iter().any(|&d| d > 4.0), "{draws:?}");
     }
 
     #[test]
