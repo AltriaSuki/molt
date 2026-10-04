@@ -175,6 +175,13 @@ pub fn workspace_files(ws: &Path) -> impl Iterator<Item = PathBuf> {
         .map(ignore::DirEntry::into_path)
 }
 
+/// True when `path` is one of [`workspace_files`]`(ws)`: a regular file the
+/// walk rules do not leave out. Cheaper than a walk of the whole workspace,
+/// since only the directories on the way to `path` are read.
+pub fn is_workspace_file(ws: &Path, path: &Path) -> bool {
+    walk::reaches_file(ws, path)
+}
+
 /// Serve `fs.*` on `svc` until its link closes. When `svc` holds a
 /// capability for `topic:fs.changed`, the files each write, edit and merge
 /// changed outside the forks are published there.

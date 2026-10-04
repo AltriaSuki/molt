@@ -400,9 +400,23 @@ fn ignored_files_are_left_out_and_dropped_when_they_become_ignored() {
     assert!(defs(&db, &root, "generated").is_empty());
     assert!(defs(&db, &root, "built").is_empty());
 
+    // Named paths follow the same rules: an ignored file is not added, and
+    // one that became ignored leaves the model.
+    let named: Vec<String> = ["src/generated.rs", "target/debug/build.rs"].map(String::from).into();
+    let r = project::index(&db, &root, Some(&named)).unwrap();
+    assert_eq!((r.files, r.parsed), (2, 0));
+    assert!(defs(&db, &root, "generated").is_empty());
+    write(&root, ".gitignore", "target/\ngenerated.rs\nlater.rs\n");
+    let r = project::index(&db, &root, Some(&["src/later.rs".to_owned()])).unwrap();
+    assert_eq!((r.files, r.removed), (1, 1));
+    assert!(defs(&db, &root, "later").is_empty());
+
+    write(&root, ".gitignore", "target/\n");
+    let r = project::index(&db, &root, None).unwrap();
+    assert_eq!(r.files, 3);
     write(&root, ".gitignore", "target/\ngenerated.rs\nlater.rs\n");
     let r = project::index(&db, &root, None).unwrap();
-    assert_eq!((r.files, r.removed), (1, 1));
+    assert_eq!((r.files, r.removed), (1, 2));
     assert!(defs(&db, &root, "later").is_empty());
 }
 

@@ -287,6 +287,10 @@ fn look_at(root: &Path, named: &[String], skipped: &mut u64) -> Vec<Candidate> {
         if parent.canonicalize().ok().as_deref() != Some(parent) {
             continue;
         }
+        // An ignored file is not in the model, whichever way it is reached.
+        if !molt_tools::is_workspace_file(root, &abs) {
+            continue;
+        }
         let Ok(meta) = fs::symlink_metadata(&abs) else { continue };
         if !meta.is_file() {
             continue;

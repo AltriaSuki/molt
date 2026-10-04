@@ -7,7 +7,7 @@
 //! files above the workspace, the global git excludes and `.git/info/exclude`
 //! do not apply, since a fork could not reproduce them.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ignore::{DirEntry, WalkBuilder};
 
@@ -61,9 +61,27 @@ fn builder(start: &Path) -> WalkBuilder {
     b
 }
 
-fn keep(entry: &DirEntry, scratch: &PathBuf) -> bool {
+fn keep(entry: &DirEntry, scratch: &Path) -> bool {
     let name = entry.file_name();
     !SKIPPED.iter().any(|s| name == *s) && entry.path() != scratch
+}
+
+/// True when `path` (absolute, inside the canonical workspace `ws`) is a
+/// regular file a walk of the workspace returns. Only the directories on the
+/// way to it are read.
+pub(crate) fn reaches_file(ws: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(ws) else { return false };
+    let depth = rel.components().count();
+    if depth == 0 {
+        return false;
+    }
+    let target = path.to_path_buf();
+    builder(ws)
+        .max_depth(Some(depth))
+        .filter_entry(move |e| keep(e, Path::new("")) && target.starts_with(e.path()))
+        .build()
+        .filter_map(Result::ok)
+        .any(|e| e.path() == path && e.file_type().is_some_and(|t| t.is_file()))
 }
 
 /// True when the walk rules let a walk from `ws` reach `sub`.
