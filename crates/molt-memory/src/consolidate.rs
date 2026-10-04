@@ -263,22 +263,26 @@ async fn read_episode(
     let mut req = ReadRequest::new(episode.clone());
     req.skip_requests_to = vec![model];
     let mut entries = Vec::new();
-    for _ in 0..MAX_PAGES {
+    let mut pages = 0;
+    loop {
         let budget = Budget::new(0, deadline.ms(Duration::from_millis(READ_MS))?, 0);
         let payload = serde_json::to_value(&req).map_err(|e| failed(e.to_string()))?;
         let reply = bus.call(audit::READ, payload, budget, trace).await?;
         let page: ReadResponse =
             serde_json::from_value(reply).map_err(|e| failed(format!("the audit log's reply did not parse: {e}")))?;
+        // A page can come back empty when the kernel's scan ran out before
+        // reaching the episode; only pages of it count.
+        pages += usize::from(!page.entries.is_empty());
         entries.extend(page.entries.into_iter().map(|mut e| {
             slim(&mut e);
             e
         }));
         match page.next {
+            Some(_) if pages == MAX_PAGES => return Ok((entries, true)),
             Some(next) => req.cursor = Some(next),
             None => return Ok((entries, false)),
         }
     }
-    Ok((entries, true))
 }
 
 /// Whether the request that started the episode (its first) has no reply yet.

@@ -195,9 +195,25 @@ pub async fn large_messages_pass<H: Harness>() {
     assert_eq!(got.payload, big.payload);
 }
 
+/// A message nested deeper than the kernel logs safely is dropped on the
+/// way in; the link stays up and the next message passes.
+pub async fn too_deep_messages_are_dropped<H: Harness>() {
+    let h = H::setup().await;
+    let mut inbound = h.transport().inbound().unwrap();
+    let (_, link) = open(&h, "a").await;
+    let mut deep = numbered(0);
+    let nested = format!("{}1{}", "[".repeat(molt_proto::MAX_DEPTH), "]".repeat(molt_proto::MAX_DEPTH));
+    deep.payload = serde_json::from_str(&nested).unwrap();
+    link.send(&deep).await.expect("the service may send it");
+    link.send(&numbered(1)).await.unwrap();
+    let m = tokio::time::timeout(Duration::from_secs(5), inbound.next()).await.expect("inbound").unwrap();
+    assert_eq!(m.msg.payload, serde_json::json!(1), "the deep message was dropped");
+}
+
 pub async fn run_all<H: Harness>() {
     ordered_both_ways::<H>().await;
     large_messages_pass::<H>().await;
+    too_deep_messages_are_dropped::<H>().await;
     sender_is_stamped_by_transport::<H>().await;
     wrong_secret_is_rejected::<H>().await;
     cannot_write_into_another_endpoint::<H>().await;

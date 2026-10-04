@@ -216,6 +216,8 @@ a notice and pass; CI always runs them.
 - The shell service is not sandboxed: commands, the check included, run as you, with your files and network. Forks keep them off the project until the merge, nothing more.
 - No streaming: model replies arrive whole, so a long turn shows no progress until it ends.
 - The audit log records every message, file contents and model conversations included, and is never rotated; it grows with every run in a data dir.
+- Reading one trace back from the audit log scans the log from the start: there is no index yet. One read looks through at most 256 MiB and keeps to its deadline, and two run at once.
+- The kernel drops a message nested more than 100 levels deep, so every logged message can be read back.
 - A cancelled attempt's running command is not stopped: it runs until it ends, times out (2 minutes unless the model asks for up to 30; `MOLT_CHECK_TIMEOUT_S` for a check) or `molt do` exits.
 - Nor is a cancelled attempt's model call: it is billed all the same. Its cost is counted if the reply lands within 2 seconds of the last attempt stopping; the report gives the number of calls it could not count.
 - After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none.

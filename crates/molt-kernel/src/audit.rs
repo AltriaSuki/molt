@@ -344,13 +344,32 @@ pub const READ_PAGE: u64 = 2 * 1024 * 1024;
 /// Largest page a reader may ask for. Twice this still fits a transport frame.
 pub const MAX_READ_PAGE: u64 = 3 * 1024 * 1024;
 
+/// How far one [`read_trace_within`] may look.
+#[derive(Clone, Copy, Debug)]
+pub struct Scan {
+    /// Stop looking at this time.
+    pub until: Option<std::time::Instant>,
+    /// Stop after this many bytes of log.
+    pub max_bytes: u64,
+}
+
+/// Bytes of log one `kernel.audit.read` looks through at most; a reader
+/// whose trace is further on reads on from the page's `next`.
+pub const MAX_SCAN: u64 = 256 * 1024 * 1024;
+
+/// [`read_trace_within`] with no limit on how far it looks.
+pub fn read_trace(path: &Path, req: &ReadRequest) -> Result<ReadResponse, AuditError> {
+    read_trace_within(path, req, Scan { until: None, max_bytes: u64::MAX })
+}
+
 /// One page of the messages of `req.trace` in the log at `path`, from
 /// `req.cursor` on. Reads the file directly and blocks: run it off the
 /// async runtime. A page holds at least one message unless the log has none
-/// left, so a reader always makes progress; a message bigger than the page
-/// comes with its payload left out. A last line still being written counts
-/// as not there yet.
-pub fn read_trace(path: &Path, req: &ReadRequest) -> Result<ReadResponse, AuditError> {
+/// left or `scan` ran out first (then `next` says where to read on), so a
+/// reader always makes progress; a message bigger than the page comes with
+/// its payload left out. A last line still being written counts as not
+/// there yet.
+pub fn read_trace_within(path: &Path, req: &ReadRequest, scan: Scan) -> Result<ReadResponse, AuditError> {
     let max = req.max_bytes.unwrap_or(READ_PAGE).clamp(1, MAX_READ_PAGE);
     let mut file = std::fs::File::open(path)?;
     let start = req.cursor.unwrap_or(0);
@@ -384,6 +403,10 @@ pub fn read_trace(path: &Path, req: &ReadRequest) -> Result<ReadResponse, AuditE
         let corrupt = |reason: String| AuditError::CorruptAt { offset: here, reason };
         let text = std::str::from_utf8(&line).map_err(|e| corrupt(e.to_string()))?;
         if !text.contains(&needle) {
+            let out_of_time = scan.until.is_some_and(|until| std::time::Instant::now() >= until);
+            if offset - start >= scan.max_bytes || out_of_time {
+                return Ok(ReadResponse { entries, next: Some(offset) });
+            }
             continue;
         }
         let entry: EntryIn = serde_json::from_str(text).map_err(|e| corrupt(e.to_string()))?;
@@ -514,6 +537,38 @@ mod tests {
         assert!(matches!(read_trace(&path, &req), Err(AuditError::Cursor(3))));
         req.cursor = Some(u64::MAX);
         assert!(matches!(read_trace(&path, &req), Err(AuditError::Cursor(_))));
+    }
+
+    #[tokio::test]
+    async fn a_scan_that_runs_out_says_where_to_read_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open(&path, false).await.unwrap();
+        let (mine, other) = (TraceId::random(), TraceId::random());
+        for n in 0..20 {
+            log.append(message(&other, "fs.read", Kind::Request, serde_json::json!(n))).await.unwrap();
+        }
+        log.append(message(&mine, "fs.read", Kind::Request, serde_json::json!("found"))).await.unwrap();
+        log.close().await;
+
+        let req = ReadRequest::new(mine.clone());
+        let short = Scan { until: None, max_bytes: 1 };
+        let mut cursor = None;
+        let mut calls = 0;
+        let found = loop {
+            calls += 1;
+            let page = read_trace_within(&path, &ReadRequest { cursor, ..req.clone() }, short).unwrap();
+            if !page.entries.is_empty() {
+                break page.entries;
+            }
+            cursor = Some(page.next.expect("a scan cut short says where to read on"));
+        };
+        assert_eq!(calls, 21, "one line per call");
+        assert_eq!(found[0].envelope.payload, serde_json::json!("found"));
+
+        let past = Scan { until: Some(std::time::Instant::now()), max_bytes: u64::MAX };
+        let page = read_trace_within(&path, &req, past).unwrap();
+        assert!(page.entries.is_empty() && page.next.is_some(), "out of time: a page with nothing, and where to go on");
     }
 
     #[tokio::test]

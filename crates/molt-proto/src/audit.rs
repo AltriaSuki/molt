@@ -52,7 +52,9 @@ pub struct Logged {
 pub struct ReadResponse {
     /// In log order.
     pub entries: Vec<Logged>,
-    /// The cursor for the next page; `None` once the end of the log is reached.
+    /// The cursor for the next page; `None` once the end of the log is
+    /// reached. A page may hold no entries and still name a next one: the
+    /// kernel looks through a limited stretch of log per read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<u64>,
 }

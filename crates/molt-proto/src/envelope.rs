@@ -37,6 +37,49 @@ pub enum Kind {
     Event,
 }
 
+/// Deepest nesting of arrays and objects a message may arrive at the kernel
+/// with, its own levels included. The kernel logs a message a few levels
+/// deeper than it arrived, and `kernel.audit.read` returns it a few more,
+/// which must all stay inside what a JSON parser reads (128).
+pub const MAX_DEPTH: usize = 100;
+/// Longest id (message, trace or capability) or target a message may carry.
+pub const MAX_ID: usize = 256;
+
+/// How deeply arrays and objects nest in the JSON text `bytes`.
+pub fn nesting(bytes: &[u8]) -> usize {
+    let (mut depth, mut deepest, mut in_string, mut escaped) = (0usize, 0usize, false, false);
+    for &b in bytes {
+        if in_string {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// How deeply arrays and objects nest in `v`, `v` itself included.
+pub fn depth(v: &Value) -> usize {
+    match v {
+        Value::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
+        Value::Object(fields) => 1 + fields.values().map(depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// One message on the bus.
 ///
 /// `from` is never trusted from the wire: the kernel overwrites it with the
@@ -60,6 +103,23 @@ pub struct Envelope {
 }
 
 impl Envelope {
+    /// Decode a message as it arrives at the kernel. Refused: one nested
+    /// deeper than [`MAX_DEPTH`], or with an id or target longer than [`MAX_ID`].
+    pub fn from_wire(bytes: &[u8]) -> Result<Self, String> {
+        let deep = nesting(bytes);
+        if deep > MAX_DEPTH {
+            return Err(format!("the message is nested {deep} deep; at most {MAX_DEPTH} is allowed"));
+        }
+        let msg: Envelope = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        let ids = [Some(msg.id.as_str()), Some(msg.trace_id.as_str()), msg.reply_to.as_ref().map(MsgId::as_str)];
+        let long = ids.into_iter().flatten().chain(msg.cap.as_ref().map(CapId::as_str)).any(|s| s.len() > MAX_ID)
+            || msg.to.to_string().len() > MAX_ID;
+        if long {
+            return Err(format!("an id or the target is longer than {MAX_ID} bytes"));
+        }
+        Ok(msg)
+    }
+
     pub fn request(trace_id: TraceId, to: Target, cap: CapId, payload: Value) -> Self {
         Self {
             id: MsgId::random(),
@@ -149,6 +209,22 @@ pub struct RemoteError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_kernel_refuses_messages_too_deep_or_with_huge_ids() {
+        let nested = |n: usize| format!("{}1{}", "[".repeat(n), "]".repeat(n));
+        let msg = |payload: &str| {
+            format!(r#"{{"id":"msg_1","trace_id":"trace_1","to":"fs.read","kind":"request","payload":{payload}}}"#)
+        };
+        assert_eq!(nesting(br#"{"a":"[[[{{","b":[1,{"c":"\"]"}]}"#), 3, "brackets in strings do not count");
+        assert!(Envelope::from_wire(msg(&nested(MAX_DEPTH - 1)).as_bytes()).is_ok());
+        let err = Envelope::from_wire(msg(&nested(MAX_DEPTH)).as_bytes()).unwrap_err();
+        assert!(err.contains("nested"), "{err}");
+        let long = msg("1").replace("msg_1", &"m".repeat(MAX_ID + 1));
+        assert!(Envelope::from_wire(long.as_bytes()).unwrap_err().contains("longer than"));
+        assert!(Envelope::from_wire(b"{").is_err());
+        assert_eq!(depth(&serde_json::from_str(&nested(5)).unwrap()), 5);
+    }
 
     #[test]
     fn envelope_json_shape() {

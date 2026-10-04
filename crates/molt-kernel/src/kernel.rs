@@ -46,6 +46,8 @@ pub const ENV_VERSION: &str = "MOLT_VERSION";
 
 /// How long a reply waits for space in a full mailbox before it is dropped.
 const REPLY_WAIT: Duration = Duration::from_secs(10);
+/// `kernel.audit.read`s that may scan the log at once.
+const AUDIT_READS: usize = 2;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -119,6 +121,9 @@ struct Inner {
     pending: Mutex<HashMap<MsgId, Pending>>,
     topics: Mutex<HashMap<String, BTreeSet<ServiceId>>>,
     status: Mutex<HashMap<ServiceId, ServiceStatus>>,
+    /// `kernel.audit.read`s scanning the log at once. Each holds a blocking
+    /// thread, so readers cannot crowd out the audit writer.
+    audit_reads: Arc<tokio::sync::Semaphore>,
     /// Handed to delivery tasks so they do not keep the kernel alive.
     weak: Weak<Inner>,
 }
@@ -161,6 +166,7 @@ impl Kernel {
             pending: Mutex::default(),
             topics: Mutex::default(),
             status: Mutex::default(),
+            audit_reads: Arc::new(tokio::sync::Semaphore::new(AUDIT_READS)),
         });
         let tasks = vec![tokio::spawn(dispatcher(inner.clone(), inbound)), tokio::spawn(reaper(inner.clone()))];
         let (close_events, closing) = oneshot::channel();
@@ -682,7 +688,9 @@ impl Inner {
     }
 
     /// Check the capability and arguments of a `kernel.audit.read`, then
-    /// read the page and reply from a task of its own.
+    /// read the page and reply from a task of its own. The read keeps to the
+    /// request's deadline: waiting for a turn counts, and a scan that runs
+    /// out of time replies with what it found and where to read on.
     async fn audit_read(&self, from: ServiceId, msg: Envelope) {
         let cap = match self.caps.verify(msg.cap.as_ref(), &from, &msg.to) {
             Ok(c) => c,
@@ -692,13 +700,31 @@ impl Inner {
             Ok(r) => r,
             Err(e) => return self.deny(&from, &msg, ErrorCode::Invalid, e.to_string()).await,
         };
+        if cap.max_ms != 0 && msg.budget.ms > cap.max_ms {
+            return self
+                .deny(&from, &msg, ErrorCode::Denied, "deadline is longer than the capability allows".into())
+                .await;
+        }
         if let Err(e) = self.caps.charge(&cap, 0, 1) {
             return self.deny(&from, &msg, ErrorCode::OverBudget, e.to_string()).await;
         }
-        let (weak, path) = (self.weak.clone(), self.audit.path().to_owned());
+        let mut ms = if msg.budget.ms == 0 { self.config.default_deadline.as_millis() as u64 } else { msg.budget.ms };
+        if cap.max_ms != 0 {
+            ms = ms.min(cap.max_ms);
+        }
+        let until = Instant::now() + Duration::from_millis(ms);
+        let (weak, path, turns) = (self.weak.clone(), self.audit.path().to_owned(), self.audit_reads.clone());
         tokio::spawn(async move {
-            let read =
-                tokio::task::spawn_blocking(move || audit::read_trace(&path, &req).map(|page| (req, page))).await;
+            let Ok(Ok(_turn)) = tokio::time::timeout_at(until.into(), turns.acquire_owned()).await else {
+                let Some(inner) = weak.upgrade() else { return };
+                let reason = "the audit log is busy with other reads; try again".to_owned();
+                return inner.deny(&from, &msg, ErrorCode::Timeout, reason).await;
+            };
+            let scan = audit::Scan { until: Some(until), max_bytes: audit::MAX_SCAN };
+            let read = tokio::task::spawn_blocking(move || {
+                audit::read_trace_within(&path, &req, scan).map(|page| (req, page))
+            })
+            .await;
             let Some(inner) = weak.upgrade() else { return };
             let (req, page) = match read {
                 Ok(Ok(done)) => done,

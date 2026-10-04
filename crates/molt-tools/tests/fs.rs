@@ -452,7 +452,10 @@ async fn diff_and_merge_carry_changes_back() {
 async fn changes_outside_forks_are_reported_for_the_project_model() {
     let env = Env::new();
     project(&env);
-    let reported = |out: Result<(Value, Option<FilesChanged>), RemoteError>| out.unwrap().1;
+    let reported = |(reply, changed): (Result<Value, RemoteError>, Option<FilesChanged>)| {
+        reply.unwrap();
+        changed
+    };
     let ws = env.ws.to_string_lossy().into_owned();
 
     let wrote = env.fs.handle_reporting("write", json!({ "workspace": "ws", "path": "./src/new.rs", "content": "" }));
@@ -468,7 +471,7 @@ async fn changes_outside_forks_are_reported_for_the_project_model() {
         None
     );
     let missing = json!({ "workspace": "ws", "path": "nope.rs", "old": "a", "new": "b" });
-    assert!(env.fs.handle_reporting("edit", missing).await.is_err());
+    assert_eq!(env.fs.handle_reporting("edit", missing).await.1, None);
 
     // A fork is private to its attempt: its writes are not reported, its merge is.
     let fork = env.fork().await;

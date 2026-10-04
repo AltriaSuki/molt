@@ -284,7 +284,14 @@ async fn reading_the_log_takes_a_capability_and_is_recorded_without_a_second_cop
     assert_eq!(code(memory.kernel("audit.read", Some(read.clone()), bad).await), ErrorCode::Invalid);
     // Every read counts against the capability's calls.
     assert!(memory.kernel("audit.read", Some(read.clone()), args.clone()).await.is_ok());
-    assert_eq!(code(memory.kernel("audit.read", Some(read), args).await), ErrorCode::OverBudget);
+    assert_eq!(code(memory.kernel("audit.read", Some(read), args.clone()).await), ErrorCode::OverBudget);
+
+    // A read keeps to the capability's deadline, like any call.
+    let short = w.grant(&memory, "kernel.audit.read", Budget::new(0, 1_000, 3)).await;
+    let long = CallOpts { cap: Some(short.clone()), budget: Budget::new(0, 5_000, 0), trace: None };
+    assert_eq!(code(memory.call("kernel.audit.read", args.clone(), long).await), ErrorCode::Denied);
+    let within = CallOpts { cap: Some(short), budget: Budget::new(0, 1_000, 0), trace: None };
+    assert!(memory.call("kernel.audit.read", args, within).await.is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

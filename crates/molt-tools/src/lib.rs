@@ -55,17 +55,52 @@ impl Fs {
 
     /// Handle one `fs` method (`read`, `write`, ...) with its request payload.
     pub async fn handle(&self, method: &str, payload: Value) -> Result<Value, RemoteError> {
-        self.handle_reporting(method, payload).await.map(|(reply, _)| reply)
+        self.handle_reporting(method, payload).await.0
     }
 
     /// [`Fs::handle`], and the files the call changed in a workspace that is
-    /// not a fork, for [`api::CHANGED`].
+    /// not a fork, for [`api::CHANGED`]. A merge that fails partway still
+    /// reports the files it wrote.
     pub async fn handle_reporting(
         &self,
         method: &str,
         payload: Value,
-    ) -> Result<(Value, Option<FilesChanged>), RemoteError> {
+    ) -> (Result<Value, RemoteError>, Option<FilesChanged>) {
         let method = method.strip_prefix("fs.").unwrap_or(method);
+        if method == "merge" {
+            return self.merge(payload).await;
+        }
+        match self.handle_other(method, payload).await {
+            Ok((reply, changed)) => (Ok(reply), changed),
+            Err(e) => (Err(e), None),
+        }
+    }
+
+    async fn merge(&self, payload: Value) -> (Result<Value, RemoteError>, Option<FilesChanged>) {
+        let req: api::MergeRequest = match parse("fs", "merge", payload) {
+            Ok(r) => r,
+            Err(e) => return (Err(e), None),
+        };
+        let (roots, forks) = (self.roots.clone(), self.forks.clone());
+        let joined = tokio::task::spawn_blocking(move || {
+            let base = fork::base(&roots, &req.fork);
+            let mut written = Vec::new();
+            let result = fork::merge(&roots, &forks, req, &mut written);
+            let changed = base
+                .filter(|base| !base.starts_with(&roots.scratch) && !written.is_empty())
+                .map(|base| FilesChanged { workspace: base.to_string_lossy().into_owned(), paths: written });
+            (result, changed)
+        })
+        .await;
+        match joined {
+            Ok((result, changed)) => {
+                (result.and_then(|r| serde_json::to_value(r).map_err(|e| failed(e.to_string()))), changed)
+            }
+            Err(e) => (Err(failed(format!("fs.merge failed: {e}"))), None),
+        }
+    }
+
+    async fn handle_other(&self, method: &str, payload: Value) -> Result<(Value, Option<FilesChanged>), RemoteError> {
         let roots = self.roots.clone();
         let forks = self.forks.clone();
         match method {
@@ -90,20 +125,6 @@ impl Fs {
             "search" => blocking(method, payload, move |req| files::search(&roots, req).map(quiet)).await,
             "fork" => blocking(method, payload, move |req| fork::fork(&roots, req).map(quiet)).await,
             "diff" => blocking(method, payload, move |req| fork::diff(&roots, req).map(quiet)).await,
-            "merge" => {
-                blocking(method, payload, move |req: api::MergeRequest| {
-                    let base = fork::base(&roots, &req.fork);
-                    let reply = fork::merge(&roots, &forks, req)?;
-                    let changed = base
-                        .filter(|base| !base.starts_with(&roots.scratch) && !reply.changes.is_empty())
-                        .map(|base| FilesChanged {
-                            workspace: base.to_string_lossy().into_owned(),
-                            paths: reply.changes.iter().map(|c| c.path.clone()).collect(),
-                        });
-                    Ok((reply, changed))
-                })
-                .await
-            }
             "drop" => blocking(method, payload, move |req| fork::drop_fork(&roots, &forks, req).map(quiet)).await,
             _ => Err(invalid(format!("unknown method fs.{method}"))),
         }
@@ -192,14 +213,18 @@ pub async fn serve_fs(svc: Arc<Service>, fs: Arc<Fs>) {
     svc.serve_concurrent(16, move |req| {
         let (fs, publisher) = (fs.clone(), publisher.clone());
         async move {
-            let (reply, changed) = fs.handle_reporting(&method_of(&req)?, req.payload).await?;
+            let (reply, changed) = fs.handle_reporting(&method_of(&req)?, req.payload).await;
             if let Some(changed) = changed.filter(|_| report) {
-                let event = serde_json::to_value(changed).map_err(|e| failed(e.to_string()))?;
-                if let Err(e) = publisher.publish(api::CHANGED, event).await {
-                    tracing::debug!(error = %e, "could not publish changed files");
+                match serde_json::to_value(changed) {
+                    Ok(event) => {
+                        if let Err(e) = publisher.publish(api::CHANGED, event).await {
+                            tracing::debug!(error = %e, "could not publish changed files");
+                        }
+                    }
+                    Err(e) => tracing::debug!(error = %e, "could not encode changed files"),
                 }
             }
-            Ok(reply)
+            reply
         }
     })
     .await

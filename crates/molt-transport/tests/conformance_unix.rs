@@ -69,6 +69,11 @@ async fn unix_large_messages_pass() {
 }
 
 #[tokio::test]
+async fn unix_too_deep_messages_are_dropped() {
+    testkit::too_deep_messages_are_dropped::<Unix>().await;
+}
+
+#[tokio::test]
 async fn unix_sender_is_stamped() {
     testkit::sender_is_stamped_by_transport::<Unix>().await;
 }

@@ -9,7 +9,7 @@ mod envelope;
 mod ids;
 mod manifest;
 
-pub use envelope::{Budget, Envelope, ErrorCode, Kind, RemoteError};
+pub use envelope::{depth, nesting, Budget, Envelope, ErrorCode, Kind, RemoteError, MAX_DEPTH, MAX_ID};
 pub use ids::{CapId, IdError, MsgId, ServiceId, Target, TraceId};
 pub use manifest::{CapRequest, Exec, Manifest, Tier, VersionId};
 
