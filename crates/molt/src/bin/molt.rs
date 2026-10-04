@@ -10,6 +10,9 @@ use molt_api::model::Effort;
 use molt_api::planner::{Outcome, RunRequest};
 use molt_proto::ServiceId;
 
+#[path = "molt/tui.rs"]
+mod tui;
+
 /// The config `molt run`, `molt audit` and `molt nats-config` read when none is given.
 const DEFAULT_CONFIG: &str = "molt.toml";
 
@@ -83,6 +86,9 @@ struct DoArgs {
     /// Print the result as JSON.
     #[arg(long)]
     json: bool,
+    /// Show live progress in a terminal dashboard (requires a TTY).
+    #[arg(long, conflicts_with = "json")]
+    tui: bool,
     /// Where kernel state and forks go. Default: ~/.cache/molt/<project>-<hash>.
     #[arg(long)]
     data_dir: Option<PathBuf>,
@@ -243,6 +249,9 @@ async fn main() -> anyhow::Result<ExitCode> {
 }
 
 async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode> {
+    if args.tui {
+        tui::ensure_tty()?;
+    }
     // From the start, so that no signal leaves services running.
     let stop = molt::stop_signal()?;
     let workspace = args.workspace.canonicalize().with_context(|| format!("workspace {}", args.workspace.display()))?;
@@ -274,8 +283,24 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
 
     let mut signal = None;
     let stopped = async { signal = Some(stop.await) };
-    let progress = |event: &_| eprintln!("{}", agent::describe(event));
+    let mut dashboard = if args.tui { Some(tui::Dashboard::new(&req.task, &workspace, req.attempts)?) } else { None };
+    let mut ui_error = None;
+    let progress = |event: &_| {
+        if let Some(ui) = dashboard.as_mut() {
+            if ui_error.is_none() {
+                if let Err(error) = ui.on_progress(event) {
+                    ui_error = Some(error);
+                }
+            }
+        } else {
+            eprintln!("{}", agent::describe(event));
+        }
+    };
     let result = agent::run_task(&cfg, req, !args.no_learn, progress, stopped).await;
+    drop(dashboard);
+    if let Some(error) = ui_error {
+        eprintln!("TUI stopped updating: {error}");
+    }
     let done = match result {
         Ok(done) => done,
         Err(e) if e.is::<Interrupted>() => {

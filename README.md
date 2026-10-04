@@ -89,7 +89,7 @@ to generate per-service credentials, put the printed `authorization` block and
 
 ```
 molt do TASK [--check CMD] [--attempts N] [--model M] [--effort E] [--max-turns N]
-        [--budget-usd X] [--no-apply] [--json] [--workspace DIR] [--data-dir DIR]
+        [--budget-usd X] [--no-apply] [--json | --tui] [--workspace DIR] [--data-dir DIR]
         [--pass-env NAME]... [--no-memory] [--no-learn] [--config FILE]
 ```
 
@@ -101,6 +101,7 @@ molt do TASK [--check CMD] [--attempts N] [--model M] [--effort E] [--max-turns 
 | `--max-turns`, `--budget-usd` | Model turns per attempt, and the spending limit for the whole run. |
 | `--no-apply` | Keep the result in its fork and print its path instead of merging it. |
 | `--json` | Print the full result (`planner.run`'s reply in `molt-api`) as JSON. |
+| `--tui` | Show check, attempt status, and recent activity in an interactive terminal. Requires stderr to be a TTY; cannot be combined with `--json`. |
 | `--workspace DIR` | The project (default: the current directory). |
 | `--data-dir DIR` | Kernel state, the audit log and forks. Default `~/.cache/molt/<project>-<hash>` (under `$XDG_CACHE_HOME` if set). Must be outside the workspace. |
 | `--pass-env NAME` | Pass a variable from your environment to the commands the agent runs, the check included. Repeatable. |
@@ -110,6 +111,9 @@ molt do TASK [--check CMD] [--attempts N] [--model M] [--effort E] [--max-turns 
 
 Progress goes to stderr and the result to stdout. Control characters in text
 from the model or from file names are printed escaped.
+With `--tui`, the dashboard updates when progress events arrive. Ctrl-C stops
+the run, restores the terminal, and keeps the same exit status as `molt do`.
+The final report is printed after the dashboard closes.
 
 | Exit status | Meaning |
 | --- | --- |
