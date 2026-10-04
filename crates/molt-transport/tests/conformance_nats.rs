@@ -146,3 +146,4 @@ nats_test!(nats_cannot_write_into_another_endpoint, cannot_write_into_another_en
 nats_test!(nats_cannot_read_another_inbox, cannot_read_another_inbox);
 nats_test!(nats_unconnected_service, unconnected_service);
 nats_test!(nats_large_messages_pass, large_messages_pass);
+nats_test!(nats_too_deep_messages_are_dropped, too_deep_messages_are_dropped);

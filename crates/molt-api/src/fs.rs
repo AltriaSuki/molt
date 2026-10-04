@@ -24,6 +24,19 @@ pub const DIFF: &str = "fs.diff";
 pub const MERGE: &str = "fs.merge";
 pub const DROP: &str = "fs.drop";
 
+/// The topic the service publishes [`FilesChanged`] on, when it may.
+pub const CHANGED: &str = "fs.changed";
+
+/// Files a write, edit or merge changed in a workspace. Forks are not
+/// reported: they are private to one attempt. Best effort, like every event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesChanged {
+    /// The canonical workspace directory.
+    pub workspace: String,
+    /// Workspace-relative paths, `/`-separated: written, edited, added or deleted.
+    pub paths: Vec<String>,
+}
+
 /// Read a text file, or a window of its lines.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadRequest {

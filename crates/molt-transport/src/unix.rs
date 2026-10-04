@@ -191,7 +191,7 @@ async fn read_loop(
     generation: u64,
 ) {
     while let Some(Ok(buf)) = frames.next().await {
-        match serde_json::from_slice::<Envelope>(&buf) {
+        match Envelope::from_wire(&buf) {
             Ok(msg) => {
                 if inbound.send(Inbound { from: id.clone(), msg }).await.is_err() {
                     break;

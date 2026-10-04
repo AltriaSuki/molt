@@ -10,6 +10,7 @@ use molt_kernel::audit::{self, AuditEvent};
 use molt_kernel::registry::Authority;
 use molt_kernel::supervisor::{Limits, RestartPolicy};
 use molt_kernel::ServiceStatus;
+use molt_proto::audit::ReadResponse;
 use molt_proto::{Budget, CapId, CapRequest, Envelope, ErrorCode, Exec, Manifest, Tier, TraceId};
 use molt_sdk::{CallOpts, SdkError};
 use serde_json::{json, Value};
@@ -236,6 +237,61 @@ async fn the_audit_log_has_no_write_path_and_detects_tampering() {
     let mut swapped: Vec<&str> = lines.clone();
     swapped.swap(1, 2);
     assert!(check(swapped.join("\n")).await.is_err(), "reordered entries went unnoticed");
+}
+
+#[tokio::test]
+async fn reading_the_log_takes_a_capability_and_is_recorded_without_a_second_copy() {
+    let w = World::new().await;
+    let planner = w.join("planner").await;
+    let memory = w.join("memory").await;
+    let rogue = w.join("rogue").await;
+    let _fs = echo(w.join("fs").await);
+    let cap = w.grant(&planner, "fs.read", Budget::new(0, 0, 100)).await;
+    let trace = TraceId::random();
+    let opts = CallOpts { cap: Some(cap), budget: Budget::default(), trace: Some(trace.clone()) };
+    planner.call("fs.read", json!({ "path": "a.rs" }), opts.clone()).await.unwrap();
+    planner.call("fs.read", json!({ "path": "b.rs" }), opts).await.unwrap();
+
+    let args = json!({ "trace": trace });
+    assert_eq!(code(rogue.kernel("audit.read", None, args.clone()).await), ErrorCode::Denied);
+    let read = w.grant(&memory, "kernel.audit.read", Budget::new(0, 0, 3)).await;
+    assert_eq!(code(rogue.kernel("audit.read", Some(read.clone()), args.clone()).await), ErrorCode::Denied, "stolen");
+
+    let page: ReadResponse =
+        serde_json::from_value(memory.kernel("audit.read", Some(read.clone()), args.clone()).await.unwrap()).unwrap();
+    let payloads: Vec<Value> = page.entries.iter().map(|e| e.envelope.payload.clone()).collect();
+    assert_eq!(
+        payloads,
+        [json!({ "path": "a.rs" }), json!({ "path": "a.rs" }), json!({ "path": "b.rs" }), json!({ "path": "b.rs" })]
+    );
+    assert_eq!(page.next, None);
+
+    // The read is on the record as the entries it returned, not as a copy of them.
+    let entries = audit::read_all(w.kernel.audit_path()).await.unwrap();
+    let copies = entries
+        .iter()
+        .filter(
+            |e| matches!(&e.event, AuditEvent::Message { envelope } if envelope.payload == json!({ "path": "a.rs" })),
+        )
+        .count();
+    assert_eq!(copies, 2, "the request and its reply, and no more");
+    let recorded = entries.iter().any(|e| {
+        matches!(&e.event, AuditEvent::AuditRead { by, entries: 4, first_seq: Some(_), .. } if by.as_str() == "memory")
+    });
+    assert!(recorded, "the read is not on the record");
+
+    let bad = json!({ "trace": trace, "cursor": 1 });
+    assert_eq!(code(memory.kernel("audit.read", Some(read.clone()), bad).await), ErrorCode::Invalid);
+    // Every read counts against the capability's calls.
+    assert!(memory.kernel("audit.read", Some(read.clone()), args.clone()).await.is_ok());
+    assert_eq!(code(memory.kernel("audit.read", Some(read), args.clone()).await), ErrorCode::OverBudget);
+
+    // A read keeps to the capability's deadline, like any call.
+    let short = w.grant(&memory, "kernel.audit.read", Budget::new(0, 1_000, 3)).await;
+    let long = CallOpts { cap: Some(short.clone()), budget: Budget::new(0, 5_000, 0), trace: None };
+    assert_eq!(code(memory.call("kernel.audit.read", args.clone(), long).await), ErrorCode::Denied);
+    let within = CallOpts { cap: Some(short), budget: Budget::new(0, 1_000, 0), trace: None };
+    assert!(memory.call("kernel.audit.read", args, within).await.is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

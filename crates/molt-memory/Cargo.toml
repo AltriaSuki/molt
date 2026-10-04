@@ -1,0 +1,37 @@
+[package]
+name = "molt-memory"
+description = "Molt's memory service: notes learned from past episodes, and a living symbol and dependency model of each project"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+molt-api.workspace = true
+molt-proto.workspace = true
+molt-sdk.workspace = true
+molt-tools.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+hex.workspace = true
+libc.workspace = true
+rand.workspace = true
+rayon.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tree-sitter.workspace = true
+tree-sitter-c.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-java.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-typescript.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::watch;
 
+use crate::memory::Memory;
 use crate::{Bus, Config};
 
 /// Deadline for reading, writing, listing and searching files.
@@ -57,6 +58,8 @@ pub(crate) struct Ctx {
     pub max_turns: u32,
     pub max_check_rounds: u32,
     pub budget_usd: f64,
+    /// What memory knows about the workspace; empty when memory is not up.
+    pub memory: Memory,
     tally: watch::Sender<Tally>,
     /// Forks created and not yet dropped or merged, so none outlives the run by accident.
     forks: Mutex<Vec<String>>,
@@ -95,6 +98,7 @@ impl Ctx {
             max_turns: req.max_turns.unwrap_or(cfg.max_turns),
             max_check_rounds: req.max_check_rounds.unwrap_or(cfg.max_check_rounds),
             budget_usd: req.budget_usd.unwrap_or(cfg.budget_usd),
+            memory: Memory::default(),
             cfg,
             tally: watch::Sender::new(Tally::default()),
             forks: Mutex::default(),

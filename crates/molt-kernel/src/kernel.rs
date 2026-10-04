@@ -12,6 +12,11 @@
 //! So nothing is delivered that is not already on the record, and messages
 //! between any two services keep their order. Replies are routed by the
 //! request they answer, which only the original callee may reply to.
+//!
+//! The kernel's own methods (`kernel.*`) are answered by the kernel. A read
+//! of the audit log (`kernel.audit.read`) runs off the dispatcher, so a long
+//! scan holds up no other message, and its reply is recorded as the range of
+//! entries it returned rather than copied into the log a second time.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, Weak};
@@ -26,7 +31,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::audit::{AuditError, AuditEvent, AuditLog, Receipt};
+use crate::audit::{self, AuditError, AuditEvent, AuditLog, Receipt};
 use crate::caps::CapTable;
 use crate::registry::{Authority, Registry, RegistryError};
 use crate::supervisor::{self, Limits, RestartPolicy, Supervisor};
@@ -35,8 +40,14 @@ use crate::supervisor::{self, Limits, RestartPolicy, Supervisor};
 /// of `target -> cap id`.
 pub const ENV_CAPS: &str = "MOLT_CAPS";
 
+/// Environment variable holding the registry version the service was
+/// launched as, which it records as the author of what it writes.
+pub const ENV_VERSION: &str = "MOLT_VERSION";
+
 /// How long a reply waits for space in a full mailbox before it is dropped.
 const REPLY_WAIT: Duration = Duration::from_secs(10);
+/// `kernel.audit.read`s that may scan the log at once.
+const AUDIT_READS: usize = 2;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -110,6 +121,9 @@ struct Inner {
     pending: Mutex<HashMap<MsgId, Pending>>,
     topics: Mutex<HashMap<String, BTreeSet<ServiceId>>>,
     status: Mutex<HashMap<ServiceId, ServiceStatus>>,
+    /// `kernel.audit.read`s scanning the log at once. Each holds a blocking
+    /// thread, so readers cannot crowd out the audit writer.
+    audit_reads: Arc<tokio::sync::Semaphore>,
     /// Handed to delivery tasks so they do not keep the kernel alive.
     weak: Weak<Inner>,
 }
@@ -152,6 +166,7 @@ impl Kernel {
             pending: Mutex::default(),
             topics: Mutex::default(),
             status: Mutex::default(),
+            audit_reads: Arc::new(tokio::sync::Semaphore::new(AUDIT_READS)),
         });
         let tasks = vec![tokio::spawn(dispatcher(inner.clone(), inbound)), tokio::spawn(reaper(inner.clone()))];
         let (close_events, closing) = oneshot::channel();
@@ -286,6 +301,7 @@ impl Kernel {
                 (molt_transport::ENV_SERVICE_ID.to_owned(), service.to_string()),
                 (molt_transport::ENV_SECRET.to_owned(), secret.expose().to_owned()),
                 (ENV_CAPS.to_owned(), serde_json::to_string(&caps).unwrap()),
+                (ENV_VERSION.to_owned(), version.to_string()),
             ]);
             self.inner.status.lock().unwrap().remove(service);
             self.inner.supervisor.start(supervisor::Spec { id: service.clone(), exec, env, limits, restart });
@@ -522,6 +538,12 @@ impl Inner {
     /// events with `Busy` (and nothing is logged). Replies are never refused:
     /// a caller is waiting on them, so they wait for mailbox space instead.
     async fn route(&self, to: &ServiceId, msg: Envelope) -> Result<(), ErrorCode> {
+        self.route_as(to, msg, None).await
+    }
+
+    /// [`Inner::route`], logging `record` in place of the message when given.
+    async fn route_as(&self, to: &ServiceId, msg: Envelope, record: Option<AuditEvent>) -> Result<(), ErrorCode> {
+        let record = record.unwrap_or_else(|| AuditEvent::Message { envelope: msg.clone() });
         let tx = self.mailboxes.lock().unwrap().get(to).map(|(tx, _)| tx.clone()).ok_or(ErrorCode::Unavailable)?;
         let permit = match tx.try_reserve() {
             Ok(p) => p,
@@ -530,7 +552,7 @@ impl Inner {
                 tokio::spawn(async move {
                     match tokio::time::timeout(REPLY_WAIT, tx.reserve_owned()).await {
                         Ok(Ok(permit)) => {
-                            if let Ok(receipt) = audit.submit(AuditEvent::Message { envelope: msg.clone() }).await {
+                            if let Ok(receipt) = audit.submit(record).await {
                                 permit.send(Delivery { receipt, msg });
                             }
                         }
@@ -544,11 +566,7 @@ impl Inner {
             Err(mpsc::error::TrySendError::Full(())) => return Err(ErrorCode::Busy),
             Err(mpsc::error::TrySendError::Closed(())) => return Err(ErrorCode::Unavailable),
         };
-        let receipt = self
-            .audit
-            .submit(AuditEvent::Message { envelope: msg.clone() })
-            .await
-            .map_err(|_| ErrorCode::Unavailable)?;
+        let receipt = self.audit.submit(record).await.map_err(|_| ErrorCode::Unavailable)?;
         permit.send(Delivery { receipt, msg });
         Ok(())
     }
@@ -655,6 +673,9 @@ impl Inner {
         if self.audit.submit(AuditEvent::Message { envelope: msg.clone() }).await.is_err() {
             return;
         }
+        if method == "audit.read" {
+            return self.audit_read(from, msg).await;
+        }
         let result = self.kernel_method(&from, method, &msg).await;
         match result {
             Ok(payload) => {
@@ -664,6 +685,74 @@ impl Inner {
             }
             Err((code, reason)) => self.deny(&from, &msg, code, reason).await,
         }
+    }
+
+    /// Check the capability and arguments of a `kernel.audit.read`, then
+    /// read the page and reply from a task of its own. The read keeps to the
+    /// request's deadline: waiting for a turn counts, and a scan that runs
+    /// out of time replies with what it found and where to read on.
+    async fn audit_read(&self, from: ServiceId, msg: Envelope) {
+        let cap = match self.caps.verify(msg.cap.as_ref(), &from, &msg.to) {
+            Ok(c) => c,
+            Err(e) => return self.deny(&from, &msg, ErrorCode::Denied, e.to_string()).await,
+        };
+        let req: molt_proto::audit::ReadRequest = match serde_json::from_value(msg.payload.clone()) {
+            Ok(r) => r,
+            Err(e) => return self.deny(&from, &msg, ErrorCode::Invalid, e.to_string()).await,
+        };
+        if cap.max_ms != 0 && msg.budget.ms > cap.max_ms {
+            return self
+                .deny(&from, &msg, ErrorCode::Denied, "deadline is longer than the capability allows".into())
+                .await;
+        }
+        if let Err(e) = self.caps.charge(&cap, 0, 1) {
+            return self.deny(&from, &msg, ErrorCode::OverBudget, e.to_string()).await;
+        }
+        let mut ms = if msg.budget.ms == 0 { self.config.default_deadline.as_millis() as u64 } else { msg.budget.ms };
+        if cap.max_ms != 0 {
+            ms = ms.min(cap.max_ms);
+        }
+        let until = Instant::now() + Duration::from_millis(ms);
+        let (weak, path, turns) = (self.weak.clone(), self.audit.path().to_owned(), self.audit_reads.clone());
+        tokio::spawn(async move {
+            let Ok(Ok(_turn)) = tokio::time::timeout_at(until.into(), turns.acquire_owned()).await else {
+                let Some(inner) = weak.upgrade() else { return };
+                let reason = "the audit log is busy with other reads; try again".to_owned();
+                return inner.deny(&from, &msg, ErrorCode::Timeout, reason).await;
+            };
+            let scan = audit::Scan { until: Some(until), max_bytes: audit::MAX_SCAN };
+            let read = tokio::task::spawn_blocking(move || {
+                audit::read_trace_within(&path, &req, scan).map(|page| (req, page))
+            })
+            .await;
+            let Some(inner) = weak.upgrade() else { return };
+            let (req, page) = match read {
+                Ok(Ok(done)) => done,
+                Ok(Err(e @ AuditError::Cursor(_))) => {
+                    return inner.deny(&from, &msg, ErrorCode::Invalid, e.to_string()).await;
+                }
+                Ok(Err(e)) => return inner.deny(&from, &msg, ErrorCode::Failed, e.to_string()).await,
+                Err(e) => return inner.deny(&from, &msg, ErrorCode::Failed, format!("the read failed: {e}")).await,
+            };
+            let payload = match serde_json::to_value(&page) {
+                Ok(p) => p,
+                Err(e) => return inner.deny(&from, &msg, ErrorCode::Failed, e.to_string()).await,
+            };
+            let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload.to_string().as_bytes()));
+            let mut reply = msg.reply(payload);
+            reply.from = Some(inner.me.clone());
+            let record = AuditEvent::AuditRead {
+                by: from.clone(),
+                reply: reply.id.clone(),
+                reply_to: msg.id.clone(),
+                trace: req.trace,
+                entries: page.entries.len() as u64,
+                first_seq: page.entries.first().map(|e| e.seq),
+                last_seq: page.entries.last().map(|e| e.seq),
+                sha256: digest,
+            };
+            let _ = inner.route_as(&from, reply, Some(record)).await;
+        });
     }
 
     async fn kernel_method(

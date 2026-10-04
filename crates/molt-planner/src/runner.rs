@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::attempt::{self, Check, Finished};
 use crate::ctx::Ctx;
 use crate::designer::{self, Design};
+use crate::memory;
 use crate::{Bus, Config};
 
 const MAX_ATTEMPTS: u32 = 8;
@@ -24,7 +25,9 @@ pub(crate) async fn run(
     trace: TraceId,
 ) -> Result<RunResponse, RemoteError> {
     validate(&req)?;
-    let ctx = Arc::new(Ctx::new(bus, cfg, trace, &req));
+    let mut ctx = Ctx::new(bus, cfg, trace, &req);
+    ctx.memory = memory::prepare(&ctx).await;
+    let ctx = Arc::new(ctx);
     tracing::info!(run = %ctx.trace, workspace = %ctx.workspace, attempts = req.attempts, "run started");
 
     let check = match &req.check {

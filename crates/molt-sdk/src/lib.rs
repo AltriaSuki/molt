@@ -17,7 +17,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use molt_proto::{Budget, CapId, Envelope, ErrorCode, Kind, MsgId, RemoteError, ServiceId, Target, TraceId};
+use molt_proto::{Budget, CapId, Envelope, ErrorCode, Kind, MsgId, RemoteError, ServiceId, Target, TraceId, MAX_DEPTH};
 use molt_transport::{Link, TransportError};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -25,6 +25,9 @@ use tokio::task::JoinHandle;
 
 /// Same as `molt_kernel::ENV_CAPS`; duplicated so services need not depend on the kernel.
 pub const ENV_CAPS: &str = "MOLT_CAPS";
+
+/// Same as `molt_kernel::ENV_VERSION`.
+pub const ENV_VERSION: &str = "MOLT_VERSION";
 
 /// Requests and events a service holds for [`Service::next`] before more
 /// requests are answered `busy` and more events are dropped.
@@ -58,12 +61,35 @@ pub struct CallOpts {
 /// A request that has been sent and whose reply has not been awaited yet.
 pub struct PendingReply {
     rx: oneshot::Receiver<Envelope>,
+    id: MsgId,
+    waiters: Waiters,
+    /// When to stop waiting: a while after the request's deadline, by which
+    /// the kernel answers every request it still knows of. A reply lost on
+    /// the way (one the transport refused, say) ends the wait here.
+    give_up: Option<Instant>,
 }
+
+/// How long past a request's deadline a caller still waits for the kernel's answer.
+#[cfg(not(test))]
+const REPLY_GRACE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const REPLY_GRACE: Duration = Duration::from_millis(50);
 
 impl PendingReply {
     /// The reply payload, or the error the callee or the kernel sent back.
     pub async fn wait(self) -> Result<Value, SdkError> {
-        let reply = self.rx.await.map_err(|_| SdkError::Closed)?;
+        let reply = match self.give_up {
+            None => self.rx.await,
+            Some(at) => match tokio::time::timeout_at(at.into(), self.rx).await {
+                Ok(reply) => reply,
+                Err(_) => {
+                    self.waiters.lock().unwrap().remove(&self.id);
+                    let message = "no reply arrived by the deadline; it was lost on the way".to_owned();
+                    return Err(SdkError::Remote(RemoteError { code: ErrorCode::Timeout, message }));
+                }
+            },
+        };
+        let reply = reply.map_err(|_| SdkError::Closed)?;
         match reply.error() {
             Some(err) => Err(SdkError::Remote(err)),
             None => Ok(reply.payload),
@@ -75,6 +101,8 @@ type Waiters = Arc<Mutex<HashMap<MsgId, oneshot::Sender<Envelope>>>>;
 
 pub struct Service {
     id: ServiceId,
+    /// The registry version the kernel launched this service as.
+    version: Option<String>,
     link: Arc<dyn Link>,
     caps: Mutex<HashMap<String, CapId>>,
     waiters: Waiters,
@@ -98,7 +126,9 @@ impl Service {
             Ok(s) => serde_json::from_str(&s).map_err(|e| SdkError::Env(e.to_string()))?,
             Err(_) => HashMap::new(),
         };
-        Ok(Self::new(id, link, caps))
+        let mut svc = Self::new(id, link, caps);
+        svc.version = std::env::var(ENV_VERSION).ok().filter(|v| !v.is_empty());
+        Ok(svc)
     }
 
     pub fn new(id: ServiceId, link: Box<dyn Link>, caps: HashMap<String, CapId>) -> Self {
@@ -106,11 +136,24 @@ impl Service {
         let waiters: Waiters = Arc::default();
         let (tx, rx) = mpsc::channel(QUEUE);
         let reader = tokio::spawn(read_loop(link.clone(), waiters.clone(), tx));
-        Self { id, link, caps: Mutex::new(caps), waiters, incoming: tokio::sync::Mutex::new(rx), reader }
+        Self { id, version: None, link, caps: Mutex::new(caps), waiters, incoming: tokio::sync::Mutex::new(rx), reader }
     }
 
     pub fn id(&self) -> &ServiceId {
         &self.id
+    }
+
+    /// The registry version this service was launched as, when the kernel
+    /// launched it (see [`ENV_VERSION`]).
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+
+    /// Set the version [`Service::version`] reports, for a service joined
+    /// to the bus some other way than [`Service::connect_from_env`].
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
     }
 
     /// Remember a capability for `target` (e.g. one delegated to this service).
@@ -162,7 +205,8 @@ impl Service {
             self.waiters.lock().unwrap().remove(&msg.id);
             return Err(e.into());
         }
-        Ok(PendingReply { rx })
+        let give_up = (msg.budget.ms > 0).then(|| Instant::now() + Duration::from_millis(msg.budget.ms) + REPLY_GRACE);
+        Ok(PendingReply { rx, id: msg.id, waiters: self.waiters.clone(), give_up })
     }
 
     /// Call a kernel method (`ping`, `cap.delegate`, `subscribe`, `registry.*`).
@@ -230,7 +274,15 @@ impl Service {
         }
     }
 
+    /// Answer `req`. A payload nested too deeply for the kernel to take is
+    /// refused here, so the caller can be told instead of left waiting.
     pub async fn reply(&self, req: &Envelope, payload: Value) -> Result<(), SdkError> {
+        // The envelope and its payload field add one level.
+        let deep = molt_proto::depth(&payload) + 1;
+        if deep > MAX_DEPTH {
+            let e = format!("the reply is nested {deep} deep; the bus carries at most {MAX_DEPTH}");
+            return Err(SdkError::Transport(TransportError::Other(e)));
+        }
         Ok(self.link.send(&req.reply(payload)).await?)
     }
 
@@ -368,6 +420,42 @@ mod tests {
         async fn recv(&self) -> Option<Envelope> {
             self.inbox.lock().await.recv().await
         }
+    }
+
+    #[tokio::test]
+    async fn a_reply_too_deep_for_the_bus_becomes_an_error_reply() {
+        let (to_service, inbox) = mpsc::channel(4);
+        let (sent, mut from_service) = mpsc::channel(4);
+        let link = SmallLink { max: usize::MAX, inbox: tokio::sync::Mutex::new(inbox), sent };
+        let svc = Service::new(ServiceId::new("svc").unwrap(), Box::new(link), HashMap::new());
+        let req = Envelope::request(TraceId::random(), "svc.deep".parse().unwrap(), CapId::random(), Value::Null);
+        to_service.send(req.clone()).await.unwrap();
+        drop(to_service);
+        let deep: Value =
+            serde_json::from_str(&format!("{}1{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH))).unwrap();
+        svc.serve(move |_| {
+            let deep = deep.clone();
+            async move { Ok(deep) }
+        })
+        .await;
+        drop(svc);
+        let err = from_service.recv().await.expect("a reply").error().expect("an error reply");
+        assert!(err.message.contains("nested"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn a_call_whose_reply_is_lost_ends_after_its_deadline() {
+        let (_to_service, inbox) = mpsc::channel(4);
+        let (sent, _from_service) = mpsc::channel(4);
+        let link = SmallLink { max: usize::MAX, inbox: tokio::sync::Mutex::new(inbox), sent };
+        let svc = Service::new(ServiceId::new("svc").unwrap(), Box::new(link), HashMap::new());
+        let opts = CallOpts { budget: Budget::new(0, 20, 0), ..Default::default() };
+        let started = Instant::now();
+        let err = svc.call("kernel.audit.read", json!({}), opts).await.unwrap_err();
+        let SdkError::Remote(err) = err else { panic!("{err:?}") };
+        assert_eq!(err.code, ErrorCode::Timeout);
+        assert!(started.elapsed() >= Duration::from_millis(70));
+        assert!(svc.waiters.lock().unwrap().is_empty(), "the call is forgotten");
     }
 
     #[tokio::test]

@@ -15,10 +15,15 @@
 //! The log holds every message, file contents and model conversations
 //! included, so a new log, and a directory created for it, is readable by
 //! its owner only.
+//!
+//! Services read it back one trace at a time through `kernel.audit.read`
+//! ([`read_trace`]).
 
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use molt_proto::{Budget, CapId, Envelope, ErrorCode, MsgId, ServiceId, Target, VersionId};
+use molt_proto::audit::{Logged, ReadRequest, ReadResponse};
+use molt_proto::{Budget, CapId, Envelope, ErrorCode, Kind, MsgId, ServiceId, Target, TraceId, VersionId};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
@@ -80,6 +85,19 @@ pub enum AuditEvent {
         to: VersionId,
         by: String,
     },
+    /// A page of the log handed to a service by `kernel.audit.read`, in
+    /// place of a copy of the reply: entries `first_seq..=last_seq` of
+    /// `trace`, and the SHA-256 of the reply payload as delivered.
+    AuditRead {
+        by: ServiceId,
+        reply: MsgId,
+        reply_to: MsgId,
+        trace: TraceId,
+        entries: u64,
+        first_seq: Option<u64>,
+        last_seq: Option<u64>,
+        sha256: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -131,6 +149,10 @@ pub enum AuditError {
     Io(#[from] std::io::Error),
     #[error("line {line}: {reason}")]
     Corrupt { line: usize, reason: String },
+    #[error("entry at byte {offset}: {reason}")]
+    CorruptAt { offset: u64, reason: String },
+    #[error("cursor {0} is not the start of an entry")]
+    Cursor(u64),
 }
 
 enum Job {
@@ -317,6 +339,96 @@ pub async fn tail(path: &Path, n: usize) -> Result<Vec<Entry>, AuditError> {
         .collect()
 }
 
+/// Default size of one page of [`read_trace`], in bytes of log.
+pub const READ_PAGE: u64 = 2 * 1024 * 1024;
+/// Largest page a reader may ask for. Twice this still fits a transport frame.
+pub const MAX_READ_PAGE: u64 = 3 * 1024 * 1024;
+
+/// How far one [`read_trace_within`] may look.
+#[derive(Clone, Copy, Debug)]
+pub struct Scan {
+    /// Stop looking at this time.
+    pub until: Option<std::time::Instant>,
+    /// Stop after this many bytes of log.
+    pub max_bytes: u64,
+}
+
+/// Bytes of log one `kernel.audit.read` looks through at most; a reader
+/// whose trace is further on reads on from the page's `next`.
+pub const MAX_SCAN: u64 = 256 * 1024 * 1024;
+
+/// [`read_trace_within`] with no limit on how far it looks.
+pub fn read_trace(path: &Path, req: &ReadRequest) -> Result<ReadResponse, AuditError> {
+    read_trace_within(path, req, Scan { until: None, max_bytes: u64::MAX })
+}
+
+/// One page of the messages of `req.trace` in the log at `path`, from
+/// `req.cursor` on. Reads the file directly and blocks: run it off the
+/// async runtime. A page holds at least one message unless the log has none
+/// left or `scan` ran out first (then `next` says where to read on), so a
+/// reader always makes progress; a message bigger than the page comes with
+/// its payload left out. A last line still being written counts as not
+/// there yet.
+pub fn read_trace_within(path: &Path, req: &ReadRequest, scan: Scan) -> Result<ReadResponse, AuditError> {
+    let max = req.max_bytes.unwrap_or(READ_PAGE).clamp(1, MAX_READ_PAGE);
+    let mut file = std::fs::File::open(path)?;
+    let start = req.cursor.unwrap_or(0);
+    if start > file.metadata()?.len() {
+        return Err(AuditError::Cursor(start));
+    }
+    if start > 0 {
+        let mut before = [0u8];
+        file.seek(SeekFrom::Start(start - 1))?;
+        file.read_exact(&mut before)?;
+        if before[0] != b'\n' {
+            return Err(AuditError::Cursor(start));
+        }
+    }
+    file.seek(SeekFrom::Start(start))?;
+    let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
+    // A cheap test before parsing a line. Strings in a payload are escaped, so
+    // only an envelope's own field matches; the parsed trace id is checked too.
+    let needle = format!("\"trace_id\":{}", serde_json::to_string(&req.trace).map_err(std::io::Error::other)?);
+    let (mut offset, mut used) = (start, 0u64);
+    let mut entries = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line)? as u64;
+        if n == 0 || line.last() != Some(&b'\n') {
+            return Ok(ReadResponse { entries, next: None });
+        }
+        let here = offset;
+        offset += n;
+        let corrupt = |reason: String| AuditError::CorruptAt { offset: here, reason };
+        let text = std::str::from_utf8(&line).map_err(|e| corrupt(e.to_string()))?;
+        if !text.contains(&needle) {
+            let out_of_time = scan.until.is_some_and(|until| std::time::Instant::now() >= until);
+            if offset - start >= scan.max_bytes || out_of_time {
+                return Ok(ReadResponse { entries, next: Some(offset) });
+            }
+            continue;
+        }
+        let entry: EntryIn = serde_json::from_str(text).map_err(|e| corrupt(e.to_string()))?;
+        let event: AuditEvent = serde_json::from_str(entry.event.get()).map_err(|e| corrupt(e.to_string()))?;
+        let AuditEvent::Message { mut envelope } = event else { continue };
+        let skipped =
+            envelope.kind == Kind::Request && envelope.to.service().is_some_and(|s| req.skip_requests_to.contains(s));
+        if envelope.trace_id != req.trace || skipped {
+            continue;
+        }
+        if used + n > max && !entries.is_empty() {
+            return Ok(ReadResponse { entries, next: Some(here) });
+        }
+        let omitted = (n > max).then(|| {
+            envelope.payload = serde_json::Value::Null;
+            n
+        });
+        used += n;
+        entries.push(Logged { seq: entry.seq, ts_ms: entry.ts_ms, envelope, omitted });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +479,113 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(&dir.path().join("data")), 0o700);
+    }
+
+    fn message(trace: &TraceId, to: &str, kind: Kind, payload: serde_json::Value) -> AuditEvent {
+        let mut envelope = Envelope::request(trace.clone(), to.parse().unwrap(), CapId::random(), payload);
+        envelope.kind = kind;
+        AuditEvent::Message { envelope }
+    }
+
+    #[tokio::test]
+    async fn a_trace_is_read_back_in_pages_without_the_skipped_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open(&path, false).await.unwrap();
+        let (mine, other) = (TraceId::random(), TraceId::random());
+        // A payload that quotes another trace's id as text must not match it.
+        let quoted = serde_json::json!({ "note": format!("\"trace_id\":\"{other}\"") });
+        log.append(message(&other, "fs.read", Kind::Request, serde_json::json!(0))).await.unwrap();
+        log.append(message(&mine, "model.complete", Kind::Request, serde_json::json!("big"))).await.unwrap();
+        log.append(message(&mine, "model.complete", Kind::Reply, serde_json::json!("answer"))).await.unwrap();
+        log.append(ev(1)).await.unwrap();
+        for n in 0..10 {
+            log.append(message(&mine, "fs.read", Kind::Request, serde_json::json!(n))).await.unwrap();
+        }
+        log.append(message(&mine, "fs.read", Kind::Request, quoted.clone())).await.unwrap();
+        log.close().await;
+
+        let all = read_trace(&path, &ReadRequest::new(other.clone())).unwrap();
+        assert_eq!(all.entries.len(), 1, "the quoted id is not a message of that trace");
+        assert_eq!(all.next, None);
+
+        let mut req = ReadRequest::new(mine.clone());
+        req.skip_requests_to = vec![ServiceId::new("model").unwrap()];
+        let whole = read_trace(&path, &req).unwrap();
+        let payloads: Vec<_> = whole.entries.iter().map(|e| e.envelope.payload.clone()).collect();
+        assert_eq!(payloads[0], serde_json::json!("answer"), "the model's reply is kept, its request left out");
+        assert_eq!(payloads.len(), 12);
+        assert_eq!(payloads[11], quoted);
+
+        // Small pages still make progress and add up to the whole.
+        req.max_bytes = Some(1);
+        let mut seen = Vec::new();
+        loop {
+            let page = read_trace(&path, &req).unwrap();
+            assert_eq!(page.entries.len(), 1);
+            assert!(page.entries[0].omitted.is_some(), "a message bigger than the page has its payload left out");
+            seen.push(page.entries[0].seq);
+            match page.next {
+                Some(next) => req.cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen, whole.entries.iter().map(|e| e.seq).collect::<Vec<_>>());
+
+        // A cursor that is not the start of an entry is refused.
+        req.cursor = Some(3);
+        assert!(matches!(read_trace(&path, &req), Err(AuditError::Cursor(3))));
+        req.cursor = Some(u64::MAX);
+        assert!(matches!(read_trace(&path, &req), Err(AuditError::Cursor(_))));
+    }
+
+    #[tokio::test]
+    async fn a_scan_that_runs_out_says_where_to_read_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open(&path, false).await.unwrap();
+        let (mine, other) = (TraceId::random(), TraceId::random());
+        for n in 0..20 {
+            log.append(message(&other, "fs.read", Kind::Request, serde_json::json!(n))).await.unwrap();
+        }
+        log.append(message(&mine, "fs.read", Kind::Request, serde_json::json!("found"))).await.unwrap();
+        log.close().await;
+
+        let req = ReadRequest::new(mine.clone());
+        let short = Scan { until: None, max_bytes: 1 };
+        let mut cursor = None;
+        let mut calls = 0;
+        let found = loop {
+            calls += 1;
+            let page = read_trace_within(&path, &ReadRequest { cursor, ..req.clone() }, short).unwrap();
+            if !page.entries.is_empty() {
+                break page.entries;
+            }
+            cursor = Some(page.next.expect("a scan cut short says where to read on"));
+        };
+        assert_eq!(calls, 21, "one line per call");
+        assert_eq!(found[0].envelope.payload, serde_json::json!("found"));
+
+        let past = Scan { until: Some(std::time::Instant::now()), max_bytes: u64::MAX };
+        let page = read_trace_within(&path, &req, past).unwrap();
+        assert!(page.entries.is_empty() && page.next.is_some(), "out of time: a page with nothing, and where to go on");
+    }
+
+    #[tokio::test]
+    async fn a_line_still_being_written_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open(&path, false).await.unwrap();
+        let trace = TraceId::random();
+        log.append(message(&trace, "fs.read", Kind::Request, serde_json::json!(1))).await.unwrap();
+        log.close().await;
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        let half = text.clone();
+        text.push_str(&half[..half.len() / 2]);
+        std::fs::write(&path, text).unwrap();
+        let page = read_trace(&path, &ReadRequest::new(trace)).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.next, None);
     }
 
     #[tokio::test]

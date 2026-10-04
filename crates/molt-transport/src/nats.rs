@@ -107,7 +107,7 @@ impl Transport for NatsTransport {
         let (id2, tx) = (id.clone(), self.inbound_tx.clone());
         let task = tokio::spawn(async move {
             while let Some(m) = sub.next().await {
-                match serde_json::from_slice::<Envelope>(&m.payload) {
+                match Envelope::from_wire(&m.payload) {
                     Ok(msg) => {
                         if tx.send(Inbound { from: id2.clone(), msg }).await.is_err() {
                             break;

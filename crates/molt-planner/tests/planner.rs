@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use molt_api::fs::{self, Change, ChangeKind};
+use molt_api::memory;
 use molt_api::model::{CompleteRequest, CompleteResponse, Usage};
 use molt_api::planner::{AttemptStatus, CheckSpec, Outcome, RunRequest, RunResponse};
 use molt_api::progress::Progress;
@@ -52,6 +53,10 @@ struct State {
     merge_partial: bool,
     drop_fails: bool,
     patch_truncated: bool,
+    /// A memory service answers `memory.*`; without it those calls are `unavailable`.
+    memory: bool,
+    /// Memory is there but answers nothing: every call times out.
+    memory_hangs: bool,
     calls: Vec<Call>,
     requests: Vec<CompleteRequest>,
     events: Vec<Progress>,
@@ -108,6 +113,8 @@ impl Fake {
             merge_partial: false,
             drop_fails: false,
             patch_truncated: false,
+            memory: false,
+            memory_hangs: false,
             calls: Vec::new(),
             requests: Vec::new(),
             events: Vec::new(),
@@ -285,6 +292,61 @@ impl Fake {
     }
 }
 
+impl Fake {
+    /// A memory that knows one note and one function of the workspace.
+    fn memory(&self, target: &str, payload: Value) -> Result<Value, RemoteError> {
+        if self.state.lock().unwrap().memory_hangs {
+            return Err(RemoteError { code: ErrorCode::Timeout, message: format!("{target} did not answer") });
+        }
+        if !self.state.lock().unwrap().memory {
+            return Err(RemoteError { code: ErrorCode::Unavailable, message: format!("no {target}") });
+        }
+        assert_eq!(payload["workspace"], WORKSPACE, "memory knows the user's workspace, not the forks");
+        Ok(match target {
+            memory::INDEX => json!(memory::IndexResponse { files: 3, parsed: 3, symbols: 7, ..Default::default() }),
+            memory::MAP => json!(memory::MapResponse {
+                map: "src/greet.rs:\n  3: pub fn greet(name: &str) -> String\n".into(),
+                files: 1,
+                symbols: 1,
+                tokens: 20,
+            }),
+            memory::RECALL => {
+                let note = memory::Note {
+                    id: "note_1".into(),
+                    kind: memory::NoteKind::Lesson,
+                    text: "hello.txt must end with a newline or the check fails.".into(),
+                    workspace: Some(WORKSPACE.into()),
+                    confidence: 0.7,
+                    created_ms: 1,
+                    updated_ms: 1,
+                    reinforced: 0,
+                    conflicts: vec![],
+                    provenance: memory::Provenance {
+                        trace: "trace_before".into(),
+                        events: vec!["msg_1".into()],
+                        service: "memory".into(),
+                        version: "v1".into(),
+                    },
+                    rev: 1,
+                };
+                json!(memory::RecallResponse { notes: vec![memory::Recalled { note, score: 1.0 }] })
+            }
+            memory::SYMBOLS => json!(memory::SymbolsResponse {
+                definitions: vec![memory::Definition {
+                    path: "src/greet.rs".into(),
+                    line: 3,
+                    kind: "function".into(),
+                    name: "greet".into(),
+                    signature: "pub fn greet(name: &str) -> String".into(),
+                }],
+                references: vec![],
+                truncated: false,
+            }),
+            other => return Err(invalid(format!("no {other}"))),
+        })
+    }
+}
+
 #[async_trait]
 impl Bus for Fake {
     async fn call(&self, target: &str, payload: Value, budget: Budget, _: &TraceId) -> Result<Value, RemoteError> {
@@ -303,6 +365,7 @@ impl Bus for Fake {
                 let snapshot = files(&mut self.state.lock().unwrap(), &r.workspace)?.clone();
                 Ok(serde_json::to_value((self.shell)(&r.command, &snapshot)).unwrap())
             }
+            t if t.starts_with("memory.") => self.memory(t, payload),
             _ => self.fs(target, payload),
         }
     }
@@ -1183,4 +1246,84 @@ async fn a_truncated_patch_is_flagged() {
     fake.set(|st| st.patch_truncated = true);
     let resp = run(&fake, request(Some("check"), 1)).await;
     assert_eq!((resp.outcome, resp.patch_truncated, resp.changes.len()), (Outcome::Passed, true, 1));
+}
+
+#[tokio::test]
+async fn memory_gives_every_conversation_the_project_context_and_its_tools() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 if is_designer(req) => use_tools(
+                req,
+                &[("submit_check", json!({ "command": "check", "files": [], "rationale": "hello.txt says hi" }))],
+            ),
+            1 => {
+                use_tools(req, &[("find_symbol", json!({ "name": "greet" })), ("recall", json!({ "query": "hello" }))])
+            }
+            2 => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        },
+        hello_check,
+    );
+    fake.set(|st| st.memory = true);
+    let resp = run(&fake, request(None, 1)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+
+    // Memory is asked for notes (which shows it answers), then the model is
+    // brought up to date, before anything else happens.
+    let calls = fake.calls();
+    let targets: Vec<&str> = calls.iter().take(3).map(|c| c.target.as_str()).collect();
+    assert_eq!(targets, ["memory.recall", "memory.index", "memory.map"]);
+    assert_eq!(calls[2].payload["query"], "Add hello.txt saying hi.");
+    assert_eq!(calls[2].payload["max_tokens"], 3000);
+
+    let requests = fake.requests();
+    for req in &requests {
+        let context = req.messages[0]["content"][0]["text"].as_str().unwrap();
+        assert!(context.starts_with("<project_context>"), "{context}");
+        assert!(context.contains("- [lesson 0.70] hello.txt must end with a newline"), "{context}");
+        assert!(context.contains("src/greet.rs:\n  3: pub fn greet"), "{context}");
+        assert!(req.messages[0]["content"][1]["text"].as_str().unwrap().starts_with("<task>"));
+        let names: Vec<&str> = req.tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"find_symbol") && names.contains(&"recall"), "{names:?}");
+    }
+
+    // Memory's answers come back as tool results.
+    let second = requests.iter().find(|r| !is_designer(r) && turn(r) == 2).unwrap();
+    let results = last_text(second);
+    assert!(results.contains("Defined at:\nsrc/greet.rs:3: function pub fn greet(name: &str) -> String"), "{results}");
+    assert!(results.contains("- [lesson 0.70] hello.txt must end"), "{results}");
+    assert_eq!(fake.calls_to("memory.symbols")[0].payload["name"], "greet");
+    assert!(fake.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
+        if message == "project model: 3 files, 7 definitions (3 parsed again, 0 ms)")));
+
+    // Without memory, the same run offers neither the block nor the tools.
+    let plain = Fake::new(
+        |req| match turn(req) {
+            1 => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        },
+        hello_check,
+    );
+    assert_eq!(run(&plain, request(Some("check"), 1)).await.outcome, Outcome::Passed);
+    let first = &plain.requests()[0];
+    assert!(first.messages[0]["content"][0]["text"].as_str().unwrap().starts_with("<task>"));
+    assert_eq!(first.tools.len(), 6);
+    assert_eq!(plain.calls_to("memory.recall").len(), 1, "asked once, then left alone");
+    assert!(plain.calls_to("memory.index").is_empty() && plain.calls_to("memory.map").is_empty());
+
+    // A memory that does not answer is given up on at once, and said so.
+    let hung = Fake::new(
+        |req| match turn(req) {
+            1 => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        },
+        hello_check,
+    );
+    hung.set(|st| st.memory_hangs = true);
+    assert_eq!(run(&hung, request(Some("check"), 1)).await.outcome, Outcome::Passed);
+    assert_eq!(hung.calls().iter().filter(|c| c.target.starts_with("memory.")).count(), 1);
+    assert_eq!(hung.calls_to("memory.recall")[0].budget.ms, 10_000);
+    assert_eq!(hung.requests()[0].tools.len(), 6);
+    assert!(hung.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
+        if message == "running without memory: memory.recall did not answer")));
 }

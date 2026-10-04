@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use globset::GlobBuilder;
 use molt_api::fs::{
-    EditRequest, EditResponse, Entry, EntryKind, ListRequest, ListResponse, Match, ReadRequest, ReadResponse,
-    SearchRequest, SearchResponse, WriteRequest, WriteResponse,
+    EditRequest, EditResponse, Entry, EntryKind, FilesChanged, ListRequest, ListResponse, Match, ReadRequest,
+    ReadResponse, SearchRequest, SearchResponse, WriteRequest, WriteResponse,
 };
 use molt_proto::RemoteError;
 use regex::RegexBuilder;
@@ -130,6 +130,17 @@ pub(crate) fn write(roots: &Roots, req: WriteRequest) -> Result<WriteResponse, R
     let created = mode.is_none();
     atomic_write(&dest, req.content.as_bytes(), mode).map_err(io)?;
     Ok(WriteResponse { bytes: req.content.len() as u64, created })
+}
+
+/// The file a successful write or edit of `path` in `workspace` changed,
+/// unless the workspace is a fork (or anything else in scratch).
+pub(crate) fn changed(roots: &Roots, workspace: &str, path: &str) -> Option<FilesChanged> {
+    let ws = roots.workspace(workspace).ok()?;
+    if ws.starts_with(&roots.scratch) {
+        return None;
+    }
+    let file = paths::existing(&ws, &paths::relative(path).ok()?, path).ok()?;
+    Some(FilesChanged { workspace: ws.to_string_lossy().into_owned(), paths: vec![paths::slash(&ws, &file)] })
 }
 
 pub(crate) fn edit(roots: &Roots, req: EditRequest) -> Result<EditResponse, RemoteError> {

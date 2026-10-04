@@ -404,7 +404,19 @@ impl Side {
     }
 }
 
-pub(crate) fn merge(roots: &Roots, lock: &Mutex<()>, req: MergeRequest) -> Result<MergeResponse, RemoteError> {
+/// The canonical workspace `fork` was copied from, if it is a fork.
+pub(crate) fn base(roots: &Roots, fork: &str) -> Option<PathBuf> {
+    open(roots, fork).ok().map(|f| f.meta.base)
+}
+
+/// Carry a fork's changes back into its original. `written` receives the
+/// paths written in the original, also when the merge fails partway.
+pub(crate) fn merge(
+    roots: &Roots,
+    lock: &Mutex<()>,
+    req: MergeRequest,
+    written: &mut Vec<String>,
+) -> Result<MergeResponse, RemoteError> {
     let _merging = lock.lock().unwrap_or_else(|e| e.into_inner());
     let fork = open(roots, &req.fork)?;
     let now = current(&fork, &roots.scratch)?;
@@ -433,7 +445,7 @@ pub(crate) fn merge(roots: &Roots, lock: &Mutex<()>, req: MergeRequest) -> Resul
             conflicts.join(", ")
         )));
     }
-    apply_all(&work, |change| apply(&fork, change))?;
+    apply_all(&work, written, |change| apply(&fork, change))?;
     if req.drop {
         remove(&fork.dir).map_err(|e| failed(format!("the merge succeeded, but dropping the fork failed: {e}")))?;
     }
@@ -443,18 +455,24 @@ pub(crate) fn merge(roots: &Roots, lock: &Mutex<()>, req: MergeRequest) -> Resul
 /// Run `apply` on each change in turn. A failure after the first write is
 /// reported as `partial:` with the paths already written, since the
 /// original then holds some of the fork's changes.
-fn apply_all(work: &[&Change], mut apply: impl FnMut(&Change) -> io::Result<()>) -> Result<(), RemoteError> {
-    let mut written: Vec<&str> = Vec::new();
+fn apply_all(
+    work: &[&Change],
+    written: &mut Vec<String>,
+    mut apply: impl FnMut(&Change) -> io::Result<()>,
+) -> Result<(), RemoteError> {
     for change in work {
         if let Err(e) = apply(change) {
             let path = &change.path;
-            return Err(failed(if written.is_empty() {
+            let message = if written.is_empty() {
                 format!("merging {path}: {e}")
             } else {
                 format!("partial: merging {path} failed ({e}) after these files were written: {}", written.join(", "))
-            }));
+            };
+            // It may be half written.
+            written.push(change.path.clone());
+            return Err(failed(message));
         }
-        written.push(&change.path);
+        written.push(change.path.clone());
     }
     Ok(())
 }
@@ -549,12 +567,16 @@ mod tests {
         let failing =
             |at: &'static str| move |c: &Change| if c.path == at { Err(io::Error::other("disk full")) } else { Ok(()) };
 
-        let e = apply_all(&work, failing("c.txt")).unwrap_err();
+        let mut written = Vec::new();
+        let e = apply_all(&work, &mut written, failing("c.txt")).unwrap_err();
         assert_eq!(e.code, molt_proto::ErrorCode::Failed);
         assert_eq!(e.message, "partial: merging c.txt failed (disk full) after these files were written: a.txt, b.txt");
-        let e = apply_all(&work, failing("a.txt")).unwrap_err();
+        assert_eq!(written, ["a.txt", "b.txt", "c.txt"], "the file it stopped in may be half written");
+        let mut written = Vec::new();
+        let e = apply_all(&work, &mut written, failing("a.txt")).unwrap_err();
         assert_eq!(e.message, "merging a.txt: disk full", "nothing was written yet");
-        assert!(apply_all(&work, failing("z.txt")).is_ok());
+        assert_eq!(written, ["a.txt"]);
+        assert!(apply_all(&work, &mut Vec::new(), failing("z.txt")).is_ok());
     }
 
     #[test]

@@ -161,7 +161,9 @@ pub struct RunResponse {
 }
 
 /// Names and inputs of the tools the planner offers the model. Each maps to
-/// one `fs` or `shell` call in the attempt's fork.
+/// one `fs` or `shell` call in the attempt's fork, or, for [`FIND_SYMBOL`]
+/// and [`RECALL`] (offered when memory is up), one `memory` call about the
+/// workspace.
 pub mod tools {
     use serde::{Deserialize, Serialize};
 
@@ -171,6 +173,8 @@ pub mod tools {
     pub const LIST_FILES: &str = "list_files";
     pub const SEARCH: &str = "search";
     pub const RUN: &str = "run";
+    pub const FIND_SYMBOL: &str = "find_symbol";
+    pub const RECALL: &str = "recall";
     /// Offered only to the check designer: the check it settled on.
     pub const SUBMIT_CHECK: &str = "submit_check";
 
@@ -222,6 +226,19 @@ pub mod tools {
         pub command: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub timeout_s: Option<u64>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct FindSymbol {
+        pub name: String,
+        /// Also list where it is used. Default true.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub references: Option<bool>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Recall {
+        pub query: String,
     }
 
     /// `command` is `None` when no automated check fits the task (a

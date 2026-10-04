@@ -9,6 +9,7 @@ repository.workspace = true
 molt-api.workspace = true
 molt-gateway.workspace = true
 molt-kernel.workspace = true
+molt-memory.workspace = true
 molt-planner.workspace = true
 molt-proto.workspace = true
 molt-sdk.workspace = true

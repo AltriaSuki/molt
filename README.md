@@ -5,11 +5,15 @@ changes itself and has no model inside it. Everything that thinks, remembers or
 acts is a separate service that the agent can rewrite, test and roll back, the
 way a crab sheds its shell to grow.
 
-This repository is at **milestone 2: a working agent**. `molt do` takes a
-task in plain words, settles on a done-check first, runs parallel attempts in
-private forks of the project, verifies each with the check and applies the
-first that passes. The agent cannot rewrite itself yet; that starts with
-milestone 5.
+This repository is at **milestone 3: memory**. `molt do` takes a task in
+plain words, settles on a done-check first, runs parallel attempts in private
+forks of the project, verifies each with the check and applies the first that
+passes. Each run starts from what Molt knows about the project: a map of the
+code most relevant to the task, from an index of every definition and
+reference that follows the files as they change, and the notes it learned
+from earlier runs there. After the run, memory reads it back from the audit
+log and keeps what would help next time. The agent cannot rewrite itself yet;
+that starts with milestone 5.
 
 ## Architecture
 
@@ -37,6 +41,7 @@ milestone 5.
 | Model gateway | `model.*`: the Anthropic Messages API; the only holder of the API key | `molt-gateway` |
 | File and shell services | `fs.*` and `shell.*`: files, forks, diffs, merges and commands, confined to a root | `molt-tools` |
 | Planner | `planner.run`: check first, parallel attempts, verify, apply | `molt-planner` |
+| Memory | `memory.*`: notes with provenance, learned from finished runs; the project model (definitions, references, repo map) | `molt-memory` |
 
 The kernel never trusts the sender named in a message. The transport
 authenticates each service's endpoint (a per-service secret on Unix sockets,
@@ -53,6 +58,8 @@ sender from that.
 | A failing service never takes the kernel down | `a_service_that_never_replies…`, `a_crashed_and_reconnected…`, `a_flooding_service…`, `garbage_on_the_wire_is_ignored`, `crates/molt/tests/e2e.rs` |
 | Both transports behave the same: ordering, at-most-once, sender stamping, isolation, bounded inboxes | `crates/molt-transport/src/testkit.rs`, run by `conformance_unix.rs` and `conformance_nats.rs` |
 | `molt do` never runs a config the project ships, and the API key never reaches the commands it runs | `crates/molt/tests/agent.rs` (`the_cli_carries_out_a_task`) |
+| Reading the audit log takes a capability, and a read is recorded without a second copy of what it returned | `reading_the_log_takes_a_capability_and_is_recorded_without_a_second_copy` |
+| Every learned note cites the messages behind it, and a run is learned from once | `crates/molt/tests/agent.rs` (`a_second_run_starts_with_what_the_first_learned…`), `crates/molt-memory/src/consolidate.rs` |
 
 ## Quick start
 
@@ -83,7 +90,7 @@ to generate per-service credentials, put the printed `authorization` block and
 ```
 molt do TASK [--check CMD] [--attempts N] [--model M] [--effort E] [--max-turns N]
         [--budget-usd X] [--no-apply] [--json] [--workspace DIR] [--data-dir DIR]
-        [--pass-env NAME]... [--config FILE]
+        [--pass-env NAME]... [--no-memory] [--no-learn] [--config FILE]
 ```
 
 | Flag | Meaning |
@@ -97,6 +104,8 @@ molt do TASK [--check CMD] [--attempts N] [--model M] [--effort E] [--max-turns 
 | `--workspace DIR` | The project (default: the current directory). |
 | `--data-dir DIR` | Kernel state, the audit log and forks. Default `~/.cache/molt/<project>-<hash>` (under `$XDG_CACHE_HOME` if set). Must be outside the workspace. |
 | `--pass-env NAME` | Pass a variable from your environment to the commands the agent runs, the check included. Repeatable. |
+| `--no-memory` | Run without memory: no map or notes for the model, nothing learned. |
+| `--no-learn` | Use memory, but do not learn from this run (learning is one more model call after it). |
 | `--config FILE` | Run your own service setup (see `molt.example.toml`) instead of the default one. |
 
 Progress goes to stderr and the result to stdout. Control characters in text
@@ -116,8 +125,8 @@ from the model or from file names are printed escaped.
 up a `molt.toml` on its own, since one shipped in a project could run any
 command with your secrets. Without one it starts the default setup: the
 gateway, `fs` and `shell` confined to the workspace with forks in
-`<data dir>/work`, and the planner, using the service binaries installed next
-to `molt`. Data dirs that molt creates are private (0700), and it warns about
+`<data dir>/work`, memory with its database in `<data dir>/memory.db`, and
+the planner, using the service binaries installed next to `molt`. Data dirs that molt creates are private (0700), and it warns about
 an existing one that others can read.
 
 Services start with a scrubbed environment: `PATH`, `HOME`, the locale and a
@@ -141,11 +150,49 @@ Defaults come from the environment:
 | `MOLT_MODEL_TIMEOUT_S`, `MOLT_MODEL_RETRIES`, `MOLT_MODEL_CONCURRENCY`, `MOLT_FALLBACKS` | gateway | `1200`, `4`, `16`, `1` |
 | `MOLT_PLANNER_MODEL`, `MOLT_MAX_TURNS`, `MOLT_BUDGET_USD` | planner | the gateway's model, `50`, `10` |
 | `MOLT_MAX_CHECK_ROUNDS`, `MOLT_CHECK_TIMEOUT_S` | planner | `3` check runs per attempt, `900` |
+| `MOLT_MAP_TOKENS` | planner | `3000` (the project map a run starts with; at most `32000`) |
+| `MOLT_MEMORY_MODEL`, `MOLT_MEMORY_EFFORT`, `MOLT_MEMORY_MAX_TOKENS`, `MOLT_MEMORY_MODEL_TIMEOUT_S` | memory | `sonnet`, `low`, `8000`, `300` |
 
 The planner reads `MOLT_MAX_TOKENS` and `MOLT_MODEL_TIMEOUT_S` too: a model
 call ends at that deadline, the gateway's retries included. `MOLT_FALLBACKS`
 is `1` or `0` (off) and `MOLT_MODEL_RETRIES` may be `0`; every other number
 must be above 0.
+
+## Memory
+
+Memory holds two things for each project.
+
+**The project model** is every definition and reference in the project's
+source (Rust, Python, JavaScript, TypeScript, Go, Java, C and C++, parsed with
+tree-sitter), in SQLite. An index parses only files whose contents changed:
+on this repository a first index takes about 170 ms and an unchanged one
+2 ms; a 3,000-file project takes about 1.5 s, then 40 ms. It leaves out other
+projects' code and build output (`node_modules`, Python virtualenvs, cache
+directories such as Cargo's `target`) and Molt's data directory, gives each
+file at most 2 seconds, and writes as it goes, so a stopped index keeps its
+progress. It follows the files the `fs` service changes as they change. From it, a run starts with a map of
+the code most relevant to its task, ranked the way Aider ranks it (PageRank
+over references, weighted toward what the task mentions), and attempts can
+ask where a name is defined and used (`find_symbol`).
+
+**Notes** are one-sentence facts, conventions, decisions, preferences and
+lessons. After a run, memory reads it back from the audit log, boils it down
+to numbered steps, and has the model write what would help a later task, each
+note citing the steps, and so the logged messages, it rests on. A note the run
+bore out gains confidence; one it proved wrong is kept beside its correction,
+both less certain, until more evidence settles it. Notes carry the version
+of the service that wrote them, so rolling a version back retracts what it
+learned. Recall ranks notes by keyword match (SQLite FTS5 with stemming),
+confidence and recency.
+
+```sh
+molt memory show [WORDS...]          # notes about the project, best first
+molt memory forget NOTE_ID --reason "the build moved to make"
+molt memory map [WORDS...]           # the map a run with that task would start with
+```
+
+`forget` goes through the kernel, so the audit log records it; the note stays
+as a tombstone with its reason.
 
 ## Tests
 
@@ -161,8 +208,8 @@ a notice and pass; CI always runs them.
 ## Roadmap
 
 1. **Kernel**: bus with both transports, capabilities, supervisor, registry, audit log, invariant and conformance tests.
-2. **A working agent** (this milestone): Anthropic model gateway, planner, file and shell tools, parallel verified attempts, check-first.
-3. **Memory**: semantic store, recall, the living project model, consolidation.
+2. **A working agent**: Anthropic model gateway, planner, file and shell tools, parallel verified attempts, check-first.
+3. **Memory** (this milestone): semantic store, recall, the living project model, consolidation.
 4. **Evaluation**: deterministic replay from the audit log, regression and held-out suites, the promotion gate.
 5. **Self-improvement, low risk**: prompts and skills only, auto-approved when the gate passes.
 6. **Self-improvement, code**: Wasm services under wasmtime, sandbox builds, canary runs, hot swap.
@@ -172,10 +219,15 @@ a notice and pass; CI always runs them.
 - The shell service is not sandboxed: commands, the check included, run as you, with your files and network. Forks keep them off the project until the merge, nothing more.
 - No streaming: model replies arrive whole, so a long turn shows no progress until it ends.
 - The audit log records every message, file contents and model conversations included, and is never rotated; it grows with every run in a data dir.
+- Reading one trace back from the audit log scans the log from the start: there is no index yet. One read looks through at most 256 MiB and keeps to its deadline, and two run at once.
+- The kernel drops a message nested more than 100 levels deep, so every logged message can be read back.
 - A cancelled attempt's running command is not stopped: it runs until it ends, times out (2 minutes unless the model asks for up to 30; `MOLT_CHECK_TIMEOUT_S` for a check) or `molt do` exits.
 - Nor is a cancelled attempt's model call: it is billed all the same. Its cost is counted if the reply lands within 2 seconds of the last attempt stopping; the report gives the number of calls it could not count.
 - After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
-- Cancellation tokens, call-cycle checks at the gate and an `audit.read` endpoint for the evaluator arrive with the services that need them.
+- Cancellation tokens and call-cycle checks at the gate arrive with the services that need them.
+- Recall matches keywords (with stemming), not meaning: there is no vector index, since the Anthropic API has no embeddings endpoint. A note worded differently from the task can be missed; the strongest notes about the project are always shown.
+- Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. With the default setup, memory lives in the project's data dir, so nothing is shared between projects yet.
+- The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - A topic capability currently allows both publishing and subscribing.
 - No license has been chosen yet.
