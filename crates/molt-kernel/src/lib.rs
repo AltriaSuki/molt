@@ -17,4 +17,4 @@ mod kernel;
 pub mod registry;
 pub mod supervisor;
 
-pub use kernel::{Config, Kernel, KernelError, Launched, ENV_CAPS};
+pub use kernel::{Config, Kernel, KernelError, Launched, ServiceStatus, ENV_CAPS};

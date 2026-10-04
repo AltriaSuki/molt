@@ -64,6 +64,11 @@ async fn unix_ordered_both_ways() {
 }
 
 #[tokio::test]
+async fn unix_large_messages_pass() {
+    testkit::large_messages_pass::<Unix>().await;
+}
+
+#[tokio::test]
 async fn unix_sender_is_stamped() {
     testkit::sender_is_stamped_by_transport::<Unix>().await;
 }

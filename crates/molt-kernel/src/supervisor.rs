@@ -43,10 +43,58 @@ impl Default for RestartPolicy {
     }
 }
 
+/// Variables a service inherits from the kernel's environment. Everything
+/// else is dropped, so a secret such as an API key reaches only the services
+/// configured to receive it (through [`Spec::env`]).
+pub const BASELINE_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "TZ",
+    "TMPDIR",
+    "TERM",
+    "RUST_LOG",
+    "RUST_BACKTRACE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "all_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    // Toolchain locations, so a service's builds and tests find the user's compilers and caches.
+    // Anything else they need (LD_LIBRARY_PATH, CC, DATABASE_URL, ...) is dropped too unless passed in Spec::env.
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "GOPATH",
+    "GOROOT",
+    "GOCACHE",
+    "GOMODCACHE",
+    "JAVA_HOME",
+    "NODE_PATH",
+    "NVM_DIR",
+    "PYTHONPATH",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+];
+
 #[derive(Clone, Debug)]
 pub struct Spec {
     pub id: ServiceId,
     pub exec: Exec,
+    /// Set on top of [`BASELINE_ENV`]; later entries win.
     pub env: Vec<(String, String)>,
     pub limits: Limits,
     pub restart: RestartPolicy,
@@ -104,13 +152,34 @@ impl Supervisor {
 
 fn command(spec: &Spec) -> Command {
     let mut cmd = Command::new(&spec.exec.command);
+    cmd.env_clear();
+    for key in BASELINE_ENV {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
     cmd.args(&spec.exec.args).envs(spec.env.iter().cloned()).kill_on_drop(true).stdin(std::process::Stdio::null());
     #[cfg(unix)]
     {
         let limits = spec.limits.clone();
-        // SAFETY: only async-signal-safe calls (setrlimit) run between fork and exec.
+        #[cfg(target_os = "linux")]
+        let kernel = std::process::id() as libc::pid_t;
+        // SAFETY: only async-signal-safe calls (setrlimit, prctl, getppid, _exit) run between fork and exec.
         unsafe {
             cmd.pre_exec(move || {
+                // A kernel killed outright runs no shutdown, and a service on NATS would not notice it is gone,
+                // so the service gets SIGTERM when the kernel dies. Linux sends it when the spawning thread
+                // exits; spawns run on the runtime's long-lived threads.
+                #[cfg(target_os = "linux")]
+                {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // The kernel died before the signal was armed.
+                    if libc::getppid() != kernel {
+                        libc::_exit(1);
+                    }
+                }
                 let set = |res, v: u64| {
                     let lim = libc::rlimit { rlim_cur: v as libc::rlim_t, rlim_max: v as libc::rlim_t };
                     if libc::setrlimit(res, &lim) != 0 {
@@ -263,6 +332,49 @@ mod tests {
         assert!(matches!(rx.recv().await.unwrap(), Event::Started { .. }));
         tokio::time::timeout(Duration::from_secs(5), sup.stop(&id)).await.expect("stop within the drain deadline");
         assert_eq!(rx.recv().await.unwrap(), Event::Exited { service: id, status: "stopped".into() });
+    }
+
+    /// A kernel killed outright runs no shutdown; its services must not outlive it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_service_gets_sigterm_when_the_thread_that_started_it_exits() {
+        let pid = std::thread::spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let pid = rt.block_on(async {
+                let (tx, mut rx) = mpsc::channel(8);
+                let sup = Supervisor::new(tx);
+                let id = ServiceId::new("orphan").unwrap();
+                sup.start(Spec {
+                    id,
+                    exec: sh("exec sleep 30"),
+                    env: vec![],
+                    limits: Limits::default(),
+                    restart: quick(0),
+                });
+                let Some(Event::Started { pid: Some(pid), .. }) = rx.recv().await else { panic!("no start") };
+                std::mem::forget(sup);
+                pid
+            });
+            // Leaked, nothing kills the child on drop: only the thread's exit can.
+            std::mem::forget(rt);
+            pid as libc::pid_t
+        })
+        .join()
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut status = 0;
+        // SAFETY: plain syscalls on a child of this process.
+        while unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } != pid {
+            if std::time::Instant::now() > deadline {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                panic!("the service outlived the thread that started it");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGTERM, "status {status:#x}");
     }
 
     #[tokio::test]

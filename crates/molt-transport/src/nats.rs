@@ -43,10 +43,13 @@ fn other(e: impl std::fmt::Display) -> TransportError {
     TransportError::Other(e.to_string())
 }
 
-/// Generate the `authorization` block of a nats-server config that enforces
-/// the bus rules for the kernel and each listed service.
+/// Generate the nats-server settings the bus needs: the `authorization`
+/// block that enforces the bus rules for the kernel and each listed service,
+/// and a `max_payload` that lets through every envelope the bus accepts (the
+/// server's default of 1 MiB is smaller than an agent's model requests).
 pub fn server_config(prefix: &str, kernel_password: &Secret, services: &[(ServiceId, Secret)]) -> String {
-    let mut out = String::from("authorization {\n  users = [\n");
+    let mut out = format!("max_payload: {}\n", crate::MAX_FRAME);
+    out.push_str("authorization {\n  users = [\n");
     let _ = writeln!(
         out,
         "    {{ user: \"kernel\", password: \"{}\", permissions: {{ publish: [\"{prefix}.svc.*.inbox\"], subscribe: [\"{prefix}.in.*\"] }} }}",

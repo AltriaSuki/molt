@@ -161,3 +161,44 @@ fn audit_verify_cli_reports_a_good_and_a_tampered_log() {
     std::fs::write(&path, text).unwrap();
     assert!(!run(&path).status.success());
 }
+
+#[tokio::test]
+async fn molt_run_stops_its_services_on_sigterm() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("molt.toml");
+    let echo = env!("CARGO_BIN_EXE_molt-echo");
+    let text = format!(
+        "[kernel]\ndata_dir = {:?}\nfsync = false\n\n[[service]]\nname = \"echo\"\nexec = {{ command = {echo:?} }}\n",
+        data.to_str().unwrap()
+    );
+    std::fs::write(&config, text).unwrap();
+    let molt = tokio::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+        .arg("--config")
+        .arg(&config)
+        .arg("run")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let echo_pid = loop {
+        let entries = audit::read_all(&data.join("audit.jsonl")).await.unwrap_or_default();
+        if let Some(pid) = entries.iter().find_map(|e| match &e.event {
+            AuditEvent::ServiceStarted { pid, .. } => *pid,
+            _ => None,
+        }) {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "echo never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    // SAFETY: plain syscall.
+    assert_eq!(unsafe { libc::kill(molt.id().unwrap() as i32, libc::SIGTERM) }, 0);
+    let out =
+        tokio::time::timeout(Duration::from_secs(20), molt.wait_with_output()).await.expect("molt run hung").unwrap();
+    assert!(out.status.success(), "{:?}: {}", out.status, String::from_utf8_lossy(&out.stderr));
+    assert!(!std::path::Path::new(&format!("/proc/{echo_pid}")).exists(), "echo outlived molt run");
+}

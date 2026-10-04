@@ -1,0 +1,10 @@
+[package]
+name = "molt-api"
+description = "Request and reply shapes for the Molt agent services: model gateway, files, shell and planner"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

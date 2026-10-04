@@ -8,7 +8,9 @@ use std::time::Duration;
 use common::*;
 use molt_kernel::audit::{self, AuditEvent};
 use molt_kernel::registry::Authority;
-use molt_proto::{Budget, CapId, CapRequest, Envelope, ErrorCode, Manifest, Tier, TraceId};
+use molt_kernel::supervisor::{Limits, RestartPolicy};
+use molt_kernel::ServiceStatus;
+use molt_proto::{Budget, CapId, CapRequest, Envelope, ErrorCode, Exec, Manifest, Tier, TraceId};
 use molt_sdk::{CallOpts, SdkError};
 use serde_json::{json, Value};
 
@@ -236,6 +238,31 @@ async fn the_audit_log_has_no_write_path_and_detects_tampering() {
     assert!(check(swapped.join("\n")).await.is_err(), "reordered entries went unnoticed");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_leaves_the_services_last_exits_on_the_record() {
+    let w = World::new().await;
+    let names = ["sleeper-1", "sleeper-2"];
+    for name in names {
+        let mut m = manifest(name, Tier::Mutable, &[]);
+        m.exec = Some(Exec { command: "/bin/sh".into(), args: vec!["-c".into(), "exec sleep 30".into()] });
+        w.kernel.install(m).await.unwrap();
+        w.kernel.launch(&sid(name), None, Limits::default(), RestartPolicy::default()).await.unwrap();
+    }
+    let path = w.kernel.audit_path().to_owned();
+    let World { dir: _dir, kernel, .. } = w;
+    tokio::time::timeout(Duration::from_secs(20), kernel.shutdown()).await.expect("shutdown within the drain deadline");
+    // Read at once, as a process exiting after shutdown would leave the file.
+    let text = std::fs::read_to_string(&path).unwrap();
+    for name in names {
+        let stopped = text.lines().any(|line| {
+            let entry: Value = serde_json::from_str(line).unwrap();
+            entry["event"] == json!({ "type": "service_exited", "service": name, "status": "stopped" })
+        });
+        assert!(stopped, "the exit of {name} is not on the record");
+    }
+    assert_eq!(audit::verify(&path).await.unwrap(), text.lines().count() as u64);
+}
+
 fn rand_suffix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
 }
@@ -280,6 +307,40 @@ async fn a_crashed_and_reconnected_service_works_again() {
     planner.kernel("ping", None, Value::Null).await.unwrap();
     let _memory = echo(w.join("memory").await);
     assert_eq!(planner.call("memory.recall", json!(2), opts()).await.unwrap(), json!(2));
+}
+
+#[tokio::test]
+async fn a_service_the_supervisor_gave_up_on_is_reported_with_its_last_exit() {
+    let w = World::new().await;
+    let broken = sid("broken");
+    let mut m = manifest("broken", Tier::Mutable, &[]);
+    m.exec = Some(Exec { command: w.dir.path().join("missing").display().to_string(), args: vec![] });
+    w.kernel.install(m).await.unwrap();
+    let restart = RestartPolicy { max_restarts: 1, backoff_initial: Duration::from_millis(10), ..Default::default() };
+    w.kernel.launch(&broken, None, Limits::default(), restart.clone()).await.unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = w.kernel.service_status(&broken);
+            if status.gave_up.is_some() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the supervisor gives up");
+    assert_eq!(status.gave_up, Some(1));
+    let last = status.last_exit.unwrap_or_default();
+    assert!(last.starts_with("spawn failed") && last.contains("No such file"), "{last}");
+
+    // A new launch starts with a clean slate.
+    let mut m = manifest("broken", Tier::Mutable, &[]);
+    m.exec = Some(Exec { command: "/bin/sh".into(), args: vec!["-c".into(), "exec sleep 30".into()] });
+    w.kernel.install(m).await.unwrap();
+    w.kernel.launch(&broken, None, Limits::default(), restart).await.unwrap();
+    assert_eq!(w.kernel.service_status(&broken), ServiceStatus::default());
+    let World { dir: _dir, kernel, .. } = w;
+    kernel.shutdown().await;
 }
 
 #[tokio::test]

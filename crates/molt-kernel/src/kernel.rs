@@ -23,7 +23,7 @@ use molt_proto::{Budget, CapId, Envelope, ErrorCode, Kind, Manifest, MsgId, Serv
 use molt_transport::{Inbound, Secret, Transport, TransportError};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::audit::{AuditError, AuditEvent, AuditLog, Receipt};
@@ -72,6 +72,16 @@ pub enum KernelError {
     InboundTaken,
 }
 
+/// What the supervisor has reported about a service since it was last
+/// launched, for a caller that waits for it to come up.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceStatus {
+    /// How its last run ended, e.g. `exit status: 1` or `spawn failed: ...`.
+    pub last_exit: Option<String>,
+    /// Set once the supervisor stopped restarting it: the restarts it made.
+    pub gave_up: Option<u32>,
+}
+
 struct Pending {
     requester: ServiceId,
     callee: ServiceId,
@@ -99,15 +109,20 @@ struct Inner {
     mailboxes: Mutex<HashMap<ServiceId, Mailbox>>,
     pending: Mutex<HashMap<MsgId, Pending>>,
     topics: Mutex<HashMap<String, BTreeSet<ServiceId>>>,
+    status: Mutex<HashMap<ServiceId, ServiceStatus>>,
     /// Handed to delivery tasks so they do not keep the kernel alive.
     weak: Weak<Inner>,
 }
 
 /// A running kernel. Dropping it stops the dispatcher; call
-/// [`Kernel::shutdown`] to also stop supervised services.
+/// [`Kernel::shutdown`] to also stop supervised services and finish writing
+/// the audit log.
 pub struct Kernel {
     inner: Arc<Inner>,
     tasks: Vec<JoinHandle<()>>,
+    /// Logs the supervisor's events. Shutdown drains it, so the services'
+    /// last exits are on the record.
+    events: Option<(oneshot::Sender<()>, JoinHandle<()>)>,
 }
 
 /// What a launched service was given.
@@ -136,13 +151,12 @@ impl Kernel {
             mailboxes: Mutex::default(),
             pending: Mutex::default(),
             topics: Mutex::default(),
+            status: Mutex::default(),
         });
-        let tasks = vec![
-            tokio::spawn(dispatcher(inner.clone(), inbound)),
-            tokio::spawn(reaper(inner.clone())),
-            tokio::spawn(supervisor_events(inner.clone(), sup_rx)),
-        ];
-        Ok(Self { inner, tasks })
+        let tasks = vec![tokio::spawn(dispatcher(inner.clone(), inbound)), tokio::spawn(reaper(inner.clone()))];
+        let (close_events, closing) = oneshot::channel();
+        let events = tokio::spawn(supervisor_events(inner.clone(), sup_rx, closing));
+        Ok(Self { inner, tasks, events: Some((close_events, events)) })
     }
 
     /// Open an endpoint for `id` with a fresh secret and return the secret.
@@ -238,6 +252,20 @@ impl Kernel {
         limits: Limits,
         restart: RestartPolicy,
     ) -> Result<Launched, KernelError> {
+        self.launch_with_env(service, secret, limits, restart, Vec::new()).await
+    }
+
+    /// [`Kernel::launch`] with extra environment variables for the process,
+    /// such as an API key only this service may hold. They cannot override
+    /// the bus address, identity, secret or capabilities.
+    pub async fn launch_with_env(
+        &self,
+        service: &ServiceId,
+        secret: Option<Secret>,
+        limits: Limits,
+        restart: RestartPolicy,
+        extra_env: Vec<(String, String)>,
+    ) -> Result<Launched, KernelError> {
         let version = self.inner.registry.live(service).ok_or_else(|| KernelError::NoLiveVersion(service.clone()))?;
         let manifest =
             self.inner.registry.manifest(&version).ok_or_else(|| KernelError::NoLiveVersion(service.clone()))?;
@@ -252,12 +280,14 @@ impl Kernel {
             caps.insert(req.target.to_string(), cap);
         }
         if let Some(exec) = manifest.exec.clone() {
-            let env = vec![
+            let mut env = extra_env;
+            env.extend([
                 (molt_transport::ENV_ADDRESS.to_owned(), self.inner.transport.address()),
                 (molt_transport::ENV_SERVICE_ID.to_owned(), service.to_string()),
                 (molt_transport::ENV_SECRET.to_owned(), secret.expose().to_owned()),
                 (ENV_CAPS.to_owned(), serde_json::to_string(&caps).unwrap()),
-            ];
+            ]);
+            self.inner.status.lock().unwrap().remove(service);
             self.inner.supervisor.start(supervisor::Spec { id: service.clone(), exec, env, limits, restart });
         }
         Ok(Launched { version, caps })
@@ -265,6 +295,12 @@ impl Kernel {
 
     pub async fn stop(&self, service: &ServiceId) {
         self.inner.supervisor.stop(service).await;
+    }
+
+    /// What the supervisor has reported about `service` since its last
+    /// launch. The audit log has the whole history.
+    pub fn service_status(&self, service: &ServiceId) -> ServiceStatus {
+        self.inner.status.lock().unwrap().get(service).cloned().unwrap_or_default()
     }
 
     pub fn caps(&self) -> &CapTable {
@@ -279,22 +315,36 @@ impl Kernel {
         self.inner.audit.path()
     }
 
+    /// The address services connect to (see `molt_transport::connect`), for
+    /// a client that joins the bus from inside this process.
+    pub fn address(&self) -> String {
+        self.inner.transport.address()
+    }
+
     /// Requests still waiting for a reply.
     pub fn pending_count(&self) -> usize {
         self.inner.pending.lock().unwrap().len()
     }
 
-    pub async fn shutdown(self) {
+    /// Stop every service, then the kernel. When it returns, everything the
+    /// kernel logged, the services' exits included, is written and the audit
+    /// writer has stopped.
+    pub async fn shutdown(mut self) {
         self.inner.supervisor.stop_all().await;
         for t in &self.tasks {
             t.abort();
         }
+        if let Some((close, events)) = self.events.take() {
+            let _ = close.send(());
+            let _ = events.await;
+        }
+        self.inner.audit.close().await;
     }
 }
 
 impl Drop for Kernel {
     fn drop(&mut self) {
-        for t in &self.tasks {
+        for t in self.tasks.iter().chain(self.events.as_ref().map(|(_, t)| t)) {
             t.abort();
         }
         for (_, (_, task)) in self.inner.mailboxes.lock().unwrap().drain() {
@@ -323,8 +373,25 @@ async fn reaper(inner: Arc<Inner>) {
     }
 }
 
-async fn supervisor_events(inner: Arc<Inner>, mut rx: mpsc::Receiver<supervisor::Event>) {
-    while let Some(ev) = rx.recv().await {
+/// Log the supervisor's events. Once `closing` fires, log the ones already
+/// queued and stop.
+async fn supervisor_events(
+    inner: Arc<Inner>,
+    mut rx: mpsc::Receiver<supervisor::Event>,
+    mut closing: oneshot::Receiver<()>,
+) {
+    let mut open = true;
+    loop {
+        let ev = tokio::select! {
+            ev = rx.recv() => ev,
+            _ = &mut closing, if open => {
+                // recv() still hands over what is queued, then returns None.
+                rx.close();
+                open = false;
+                continue;
+            }
+        };
+        let Some(ev) = ev else { return };
         let event = match ev {
             supervisor::Event::Started { service, pid } => AuditEvent::ServiceStarted { service, pid },
             supervisor::Event::Exited { service, status } => {
@@ -339,9 +406,13 @@ async fn supervisor_events(inner: Arc<Inner>, mut rx: mpsc::Receiver<supervisor:
                 for id in waiting {
                     inner.fail_pending(&id, ErrorCode::Unavailable, "the service exited").await;
                 }
+                inner.status.lock().unwrap().entry(service.clone()).or_default().last_exit = Some(status.clone());
                 AuditEvent::ServiceExited { service, status }
             }
-            supervisor::Event::GaveUp { service, restarts } => AuditEvent::ServiceGaveUp { service, restarts },
+            supervisor::Event::GaveUp { service, restarts } => {
+                inner.status.lock().unwrap().entry(service.clone()).or_default().gave_up = Some(restarts);
+                AuditEvent::ServiceGaveUp { service, restarts }
+            }
         };
         if inner.audit.append(event).await.is_err() {
             return;

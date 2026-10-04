@@ -1,0 +1,27 @@
+[package]
+name = "molt-tools"
+description = "Molt's file and shell services: workspace files, forks, diffs and merges, and sandboxed commands"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+molt-api.workspace = true
+molt-proto.workspace = true
+molt-sdk.workspace = true
+anyhow.workspace = true
+globset.workspace = true
+hex.workspace = true
+ignore.workspace = true
+libc.workspace = true
+rand.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+similar.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
