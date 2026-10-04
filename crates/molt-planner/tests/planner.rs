@@ -55,6 +55,8 @@ struct State {
     patch_truncated: bool,
     /// A memory service answers `memory.*`; without it those calls are `unavailable`.
     memory: bool,
+    /// Memory is there but answers nothing: every call times out.
+    memory_hangs: bool,
     calls: Vec<Call>,
     requests: Vec<CompleteRequest>,
     events: Vec<Progress>,
@@ -112,6 +114,7 @@ impl Fake {
             drop_fails: false,
             patch_truncated: false,
             memory: false,
+            memory_hangs: false,
             calls: Vec::new(),
             requests: Vec::new(),
             events: Vec::new(),
@@ -292,6 +295,9 @@ impl Fake {
 impl Fake {
     /// A memory that knows one note and one function of the workspace.
     fn memory(&self, target: &str, payload: Value) -> Result<Value, RemoteError> {
+        if self.state.lock().unwrap().memory_hangs {
+            return Err(RemoteError { code: ErrorCode::Timeout, message: format!("{target} did not answer") });
+        }
         if !self.state.lock().unwrap().memory {
             return Err(RemoteError { code: ErrorCode::Unavailable, message: format!("no {target}") });
         }
@@ -1262,12 +1268,13 @@ async fn memory_gives_every_conversation_the_project_context_and_its_tools() {
     let resp = run(&fake, request(None, 1)).await;
     assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
 
-    // The model is brought up to date before anything else happens.
+    // Memory is asked for notes (which shows it answers), then the model is
+    // brought up to date, before anything else happens.
     let calls = fake.calls();
     let targets: Vec<&str> = calls.iter().take(3).map(|c| c.target.as_str()).collect();
-    assert_eq!(targets, ["memory.index", "memory.map", "memory.recall"]);
-    assert_eq!(calls[1].payload["query"], "Add hello.txt saying hi.");
-    assert_eq!(calls[1].payload["max_tokens"], 3000);
+    assert_eq!(targets, ["memory.recall", "memory.index", "memory.map"]);
+    assert_eq!(calls[2].payload["query"], "Add hello.txt saying hi.");
+    assert_eq!(calls[2].payload["max_tokens"], 3000);
 
     let requests = fake.requests();
     for req in &requests {
@@ -1301,6 +1308,22 @@ async fn memory_gives_every_conversation_the_project_context_and_its_tools() {
     let first = &plain.requests()[0];
     assert!(first.messages[0]["content"][0]["text"].as_str().unwrap().starts_with("<task>"));
     assert_eq!(first.tools.len(), 6);
-    assert_eq!(plain.calls_to("memory.index").len(), 1, "asked once, then left alone");
-    assert!(plain.calls_to("memory.map").is_empty());
+    assert_eq!(plain.calls_to("memory.recall").len(), 1, "asked once, then left alone");
+    assert!(plain.calls_to("memory.index").is_empty() && plain.calls_to("memory.map").is_empty());
+
+    // A memory that does not answer is given up on at once, and said so.
+    let hung = Fake::new(
+        |req| match turn(req) {
+            1 => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        },
+        hello_check,
+    );
+    hung.set(|st| st.memory_hangs = true);
+    assert_eq!(run(&hung, request(Some("check"), 1)).await.outcome, Outcome::Passed);
+    assert_eq!(hung.calls().iter().filter(|c| c.target.starts_with("memory.")).count(), 1);
+    assert_eq!(hung.calls_to("memory.recall")[0].budget.ms, 10_000);
+    assert_eq!(hung.requests()[0].tools.len(), 6);
+    assert!(hung.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
+        if message == "running without memory: memory.recall did not answer")));
 }

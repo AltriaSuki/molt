@@ -112,7 +112,9 @@ pub(crate) fn project_context(notes: &[Recalled], map: Option<&str>) -> Option<S
 }
 
 /// The task, the check, and `context` first when memory gave one. The
-/// context is the same for every attempt and the designer, so it caches.
+/// context is the same in every attempt's first message and comes before
+/// what differs between them. Attempts start together, so each still pays
+/// to cache it once; it saves on their later turns.
 pub(crate) fn attempt_first_message(
     task: &str,
     check: Option<(&str, &[String])>,

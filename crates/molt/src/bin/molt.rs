@@ -16,8 +16,8 @@ const DEFAULT_CONFIG: &str = "molt.toml";
 #[derive(Parser)]
 #[command(name = "molt", version, about = "Molt kernel daemon and tools")]
 struct Cli {
-    /// Path to molt.toml [default: molt.toml]. `molt do` reads one only when
-    /// this is given.
+    /// Path to molt.toml [default: molt.toml]. `molt do` and `molt memory`
+    /// read one only when this is given.
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -73,7 +73,8 @@ struct DoArgs {
     /// Model turns per attempt.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     max_turns: Option<u32>,
-    /// Spending limit for the whole run, in US dollars.
+    /// Spending limit for the whole run, learning included, in US dollars.
+    /// It is checked before each model call, so the last one can go past it.
     #[arg(long, value_parser = usd)]
     budget_usd: Option<f64>,
     /// Keep the result in its fork instead of applying it to the workspace.
@@ -286,12 +287,19 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     };
     let resp = done.run;
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&resp)?);
+        let mut out = serde_json::to_value(&resp)?;
+        // What learning did and cost, next to the run's own spend.
+        out["learning"] = done.learned.as_ref().map_or(serde_json::Value::Null, agent::learning_json);
+        println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         print!("{}", agent::report(&resp));
     }
     if let Some(learned) = &done.learned {
         eprintln!("{}", agent::learned(learned));
+    }
+    // A signal while memory learned from the run still ends it as stopped.
+    if let Some(n) = signal {
+        return Ok(ExitCode::from(u8::try_from(128 + n).unwrap_or(130)));
     }
     Ok(match resp.outcome {
         Outcome::Failed => ExitCode::FAILURE,

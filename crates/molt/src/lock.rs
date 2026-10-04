@@ -62,9 +62,17 @@ impl DataDirLock {
 
 /// Create `dir`, and any missing parent, with mode 0700. A data dir holds
 /// the audit log and forks of the project, which are for this user only. An
-/// existing directory keeps its mode.
+/// existing directory keeps its mode. A new one gets a `.gitignore` that
+/// ignores everything, so one inside a project is never committed with it.
 pub(crate) fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
-    DirBuilder::new().recursive(true).mode(0o700).create(dir).with_context(|| format!("creating {}", dir.display()))
+    let new = !dir.exists();
+    DirBuilder::new().recursive(true).mode(0o700).create(dir).with_context(|| format!("creating {}", dir.display()))?;
+    if new {
+        let ignore = dir.join(".gitignore");
+        std::fs::write(&ignore, "# Molt's data: the audit log, memory and secrets. Never commit it.\n*\n")
+            .with_context(|| format!("creating {}", ignore.display()))?;
+    }
+    Ok(())
 }
 
 /// The mode of `dir` when its group or others have any access to it.
@@ -99,6 +107,7 @@ mod tests {
         assert_eq!(mode(&dir.path().join("cache")), 0o700, "parents molt creates are private too");
         assert_eq!(mode(&data.join(LOCK_FILE)), 0o600);
         assert_eq!(open_to_others(&data).unwrap(), None);
+        assert!(std::fs::read_to_string(data.join(".gitignore")).unwrap().ends_with("\n*\n"));
 
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(open_to_others(&data).unwrap(), Some(0o755));

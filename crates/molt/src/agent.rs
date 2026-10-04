@@ -44,6 +44,8 @@ const PROBE_MS: u64 = 500;
 const RUN_MS: u64 = 6 * 3600 * 1000;
 /// Reply deadline for learning from a run.
 const LEARN_MS: u64 = 600_000;
+/// How long memory gets to show it still answers before learning starts.
+const LEARN_PROBE: Duration = Duration::from_secs(10);
 
 /// The run was stopped before it finished.
 #[derive(Debug, thiserror::Error)]
@@ -90,11 +92,18 @@ fn bin_dir() -> anyhow::Result<PathBuf> {
 }
 
 /// The configuration `molt memory` works with: the file at `path` when one
-/// is given, otherwise the default setup of `molt do` for the canonical
-/// `workspace`, which must have run there before (nothing is created).
+/// is given (with `data_dir` in place of its own, when given), otherwise the
+/// default setup of `molt do` for the canonical `workspace`, which must have
+/// run there before (nothing is created).
 pub fn memory_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&Path>) -> anyhow::Result<Config> {
     let cfg = match path {
-        Some(path) => Config::load(path)?,
+        Some(path) => {
+            let mut cfg = Config::load(path)?;
+            if let Some(dir) = data_dir {
+                cfg.kernel.data_dir = dir.to_path_buf();
+            }
+            cfg
+        }
         None => {
             let data_dir = match data_dir {
                 Some(dir) => dir.to_path_buf(),
@@ -238,6 +247,7 @@ pub async fn run_task(
     // Before planner.run, the only caller that makes forks.
     let forks = RunForks::before(cfg);
     let workspace = req.workspace.clone();
+    let budget_usd = req.budget_usd;
     tokio::pin!(stop);
     let result = tokio::select! {
         // A Ctrl-C in a terminal also reaches the services, and the run may
@@ -251,15 +261,27 @@ pub async fn run_task(
             let learned = match (learn, ran.memory) {
                 (false, _) | (true, None) => None,
                 (true, Some(Err(e))) => Some(Err(e)),
+                // Learning is a model call too: the run's budget covers it.
+                (true, Some(Ok(()))) if budget_usd.is_some_and(|b| ran.resp.cost_usd >= b) => {
+                    Some(Err("skipped: the run spent its whole budget".to_owned()))
+                }
                 (true, Some(Ok(()))) => {
                     on_progress(&Progress::Note {
                         run: ran.trace.to_string(),
                         message: "learning from the run".into(),
                     });
+                    let learn = async {
+                        // Memory may have stopped during the run; a call to it then waits out its whole deadline.
+                        let kernel = running.kernel();
+                        wait_until_up(kernel, &ran.cli, MEMORY, Instant::now() + LEARN_PROBE)
+                            .await
+                            .map_err(|e| format!("{e:#}"))?;
+                        consolidate(kernel, &ran.cli, &ran.trace, &workspace).await
+                    };
                     tokio::select! {
                         biased;
-                        () = &mut stop => Some(Err("interrupted".to_owned())),
-                        learned = consolidate(running.kernel(), &ran.cli, &ran.trace, &workspace) => Some(learned),
+                        () = &mut stop => Some(Err("interrupted; what it spent is not counted".to_owned())),
+                        learned = learn => Some(learned),
                     }
                 }
             };
@@ -557,6 +579,14 @@ pub fn report(resp: &RunResponse) -> String {
 
 /// What memory learned from a run, as one line for the terminal, made
 /// [`printable`].
+/// What learning did, for `molt do --json`: memory's answer, or `{"error": ...}`.
+pub fn learning_json(learned: &Result<ConsolidateResponse, String>) -> Value {
+    match learned {
+        Ok(r) => serde_json::to_value(r).unwrap_or(Value::Null),
+        Err(e) => serde_json::json!({ "error": e }),
+    }
+}
+
 pub fn learned(learned: &Result<ConsolidateResponse, String>) -> String {
     let line = match learned {
         Err(e) => format!("memory: learned nothing: {e}"),
