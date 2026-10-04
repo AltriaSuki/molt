@@ -136,8 +136,8 @@ pub struct RememberRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RememberResponse {
     pub note: Note,
-    /// An existing note with the same text was reinforced instead of a new
-    /// one created.
+    /// An existing note with the same text was found instead of a new one
+    /// created. It is reinforced once per episode (`trace`).
     pub reinforced: bool,
 }
 
@@ -188,8 +188,10 @@ pub struct ForgetResponse {
     pub forgotten: bool,
 }
 
-/// Forget every note a service version wrote, as rolling that version back
-/// requires.
+/// Undo what a service version did to the notes, as rolling that version
+/// back requires: the notes it created are forgotten unless another writer
+/// bore them out, and the notes it reinforced or contradicted are worked out
+/// again without it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetractRequest {
     pub service: String,
@@ -199,7 +201,11 @@ pub struct RetractRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetractResponse {
+    /// Notes forgotten.
     pub retracted: u64,
+    /// Notes kept, with the version's part in them undone.
+    #[serde(default)]
+    pub adjusted: u64,
 }
 
 /// Learn from a finished episode: read it from the audit log, have the model

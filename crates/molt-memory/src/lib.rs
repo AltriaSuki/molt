@@ -280,9 +280,9 @@ impl Memory {
             "retract" => {
                 let r: RetractRequest = parse(&method, req.payload)?;
                 let trace = req.trace_id.to_string();
-                let retracted =
+                let done =
                     self.blocking(move |db| notes::retract(db, &r.service, &r.version, &r.reason, &trace, now)).await?;
-                reply(RetractResponse { retracted })
+                reply(RetractResponse { retracted: done.retracted, adjusted: done.adjusted })
             }
             "consolidate" => {
                 let r: ConsolidateRequest = parse(&method, req.payload)?;

@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use molt_api::memory::{ConsolidateRequest, ConsolidateResponse, Note, NoteKind, Provenance, RecallRequest};
 use molt_api::model::{self, CompleteRequest, CompleteResponse, Usage};
-use molt_api::planner;
 use molt_proto::audit::{self, Logged, ReadRequest, ReadResponse};
 use molt_proto::{Budget, ErrorCode, Kind, RemoteError, ServiceId, TraceId};
 use rusqlite::{params, OptionalExtension};
@@ -27,10 +26,11 @@ use serde_json::{json, Value};
 use crate::db::Db;
 use crate::digest;
 use crate::error::{self, failed, invalid};
-use crate::notes::{self, NewNote};
+use crate::notes::{self, By, Correction, NewNote, Scope, Stored};
 use crate::{Bus, Config, Writer};
 
-/// Most pages of log one episode may take. Past it, what was read is used.
+/// Most pages of log one episode may take. Past it, what was read is used,
+/// finished or not.
 const MAX_PAGES: usize = 128;
 /// Deadline for one page of the log.
 const READ_MS: u64 = 60_000;
@@ -119,11 +119,11 @@ fn answer_schema() -> Value {
     })
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// Both fields are required, as the schema says: an answer that names
+/// neither is not an answer, and must not mark the episode learned from.
+#[derive(Debug, Deserialize)]
 struct Answer {
-    #[serde(default)]
     notes: Vec<Learned>,
-    #[serde(default)]
     supports: Vec<String>,
 }
 
@@ -207,12 +207,47 @@ fn learned_already(db: &Db, episode: &str) -> Result<bool, RemoteError> {
     .map_err(error::db)
 }
 
+/// Strings longer than twice this keep only this much of each end: the
+/// digest shows at most the first or the last [`digest`] limit of any of them.
+const KEEP_END: usize = 4_096;
+
 /// Drop what the digest does not use from an entry, so a long episode does
-/// not have to fit in memory whole.
+/// not have to fit in memory whole: the payloads of replies that only
+/// looked, and the middle of every long string (file contents, command
+/// output, model replies, patches).
 fn slim(entry: &mut Logged) {
     let msg = &mut entry.envelope;
     if msg.kind == Kind::Reply && msg.error().is_none() && LOOKED.contains(&msg.to.to_string().as_str()) {
         msg.payload = Value::Null;
+        return;
+    }
+    if msg.kind == Kind::Request && msg.to.to_string() == molt_api::fs::WRITE {
+        // The digest shows a write's size, not what it wrote.
+        if let Some(content) = msg.payload.get_mut("content") {
+            let bytes = content.as_str().map_or(0, str::len);
+            *content = Value::Null;
+            msg.payload[digest::CONTENT_BYTES] = bytes.into();
+        }
+    }
+    shrink(&mut msg.payload);
+}
+
+fn shrink(v: &mut Value) {
+    match v {
+        Value::String(s) if s.len() > 2 * KEEP_END => {
+            let mut head = KEEP_END;
+            while !s.is_char_boundary(head) {
+                head -= 1;
+            }
+            let mut tail = s.len() - KEEP_END;
+            while !s.is_char_boundary(tail) {
+                tail += 1;
+            }
+            *s = format!("{}\n…\n{}", &s[..head], &s[tail..]);
+        }
+        Value::Array(items) => items.iter_mut().for_each(shrink),
+        Value::Object(fields) => fields.values_mut().for_each(shrink),
+        _ => {}
     }
 }
 
@@ -246,24 +281,10 @@ async fn read_episode(
     Ok((entries, true))
 }
 
-/// The `planner.run` requests of the episode that have no reply yet.
-fn unfinished(entries: &[Logged]) -> usize {
-    let mut open = HashSet::new();
-    for e in entries {
-        let msg = &e.envelope;
-        match msg.kind {
-            Kind::Request if msg.to.to_string() == planner::RUN => {
-                open.insert(msg.id.clone());
-            }
-            Kind::Reply => {
-                if let Some(id) = &msg.reply_to {
-                    open.remove(id);
-                }
-            }
-            _ => {}
-        }
-    }
-    open.len()
+/// Whether the request that started the episode (its first) has no reply yet.
+fn unfinished(entries: &[Logged]) -> bool {
+    let Some(root) = entries.iter().map(|e| &e.envelope).find(|m| m.kind == Kind::Request) else { return false };
+    !entries.iter().any(|e| e.envelope.kind == Kind::Reply && e.envelope.reply_to.as_ref() == Some(&root.id))
 }
 
 /// Keep `</tag` in untrusted text from closing the block it is shown in.
@@ -272,7 +293,9 @@ fn quoted(text: &str) -> String {
 }
 
 /// Notes about `workspace` the model should know of, best first: matches
-/// for the task, then the strongest standing notes.
+/// for the task, then the strongest standing notes. Only the workspace's
+/// own: an episode is text the project chose, so it may bear out or dispute
+/// notes about the project, never the notes that hold everywhere.
 fn known(db: &Db, task: &str, workspace: &str, now: u64) -> Result<Vec<Note>, RemoteError> {
     let mut asks = vec![(String::new(), KNOWN_STANDING)];
     if !task.trim().is_empty() {
@@ -282,7 +305,7 @@ fn known(db: &Db, task: &str, workspace: &str, now: u64) -> Result<Vec<Note>, Re
     let mut out = Vec::new();
     for (query, k) in asks {
         let req = RecallRequest { query, workspace: Some(workspace.to_owned()), k: Some(k), ..Default::default() };
-        for r in notes::recall(db, &req, now)? {
+        for r in notes::recall_in(db, &req, Scope::Own, now)? {
             if seen.insert(r.note.id.clone()) {
                 out.push(r.note);
             }
@@ -336,6 +359,7 @@ fn resolve(
         known.get(n.checked_sub(1)?).map(|note| note.id.clone())
     };
     let mut changes = Changes::default();
+    let mut said = HashSet::new();
     let mut supported = HashSet::new();
     for h in &answer.supports {
         if let Some(id) = handle(h) {
@@ -345,6 +369,9 @@ fn resolve(
         }
     }
     for learned in answer.notes.into_iter().take(MAX_NEW) {
+        if !said.insert(notes::norm(&learned.text)) {
+            continue;
+        }
         let mut events = Vec::new();
         for n in learned.steps {
             let Some(ids) = usize::try_from(n).ok().and_then(|n| n.checked_sub(1)).and_then(|i| steps.get(i)) else {
@@ -407,28 +434,56 @@ fn apply(db: &Db, episode: &str, writer: &Writer, changes: &Changes, now: u64) -
         if claimed == 0 {
             return Ok(None);
         }
+        let by = By { trace: episode, service: &writer.service, version: &writer.version };
         let (mut added, mut reinforced, mut contradicted) = (Vec::new(), Vec::new(), Vec::new());
+        let push = |list: &mut Vec<String>, id: &str| {
+            if !list.iter().any(|x| x == id) {
+                list.push(id.to_owned());
+            }
+        };
         for id in &changes.supports {
-            if notes::reinforce(&tx, id, episode, now)? {
-                reinforced.push(id.clone());
+            if notes::reinforce(&tx, id, by, now)? {
+                push(&mut reinforced, id);
             }
         }
         for (new, corrects) in &changes.new {
             if let Some(old) = corrects {
-                if let Some(id) = notes::contradict(&tx, old, new, now)? {
-                    if id != *old {
-                        contradicted.push(old.clone());
-                        added.push(id);
+                match notes::contradict(&tx, old, new, now)? {
+                    Correction::Added(id) => {
+                        push(&mut contradicted, old);
+                        push(&mut added, &id);
                     }
-                    continue;
+                    Correction::Matched(id, first) => {
+                        push(&mut contradicted, old);
+                        if first {
+                            push(&mut reinforced, &id);
+                        }
+                    }
+                    Correction::Restated(first) => {
+                        if first {
+                            push(&mut reinforced, old);
+                        }
+                    }
+                    Correction::Missing => {
+                        let (id, stored) = notes::store(&tx, new, now)?;
+                        match stored {
+                            Stored::New => push(&mut added, &id),
+                            Stored::Reinforced => push(&mut reinforced, &id),
+                            Stored::Unchanged => {}
+                        }
+                    }
                 }
+                continue;
             }
-            let (id, again) = notes::store(&tx, new, now)?;
-            let list = if again { &mut reinforced } else { &mut added };
-            if !list.contains(&id) {
-                list.push(id);
+            let (id, stored) = notes::store(&tx, new, now)?;
+            match stored {
+                Stored::New => push(&mut added, &id),
+                Stored::Reinforced => push(&mut reinforced, &id),
+                Stored::Unchanged => {}
             }
         }
+        // A note this episode created is reported as added, not also as reinforced.
+        reinforced.retain(|id| !added.contains(id));
         tx.commit()?;
         let mut notes = Vec::new();
         for id in &added {
@@ -472,13 +527,14 @@ pub(crate) async fn consolidate(
     if entries.is_empty() {
         return Ok(skipped("the audit log holds no messages of the episode", Usage::default(), 0.0));
     }
-    if unfinished(&entries) > 0 {
-        return Err(invalid(format!("episode {} has not finished", episode.as_str())));
-    }
+    // Past the pages memory reads, how the episode ended is out of sight:
+    // what was read is used either way.
     if cut {
         tracing::warn!(episode = episode.as_str(), pages = MAX_PAGES, "the episode is longer than memory reads");
+    } else if unfinished(&entries) {
+        return Err(invalid(format!("episode {} has not finished", episode.as_str())));
     }
-    let digest = digest::build(&entries, workspace);
+    let digest = digest::build(&entries, workspace, cut);
     drop(entries);
     if digest.is_empty() {
         return Ok(skipped("the episode has nothing to learn from", Usage::default(), 0.0));
@@ -538,7 +594,7 @@ mod tests {
     use async_trait::async_trait;
     use molt_api::fs;
     use molt_api::memory::RememberRequest;
-    use molt_api::planner::RunRequest;
+    use molt_api::planner::{self, RunRequest};
     use molt_api::shell;
     use molt_proto::{CapId, Envelope, Target};
 
@@ -763,7 +819,7 @@ mod tests {
 
         // Retracting what that version learned lets the episode be learned from again.
         let gone = notes::retract(&db, "memory", "v1", "bad version", "trace_rollback", 5).unwrap();
-        assert_eq!(gone, 1);
+        assert_eq!(gone.retracted, 1);
         assert!(!learned_already(&db, trace.as_str()).unwrap());
     }
 
@@ -800,11 +856,107 @@ mod tests {
         assert!(!learned_already(&db, trace.as_str()).unwrap());
     }
 
+    #[tokio::test]
+    async fn an_answer_counts_each_note_once_and_leaves_global_notes_alone() {
+        let db = Arc::new(Db::in_memory().unwrap());
+        let known = remember(&db, NoteKind::Fact, "Tests run with pytest -q", 0.6);
+        let global = NewNote {
+            kind: NoteKind::Preference,
+            text: "Answer in English.".into(),
+            workspace: None,
+            confidence: 0.9,
+            provenance: Provenance {
+                trace: "trace_user".into(),
+                events: vec![],
+                service: "cli".into(),
+                version: "v0".into(),
+            },
+        };
+        let global = notes::remember(&db, global, 1).unwrap().0;
+        let trace = TraceId::random();
+        let fact = json!({ "kind": "fact", "text": "The parser is src/dates.py.", "confidence": 0.9, "steps": [1],
+            "contradicts": "" });
+        let answer = json!({
+            "notes": [fact, fact, fact,
+                { "kind": "fact", "text": "tests run with pytest -q", "confidence": 0.9, "steps": [2], "contradicts": "" }],
+            "supports": ["N1", "N2", "N1"]
+        });
+        let bus = bus(episode(&trace), 100, Some(answer));
+        let resp = run(&bus, &db, &trace).await.unwrap();
+        assert_eq!(resp.added.len(), 1, "{resp:?}");
+        assert_eq!(resp.added[0].confidence, 0.9);
+        assert_eq!(resp.added[0].reinforced, 0);
+        assert_eq!(resp.reinforced, vec![known.id.clone()]);
+        let k = db.with(|c| notes::get(c, &known.id).unwrap().unwrap());
+        assert_eq!(k.reinforced, 1, "supported and restated in one episode: borne out once");
+        // The note that holds everywhere was not shown, so it cannot be named.
+        let calls = bus.calls.lock().unwrap();
+        let (_, payload, _) = calls.iter().find(|(t, ..)| t == model::COMPLETE).unwrap();
+        assert!(!payload.to_string().contains("Answer in English"));
+        assert!(!payload.to_string().contains("[N2]"));
+        assert_eq!(db.with(|c| notes::get(c, &global.id).unwrap().unwrap()).confidence, 0.9);
+    }
+
+    #[tokio::test]
+    async fn a_record_longer_than_memory_reads_is_learned_from_as_far_as_it_goes() {
+        let db = Arc::new(Db::in_memory().unwrap());
+        let trace = TraceId::random();
+        let mut log = episode(&trace);
+        let reply = log.pop().unwrap();
+        for n in 0..MAX_PAGES {
+            let read = request(&trace, fs::READ, json!({ "workspace": WS, "path": format!("src/f{n}.py") }));
+            log.push(logged(100 + n as u64, read));
+        }
+        log.push(reply);
+        let answer = json!({ "notes": [{ "kind": "fact", "text": "The CLI entry point is src/cli.py.",
+            "confidence": 0.7, "steps": [1], "contradicts": "" }], "supports": [] });
+        let bus = bus(log, 1, Some(answer));
+        let resp = run(&bus, &db, &trace).await.unwrap();
+        assert_eq!(resp.added.len(), 1, "{resp:?}");
+        let calls = bus.calls.lock().unwrap();
+        assert_eq!(calls.iter().filter(|(t, ..)| t == audit::READ).count(), MAX_PAGES);
+        let (_, payload, _) = calls.iter().find(|(t, ..)| t == model::COMPLETE).unwrap();
+        assert!(payload.to_string().contains("cut short"));
+    }
+
+    #[tokio::test]
+    async fn any_episode_must_have_finished() {
+        let db = Arc::new(Db::in_memory().unwrap());
+        let trace = TraceId::random();
+        let root = request(&trace, "builder.make", json!({}));
+        let step = request(&trace, shell::RUN, json!({ "workspace": WS, "command": "make" }));
+        let log = vec![logged(1, root.clone()), logged(2, step.clone()), logged(3, step.reply(json!({})))];
+        let err = run(&bus(log.clone(), 100, None), &db, &trace).await.unwrap_err();
+        assert!(err.message.contains("has not finished"), "{}", err.message);
+        let mut done = log;
+        done.push(logged(4, root.reply(json!({}))));
+        let answer = json!({ "notes": [], "supports": [] });
+        let resp = run(&bus(done, 100, Some(answer)), &db, &trace).await.unwrap();
+        assert_eq!(resp.skipped.as_deref(), Some("the episode held nothing worth keeping"));
+    }
+
+    #[test]
+    fn long_strings_keep_their_ends_and_writes_their_size() {
+        let trace = TraceId::random();
+        let out = format!("BEGIN{}END", "x".repeat(100_000));
+        let mut entry = logged(1, request(&trace, shell::RUN, json!({ "command": out, "n": [out] })));
+        slim(&mut entry);
+        let p = &entry.envelope.payload;
+        for s in [p["command"].as_str().unwrap(), p["n"][0].as_str().unwrap()] {
+            assert!(s.len() < 2 * KEEP_END + 10 && s.starts_with("BEGIN") && s.ends_with("END"));
+        }
+        let mut write = logged(2, request(&trace, fs::WRITE, json!({ "path": "a", "content": out })));
+        slim(&mut write);
+        assert_eq!(write.envelope.payload[digest::CONTENT_BYTES], json!(out.len()));
+        assert!(write.envelope.payload["content"].is_null());
+    }
+
     #[test]
     fn answers_are_read_leniently_but_checked_strictly() {
         let fenced = "Here you go:\n```json\n{\"notes\": [], \"supports\": [\"N1\"]}\n```";
         assert_eq!(parse_answer(fenced).unwrap().supports, vec!["N1"]);
         assert!(parse_answer("no json").is_err());
+        assert!(parse_answer("Sorry, I cannot help with that. {}").is_err(), "an empty object is not an answer");
 
         let known = vec![];
         let steps = vec![vec!["msg_a".to_owned()]];

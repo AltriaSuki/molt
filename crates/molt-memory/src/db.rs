@@ -57,6 +57,7 @@ impl Db {
             version <= SCHEMA_VERSION,
             "the database was written by a newer Molt (schema {version}; this one knows up to {SCHEMA_VERSION})"
         );
+        crate::notes::register(&conn)?;
         conn.execute_batch(crate::notes::SCHEMA)?;
         conn.execute_batch(crate::project::SCHEMA)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
