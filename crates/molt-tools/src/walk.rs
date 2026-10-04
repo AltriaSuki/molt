@@ -66,10 +66,25 @@ fn keep(entry: &DirEntry, scratch: &Path) -> bool {
     !SKIPPED.iter().any(|s| name == *s) && entry.path() != scratch
 }
 
-/// True when `path` (absolute, inside the canonical workspace `ws`) is a
-/// regular file a walk of the workspace returns. Only the directories on the
-/// way to it are read.
-pub(crate) fn reaches_file(ws: &Path, path: &Path) -> bool {
+/// The regular files a walk of the canonical workspace `ws` returns, not
+/// entering the directories `left_out` names.
+pub(crate) fn files<F>(ws: &Path, left_out: F) -> impl Iterator<Item = DirEntry>
+where
+    F: Fn(&Path) -> bool + Send + Sync + 'static,
+{
+    builder(ws)
+        .filter_entry(move |e| keep(e, Path::new("")) && !(is_dir(e) && left_out(e.path())))
+        .build()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+}
+
+/// True when `path` (absolute, inside the canonical workspace `ws`) is one
+/// of [`files`]`(ws, left_out)`. Only the directories on the way to it are read.
+pub(crate) fn reaches_file<F>(ws: &Path, path: &Path, left_out: F) -> bool
+where
+    F: Fn(&Path) -> bool + Send + Sync + 'static,
+{
     let Ok(rel) = path.strip_prefix(ws) else { return false };
     let depth = rel.components().count();
     if depth == 0 {
@@ -78,10 +93,17 @@ pub(crate) fn reaches_file(ws: &Path, path: &Path) -> bool {
     let target = path.to_path_buf();
     builder(ws)
         .max_depth(Some(depth))
-        .filter_entry(move |e| keep(e, Path::new("")) && target.starts_with(e.path()))
+        .filter_entry(move |e| {
+            keep(e, Path::new("")) && target.starts_with(e.path()) && !(is_dir(e) && left_out(e.path()))
+        })
         .build()
         .filter_map(Result::ok)
         .any(|e| e.path() == path && e.file_type().is_some_and(|t| t.is_file()))
+}
+
+/// True for a directory other than the walk's start.
+fn is_dir(entry: &DirEntry) -> bool {
+    entry.depth() > 0 && entry.file_type().is_some_and(|t| t.is_dir())
 }
 
 /// True when the walk rules let a walk from `ws` reach `sub`.

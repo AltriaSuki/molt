@@ -10,7 +10,7 @@
 //! over the definitions it uses, which orders the definitions; the best of
 //! them are rendered, file by file, until the budget is spent.
 //!
-//! The graph is read with aggregates (one row per file and name it uses), and
+//! The graph is read as stored, one row per file and name it uses, and
 //! PageRank runs over names rather than file pairs, so a name defined in
 //! many files and used in many more costs their sum, not their product.
 //! Every loop runs in a fixed order, so the same model and query always give
@@ -58,7 +58,7 @@ pub(crate) fn map(db: &Db, root: &Path, req: &MapRequest) -> Result<MapResponse,
     let budget = req.max_tokens.unwrap_or(DEFAULT_TOKENS).clamp(1, MAX_TOKENS) as usize * BYTES_PER_TOKEN;
     let key = project_key(root)?;
     let graph = db
-        .with(|c| match project_id(c, key)? {
+        .read(|c| match project_id(c, key)? {
             Some(project) => Graph::load(c, project).map(Some),
             None => Ok(None),
         })
@@ -68,7 +68,7 @@ pub(crate) fn map(db: &Db, root: &Path, req: &MapRequest) -> Result<MapResponse,
     };
     let mentions = Mentions::find(&graph, &req.query);
     let order = graph.order(&mentions);
-    let picked = db.with(|c| pick(c, &graph, &order, budget)).map_err(error::db)?;
+    let picked = db.read(|c| pick(c, &graph, &order, budget)).map_err(error::db)?;
     Ok(render(&graph, picked))
 }
 
@@ -99,33 +99,22 @@ impl Graph {
         let files = stmt.query_map([project], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let number: HashMap<i64, u32> = files.iter().enumerate().map(|(i, (id, _))| (*id, i as u32)).collect();
 
-        // Names are numbered as they come, then renumbered in sorted order,
-        // so the numbering does not depend on the row order.
-        let mut first_seen: HashMap<String, u32> = HashMap::new();
+        // In name order (the index covers the query), so names are numbered
+        // in sorted order as they come, whatever order the rows were written in.
+        let mut names: Vec<String> = Vec::new();
+        let mut definers: Vec<Vec<u32>> = Vec::new();
         let mut defs = Vec::new();
-        let mut stmt = conn.prepare("SELECT rowid, file, name, line FROM defs WHERE project = ?1")?;
+        let mut stmt = conn.prepare("SELECT rowid, file, name, line FROM defs WHERE project = ?1 ORDER BY name")?;
         let mut rows = stmt.query([project])?;
         while let Some(r) = rows.next()? {
             let Some(&file) = number.get(&r.get(1)?) else { continue };
             let name = text(r, 2)?;
-            let next = first_seen.len() as u32;
-            let name = match first_seen.get(name) {
-                Some(&n) => n,
-                None => *first_seen.entry(name.to_owned()).or_insert(next),
-            };
-            defs.push(Def { rowid: r.get(0)?, file, name, line: r.get(3)? });
-        }
-        let mut names: Vec<(String, u32)> = first_seen.into_iter().collect();
-        names.sort_unstable();
-        let mut renumber = vec![0u32; names.len()];
-        for (sorted, (_, seen)) in names.iter().enumerate() {
-            renumber[*seen as usize] = sorted as u32;
-        }
-        let names: Vec<String> = names.into_iter().map(|(name, _)| name).collect();
-        let mut definers = vec![Vec::new(); names.len()];
-        for def in &mut defs {
-            def.name = renumber[def.name as usize];
-            definers[def.name as usize].push(def.file);
+            if names.last().map(String::as_str) != Some(name) {
+                names.push(name.to_owned());
+                definers.push(Vec::new());
+            }
+            definers[names.len() - 1].push(file);
+            defs.push(Def { rowid: r.get(0)?, file, name: (names.len() - 1) as u32, line: r.get(3)? });
         }
         for files in &mut definers {
             files.sort_unstable();
@@ -133,17 +122,23 @@ impl Graph {
         }
 
         let mut referers = vec![Vec::new(); names.len()];
-        let mut stmt = conn.prepare(
-            "SELECT name, file, COUNT(*) FROM refs
-             WHERE project = ?1 AND name IN (SELECT name FROM defs WHERE project = ?1)
-             GROUP BY name, file",
-        )?;
+        // In name order (the index covers the query). Uses of names nothing
+        // defines are dropped here, faster than SQL could by looking each up
+        // among the definitions.
+        let mut stmt = conn.prepare("SELECT name, file, uses FROM refs WHERE project = ?1 ORDER BY name")?;
         let mut rows = stmt.query([project])?;
+        let mut last: Option<(String, Option<usize>)> = None;
         while let Some(r) = rows.next()? {
-            let (name, file) = (text(r, 0)?, r.get(1)?);
-            let (Ok(name), Some(&file)) = (names.binary_search_by(|n| n.as_str().cmp(name)), number.get(&file)) else {
-                continue;
+            let name = text(r, 0)?;
+            let number_of_name = match &last {
+                Some((seen, n)) if seen == name => *n,
+                _ => {
+                    let n = names.binary_search_by(|n| n.as_str().cmp(name)).ok();
+                    last = Some((name.to_owned(), n));
+                    n
+                }
             };
+            let (Some(name), Some(&file)) = (number_of_name, number.get(&r.get(1)?)) else { continue };
             referers[name].push((file, r.get(2)?));
         }
         for files in &mut referers {

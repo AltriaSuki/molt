@@ -189,3 +189,24 @@ async fn changed(s: &Setup, workspace: &str, paths: &[&str]) {
         Envelope::event(TraceId::random(), CHANGED, CapId::random(), serde_json::to_value(event).unwrap()).unwrap();
     assert_eq!(s.memory.handle(msg).await.unwrap(), Value::Null);
 }
+
+#[tokio::test]
+async fn changes_reported_while_an_index_runs_are_all_indexed() {
+    let s = Setup::new();
+    let _: IndexResponse = s.call("memory.index", json!({ "workspace": "app" })).await;
+    for i in 0..3 {
+        std::fs::write(s.root.join(format!("app/src/n{i}.rs")), format!("pub fn new{i}() {{}}\n")).unwrap();
+    }
+    // One handler indexes; the others leave their files to it and return.
+    let app = s.app();
+    tokio::join!(
+        changed(&s, &app, &["src/n0.rs"]),
+        changed(&s, &app, &["src/n1.rs"]),
+        changed(&s, &app, &["src/n2.rs"])
+    );
+    for i in 0..3 {
+        let found: SymbolsResponse =
+            s.call("memory.symbols", json!({ "workspace": "app", "name": format!("new{i}") })).await;
+        assert_eq!(found.definitions.len(), 1, "new{i}");
+    }
+}

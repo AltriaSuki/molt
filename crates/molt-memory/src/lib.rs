@@ -12,8 +12,9 @@ mod error;
 mod notes;
 pub mod project;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{ensure, Context};
@@ -51,6 +52,9 @@ pub struct Config {
     pub model_timeout: Duration,
     /// Requests handled at once.
     pub max_concurrent: usize,
+    /// Directories the project model leaves out: Molt's data directory,
+    /// with the `fs` service's forks in it, when it is inside the root.
+    pub skip: Vec<PathBuf>,
 }
 
 impl Default for Config {
@@ -61,6 +65,7 @@ impl Default for Config {
             max_tokens: 8_000,
             model_timeout: Duration::from_secs(300),
             max_concurrent: 8,
+            skip: Vec::new(),
         }
     }
 }
@@ -101,6 +106,7 @@ impl Config {
                 .context("MOLT_MEMORY_MAX_TOKENS is too large")?,
             model_timeout: Duration::from_secs(number("MOLT_MEMORY_MODEL_TIMEOUT_S", d.model_timeout.as_secs())?),
             max_concurrent: d.max_concurrent,
+            skip: d.skip,
         })
     }
 }
@@ -174,13 +180,35 @@ pub struct Memory {
     bus: Arc<dyn Bus>,
     /// Index updates run one at a time, so two never parse the same files.
     indexing: tokio::sync::Mutex<()>,
+    /// Files `fs` changed that are waiting to be indexed again.
+    changes: std::sync::Mutex<Waiting>,
+}
+
+/// Changed files waiting to be indexed again, by workspace. While one event
+/// handler works through them (`draining`), the others only add to them, so
+/// a slow index never has events pile up behind it.
+#[derive(Default)]
+struct Waiting {
+    paths: BTreeMap<PathBuf, BTreeSet<String>>,
+    draining: bool,
 }
 
 impl Memory {
     /// Memory over `db`, for workspaces inside `root`.
     pub fn new(db: Arc<Db>, root: &Path, cfg: Config, writer: Writer, bus: Arc<dyn Bus>) -> anyhow::Result<Self> {
         let root = root.canonicalize().with_context(|| format!("root {}", root.display()))?;
-        Ok(Self { db, root, cfg, writer, bus, indexing: tokio::sync::Mutex::new(()) })
+        let mut cfg = cfg;
+        // The walk sees canonical paths; a directory not made yet cannot hold forks.
+        cfg.skip = cfg.skip.iter().filter_map(|d| d.canonicalize().ok()).collect();
+        Ok(Self {
+            db,
+            root,
+            cfg,
+            writer,
+            bus,
+            indexing: tokio::sync::Mutex::new(()),
+            changes: std::sync::Mutex::default(),
+        })
     }
 
     /// The canonical directory a request's `workspace` names: an absolute
@@ -227,7 +255,8 @@ impl Memory {
     /// Bring the model of the canonical `ws` up to date, one update at a time.
     async fn index(&self, ws: PathBuf, paths: Option<Vec<String>>) -> Result<Value, RemoteError> {
         let _turn = self.indexing.lock().await;
-        reply(self.blocking(move |db| project::index(db, &ws, paths.as_deref())).await?)
+        let skip = self.cfg.skip.clone();
+        reply(self.blocking(move |db| project::index_skipping(db, &ws, paths.as_deref(), &skip)).await?)
     }
 
     /// Handle one request or event addressed to the service.
@@ -329,8 +358,46 @@ impl Memory {
         if !matches!(modelled, Ok(true)) || changed.paths.is_empty() {
             return;
         }
-        if let Err(e) = self.index(ws, Some(changed.paths)).await {
-            tracing::debug!(error = %e.message, "could not re-index changed files");
+        {
+            let mut waiting = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
+            waiting.paths.entry(ws).or_default().extend(changed.paths);
+            if waiting.draining {
+                return;
+            }
+            waiting.draining = true;
+        }
+        // Should this handler be dropped part way, the next event drains.
+        let mut draining = Draining { changes: &self.changes, done: false };
+        loop {
+            let batch = {
+                let mut waiting = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
+                if waiting.paths.is_empty() {
+                    // In the same turn of the lock, so no event is left waiting.
+                    waiting.draining = false;
+                    draining.done = true;
+                    return;
+                }
+                std::mem::take(&mut waiting.paths)
+            };
+            for (ws, paths) in batch {
+                if let Err(e) = self.index(ws, Some(paths.into_iter().collect())).await {
+                    tracing::debug!(error = %e.message, "could not re-index changed files");
+                }
+            }
+        }
+    }
+}
+
+/// Marks the changes as no longer being drained if the drain stops before it is `done`.
+struct Draining<'a> {
+    changes: &'a std::sync::Mutex<Waiting>,
+    done: bool,
+}
+
+impl Drop for Draining<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.changes.lock().unwrap_or_else(PoisonError::into_inner).draining = false;
         }
     }
 }

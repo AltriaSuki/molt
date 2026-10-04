@@ -132,6 +132,16 @@ pub fn memory_db(cfg: &Config) -> Option<PathBuf> {
     args.iter().skip_while(|a| *a != "--db").nth(1).map(PathBuf::from)
 }
 
+/// The directories the memory service's project model leaves out (its
+/// `--skip` arguments), canonical where they exist.
+pub fn memory_skips(cfg: &Config) -> Vec<PathBuf> {
+    let Some(args) = cfg.service(MEMORY).and_then(|s| s.exec.as_ref()).map(|e| &e.args) else { return Vec::new() };
+    args.windows(2)
+        .filter(|pair| pair[0] == "--skip")
+        .filter_map(|pair| Path::new(&pair[1]).canonicalize().ok())
+        .collect()
+}
+
 /// `path` made absolute, with symlinks and `..` resolved as far as it exists.
 /// In the rest, which creating it would make plain directories, `..` is
 /// resolved by name.

@@ -227,7 +227,15 @@ impl Config {
         fs.requests = vec![request(&changed, Budget::new(0, 0, 100_000_000))?];
         let shell = service("shell", Tier::Mutable, tools("shell")?)?;
         let mut memory_exec = bin("molt-memory")?;
-        memory_exec.args = vec!["--root".into(), text(workspace)?, "--db".into(), text(&data_dir.join(MEMORY_DB))?];
+        // The project model leaves out the data dir, with the forks in it, should it be inside the workspace.
+        memory_exec.args = vec![
+            "--root".into(),
+            text(workspace)?,
+            "--db".into(),
+            text(&data_dir.join(MEMORY_DB))?,
+            "--skip".into(),
+            text(data_dir)?,
+        ];
         let mut memory = service("memory", Tier::Mutable, memory_exec)?;
         memory.pass_env = names(MEMORY_ENV);
         // Memory reads finished episodes from the audit log and has the model
@@ -434,7 +442,10 @@ mod tests {
         let memory = cfg.service("memory").unwrap();
         let exec = memory.exec.as_ref().unwrap();
         assert_eq!(exec.command, "/opt/molt/bin/molt-memory");
-        assert_eq!(exec.args, ["--root", "/home/u/proj", "--db", "/cache/molt/proj/memory.db"]);
+        assert_eq!(
+            exec.args,
+            ["--root", "/home/u/proj", "--db", "/cache/molt/proj/memory.db", "--skip", "/cache/molt/proj"]
+        );
         assert_eq!(memory.tier, Tier::Mutable);
         assert_eq!(targets("memory"), ["model.complete", "kernel.audit.read", "topic:fs.changed"]);
         assert!(memory.pass_env.iter().all(|v| v.starts_with("MOLT_MEMORY_")));

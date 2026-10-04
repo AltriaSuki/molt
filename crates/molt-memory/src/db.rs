@@ -13,10 +13,14 @@ use rusqlite::Connection;
 /// Bumped when the schema changes in a way old databases must be migrated for.
 const SCHEMA_VERSION: i64 = 1;
 
-/// The database. Every read and write goes through its one connection, so
-/// writes never race; keep the work done under [`Db::with`] short.
+/// The database. Every write goes through its one connection, so writes
+/// never race; keep the work done under [`Db::with`] short. Long reads (the
+/// project model's map and lookups) go through a second connection with
+/// [`Db::read`], so they hold up neither writes nor other reads of notes.
 pub struct Db {
     conn: Mutex<Connection>,
+    /// `None` for a database in memory, which one connection must serve.
+    reader: Option<Mutex<Connection>>,
 }
 
 impl Db {
@@ -52,7 +56,13 @@ impl Db {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "wal")?;
         conn.pragma_update(None, "synchronous", "normal")?;
-        Self::init(conn).with_context(|| format!("preparing {}", path.display()))
+        let mut db = Self::init(conn).with_context(|| format!("preparing {}", path.display()))?;
+        let reader = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        reader.busy_timeout(Duration::from_secs(5))?;
+        reader.pragma_update(None, "query_only", true)?;
+        crate::notes::register(&reader)?;
+        db.reader = Some(Mutex::new(reader));
+        Ok(db)
     }
 
     /// A database that lives in memory, for tests.
@@ -72,7 +82,7 @@ impl Db {
         conn.execute_batch(crate::notes::SCHEMA)?;
         conn.execute_batch(crate::project::SCHEMA)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self { conn: Mutex::new(conn), reader: None })
     }
 
     /// Run `f` with the connection. A panic in an earlier `f` does not lock
@@ -80,6 +90,20 @@ impl Db {
     /// mid-way leaves nothing half done.
     pub fn with<R>(&self, f: impl FnOnce(&mut Connection) -> R) -> R {
         f(&mut self.conn.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Run `f`, which only reads, with the reading connection, in one
+    /// transaction: it sees the database as it was at its first statement,
+    /// whatever is written meanwhile.
+    pub fn read<R>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<R>) -> rusqlite::Result<R> {
+        let run = |conn: &Connection| {
+            let tx = conn.unchecked_transaction()?;
+            f(&tx)
+        };
+        match &self.reader {
+            Some(reader) => run(&reader.lock().unwrap_or_else(PoisonError::into_inner)),
+            None => self.with(|conn| run(conn)),
+        }
     }
 }
 
@@ -98,6 +122,23 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let version: i64 = db.with(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0))).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn reads_do_not_wait_for_a_write_and_cannot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("memory.sqlite")).unwrap();
+        db.with(|c| {
+            let tx = c.transaction().unwrap();
+            tx.execute("INSERT INTO projects (root) VALUES ('/w')", []).unwrap();
+            // The write is under way, and not yet seen.
+            let n: i64 = db.read(|r| r.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))).unwrap();
+            assert_eq!(n, 0);
+            tx.commit().unwrap();
+        });
+        let n: i64 = db.read(|r| r.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))).unwrap();
+        assert_eq!(n, 1);
+        assert!(db.read(|r| r.execute("DELETE FROM projects", [])).is_err());
     }
 
     #[test]

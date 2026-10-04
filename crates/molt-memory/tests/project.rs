@@ -421,6 +421,69 @@ fn ignored_files_are_left_out_and_dropped_when_they_become_ignored() {
 }
 
 #[test]
+fn other_projects_code_and_build_output_are_left_out() {
+    let (_dir, root) = workspace(&[
+        ("src/lib.rs", "fn lib() {}\n"),
+        ("node_modules/dep/index.js", "function dep() {}\n"),
+        ("web/node_modules/x.js", "function nested() {}\n"),
+        (".venv/pyvenv.cfg", "home = /usr/bin\n"),
+        (".venv/lib/site.py", "def site(): pass\n"),
+        ("out/CACHEDIR.TAG", "Signature: 8a477f597d28d172789f06886806bc55\n"),
+        ("out/gen.rs", "fn generated() {}\n"),
+        ("data/work/fork-1/src/lib.rs", "fn forked() {}\n"),
+    ]);
+    let db = Db::in_memory().unwrap();
+    let skip = [root.join("data")];
+    let r = project::index_skipping(&db, &root, None, &skip).unwrap();
+    assert_eq!(r.files, 1);
+    for name in ["dep", "nested", "site", "generated", "forked"] {
+        assert!(defs(&db, &root, name).is_empty(), "{name}");
+    }
+    // Named paths follow the same rules.
+    let named: Vec<String> =
+        ["node_modules/dep/index.js", ".venv/lib/site.py", "out/gen.rs", "data/work/fork-1/src/lib.rs"]
+            .map(String::from)
+            .into();
+    let r = project::index_skipping(&db, &root, Some(&named), &skip).unwrap();
+    assert_eq!((r.files, r.parsed), (1, 0));
+    // Without the skip, the forks would be indexed.
+    assert_eq!(project::index(&db, &root, None).unwrap().files, 2);
+}
+
+#[test]
+fn a_file_parsed_by_another_extractor_is_parsed_again() {
+    let (_dir, root) = workspace(&[("a.rs", "fn a() {}\n"), ("b.py", "def b(): pass\n")]);
+    let db = Db::in_memory().unwrap();
+    project::index(&db, &root, None).unwrap();
+    assert_eq!(project::index(&db, &root, None).unwrap().parsed, 0);
+    // As after a new grammar or query: the contents are the same.
+    db.with(|c| c.execute("UPDATE files SET extractor = 'older' WHERE path = 'a.rs'", [])).unwrap();
+    let r = project::index(&db, &root, None).unwrap();
+    assert_eq!((r.files, r.parsed), (2, 1));
+    assert_eq!(project::index(&db, &root, None).unwrap().parsed, 0);
+    db.with(|c| c.execute("UPDATE files SET extractor = 'older'", [])).unwrap();
+    assert_eq!(project::index(&db, &root, Some(&["b.py".to_owned()])).unwrap().parsed, 1);
+}
+
+#[test]
+fn an_index_larger_than_a_batch_is_written_whole() {
+    let files: Vec<(String, String)> =
+        (0..600).map(|i| (format!("m{i:03}.rs"), format!("pub fn f{i}() {{ f{}(); }}\n", (i + 1) % 600))).collect();
+    let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+    let (_dir, root) = workspace(&borrowed);
+    let db = Db::in_memory().unwrap();
+    let r = project::index(&db, &root, None).unwrap();
+    assert_eq!((r.files, r.parsed, r.symbols), (600, 600, 600));
+    assert_eq!(uses(&db, &root, "f0"), [("m599.rs".to_owned(), 1)]);
+    for (path, _) in &files[..300] {
+        fs::remove_file(root.join(path)).unwrap();
+    }
+    let r = project::index(&db, &root, None).unwrap();
+    assert_eq!((r.files, r.removed, r.symbols), (300, 300, 300));
+    assert!(defs(&db, &root, "f0").is_empty());
+}
+
+#[test]
 fn binary_and_oversized_files_are_skipped() {
     let big = format!("fn big() {{}}\n{}", "// padding\n".repeat(100_000));
     let (_dir, root) = workspace(&[("a.rs", "fn a() {}\n"), ("big.rs", &big), ("bin.rs", "fn bin() {}\0\n")]);
@@ -637,6 +700,33 @@ fn references_show_the_line_as_it_is_now() {
             ("c.rs".to_owned(), 4, String::new()),
         ]
     );
+}
+
+#[test]
+fn references_are_read_only_from_regular_files_in_the_workspace() {
+    let (_dir, root) = workspace(&[
+        ("a.rs", "fn a() {\n    foo();\n    foo();\n}\n"),
+        ("sub/b.rs", "fn b() {\n    foo();\n}\n"),
+        ("c.rs", "fn c() {\n    foo();\n}\n"),
+        (".molt/secrets.json", "{\n  \"kernel\": \"SECRET\",\n  \"fs\": \"SECRET\"\n}\n"),
+    ]);
+    let db = Db::in_memory().unwrap();
+    project::index(&db, &root, None).unwrap();
+    assert!(lookup(&db, &root, "foo").references.iter().all(|r| r.text == "foo();"));
+
+    // Each file is swapped for something else, and not indexed again.
+    fs::remove_file(root.join("a.rs")).unwrap();
+    std::os::unix::fs::symlink(".molt/secrets.json", root.join("a.rs")).unwrap();
+    fs::rename(root.join("sub"), root.join(".molt/sub")).unwrap();
+    std::os::unix::fs::symlink(".molt/sub", root.join("sub")).unwrap();
+    fs::remove_file(root.join("c.rs")).unwrap();
+    let fifo = std::ffi::CString::new(root.join("c.rs").into_os_string().into_encoded_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+
+    let refs = lookup(&db, &root, "foo").references;
+    assert_eq!(refs.len(), 4);
+    assert!(refs.iter().all(|r| r.text.is_empty()), "{refs:?}");
 }
 
 #[test]

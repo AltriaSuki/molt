@@ -1,7 +1,8 @@
 //! Where a name is defined and used.
 
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use molt_api::memory::{Definition, Reference, SymbolsRequest, SymbolsResponse};
@@ -29,7 +30,7 @@ pub(crate) fn symbols(db: &Db, root: &Path, req: &SymbolsRequest) -> Result<Symb
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as usize;
     let key = project_key(root)?;
     let mut found = db
-        .with(|c| {
+        .read(|c| {
             let Some(project) = project_id(c, key)? else { return Ok(Found::default()) };
             let exact = find(c, project, name, false, req.references, limit + 1)?;
             if exact.definitions.is_empty() && exact.lines.is_empty() {
@@ -85,13 +86,36 @@ fn find(
         return Ok(Found { definitions, lines: Vec::new() });
     }
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT DISTINCT f.path, r.line FROM refs r JOIN files f ON f.id = r.file
-         WHERE r.project = ?1 AND r.name = ?2 {collate} ORDER BY f.path, r.line LIMIT ?3"
+        "SELECT f.path, r.lines FROM refs r JOIN files f ON f.id = r.file
+         WHERE r.project = ?1 AND r.name = ?2 {collate} ORDER BY f.path, r.name"
     ))?;
-    let lines = stmt
-        .query_map(params![project, name, limit as i64], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut rows = stmt.query(params![project, name])?;
+    let mut lines = Vec::new();
+    // Ignoring case, a file may use several spellings of the name: its
+    // lines are merged before they are counted.
+    let mut file: Option<(String, Vec<u32>)> = None;
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        if file.as_ref().is_some_and(|(p, _)| *p != path) {
+            add_lines(&mut lines, file.take());
+            if lines.len() >= limit {
+                break;
+            }
+        }
+        let (_, at) = file.get_or_insert_with(|| (path, Vec::new()));
+        at.extend(super::decode_lines(row.get_ref(1)?.as_blob()?));
+    }
+    add_lines(&mut lines, file);
+    lines.truncate(limit);
     Ok(Found { definitions, lines })
+}
+
+/// Add one file's reference lines to `lines`, in order, each once.
+fn add_lines(lines: &mut Vec<(String, u64)>, file: Option<(String, Vec<u32>)>) {
+    let Some((path, mut at)) = file else { return };
+    at.sort_unstable();
+    at.dedup();
+    lines.extend(at.into_iter().map(|line| (path.clone(), u64::from(line))));
 }
 
 /// The references at `lines` (ordered by path), each with its line as the
@@ -117,15 +141,24 @@ fn texts(root: &Path, lines: Vec<(String, u64)>) -> Vec<Reference> {
     out
 }
 
-/// The contents of the workspace file `rel`, if it is still a regular file
-/// inside the workspace once symlinks are resolved.
+/// The contents of the workspace file `rel`, if it is a regular file
+/// reached from the root without a symlink, and not inside `.git` or
+/// `.molt` (a row can outlive its file, and something else can take its
+/// place). A FIFO is not waited on.
 fn read(root: &Path, rel: &str) -> Option<Vec<u8>> {
-    let path = root.join(rel).canonicalize().ok()?;
-    if !path.starts_with(root) || !path.is_file() {
+    if rel.split('/').any(|part| super::update::SKIPPED_DIRS.contains(&part)) {
+        return None;
+    }
+    let path = root.join(rel);
+    if path.parent()?.canonicalize().ok()? != path.parent()? {
+        return None;
+    }
+    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path).ok()?;
+    if !file.metadata().ok()?.is_file() {
         return None;
     }
     let mut bytes = Vec::new();
-    File::open(path).ok()?.take(MAX_READ_BYTES).read_to_end(&mut bytes).ok()?;
+    file.take(MAX_READ_BYTES).read_to_end(&mut bytes).ok()?;
     Some(bytes)
 }
 

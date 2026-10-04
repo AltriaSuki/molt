@@ -341,7 +341,9 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
         }
         MemoryCmd::Map { words, tokens, .. } => {
             let db = open()?;
-            molt_memory::project::index(&db, &workspace, None).map_err(|e| anyhow::anyhow!(e.message))?;
+            let skip = agent::memory_skips(&cfg);
+            molt_memory::project::index_skipping(&db, &workspace, None, &skip)
+                .map_err(|e| anyhow::anyhow!(e.message))?;
             let req = MapRequest { workspace: key, query: words.join(" "), max_tokens: Some(tokens) };
             let map = molt_memory::project::map(&db, &workspace, &req).map_err(|e| anyhow::anyhow!(e.message))?;
             print!("{}", agent::printable(&map.map));

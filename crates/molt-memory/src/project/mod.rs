@@ -13,7 +13,7 @@
 //! row can be rebuilt by indexing again, so it is written for speed (one
 //! transaction per update) rather than kept forever.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use molt_api::memory::{IndexResponse, MapRequest, MapResponse, SymbolsRequest, SymbolsResponse};
 use molt_proto::RemoteError;
@@ -28,7 +28,13 @@ mod update;
 
 /// The project tables. A file's definitions and references go with it
 /// (`ON DELETE CASCADE`, which `Db` turns on); `project` is repeated in them
-/// so a name is looked up within one project through one index.
+/// so a name is looked up within one project through one index. A file's
+/// references to one name are one row: how often it is used, and the lines
+/// it is used on (ascending, as little-endian `u32`s), which keeps the table
+/// a fraction of a row per use. The name indexes cover what the map reads,
+/// so it reads no table rows. Definitions can also be found ignoring case
+/// through an index; references are searched that way only after an exact
+/// miss, and an index for it would cost more to keep up than it saves.
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS projects (
     id INTEGER PRIMARY KEY,
@@ -45,6 +51,7 @@ CREATE TABLE IF NOT EXISTS files (
     verified_ns INTEGER NOT NULL,
     hash TEXT NOT NULL,
     lang TEXT NOT NULL,
+    extractor TEXT NOT NULL,
     UNIQUE (project, path)
 );
 CREATE TABLE IF NOT EXISTS defs (
@@ -55,15 +62,17 @@ CREATE TABLE IF NOT EXISTS defs (
     line INTEGER NOT NULL,
     signature TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS defs_name ON defs(project, name, file);
+CREATE INDEX IF NOT EXISTS defs_name ON defs(project, name, file, line);
+CREATE INDEX IF NOT EXISTS defs_name_nocase ON defs(project, name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS defs_file ON defs(file);
 CREATE TABLE IF NOT EXISTS refs (
     project INTEGER NOT NULL,
     file INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
-    line INTEGER NOT NULL
+    uses INTEGER NOT NULL,
+    lines BLOB NOT NULL
 );
-CREATE INDEX IF NOT EXISTS refs_name ON refs(project, name, file);
+CREATE INDEX IF NOT EXISTS refs_name ON refs(project, name, file, uses);
 CREATE INDEX IF NOT EXISTS refs_file ON refs(file);
 ";
 
@@ -72,13 +81,25 @@ CREATE INDEX IF NOT EXISTS refs_file ON refs(file);
 ///
 /// The whole workspace is walked by the same rules as the `fs` service
 /// (`.gitignore` applies; `.git` and `.molt` are skipped; symlinks are not
-/// followed), and files that are no longer found are dropped. With `paths`,
-/// only those are looked at: each is indexed again if it is a source file
-/// in the workspace, and dropped otherwise (missing, not a regular file,
-/// inside `.git` or `.molt`). Ignore rules are not consulted for `paths`, so
-/// a file that became ignored leaves the model at the next full index.
+/// followed), leaving out other projects' code and build output as well:
+/// `node_modules`, Python virtualenvs and cache directories (those with a
+/// `CACHEDIR.TAG`, such as Cargo's `target`). Files that are no longer
+/// found are dropped. With `paths`, only those are looked at: each is
+/// indexed again if the walk would reach it, and dropped otherwise.
 pub fn index(db: &Db, root: &Path, paths: Option<&[String]>) -> Result<IndexResponse, RemoteError> {
-    update::index(db, root, paths, update::MAX_FILES)
+    index_skipping(db, root, paths, &[])
+}
+
+/// [`index`], leaving out the directories `skip` too (absolute, under the
+/// canonical `root`): Molt's data directory, with the forks in it, when it
+/// is inside the workspace.
+pub fn index_skipping(
+    db: &Db,
+    root: &Path,
+    paths: Option<&[String]>,
+    skip: &[PathBuf],
+) -> Result<IndexResponse, RemoteError> {
+    update::index(db, root, paths, skip, update::MAX_FILES)
 }
 
 /// The map of `root` for `req.query` (`req.workspace` is ignored: `root` is it, resolved).
@@ -104,4 +125,14 @@ fn project_key(root: &Path) -> Result<&str, RemoteError> {
 fn project_id(conn: &rusqlite::Connection, key: &str) -> rusqlite::Result<Option<i64>> {
     use rusqlite::OptionalExtension;
     conn.query_row("SELECT id FROM projects WHERE root = ?1", [key], |r| r.get(0)).optional()
+}
+
+/// The lines of a file's references to one name, as stored.
+fn encode_lines(lines: &[u32]) -> Vec<u8> {
+    lines.iter().flat_map(|l| l.to_le_bytes()).collect()
+}
+
+/// The lines [`encode_lines`] stored.
+fn decode_lines(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b))
 }

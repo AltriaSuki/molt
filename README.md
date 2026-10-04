@@ -165,9 +165,12 @@ Memory holds two things for each project.
 **The project model** is every definition and reference in the project's
 source (Rust, Python, JavaScript, TypeScript, Go, Java, C and C++, parsed with
 tree-sitter), in SQLite. An index parses only files whose contents changed:
-on this repository a first index takes about 130 ms and an unchanged one
-2 ms; a 3,000-file project takes about 1.3 s, then 33 ms. It follows the files
-the `fs` service changes as they change. From it, a run starts with a map of
+on this repository a first index takes about 170 ms and an unchanged one
+2 ms; a 3,000-file project takes about 1.5 s, then 40 ms. It leaves out other
+projects' code and build output (`node_modules`, Python virtualenvs, cache
+directories such as Cargo's `target`) and Molt's data directory, gives each
+file at most 2 seconds, and writes as it goes, so a stopped index keeps its
+progress. It follows the files the `fs` service changes as they change. From it, a run starts with a map of
 the code most relevant to its task, ranked the way Aider ranks it (PageRank
 over references, weighted toward what the task mentions), and attempts can
 ask where a name is defined and used (`find_symbol`).
@@ -225,6 +228,6 @@ a notice and pass; CI always runs them.
 - Cancellation tokens and call-cycle checks at the gate arrive with the services that need them.
 - Recall matches keywords (with stemming), not meaning: there is no vector index, since the Anthropic API has no embeddings endpoint. A note worded differently from the task can be missed; the strongest notes about the project are always shown.
 - Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. With the default setup, memory lives in the project's data dir, so nothing is shared between projects yet.
-- The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more.
+- The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - A topic capability currently allows both publishing and subscribing.
 - No license has been chosen yet.

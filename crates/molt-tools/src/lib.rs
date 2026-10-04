@@ -188,19 +188,23 @@ pub fn stop_signal() -> std::io::Result<impl Future<Output = ()>> {
 /// The regular files of the canonical workspace directory `ws`, as absolute
 /// paths, by the rules list, search and fork follow (see the `walk` module):
 /// ignored files, `.git` and `.molt` are left out, and symlinks are neither
-/// followed nor returned. Entries that cannot be read are skipped.
-pub fn workspace_files(ws: &Path) -> impl Iterator<Item = PathBuf> {
-    walk::walk(ws, ws, None, Path::new(""))
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
-        .map(ignore::DirEntry::into_path)
+/// followed nor returned. Directories `left_out` names (given their absolute
+/// path) are not entered either. Entries that cannot be read are skipped.
+pub fn workspace_files<F>(ws: &Path, left_out: F) -> impl Iterator<Item = PathBuf>
+where
+    F: Fn(&Path) -> bool + Send + Sync + 'static,
+{
+    walk::files(ws, left_out).map(ignore::DirEntry::into_path)
 }
 
-/// True when `path` is one of [`workspace_files`]`(ws)`: a regular file the
-/// walk rules do not leave out. Cheaper than a walk of the whole workspace,
-/// since only the directories on the way to `path` are read.
-pub fn is_workspace_file(ws: &Path, path: &Path) -> bool {
-    walk::reaches_file(ws, path)
+/// True when `path` is one of [`workspace_files`]`(ws, left_out)`. Cheaper
+/// than a walk of the whole workspace, since only the directories on the
+/// way to `path` are read.
+pub fn is_workspace_file<F>(ws: &Path, path: &Path, left_out: F) -> bool
+where
+    F: Fn(&Path) -> bool + Send + Sync + 'static,
+{
+    walk::reaches_file(ws, path, left_out)
 }
 
 /// Serve `fs.*` on `svc` until its link closes. When `svc` holds a
