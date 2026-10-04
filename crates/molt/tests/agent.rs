@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use molt::agent::{run_task, Interrupted};
+use molt::agent::{run_task, Done, Interrupted};
 use molt::{Config, Secrets, TransportKind};
 use molt_api::fs::{ChangeKind, DROP, FORK, MERGE, WRITE};
 use molt_api::model::COMPLETE;
@@ -37,6 +37,8 @@ const LONG_GREETING: usize = 1536 * 1024;
 const RUN_LIMIT: Duration = Duration::from_secs(120);
 /// The `--scratch` placeholder in molt.example.toml.
 const EXAMPLE_SCRATCH: &str = "/home/you/.cache/molt/work";
+/// The note the fake model takes from every finished run.
+const LEARNED_TEXT: &str = "The done-check greps greeting.txt for hello.";
 
 #[derive(Clone)]
 enum Fake {
@@ -71,6 +73,19 @@ impl Respond for FakeApi {
             Err(problem) => return ResponseTemplate::new(400).set_body_json(error("invalid_request_error", &problem)),
         };
         let messages = body["messages"].as_array().cloned().unwrap_or_default();
+        let n = messages.len();
+        let model = body["model"].as_str().unwrap_or("unknown");
+        // Memory learning from a finished run asks for JSON in a fixed shape.
+        if body["output_config"]["format"]["type"] == "json_schema" {
+            let note =
+                json!({ "kind": "lesson", "text": LEARNED_TEXT, "confidence": 0.9, "steps": [1], "contradicts": "" });
+            let text = json!({ "notes": [note], "supports": [] }).to_string();
+            let content = vec![
+                json!({ "type": "thinking", "thinking": "", "signature": signature(n) }),
+                json!({ "type": "text", "text": text }),
+            ];
+            return message(n, model, content, "end_turn");
+        }
         let designer = body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_CHECK));
         let last = messages.last().cloned().unwrap_or(Value::Null);
         let after_tools = last["content"].as_array().is_some_and(|c| c.iter().any(|b| b["type"] == "tool_result"));
@@ -79,8 +94,6 @@ impl Respond for FakeApi {
             (_, true) => Turn::AfterTools,
             (_, false) => Turn::Feedback,
         };
-        let n = messages.len();
-        let model = body["model"].as_str().unwrap_or("unknown");
         let write = |path: &str, content: &str| tool_use(n, WRITE_FILE, json!({ "path": path, "content": content }));
         let (mut content, stop) = match (&self.0, designer, turn) {
             (Fake::Refuses, ..) => return refusal(n, model),
@@ -220,6 +233,8 @@ struct Setup {
     workspace: TempDir,
     data: TempDir,
     cfg: Config,
+    /// Have memory learn from each run: one more model call after it.
+    learn: bool,
 }
 
 impl Setup {
@@ -239,7 +254,7 @@ impl Setup {
         let model = cfg.service_mut("model").unwrap();
         model.env.insert("ANTHROPIC_BASE_URL".into(), server.uri());
         model.env.insert("ANTHROPIC_API_KEY".into(), API_KEY.into());
-        Self { workspace, data, cfg }
+        Self { workspace, data, cfg, learn: false }
     }
 
     fn request(&self, check: Option<&str>, attempts: u32) -> RunRequest {
@@ -251,10 +266,15 @@ impl Setup {
     }
 
     async fn run(&self, req: RunRequest) -> (RunResponse, Vec<Progress>) {
+        let (done, events) = self.run_done(req).await;
+        (done.run, events)
+    }
+
+    async fn run_done(&self, req: RunRequest) -> (Done, Vec<Progress>) {
         let mut events = Vec::new();
-        let run = run_task(&self.cfg, req, |e| events.push(e.clone()), std::future::pending());
-        let resp = tokio::time::timeout(RUN_LIMIT, run).await.expect("the run hung").unwrap();
-        (resp, events)
+        let run = run_task(&self.cfg, req, self.learn, |e| events.push(e.clone()), std::future::pending());
+        let done = tokio::time::timeout(RUN_LIMIT, run).await.expect("the run hung").unwrap();
+        (done, events)
     }
 
     fn file(&self, name: &str) -> Option<String> {
@@ -372,6 +392,11 @@ fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) ->
         "MOLT_MAX_CHECK_ROUNDS",
         "MOLT_BUDGET_USD",
         "MOLT_CHECK_TIMEOUT_S",
+        "MOLT_MAP_TOKENS",
+        "MOLT_MEMORY_MODEL",
+        "MOLT_MEMORY_EFFORT",
+        "MOLT_MEMORY_MAX_TOKENS",
+        "MOLT_MEMORY_MODEL_TIMEOUT_S",
     ] {
         cmd.env_remove(var);
     }
@@ -425,12 +450,64 @@ async fn a_given_check_passes_and_the_result_is_applied() {
     }
     let mut started: Vec<_> = pids.keys().map(String::as_str).collect();
     started.sort_unstable();
-    assert_eq!(started, ["fs", "model", "planner", "shell"]);
+    assert_eq!(started, ["fs", "memory", "model", "planner", "shell"]);
     assert!(!pids.values().any(|&pid| pid == std::process::id()));
     for method in [COMPLETE, FORK, WRITE, RUN_CHECK, MERGE, DROP] {
         assert!(requests.contains(&(Some("planner".into()), method.into())), "{method}: {requests:?}");
     }
     assert!(requests.iter().any(|(_, to)| to == PLANNER_RUN), "{requests:?}");
+}
+
+#[tokio::test]
+async fn a_second_run_starts_with_what_the_first_learned_and_a_map_of_the_code() {
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    setup.learn = true;
+    std::fs::create_dir(setup.workspace.path().join("src")).unwrap();
+    std::fs::write(setup.workspace.path().join("src/greet.py"), "def greet(name):\n    return 'hello ' + name\n")
+        .unwrap();
+
+    let (first, events) = setup.run_done(setup.request(Some(CHECK), 1)).await;
+    assert_eq!(first.run.outcome, Outcome::Passed, "{:#?}", first.run);
+    let learned = first.learned.expect("memory was asked to learn").expect("memory learned");
+    assert_eq!(learned.added.len(), 1, "{learned:#?}");
+    let note = &learned.added[0];
+    assert_eq!(note.text, LEARNED_TEXT);
+    assert_eq!(note.workspace.as_deref(), setup.workspace.path().canonicalize().unwrap().to_str());
+    assert!(learned.cost_usd > 0.0 && learned.usage.total() > 0, "{learned:#?}");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Progress::Note { message, .. } if message.starts_with("project model: "))));
+    // The note names its evidence: messages of the run, as the audit log has them.
+    let audit = molt_kernel::audit::read_all(&setup.data.path().join("audit.jsonl")).await.unwrap();
+    let logged: std::collections::HashSet<String> = audit
+        .iter()
+        .filter_map(|e| match &e.event {
+            AuditEvent::Message { envelope } => Some(envelope.id.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert!(!note.provenance.events.is_empty());
+    assert!(note.provenance.events.iter().all(|id| logged.contains(id)), "{:?}", note.provenance);
+    assert!(audit.iter().any(|e| matches!(e.event, AuditEvent::AuditRead { .. })), "memory read the run back");
+    let asked = bodies(&server).await.len();
+
+    let (second, _) = setup.run_done(setup.request(Some(CHECK), 1)).await;
+    assert_eq!(second.run.outcome, Outcome::Passed, "{:#?}", second.run);
+    let bodies = bodies(&server).await;
+    let attempt = bodies[asked..].iter().find(|b| b["tools"].is_array()).expect("the second run's attempt");
+    let context = attempt["messages"][0]["content"][0]["text"].as_str().unwrap();
+    assert!(context.starts_with("<project_context>"), "{context}");
+    assert!(context.contains(&format!("] {LEARNED_TEXT}")), "{context}");
+    assert!(context.contains("src/greet.py"), "{context}");
+    assert!(context.contains("def greet(name):"), "{context}");
+    let tools: Vec<&str> = attempt["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(tools.contains(&"find_symbol") && tools.contains(&"recall"), "{tools:?}");
+    // Learning the same thing again confirms the note rather than adding a copy.
+    let again = second.learned.unwrap().unwrap();
+    assert!(again.added.is_empty() && again.reinforced == vec![note.id.clone()], "{again:#?}");
+    assert_requests_valid(&server).await;
+    setup.assert_forks_dropped();
 }
 
 #[tokio::test]
@@ -509,7 +586,7 @@ async fn stopping_a_run_kills_the_commands_it_started() {
     let server = fake_api(Fake::Hangs(pidfile.clone())).await;
     let setup = Setup::new(&server);
     let started = wait_for_pid(&pidfile);
-    let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), |_| {}, async {
+    let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), false, |_| {}, async {
         started.await;
     });
     let err = tokio::time::timeout(RUN_LIMIT, run).await.expect("the run hung").unwrap_err();
@@ -549,7 +626,7 @@ async fn a_planner_that_dies_mid_run_ends_the_run_rather_than_starting_it_again(
         assert_eq!(unsafe { libc::kill(planner, libc::SIGKILL) }, 0);
         sleep
     };
-    let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), |_| {}, std::future::pending());
+    let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), false, |_| {}, std::future::pending());
     // Sent again, planner.run would start the hanging task over on the restarted planner.
     let (result, sleep) = tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(run, kill_planner) })
         .await
@@ -570,7 +647,7 @@ async fn a_service_that_cannot_start_ends_the_run_at_once_and_says_why() {
     exec.command = format!("{}/missing-gateway", bin_dir().display());
     model.max_restarts = 1;
     let started = Instant::now();
-    let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), |_| {}, std::future::pending());
+    let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), false, |_| {}, std::future::pending());
     let err = tokio::time::timeout(RUN_LIMIT, run).await.expect("the run hung").unwrap_err();
     let err = format!("{err:#}");
     assert!(err.contains("the model service did not come up: gave up after 1 restarts"), "{err}");
@@ -598,6 +675,37 @@ async fn the_cli_carries_out_a_task() {
     assert!(stdout.contains("added    greeting.txt"), "{stdout}");
     assert!(stderr.contains("check passed"), "{stderr}");
     assert!(!stderr.contains("config:"), "{stderr}");
+    // Memory learned from the run, and says so.
+    assert!(stderr.contains("memory: learned 1 note; cost $"), "{stderr}");
+    assert!(stderr.contains(&format!("  + [lesson] {LEARNED_TEXT}")), "{stderr}");
+    assert!(data.path().join("memory.db").is_file());
+
+    // What memory holds can be seen and corrected from the CLI.
+    let memory = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+            .arg("memory")
+            .args(args)
+            .arg("--data-dir")
+            .arg(data.path())
+            .current_dir(workspace.path())
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "molt memory {args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        (stdout.into_owned(), stderr.into_owned())
+    };
+    let (shown, _) = memory(&["show"]);
+    assert!(shown.contains(&format!("lesson 0.90\n    {LEARNED_TEXT}\n")), "{shown}");
+    let id = shown.split_whitespace().next().unwrap().to_owned();
+    assert!(id.starts_with("note_"), "{shown}");
+    assert_eq!(memory(&["show", "greps", "hello"]).0, shown, "matched by its words");
+    let (forgot, _) = memory(&["forget", &id, "--reason", "the check changed"]);
+    assert_eq!(forgot, format!("forgot {id}\n"));
+    assert_eq!(memory(&["show"]), (String::new(), "no notes\n".to_owned()));
+    // The forget went through the bus, so the audit log has it.
+    let audit = molt_kernel::audit::read_all(&data.path().join("audit.jsonl")).await.unwrap();
+    assert!(audit.iter().any(|e| matches!(&e.event, AuditEvent::Message { envelope }
+        if envelope.to.to_string() == "memory.forget" && envelope.payload["reason"] == "the check changed")));
     assert_eq!(std::fs::read_to_string(workspace.path().join("greeting.txt")).unwrap(), "hello\n");
     assert!(data.path().join("audit.jsonl").exists());
     assert_requests_valid(&server).await;
@@ -626,6 +734,8 @@ async fn the_cli_runs_the_example_config_when_given_one() {
     assert!(out.status.success(), "status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}", out.status);
     assert!(stderr.contains(&format!("config: {}\n", path.display())), "{stderr}");
     assert!(stdout.contains("applied to the workspace"), "{stdout}");
+    assert!(stderr.contains("memory: learned 1 note"), "{stderr}");
+    assert!(workspace.path().join(".molt/memory.db").is_file(), "where the example puts it");
     assert_eq!(std::fs::read_to_string(workspace.path().join("greeting.txt")).unwrap(), "hello\n");
     assert_requests_valid(&server).await;
     assert_forks_dropped(data.path());

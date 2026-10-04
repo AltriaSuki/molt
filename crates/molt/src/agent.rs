@@ -1,8 +1,9 @@
 //! `molt do`: start the agent services, have the planner carry out one
 //! task, and report how it went.
 //!
-//! The CLI joins the bus in process as [`CLI`]. It holds only `planner.run`
-//! and `topic:progress`; the planner does the work with its own capabilities.
+//! The CLI joins the bus in process as [`CLI`]. It holds only `planner.run`,
+//! `topic:progress` and, to have memory learn from the finished run,
+//! `memory.consolidate`; the planner does the work with its own capabilities.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
 use molt_api::fs::ChangeKind;
+use molt_api::memory::{self, ConsolidateRequest, ConsolidateResponse};
 use molt_api::planner::{self, AttemptStatus, Outcome, RunRequest, RunResponse};
 use molt_api::progress::{self, Progress};
 use molt_kernel::Kernel;
@@ -27,6 +29,8 @@ pub const CLI: &str = "cli";
 
 /// The services a run needs.
 pub const SERVICES: [&str; 4] = ["model", "fs", "shell", "planner"];
+/// The service a run uses, and learns into, when the config has it.
+pub const MEMORY: &str = "memory";
 
 /// How long services get to come up.
 const STARTUP: Duration = Duration::from_secs(15);
@@ -38,6 +42,8 @@ const PROBE: &str = "ping";
 const PROBE_MS: u64 = 500;
 /// Reply deadline for a whole run; the planner's own limits end it sooner.
 const RUN_MS: u64 = 6 * 3600 * 1000;
+/// Reply deadline for learning from a run.
+const LEARN_MS: u64 = 600_000;
 
 /// The run was stopped before it finished.
 #[derive(Debug, thiserror::Error)]
@@ -74,9 +80,47 @@ pub fn resolve_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&P
     crate::lock::create_private_dir(&data_dir)?;
     let data_dir = data_dir.canonicalize().with_context(|| format!("data dir {}", data_dir.display()))?;
     outside(workspace, &data_dir)?;
+    Config::agent(workspace, &data_dir, &bin_dir()?)
+}
+
+/// The directory of the running executable, where the services are.
+fn bin_dir() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe().context("finding the molt executable")?;
-    let bin_dir = exe.parent().context("the molt executable has no parent directory")?;
-    Config::agent(workspace, &data_dir, bin_dir)
+    Ok(exe.parent().context("the molt executable has no parent directory")?.to_path_buf())
+}
+
+/// The configuration `molt memory` works with: the file at `path` when one
+/// is given, otherwise the default setup of `molt do` for the canonical
+/// `workspace`, which must have run there before (nothing is created).
+pub fn memory_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&Path>) -> anyhow::Result<Config> {
+    let cfg = match path {
+        Some(path) => Config::load(path)?,
+        None => {
+            let data_dir = match data_dir {
+                Some(dir) => dir.to_path_buf(),
+                None => default_data_dir(workspace)?,
+            };
+            if !data_dir.is_dir() {
+                bail!(
+                    "molt has not run in {} yet (no data dir at {}); memory starts with the first `molt do`",
+                    workspace.display(),
+                    data_dir.display()
+                );
+            }
+            let data_dir = data_dir.canonicalize().with_context(|| format!("data dir {}", data_dir.display()))?;
+            Config::agent(workspace, &data_dir, &bin_dir()?)?
+        }
+    };
+    cfg.service(MEMORY).context("the config has no memory service")?;
+    Ok(cfg)
+}
+
+/// The database the memory service of `cfg` keeps, from its `--db`
+/// argument (a relative one is relative to the current directory, as it is
+/// for the service).
+pub fn memory_db(cfg: &Config) -> Option<PathBuf> {
+    let args = &cfg.service(MEMORY)?.exec.as_ref()?.args;
+    args.iter().skip_while(|a| *a != "--db").nth(1).map(PathBuf::from)
 }
 
 /// `path` made absolute, with symlinks and `..` resolved as far as it exists.
@@ -128,7 +172,7 @@ pub fn default_data_dir(workspace: &Path) -> anyhow::Result<PathBuf> {
 /// `<parent>/<name>-<hash>`, the name shortened or left out so that the
 /// sockets of a run fit [`MAX_SOCKET_PATH`](crate::MAX_SOCKET_PATH).
 fn data_dir_in(parent: &Path, workspace: &Path) -> PathBuf {
-    let longest = SERVICES.iter().chain([&CLI]).map(|s| s.len()).max().unwrap_or_default();
+    let longest = SERVICES.iter().chain([&CLI, &MEMORY]).map(|s| s.len()).max().unwrap_or_default();
     let sockets = "/sock/".len() + longest + ".sock".len();
     let room = crate::MAX_SOCKET_PATH.saturating_sub(parent.as_os_str().len() + "/-".len() + 8 + sockets);
     parent.join(data_dir_name(workspace, room.min(32)))
@@ -163,33 +207,71 @@ pub fn require_services(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What a run produced.
+#[derive(Debug)]
+pub struct Done {
+    pub run: RunResponse,
+    /// What memory learned from the run; `None` when it was not asked to
+    /// learn (learning is off, or the config has no memory service). An
+    /// error when it could not: memory is down, the model failed, or the
+    /// run was interrupted while memory was learning.
+    pub learned: Option<Result<ConsolidateResponse, String>>,
+}
+
 /// Carry out one task: start the kernel and the services of `cfg`, ask the
 /// planner to run `req`, hand this run's progress events to `on_progress`,
-/// and shut everything down again. If `stop` resolves first, the run is
-/// abandoned with [`Interrupted`]. The forks the run leaves behind, other
-/// than the one its result names, are then removed (see [`RunForks`]).
+/// then, with `learn` and a memory service in `cfg`, have memory learn from
+/// the run, and shut everything down again. If `stop` resolves before the
+/// planner answers, the run is abandoned with [`Interrupted`]; if it
+/// resolves while memory learns, only the learning is. The forks the run
+/// leaves behind, other than the one its result names, are then removed
+/// (see [`RunForks`]).
 pub async fn run_task(
     cfg: &Config,
     req: RunRequest,
-    on_progress: impl FnMut(&Progress),
+    learn: bool,
+    mut on_progress: impl FnMut(&Progress),
     stop: impl Future<Output = ()>,
-) -> anyhow::Result<RunResponse> {
+) -> anyhow::Result<Done> {
     require_services(cfg)?;
     let running = crate::start(cfg).await?;
     // Before planner.run, the only caller that makes forks.
     let forks = RunForks::before(cfg);
+    let workspace = req.workspace.clone();
+    tokio::pin!(stop);
     let result = tokio::select! {
         // A Ctrl-C in a terminal also reaches the services, and the run may
         // fail from their exit at the same moment: the interruption wins.
         biased;
-        () = stop => Err(Interrupted.into()),
-        result = drive(&running, req, on_progress) => result,
+        () = &mut stop => Err(Interrupted.into()),
+        result = drive(&running, cfg, req, &mut on_progress) => result,
+    };
+    let done = match result {
+        Ok(ran) => {
+            let learned = match (learn, ran.memory) {
+                (false, _) | (true, None) => None,
+                (true, Some(Err(e))) => Some(Err(e)),
+                (true, Some(Ok(()))) => {
+                    on_progress(&Progress::Note {
+                        run: ran.trace.to_string(),
+                        message: "learning from the run".into(),
+                    });
+                    tokio::select! {
+                        biased;
+                        () = &mut stop => Some(Err("interrupted".to_owned())),
+                        learned = consolidate(running.kernel(), &ran.cli, &ran.trace, &workspace) => Some(learned),
+                    }
+                }
+            };
+            Ok(Done { run: ran.resp, learned })
+        }
+        Err(e) => Err(e),
     };
     running.shutdown().await;
     if let Some(forks) = forks {
-        forks.remove_new(result.as_ref().ok().and_then(|resp| resp.fork.as_deref()));
+        forks.remove_new(done.as_ref().ok().and_then(|d| d.run.fork.as_deref()));
     }
-    result
+    done
 }
 
 /// The forks in the `fs` service's scratch dir when a run starts. A planner
@@ -241,38 +323,95 @@ fn fork_entries(scratch: &Path) -> HashSet<OsString> {
         .collect()
 }
 
+/// A run the planner answered.
+struct Ran {
+    cli: Service,
+    trace: TraceId,
+    resp: RunResponse,
+    /// `None` without a memory service; an error when it did not come up.
+    memory: Option<Result<(), String>>,
+}
+
 async fn drive(
     running: &Running,
+    cfg: &Config,
     req: RunRequest,
     mut on_progress: impl FnMut(&Progress),
-) -> anyhow::Result<RunResponse> {
+) -> anyhow::Result<Ran> {
     let kernel = running.kernel();
     let cli = join_bus(running).await?;
     let deadline = Instant::now() + STARTUP;
     for service in SERVICES {
         wait_until_up(kernel, &cli, service, deadline).await?;
     }
+    let trace = TraceId::random();
+    // A run goes ahead without memory: the planner finds it unavailable.
+    let memory = match cfg.service(MEMORY) {
+        None => None,
+        Some(_) => Some(wait_until_up(kernel, &cli, MEMORY, deadline).await.map_err(|e| format!("{e:#}"))),
+    };
+    if let Some(Err(e)) = &memory {
+        let message = format!("running without memory: {e}");
+        on_progress(&Progress::Note { run: trace.to_string(), message });
+    }
     grant(kernel, &cli, planner::RUN, Budget::new(0, 0, 1_000)).await?;
     grant(kernel, &cli, &format!("topic:{}", progress::TOPIC), Budget::new(0, 0, 1_000)).await?;
     cli.subscribe(progress::TOPIC).await?;
 
-    let trace = TraceId::random();
-    let call = call_planner(&cli, &req, &trace);
-    tokio::pin!(call);
-    let reply = loop {
-        tokio::select! {
-            // Events go first. The link hands over the events published
-            // before the reply ahead of it, so none is left unshown.
-            biased;
-            Some(msg) = cli.next() => {
-                if let Some(event) = progress_of(&msg, trace.as_str()) {
-                    on_progress(&event);
+    let reply = {
+        let call = call_planner(&cli, &req, &trace);
+        tokio::pin!(call);
+        loop {
+            tokio::select! {
+                // Events go first. The link hands over the events published
+                // before the reply ahead of it, so none is left unshown.
+                biased;
+                Some(msg) = cli.next() => {
+                    if let Some(event) = progress_of(&msg, trace.as_str()) {
+                        on_progress(&event);
+                    }
                 }
+                reply = &mut call => break reply?,
             }
-            reply = &mut call => break reply?,
         }
     };
-    serde_json::from_value(reply).context("the planner's result is not a planner.run response")
+    let resp = serde_json::from_value(reply).context("the planner's result is not a planner.run response")?;
+    Ok(Ran { cli, trace, resp, memory })
+}
+
+/// Have memory learn from the run `episode` in `workspace`. The call has a
+/// trace of its own, so it does not become part of the episode.
+async fn consolidate(
+    kernel: &Kernel,
+    cli: &Service,
+    episode: &TraceId,
+    workspace: &str,
+) -> Result<ConsolidateResponse, String> {
+    grant(kernel, cli, memory::CONSOLIDATE, Budget::new(0, 0, 10)).await.map_err(|e| format!("{e:#}"))?;
+    let req = ConsolidateRequest { episode: episode.to_string(), workspace: workspace.to_owned(), model: None };
+    let payload = serde_json::to_value(req).map_err(|e| e.to_string())?;
+    let opts = CallOpts { cap: None, budget: Budget::new(0, LEARN_MS, 0), trace: None };
+    let reply = cli.call(memory::CONSOLIDATE, payload, opts).await.map_err(|e| e.to_string())?;
+    serde_json::from_value(reply).map_err(|e| format!("memory's answer is not a consolidate response: {e}"))
+}
+
+/// Call `target` on the memory service of `cfg`, started on its own: what
+/// `molt memory forget` uses, so that the change is in the audit log.
+pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::Result<Value> {
+    let service = cfg.service(MEMORY).context("the config has no memory service")?.clone();
+    let alone = Config { kernel: cfg.kernel.clone(), services: vec![service] };
+    let running = crate::start(&alone).await?;
+    let result = async {
+        let kernel = running.kernel();
+        let cli = join_bus(&running).await?;
+        wait_until_up(kernel, &cli, MEMORY, Instant::now() + STARTUP).await?;
+        grant(kernel, &cli, target, Budget::new(0, 0, 1)).await?;
+        let opts = CallOpts { cap: None, budget: Budget::new(0, 60_000, 0), trace: None };
+        cli.call(target, payload, opts).await.with_context(|| format!("{target} failed"))
+    }
+    .await;
+    running.shutdown().await;
+    result
 }
 
 /// Register [`CLI`] with the kernel and connect to it like a service would.
@@ -414,6 +553,38 @@ pub fn report(resp: &RunResponse) -> String {
         lines.push(summary.to_owned());
     }
     printable(&(lines.join("\n") + "\n"))
+}
+
+/// What memory learned from a run, as one line for the terminal, made
+/// [`printable`].
+pub fn learned(learned: &Result<ConsolidateResponse, String>) -> String {
+    let line = match learned {
+        Err(e) => format!("memory: learned nothing: {e}"),
+        Ok(r) => {
+            let mut parts = Vec::new();
+            let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+            if !r.added.is_empty() {
+                parts.push(format!("learned {}", count(r.added.len(), "note", "notes")));
+            }
+            if !r.reinforced.is_empty() {
+                parts.push(format!("confirmed {}", count(r.reinforced.len(), "note", "notes")));
+            }
+            if !r.contradicted.is_empty() {
+                parts.push(format!("disputed {}", count(r.contradicted.len(), "note", "notes")));
+            }
+            let what = if parts.is_empty() {
+                format!("learned nothing new ({})", r.skipped.as_deref().unwrap_or("nothing worth keeping"))
+            } else {
+                parts.join(", ")
+            };
+            let mut line = format!("memory: {what}; cost ${:.4} ({} tokens)", r.cost_usd, r.usage.total());
+            for note in &r.added {
+                line.push_str(&format!("\n  + [{}] {}", note.kind.as_str(), note.text));
+            }
+            line
+        }
+    };
+    printable(&line)
 }
 
 /// `text` with each control character but newline and tab escaped (ESC as
@@ -559,6 +730,10 @@ mod tests {
     #[test]
     fn a_config_without_the_agent_services_is_refused() {
         let err = require_services(&Config::default()).unwrap_err().to_string();
+        // Memory is not required: a run goes ahead without it.
+        let mut no_memory = Config::agent(Path::new("/w"), Path::new("/d"), Path::new("/b")).unwrap();
+        no_memory.services.retain(|s| s.name.as_str() != MEMORY);
+        require_services(&no_memory).unwrap();
         assert!(err.contains("missing the services model, fs, shell, planner"), "{err}");
         let mut cfg = Config::agent(Path::new("/w"), Path::new("/d"), Path::new("/b")).unwrap();
         require_services(&cfg).unwrap();

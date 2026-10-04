@@ -174,7 +174,15 @@ const PLANNER_ENV: &[&str] = &[
     "MOLT_MAX_TOKENS",
     "MOLT_MODEL_TIMEOUT_S",
     "MOLT_CHECK_TIMEOUT_S",
+    "MOLT_MAP_TOKENS",
 ];
+
+/// What the memory service reads from its environment (see `molt_memory::Config::from_env`).
+const MEMORY_ENV: &[&str] =
+    &["MOLT_MEMORY_MODEL", "MOLT_MEMORY_EFFORT", "MOLT_MEMORY_MAX_TOKENS", "MOLT_MEMORY_MODEL_TIMEOUT_S"];
+
+/// The memory database in a data dir.
+pub const MEMORY_DB: &str = "memory.db";
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -187,8 +195,9 @@ impl Config {
     }
 
     /// The default agent setup: the model gateway, file and shell services
-    /// confined to `workspace` with forks in `<data_dir>/work`, and the
-    /// planner. The executables are taken from `bin_dir`.
+    /// confined to `workspace` with forks in `<data_dir>/work`, memory with
+    /// its database in `<data_dir>/memory.db`, and the planner. The
+    /// executables are taken from `bin_dir`.
     ///
     /// Keep `data_dir` outside `workspace`: a fork inside the project would
     /// find the original's `Cargo.toml` and `.git` in a parent directory.
@@ -213,8 +222,21 @@ impl Config {
         // The gateway is the only holder of the API key, so only a human may change it.
         let mut model = service("model", Tier::Protected, bin("molt-gateway")?)?;
         model.pass_env = names(GATEWAY_ENV);
-        let fs = service("fs", Tier::Mutable, tools("fs")?)?;
+        let changed = format!("topic:{}", molt_api::fs::CHANGED);
+        let mut fs = service("fs", Tier::Mutable, tools("fs")?)?;
+        fs.requests = vec![request(&changed, Budget::new(0, 0, 100_000_000))?];
         let shell = service("shell", Tier::Mutable, tools("shell")?)?;
+        let mut memory_exec = bin("molt-memory")?;
+        memory_exec.args = vec!["--root".into(), text(workspace)?, "--db".into(), text(&data_dir.join(MEMORY_DB))?];
+        let mut memory = service("memory", Tier::Mutable, memory_exec)?;
+        memory.pass_env = names(MEMORY_ENV);
+        // Memory reads finished episodes from the audit log and has the model
+        // learn from them; it follows the files fs changes to keep its model current.
+        memory.requests = vec![
+            request(molt_api::model::COMPLETE, Budget::new(1_000_000_000, 0, 1_000_000))?,
+            request(molt_proto::audit::READ, Budget::new(0, 0, 10_000_000))?,
+            request(&changed, Budget::new(0, 0, 10))?,
+        ];
         let mut planner = service("planner", Tier::Mutable, bin("molt-planner")?)?;
         planner.pass_env = names(PLANNER_ENV);
         // A budget of zero calls refuses every call, and `ms` 0 leaves deadlines
@@ -225,9 +247,15 @@ impl Config {
             request(molt_api::shell::RUN, Budget::new(0, 0, 1_000_000))?,
             request(&format!("topic:{}", molt_api::progress::TOPIC), Budget::new(0, 0, 10_000_000))?,
         ];
+        // What memory knows about the workspace; not remember, forget or consolidate.
+        for method in
+            [molt_api::memory::INDEX, molt_api::memory::MAP, molt_api::memory::RECALL, molt_api::memory::SYMBOLS]
+        {
+            planner.requests.push(request(method, Budget::new(0, 0, 10_000_000))?);
+        }
         Ok(Self {
             kernel: KernelSection { data_dir: data_dir.to_path_buf(), ..KernelSection::default() },
-            services: vec![model, fs, shell, planner],
+            services: vec![model, fs, shell, memory, planner],
         })
     }
 
@@ -374,13 +402,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_config_has_the_four_services() {
+    fn agent_config_has_the_five_services() {
         let cfg = Config::agent(Path::new("/home/u/proj"), Path::new("/cache/molt/proj"), Path::new("/opt/molt/bin"))
             .unwrap();
         assert_eq!(cfg.kernel.data_dir, Path::new("/cache/molt/proj"));
         assert_eq!(cfg.kernel.transport, TransportKind::Unix);
         let names: Vec<&str> = cfg.services.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["model", "fs", "shell", "planner"]);
+        assert_eq!(names, ["model", "fs", "shell", "memory", "planner"]);
         for svc in &cfg.services {
             assert_eq!(svc.provides, [format!("{}.*", svc.name).parse::<Target>().unwrap()]);
         }
@@ -396,15 +424,39 @@ mod tests {
             let exec = cfg.service(kind).unwrap().exec.clone().unwrap();
             assert_eq!(exec.command, "/opt/molt/bin/molt-tools");
             assert_eq!(exec.args, [kind, "--root", "/home/u/proj", "--scratch", "/cache/molt/proj/work"]);
-            assert!(cfg.service(kind).unwrap().requests.is_empty());
         }
+        let targets = |name: &str| -> Vec<String> {
+            cfg.service(name).unwrap().requests.iter().map(|r| r.target.to_string()).collect()
+        };
+        assert_eq!(targets("fs"), ["topic:fs.changed"], "fs reports the files it changes");
+        assert!(targets("shell").is_empty());
+
+        let memory = cfg.service("memory").unwrap();
+        let exec = memory.exec.as_ref().unwrap();
+        assert_eq!(exec.command, "/opt/molt/bin/molt-memory");
+        assert_eq!(exec.args, ["--root", "/home/u/proj", "--db", "/cache/molt/proj/memory.db"]);
+        assert_eq!(memory.tier, Tier::Mutable);
+        assert_eq!(targets("memory"), ["model.complete", "kernel.audit.read", "topic:fs.changed"]);
+        assert!(memory.pass_env.iter().all(|v| v.starts_with("MOLT_MEMORY_")));
 
         let planner = cfg.service("planner").unwrap();
         assert_eq!(planner.exec.as_ref().unwrap().command, "/opt/molt/bin/molt-planner");
         assert!(planner.pass_env.iter().any(|v| v == "MOLT_MAX_TURNS"));
         assert!(!planner.pass_env.iter().any(|v| v.starts_with("ANTHROPIC")), "the planner never sees the key");
         let targets: Vec<String> = planner.requests.iter().map(|r| r.target.to_string()).collect();
-        assert_eq!(targets, ["model.complete", "fs.*", "shell.run", "topic:progress"]);
+        assert_eq!(
+            targets,
+            [
+                "model.complete",
+                "fs.*",
+                "shell.run",
+                "topic:progress",
+                "memory.index",
+                "memory.map",
+                "memory.recall",
+                "memory.symbols"
+            ]
+        );
         for req in &planner.requests {
             assert_eq!(req.budget.ms, 0, "{}: no deadline cap", req.target);
             assert!(req.budget.calls >= 1_000_000, "{}: room for long runs", req.target);

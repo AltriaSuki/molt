@@ -4,6 +4,7 @@
 //! [`Envelope`], identifiers, budgets and service manifests. The kernel never
 //! looks inside [`Envelope::payload`]; services own their payload shapes.
 
+pub mod audit;
 mod envelope;
 mod ids;
 mod manifest;

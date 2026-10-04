@@ -6,7 +6,7 @@ use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use molt_api::fs::{ChangeKind, DiffResponse, ForkResponse, ListResponse, ReadResponse, SearchResponse};
+use molt_api::fs::{ChangeKind, DiffResponse, FilesChanged, ForkResponse, ListResponse, ReadResponse, SearchResponse};
 use molt_proto::{ErrorCode, RemoteError};
 use molt_tools::{Fs, Roots};
 use serde_json::{json, Value};
@@ -446,6 +446,43 @@ async fn diff_and_merge_carry_changes_back() {
     assert!(env.ws.join(".git/HEAD").is_file());
     assert!(!fork.exists(), "drop: true removes the fork");
     assert!(fs::read_dir(&env.scratch).unwrap().next().is_none(), "and its metadata");
+}
+
+#[tokio::test]
+async fn changes_outside_forks_are_reported_for_the_project_model() {
+    let env = Env::new();
+    project(&env);
+    let reported = |out: Result<(Value, Option<FilesChanged>), RemoteError>| out.unwrap().1;
+    let ws = env.ws.to_string_lossy().into_owned();
+
+    let wrote = env.fs.handle_reporting("write", json!({ "workspace": "ws", "path": "./src/new.rs", "content": "" }));
+    assert_eq!(reported(wrote.await), Some(FilesChanged { workspace: ws.clone(), paths: vec!["src/new.rs".into()] }));
+    let edit = json!({ "workspace": "ws", "path": "src/main.rs", "old": "hi", "new": "hey" });
+    assert_eq!(
+        reported(env.fs.handle_reporting("edit", edit).await),
+        Some(FilesChanged { workspace: ws.clone(), paths: vec!["src/main.rs".into()] })
+    );
+    // Reads change nothing, and failures report nothing.
+    assert_eq!(
+        reported(env.fs.handle_reporting("read", json!({ "workspace": "ws", "path": "README.md" })).await),
+        None
+    );
+    let missing = json!({ "workspace": "ws", "path": "nope.rs", "old": "a", "new": "b" });
+    assert!(env.fs.handle_reporting("edit", missing).await.is_err());
+
+    // A fork is private to its attempt: its writes are not reported, its merge is.
+    let fork = env.fork().await;
+    let in_fork = json!({ "workspace": fork, "path": "src/lib.rs", "content": "pub fn f() {}\n" });
+    assert_eq!(reported(env.fs.handle_reporting("write", in_fork).await), None);
+    fs::remove_file(fork.join("run.sh")).unwrap();
+    let merged = env.fs.handle_reporting("merge", json!({ "fork": fork, "drop": true })).await;
+    assert_eq!(
+        reported(merged),
+        Some(FilesChanged { workspace: ws, paths: vec!["run.sh".into(), "src/lib.rs".into()] })
+    );
+    // A merge with nothing to carry back reports nothing.
+    let fork = env.fork().await;
+    assert_eq!(reported(env.fs.handle_reporting("merge", json!({ "fork": fork, "drop": true })).await), None);
 }
 
 #[tokio::test]

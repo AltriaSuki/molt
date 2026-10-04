@@ -404,6 +404,11 @@ impl Side {
     }
 }
 
+/// The canonical workspace `fork` was copied from, if it is a fork.
+pub(crate) fn base(roots: &Roots, fork: &str) -> Option<PathBuf> {
+    open(roots, fork).ok().map(|f| f.meta.base)
+}
+
 pub(crate) fn merge(roots: &Roots, lock: &Mutex<()>, req: MergeRequest) -> Result<MergeResponse, RemoteError> {
     let _merging = lock.lock().unwrap_or_else(|e| e.into_inner());
     let fork = open(roots, &req.fork)?;

@@ -1,9 +1,11 @@
 //! Run the model's tool calls in a fork: each call becomes one `fs` or
-//! `shell` request, and its outcome a `tool_result` block.
+//! `shell` request (or a `memory` question about the workspace), and its
+//! outcome a `tool_result` block.
 
 use std::sync::Arc;
 
 use molt_api::fs::{self, EntryKind};
+use molt_api::memory::{self, RecallRequest, RecallResponse, SymbolsRequest, SymbolsResponse};
 use molt_api::model::{tool_result, ToolUse};
 use molt_api::planner::tools as t;
 use molt_api::progress::Progress;
@@ -14,12 +16,17 @@ use serde_json::Value;
 use tokio::task::JoinSet;
 
 use crate::ctx::{Ctx, FILE_MS, SHELL_GRACE_MS};
+use crate::memory::note_lines;
 use crate::prompts::{self, clip};
 
 /// Largest tool result sent back to the model; longer ones lose their middle.
 const MAX_RESULT: usize = 50_000;
 const RUN_TIMEOUT_S: u64 = 120;
 const MAX_RUN_TIMEOUT_S: u64 = 1800;
+/// Most definitions, and most references, find_symbol lists.
+const SYMBOL_LIMIT: u32 = 40;
+/// Notes recall returns.
+const RECALL_K: u32 = 8;
 
 /// Who made the calls, for progress events.
 #[derive(Clone, Copy, Debug)]
@@ -36,6 +43,8 @@ enum Tool {
     List(t::ListFiles),
     Search(t::Search),
     Run(t::Run),
+    FindSymbol(t::FindSymbol),
+    Recall(t::Recall),
 }
 
 impl Tool {
@@ -52,13 +61,16 @@ impl Tool {
             t::LIST_FILES => Self::List(input(call)?),
             t::SEARCH => Self::Search(input(call)?),
             t::RUN => Self::Run(input(call)?),
+            // Offered only when memory is up; a call when it is not fails like any unavailable service.
+            t::FIND_SYMBOL => Self::FindSymbol(input(call)?),
+            t::RECALL => Self::Recall(input(call)?),
             other => return Err(format!("There is no tool named {other:?}.")),
         })
     }
 
     /// Reads can run side by side; anything that changes the fork runs alone, in order.
     fn read_only(&self) -> bool {
-        matches!(self, Self::Read(_) | Self::List(_) | Self::Search(_))
+        matches!(self, Self::Read(_) | Self::List(_) | Self::Search(_) | Self::FindSymbol(_) | Self::Recall(_))
     }
 
     fn detail(&self) -> String {
@@ -69,6 +81,8 @@ impl Tool {
             Self::List(l) => format!("list {}", l.path.as_deref().unwrap_or(".")),
             Self::Search(s) => format!("search {}", s.pattern),
             Self::Run(r) => format!("run {}", r.command),
+            Self::FindSymbol(f) => format!("find symbol {}", f.name),
+            Self::Recall(r) => format!("recall {}", r.query),
         }
     }
 
@@ -93,6 +107,8 @@ impl Tool {
             Self::List(_) => t::LIST_FILES,
             Self::Search(_) => t::SEARCH,
             Self::Run(_) => t::RUN,
+            Self::FindSymbol(_) => t::FIND_SYMBOL,
+            Self::Recall(_) => t::RECALL,
         }
     }
 
@@ -137,6 +153,26 @@ impl Tool {
                 let timeout_s = r.timeout_s.unwrap_or(RUN_TIMEOUT_S).clamp(1, MAX_RUN_TIMEOUT_S);
                 let resp = run_command(ctx, fork, &r.command, timeout_s * 1000).await?;
                 Ok(show_run(&resp, timeout_s))
+            }
+            // Memory indexes the user's workspace, not the fork: the paths are the same.
+            Self::FindSymbol(f) => {
+                let req = SymbolsRequest {
+                    workspace: ctx.workspace.clone(),
+                    name: f.name,
+                    references: f.references.unwrap_or(true),
+                    limit: Some(SYMBOL_LIMIT),
+                };
+                Ok(show_symbols(ctx.call(memory::SYMBOLS, req, files).await?))
+            }
+            Self::Recall(r) => {
+                let req = RecallRequest {
+                    query: r.query,
+                    workspace: Some(ctx.workspace.clone()),
+                    k: Some(RECALL_K),
+                    ..Default::default()
+                };
+                let resp: RecallResponse = ctx.call(memory::RECALL, req, files).await?;
+                Ok(if resp.notes.is_empty() { "No notes match.".to_owned() } else { note_lines(&resp.notes) })
             }
         }
     }
@@ -284,6 +320,25 @@ fn show_search(s: fs::SearchResponse) -> String {
     }
     if s.truncated {
         out.push("[more matches not shown: narrow the pattern, path or glob]".to_owned());
+    }
+    out.join("\n")
+}
+
+fn show_symbols(s: SymbolsResponse) -> String {
+    if s.definitions.is_empty() && s.references.is_empty() {
+        return "Not found in the index. It may be new, or defined in a file the index skips; try search.".to_owned();
+    }
+    let mut out = Vec::new();
+    if !s.definitions.is_empty() {
+        out.push("Defined at:".to_owned());
+        out.extend(s.definitions.iter().map(|d| format!("{}:{}: {} {}", d.path, d.line, d.kind, d.signature)));
+    }
+    if !s.references.is_empty() {
+        out.push("Used at:".to_owned());
+        out.extend(s.references.iter().map(|r| format!("{}:{}: {}", r.path, r.line, r.text)));
+    }
+    if s.truncated {
+        out.push("[more not shown]".to_owned());
     }
     out.join("\n")
 }

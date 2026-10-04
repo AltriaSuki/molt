@@ -40,11 +40,14 @@ pass_env = [
 # - outside the project and any repository or cargo workspace around it, or
 #   tools run in a fork find the original's Cargo.toml and .git above them;
 #   so not under data_dir while that is inside the project, as .molt is.
+# It reports the files it changes outside forks on topic:fs.changed, which
+# memory follows to keep its model of the project current.
 [[service]]
 name = "fs"
 tier = "mutable"
 exec = { command = "molt-tools", args = ["fs", "--root", ".", "--scratch", "/home/you/.cache/molt/work"] }
 provides = ["fs.*"]
+requests = [{ target = "topic:fs.changed", budget = { calls = 100000000 } }]
 
 # Commands run as you, unsandboxed, with a scrubbed environment; add what
 # your builds and tests need with pass_env (`molt do --pass-env NAME` does the
@@ -55,7 +58,24 @@ tier = "mutable"
 exec = { command = "molt-tools", args = ["shell", "--root", ".", "--scratch", "/home/you/.cache/molt/work"] }
 provides = ["shell.*"]
 
+# Memory: notes learned from finished runs, and a model of the project's code
+# (definitions and references) the planner maps and searches. It reads runs
+# back from the audit log and has the model learn from them. Remove this
+# service to run without memory; the planner works without it.
+[[service]]
+name = "memory"
+tier = "mutable"
+exec = { command = "molt-memory", args = ["--root", ".", "--db", ".molt/memory.db"] }
+provides = ["memory.*"]
+pass_env = ["MOLT_MEMORY_MODEL", "MOLT_MEMORY_EFFORT", "MOLT_MEMORY_MAX_TOKENS", "MOLT_MEMORY_MODEL_TIMEOUT_S"]
+requests = [
+  { target = "model.complete", budget = { tokens = 1000000000, calls = 1000000 } },
+  { target = "kernel.audit.read", budget = { calls = 10000000 } },
+  { target = "topic:fs.changed", budget = { calls = 10 } },
+]
+
 # Calls 0 would refuse every call; ms 0 leaves deadlines to each request.
+# Of memory, the planner may only ask: not remember, forget or learn.
 [[service]]
 name = "planner"
 tier = "mutable"
@@ -63,11 +83,15 @@ exec = { command = "molt-planner" }
 provides = ["planner.*"]
 pass_env = [
   "MOLT_PLANNER_MODEL", "MOLT_MAX_TURNS", "MOLT_MAX_CHECK_ROUNDS", "MOLT_BUDGET_USD", "MOLT_MAX_TOKENS",
-  "MOLT_MODEL_TIMEOUT_S", "MOLT_CHECK_TIMEOUT_S",
+  "MOLT_MODEL_TIMEOUT_S", "MOLT_CHECK_TIMEOUT_S", "MOLT_MAP_TOKENS",
 ]
 requests = [
   { target = "model.complete", budget = { tokens = 4000000000, calls = 1000000 } },
   { target = "fs.*", budget = { calls = 10000000 } },
   { target = "shell.run", budget = { calls = 1000000 } },
   { target = "topic:progress", budget = { calls = 10000000 } },
+  { target = "memory.index", budget = { calls = 10000000 } },
+  { target = "memory.map", budget = { calls = 10000000 } },
+  { target = "memory.recall", budget = { calls = 10000000 } },
+  { target = "memory.symbols", budget = { calls = 10000000 } },
 ]

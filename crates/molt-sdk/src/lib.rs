@@ -26,6 +26,9 @@ use tokio::task::JoinHandle;
 /// Same as `molt_kernel::ENV_CAPS`; duplicated so services need not depend on the kernel.
 pub const ENV_CAPS: &str = "MOLT_CAPS";
 
+/// Same as `molt_kernel::ENV_VERSION`.
+pub const ENV_VERSION: &str = "MOLT_VERSION";
+
 /// Requests and events a service holds for [`Service::next`] before more
 /// requests are answered `busy` and more events are dropped.
 pub const QUEUE: usize = 256;
@@ -75,6 +78,8 @@ type Waiters = Arc<Mutex<HashMap<MsgId, oneshot::Sender<Envelope>>>>;
 
 pub struct Service {
     id: ServiceId,
+    /// The registry version the kernel launched this service as.
+    version: Option<String>,
     link: Arc<dyn Link>,
     caps: Mutex<HashMap<String, CapId>>,
     waiters: Waiters,
@@ -98,7 +103,9 @@ impl Service {
             Ok(s) => serde_json::from_str(&s).map_err(|e| SdkError::Env(e.to_string()))?,
             Err(_) => HashMap::new(),
         };
-        Ok(Self::new(id, link, caps))
+        let mut svc = Self::new(id, link, caps);
+        svc.version = std::env::var(ENV_VERSION).ok().filter(|v| !v.is_empty());
+        Ok(svc)
     }
 
     pub fn new(id: ServiceId, link: Box<dyn Link>, caps: HashMap<String, CapId>) -> Self {
@@ -106,11 +113,24 @@ impl Service {
         let waiters: Waiters = Arc::default();
         let (tx, rx) = mpsc::channel(QUEUE);
         let reader = tokio::spawn(read_loop(link.clone(), waiters.clone(), tx));
-        Self { id, link, caps: Mutex::new(caps), waiters, incoming: tokio::sync::Mutex::new(rx), reader }
+        Self { id, version: None, link, caps: Mutex::new(caps), waiters, incoming: tokio::sync::Mutex::new(rx), reader }
     }
 
     pub fn id(&self) -> &ServiceId {
         &self.id
+    }
+
+    /// The registry version this service was launched as, when the kernel
+    /// launched it (see [`ENV_VERSION`]).
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+
+    /// Set the version [`Service::version`] reports, for a service joined
+    /// to the bus some other way than [`Service::connect_from_env`].
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
     }
 
     /// Remember a capability for `target` (e.g. one delegated to this service).

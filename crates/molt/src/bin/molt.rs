@@ -5,6 +5,7 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use molt::agent::{self, Interrupted};
 use molt::{Config, Secrets};
+use molt_api::memory::{self, ForgetRequest, ForgetResponse, MapRequest, RecallRequest};
 use molt_api::model::Effort;
 use molt_api::planner::{Outcome, RunRequest};
 use molt_proto::ServiceId;
@@ -35,6 +36,11 @@ enum Cmd {
                             report names; 128+N when stopped by signal N (130 for Ctrl-C, 129 for SIGHUP, 143 for SIGTERM)."
     )]
     Do(DoArgs),
+    /// See and correct what memory holds about a project.
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
     /// Work with the audit log.
     Audit {
         #[command(subcommand)]
@@ -84,6 +90,62 @@ struct DoArgs {
     /// locale and a few more otherwise.
     #[arg(long, value_name = "NAME", value_parser = env_name)]
     pass_env: Vec<String>,
+    /// Run without memory: no project map or notes for the model, and
+    /// nothing learned from the run.
+    #[arg(long)]
+    no_memory: bool,
+    /// Use memory, but do not learn from this run (learning is one more
+    /// model call after the run).
+    #[arg(long)]
+    no_learn: bool,
+}
+
+/// Where a project's memory is.
+#[derive(Args)]
+struct MemoryAt {
+    /// The project.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// The data dir `molt do` used there. Default: ~/.cache/molt/<project>-<hash>.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum MemoryCmd {
+    /// List the notes about the project, strongest first, or those matching WORDS.
+    Show {
+        #[command(flatten)]
+        at: MemoryAt,
+        words: Vec<String>,
+        /// Most notes to list (at most 50).
+        #[arg(short, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=50))]
+        n: u32,
+        /// Print the notes as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Forget a note. It is kept as a tombstone with the reason, and the
+    /// forget is recorded in the audit log.
+    Forget {
+        #[command(flatten)]
+        at: MemoryAt,
+        /// The note's id, as `molt memory show` prints it.
+        id: String,
+        /// Why it is wrong.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Print the map of the project's code that a run starts with, for WORDS
+    /// (a task) or for the project as a whole.
+    Map {
+        #[command(flatten)]
+        at: MemoryAt,
+        words: Vec<String>,
+        /// Size of the map, in estimated tokens (at most 32000).
+        #[arg(long, default_value_t = 3000, value_parser = clap::value_parser!(u32).range(1..=32_000))]
+        tokens: u32,
+    },
 }
 
 /// A positive amount of US dollars, refused here rather than by the planner
@@ -123,8 +185,8 @@ enum AuditCmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
-    // `molt do` prints its own progress; kernel logs would bury it.
-    molt::init_tracing(if matches!(cli.cmd, Cmd::Do(_)) { "warn" } else { "info" });
+    // `molt do` and `molt memory` print their own progress; kernel logs would bury it.
+    molt::init_tracing(if matches!(cli.cmd, Cmd::Do(_) | Cmd::Memory { .. }) { "warn" } else { "info" });
     let config = || Config::load(cli.config.as_deref().unwrap_or(Path::new(DEFAULT_CONFIG)));
     let audit_path = |p: Option<PathBuf>| -> anyhow::Result<PathBuf> {
         match p {
@@ -143,6 +205,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             running.shutdown().await;
         }
         Cmd::Do(args) => return do_task(cli.config.as_deref(), args).await,
+        Cmd::Memory { cmd } => memory_cmd(cli.config.as_deref(), cmd).await?,
         Cmd::Audit { cmd: AuditCmd::Verify { path } } => {
             let path = audit_path(path)?;
             let n =
@@ -190,6 +253,9 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     if let Some(shell) = cfg.service_mut("shell") {
         shell.pass_env.extend(args.pass_env);
     }
+    if args.no_memory {
+        cfg.services.retain(|s| s.name.as_str() != agent::MEMORY);
+    }
     if std::env::var_os("RUST_LOG").is_none() {
         for svc in &mut cfg.services {
             svc.env.entry("RUST_LOG".into()).or_insert_with(|| "warn".into());
@@ -207,9 +273,10 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
 
     let mut signal = None;
     let stopped = async { signal = Some(stop.await) };
-    let result = agent::run_task(&cfg, req, |event| eprintln!("{}", agent::describe(event)), stopped).await;
-    let resp = match result {
-        Ok(resp) => resp,
+    let progress = |event: &_| eprintln!("{}", agent::describe(event));
+    let result = agent::run_task(&cfg, req, !args.no_learn, progress, stopped).await;
+    let done = match result {
+        Ok(done) => done,
         Err(e) if e.is::<Interrupted>() => {
             eprintln!("interrupted; the services are stopped");
             let status = signal.map_or(130, |n| 128 + n);
@@ -217,10 +284,14 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
         }
         Err(e) => return Err(e),
     };
+    let resp = done.run;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&resp)?);
     } else {
         print!("{}", agent::report(&resp));
+    }
+    if let Some(learned) = &done.learned {
+        eprintln!("{}", agent::learned(learned));
     }
     Ok(match resp.outcome {
         Outcome::Failed => ExitCode::FAILURE,
@@ -228,4 +299,65 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
         Outcome::Passed | Outcome::Unverified if apply && !resp.applied && resp.fork.is_some() => ExitCode::from(3),
         Outcome::Passed | Outcome::Unverified => ExitCode::SUCCESS,
     })
+}
+
+async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()> {
+    let at = match &cmd {
+        MemoryCmd::Show { at, .. } | MemoryCmd::Forget { at, .. } | MemoryCmd::Map { at, .. } => at,
+    };
+    let workspace = at.workspace.canonicalize().with_context(|| format!("workspace {}", at.workspace.display()))?;
+    let key = workspace.to_str().context("the workspace path is not UTF-8")?.to_owned();
+    let cfg = agent::memory_config(config, &workspace, at.data_dir.as_deref())?;
+    let open = || -> anyhow::Result<molt_memory::Db> {
+        let db = agent::memory_db(&cfg).context("the memory service has no --db")?;
+        anyhow::ensure!(db.is_file(), "memory has nothing yet ({} does not exist)", db.display());
+        molt_memory::Db::open(&db)
+    };
+    match cmd {
+        MemoryCmd::Show { words, n, json, .. } => {
+            let req = RecallRequest { query: words.join(" "), workspace: Some(key), k: Some(n), ..Default::default() };
+            let notes = molt_memory::recall(&open()?, &req).map_err(|e| anyhow::anyhow!(e.message))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&notes)?);
+            } else if notes.is_empty() {
+                eprintln!("no notes");
+            } else {
+                print!("{}", agent::printable(&show_notes(&notes)));
+            }
+        }
+        MemoryCmd::Forget { id, reason, .. } => {
+            let req = serde_json::to_value(ForgetRequest { id: id.clone(), reason })?;
+            let reply: ForgetResponse = serde_json::from_value(agent::call_memory(&cfg, memory::FORGET, req).await?)?;
+            anyhow::ensure!(reply.forgotten, "there is no note {id}, or it is already forgotten");
+            println!("forgot {id}");
+        }
+        MemoryCmd::Map { words, tokens, .. } => {
+            let db = open()?;
+            molt_memory::project::index(&db, &workspace, None).map_err(|e| anyhow::anyhow!(e.message))?;
+            let req = MapRequest { workspace: key, query: words.join(" "), max_tokens: Some(tokens) };
+            let map = molt_memory::project::map(&db, &workspace, &req).map_err(|e| anyhow::anyhow!(e.message))?;
+            print!("{}", agent::printable(&map.map));
+            eprintln!("{} files, {} definitions, about {} tokens", map.files, map.symbols, map.tokens);
+        }
+    }
+    Ok(())
+}
+
+/// Notes as `molt memory show` lists them: id, kind, confidence and how
+/// often an episode bore the note out, then the text.
+fn show_notes(notes: &[molt_api::memory::Recalled]) -> String {
+    let mut out = String::new();
+    for r in notes {
+        let n = &r.note;
+        let mut extra = Vec::new();
+        if n.reinforced > 0 {
+            extra.push(format!("confirmed {}x", n.reinforced));
+        }
+        if !n.conflicts.is_empty() {
+            extra.push(format!("disputed by {}", n.conflicts.join(", ")));
+        }
+        let extra = if extra.is_empty() { String::new() } else { format!(" ({})", extra.join("; ")) };
+        out.push_str(&format!("{}  {} {:.2}{extra}\n    {}\n", n.id, n.kind.as_str(), n.confidence, n.text));
+    }
+    out
 }

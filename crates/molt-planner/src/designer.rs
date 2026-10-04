@@ -43,8 +43,9 @@ pub(crate) async fn design(ctx: &Arc<Ctx>) -> Result<Design, RemoteError> {
 }
 
 async fn work(ctx: &Arc<Ctx>, fork: &str) -> Design {
-    let tools = Arc::new(prompts::designer_tools());
-    let mut conv = Conversation::new(prompts::DESIGNER_SYSTEM, tools, prompts::designer_first_message(&ctx.task));
+    let tools = Arc::new(prompts::designer_tools(ctx.memory.up));
+    let first = prompts::designer_first_message(&ctx.task, ctx.memory.context.as_deref());
+    let mut conv = Conversation::new(prompts::DESIGNER_SYSTEM, tools, first);
     let mut meter = Meter::default();
     let never = CancellationToken::new();
     let mut nudged = false;

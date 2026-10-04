@@ -8,6 +8,7 @@ mod agent;
 mod attempt;
 mod ctx;
 mod designer;
+mod memory;
 mod prompts;
 mod runner;
 mod tools;
@@ -38,6 +39,8 @@ pub struct Config {
     pub check_timeout: Duration,
     /// Runs handled at once.
     pub max_concurrent_runs: usize,
+    /// Size of the project map at the start of a run, in estimated tokens.
+    pub map_tokens: u32,
     /// How long a finished run waits, while it applies the winner, for the
     /// replies to model calls that cancelled attempts left running, so their
     /// cost is counted. Calls still unanswered are reported as uncounted.
@@ -55,6 +58,7 @@ impl Default for Config {
             model_timeout: Duration::from_secs(1200),
             check_timeout: Duration::from_secs(900),
             max_concurrent_runs: 4,
+            map_tokens: 3_000,
             late_reply_wait: Duration::from_secs(2),
         }
     }
@@ -63,7 +67,8 @@ impl Default for Config {
 impl Config {
     /// [`Config::default`] overridden by `MOLT_PLANNER_MODEL`,
     /// `MOLT_MAX_TURNS`, `MOLT_MAX_CHECK_ROUNDS`, `MOLT_BUDGET_USD`,
-    /// `MOLT_MAX_TOKENS`, `MOLT_MODEL_TIMEOUT_S` and `MOLT_CHECK_TIMEOUT_S`.
+    /// `MOLT_MAX_TOKENS`, `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S` and
+    /// `MOLT_MAP_TOKENS`.
     ///
     /// | Variable | Default |
     /// |---|---|
@@ -74,6 +79,7 @@ impl Config {
     /// | `MOLT_MAX_TOKENS` | `32000` |
     /// | `MOLT_MODEL_TIMEOUT_S` | `1200` |
     /// | `MOLT_CHECK_TIMEOUT_S` | `900` |
+    /// | `MOLT_MAP_TOKENS` | `3000` (at most 32000) |
     ///
     /// An empty variable counts as unset. A value that does not parse is an
     /// error, and so is a zero: none of these limits has a "no limit" value.
@@ -109,6 +115,7 @@ impl Config {
             max_tokens: small("MOLT_MAX_TOKENS", d.max_tokens)?,
             model_timeout: Duration::from_secs(number("MOLT_MODEL_TIMEOUT_S", d.model_timeout.as_secs())?),
             check_timeout: Duration::from_secs(number("MOLT_CHECK_TIMEOUT_S", d.check_timeout.as_secs())?),
+            map_tokens: small("MOLT_MAP_TOKENS", d.map_tokens)?.min(32_000),
             max_concurrent_runs: d.max_concurrent_runs,
             late_reply_wait: d.late_reply_wait,
         })
@@ -212,6 +219,7 @@ mod tests {
         assert_eq!(cfg.model_timeout, d.model_timeout);
         assert_eq!(cfg.check_timeout, d.check_timeout);
         assert_eq!(cfg.max_concurrent_runs, d.max_concurrent_runs);
+        assert_eq!(cfg.map_tokens, 3_000);
     }
 
     #[test]
@@ -224,8 +232,10 @@ mod tests {
             ("MOLT_MAX_TOKENS", "1000"),
             ("MOLT_MODEL_TIMEOUT_S", "5"),
             ("MOLT_CHECK_TIMEOUT_S", "6"),
+            ("MOLT_MAP_TOKENS", "99999"),
         ])
         .unwrap();
+        assert_eq!(cfg.map_tokens, 32_000);
         assert_eq!(cfg.default_model.as_deref(), Some("sonnet"));
         assert_eq!(cfg.max_turns, 7);
         assert_eq!(cfg.max_check_rounds, 4);
@@ -245,6 +255,7 @@ mod tests {
             "MOLT_MAX_TOKENS",
             "MOLT_MODEL_TIMEOUT_S",
             "MOLT_CHECK_TIMEOUT_S",
+            "MOLT_MAP_TOKENS",
         ] {
             let err = from(&[(name, "0")]).unwrap_err().to_string();
             assert!(err.contains(name), "{err}");
