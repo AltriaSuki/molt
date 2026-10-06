@@ -8,6 +8,7 @@
 //! failed check's feedback. It answers `400` to anything the real API would
 //! refuse (see [`check_request`]), and every test checks that it never had to.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -687,6 +688,7 @@ async fn the_cli_carries_out_a_task() {
     let server = fake_api(Fake::Greets).await;
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     // A project's own molt.toml is never read unless asked for: it could run anything with the user's key.
     std::fs::write(workspace.path().join("molt.toml"), "[[service]]\nname = \"model\"\nexec = 'not toml\n").unwrap();
     // The check fails if the API key reached the commands the agent runs, or the passed variable did not.
