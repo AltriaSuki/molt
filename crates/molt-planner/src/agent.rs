@@ -51,7 +51,7 @@ pub(crate) async fn turn(
     let resp = tokio::select! {
         // A reply that is already in wins a tie, so the loop's meter counts it too.
         biased;
-        resp = ctx.complete(conv) => resp,
+        resp = ctx.complete(conv, meter.turns + 1) => resp,
         _ = cancel.cancelled() => return Err(Stop::Cancelled),
     };
     meter.turns += 1;

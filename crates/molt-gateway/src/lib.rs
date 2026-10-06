@@ -10,6 +10,7 @@
 mod api;
 mod body;
 mod profile;
+mod stream;
 
 use std::fmt;
 use std::str::FromStr;
@@ -18,9 +19,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, ensure, Context};
 use molt_api::model::{CompleteRequest, CompleteResponse, Effort, Usage, STOP_REFUSAL};
+use molt_api::progress::{self, ModelCall, Progress};
 use molt_proto::{Envelope, ErrorCode, RemoteError, Target};
 use molt_sdk::Service;
 use serde_json::Value;
+use tokio::sync::mpsc;
 
 use crate::profile::profile;
 
@@ -168,6 +171,30 @@ impl Gateway {
         req: CompleteRequest,
         within: Option<Duration>,
     ) -> Result<CompleteResponse, RemoteError> {
+        self.complete_observed(req, within, None).await
+    }
+
+    /// Stream text previews to a bounded observer while keeping tool input,
+    /// signatures, usage and the final message in the authoritative reply.
+    /// The observer must not block; serving over the bus uses a bounded queue.
+    pub async fn complete_streamed(
+        &self,
+        req: CompleteRequest,
+        within: Option<Duration>,
+        mut on_text: impl FnMut(String) + Send,
+    ) -> Result<CompleteResponse, RemoteError> {
+        if req.stream.is_none() {
+            return Err(RemoteError { code: ErrorCode::Invalid, message: "stream context is required".into() });
+        }
+        self.complete_observed(req, within, Some(&mut on_text)).await
+    }
+
+    async fn complete_observed(
+        &self,
+        req: CompleteRequest,
+        within: Option<Duration>,
+        on_text: Option<&mut (dyn FnMut(String) + Send)>,
+    ) -> Result<CompleteResponse, RemoteError> {
         // A deadline too far off to represent is no deadline.
         let deadline = within.and_then(|d| Instant::now().checked_add(d));
         let named = req.model.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or(&self.cfg.default_model);
@@ -182,7 +209,11 @@ impl Gateway {
             "calling the Messages API"
         );
 
-        let msg = self.api.create(&call.body, call.fallbacks, deadline).await?;
+        let msg = if on_text.is_some() {
+            self.api.create_observed(&call.body, call.fallbacks, deadline, on_text).await?
+        } else {
+            self.api.create(&call.body, call.fallbacks, deadline).await?
+        };
         let usage = Usage::from(msg.usage);
         // After a fallback another model answered, and its prices apply.
         let cost_usd = profile(&msg.model).prices.or(profile(&model).prices).map(|p| p.cost(&usage));
@@ -218,30 +249,101 @@ impl Gateway {
 /// stops in time to answer within it.
 pub async fn serve(svc: Arc<Service>, gateway: Arc<Gateway>) {
     let max_in_flight = gateway.cfg.max_in_flight;
+    let events = svc.clone();
     svc.serve_concurrent(max_in_flight, move |req| {
         let gateway = gateway.clone();
-        async move { handle(&gateway, req).await }
+        let events = events.clone();
+        async move { handle_observed(&gateway, req, Some(events)).await }
     })
     .await;
 }
 
+#[cfg(test)]
 async fn handle(gateway: &Gateway, req: Envelope) -> Result<Value, RemoteError> {
+    handle_observed(gateway, req, None).await
+}
+
+async fn handle_observed(gateway: &Gateway, req: Envelope, events: Option<Arc<Service>>) -> Result<Value, RemoteError> {
     let method = match &req.to {
         Target::Method { method, .. } => method.as_str(),
         _ => "",
     };
     match method {
         "complete" => {
+            let started = Instant::now();
             let within = reply_window(req.budget.ms);
             let request: CompleteRequest = serde_json::from_value(req.payload).map_err(|e| RemoteError {
                 code: ErrorCode::Invalid,
                 message: format!("bad model.complete request: {e}"),
             })?;
-            let response = gateway.complete_within(request, within).await?;
+            let response = if let (Some(context), Some(events)) = (request.stream.clone(), events) {
+                let mut call = ModelCall {
+                    run: req.trace_id.to_string(),
+                    attempt: context.attempt,
+                    turn: context.turn,
+                    call: req.id.to_string(),
+                    seq: 0,
+                };
+                publish(&events, &req.trace_id, Progress::ModelStarted { context: call.clone() }).await;
+                // A slow event consumer cannot block the model response or
+                // build an unbounded queue. Missing previews produce seq gaps.
+                let (tx, mut rx) = mpsc::channel::<(u64, String)>(32);
+                let mut publisher = {
+                    let events = events.clone();
+                    let trace = req.trace_id.clone();
+                    let context = call.clone();
+                    tokio::spawn(async move {
+                        while let Some((seq, text)) = rx.recv().await {
+                            let mut context = context.clone();
+                            context.seq = seq;
+                            publish(&events, &trace, Progress::ModelText { context, text }).await;
+                        }
+                    })
+                };
+                let response = gateway
+                    .complete_streamed(request, within.map(|limit| limit.saturating_sub(started.elapsed())), |text| {
+                        call.seq += 1;
+                        let _ = tx.try_send((call.seq, text));
+                    })
+                    .await;
+                drop(tx);
+                let drain = within.map_or(Duration::from_millis(400), |limit| limit.saturating_sub(started.elapsed()));
+                if tokio::time::timeout(drain, &mut publisher).await.is_err() {
+                    publisher.abort();
+                    let _ = publisher.await;
+                }
+                call.seq += 1;
+                let (usage, cost_usd, error) = match &response {
+                    Ok(resp) => (
+                        Some(resp.usage),
+                        resp.cost_usd,
+                        resp.is_refusal().then(|| "the model declined; preview is not a result".into()),
+                    ),
+                    Err(e) => (None, None, Some(e.to_string())),
+                };
+                publish(&events, &req.trace_id, Progress::ModelFinished { context: call, usage, cost_usd, error })
+                    .await;
+                response?
+            } else {
+                gateway.complete_within(request, within).await?
+            };
             serde_json::to_value(response)
                 .map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("encoding the response: {e}") })
         }
         other => Err(RemoteError { code: ErrorCode::Invalid, message: format!("no method {other:?}") }),
+    }
+}
+
+async fn publish(service: &Service, trace: &molt_proto::TraceId, event: Progress) {
+    if let Ok(payload) = serde_json::to_value(event) {
+        // Progress is best effort, even when the transport's outgoing queue
+        // is full. This bound also keeps draining 32 previews within the
+        // gateway's normal reply margin.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(10),
+            service.publish_traced(progress::TOPIC, payload, trace.clone()),
+        )
+        .await;
     }
 }
 

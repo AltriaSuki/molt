@@ -89,7 +89,7 @@ to generate per-service credentials, put the printed `authorization` block and
 
 ```
 molt do TASK [--check CMD] [--attempts N] [--model M] [--effort E] [--max-turns N]
-        [--budget-usd X] [--no-apply] [--json] [--workspace DIR] [--data-dir DIR]
+        [--budget-usd X] [--no-apply] [--json] [--stream] [--workspace DIR] [--data-dir DIR]
         [--pass-env NAME]... [--no-memory] [--no-learn] [--config FILE]
 ```
 
@@ -101,6 +101,7 @@ molt do TASK [--check CMD] [--attempts N] [--model M] [--effort E] [--max-turns 
 | `--max-turns`, `--budget-usd` | Model turns per attempt, and the spending limit for the whole run. |
 | `--no-apply` | Keep the result in its fork and print its path instead of merging it. |
 | `--json` | Print the full result (`planner.run`'s reply in `molt-api`) as JSON. |
+| `--stream` | Show model text previews on stderr while the designer and attempts work. The final result still goes to stdout, including with `--json`. |
 | `--workspace DIR` | The project (default: the current directory). |
 | `--data-dir DIR` | Kernel state, the audit log and forks. Default `~/.cache/molt/<project>-<hash>` (under `$XDG_CACHE_HOME` if set). Must be outside the workspace. |
 | `--pass-env NAME` | Pass a variable from your environment to the commands the agent runs, the check included. Repeatable. |
@@ -110,6 +111,28 @@ molt do TASK [--check CMD] [--attempts N] [--model M] [--effort E] [--max-turns 
 
 Progress goes to stderr and the result to stdout. Control characters in text
 from the model or from file names are printed escaped.
+
+With `--stream`, previews identify the attempt (or check designer), turn and
+model call. These are provisional text, not verified results. Thinking and
+partial tool arguments are not displayed; tools execute only after the entire
+message, including its JSON inputs, has been received and validated. A broken
+or malformed stream fails the call without retrying its partial answer. HTTP
+errors before a stream begins still use the gateway's normal retry policy.
+
+Preview events are coalesced, capped at 4 KiB and queued with a fixed bound.
+A slow subscriber can miss previews; sequence gaps are reported, and the
+complete model reply and final task result remain authoritative. The display
+shows cost pending until the call ends, and cost unknown when pricing or a
+complete response is unavailable. Cancelled attempts' late previews are hidden;
+their remote calls can still run and incur charges (see the limits below).
+This line-oriented mode uses no alternate screen or cursor controls, so it
+also works in a narrow terminal or when stderr is redirected.
+
+For `--config`, give the model service a `topic:progress` request capability,
+as in `molt.example.toml`; `--stream` refuses a setup without it. The new
+gateway events use the request's audit trace and are accepted by the CLI only
+from the kernel-authenticated model service. A TUI can consume the same
+events through the existing progress callback.
 
 | Exit status | Meaning |
 | --- | --- |
@@ -217,7 +240,7 @@ a notice and pass; CI always runs them.
 ## Known limits
 
 - The shell service is not sandboxed: commands, the check included, run as you, with your files and network. Forks keep them off the project until the merge, nothing more.
-- No streaming: model replies arrive whole, so a long turn shows no progress until it ends.
+- Model text streams only with `--stream`; thinking is not shown and tool calls wait for the complete message. Preview delivery is best effort, and the final reply remains complete.
 - The audit log records every message, file contents and model conversations included, and is never rotated; it grows with every run in a data dir.
 - Reading one trace back from the audit log scans the log from the start: there is no index yet. One read looks through at most 256 MiB and keeps to its deadline, and two run at once.
 - The kernel drops a message nested more than 100 levels deep, so every logged message can be read back.

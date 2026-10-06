@@ -146,7 +146,7 @@ impl Attempt {
             ctx.memory.context.as_deref(),
         );
         let tools = Arc::new(prompts::attempt_tools(ctx.memory.up));
-        let mut conv = Conversation::new(prompts::ATTEMPT_SYSTEM, tools, first);
+        let mut conv = Conversation::new(prompts::ATTEMPT_SYSTEM, tools, first, Some(self.index));
         // The final reply so far. The output limit can split it over several turns.
         let mut reply: Vec<String> = Vec::new();
         // An empty final reply gets one request for a real one before it is accepted.
