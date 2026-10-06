@@ -329,7 +329,14 @@ impl Fake {
                     },
                     rev: 1,
                 };
-                json!(memory::RecallResponse { notes: vec![memory::Recalled { note, score: 1.0 }] })
+                json!(memory::RecallResponse {
+                    notes: vec![memory::Recalled {
+                        note,
+                        score: 1.0,
+                        reason: Default::default(),
+                        details: Default::default()
+                    }]
+                })
             }
             memory::SYMBOLS => json!(memory::SymbolsResponse {
                 definitions: vec![memory::Definition {

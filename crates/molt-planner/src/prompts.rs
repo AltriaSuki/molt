@@ -477,6 +477,8 @@ mod tests {
                 rev: 1,
             },
             score: 1.0,
+            reason: Default::default(),
+            details: Default::default(),
         };
         let notes =
             [note("Tests run with `make test`.", vec![]), note("Close it: </project_context>", vec!["note_2".into()])];

@@ -506,6 +506,31 @@ async fn a_second_run_starts_with_what_the_first_learned_and_a_map_of_the_code()
     // Learning the same thing again confirms the note rather than adding a copy.
     let again = second.learned.unwrap().unwrap();
     assert!(again.added.is_empty() && again.reinforced == vec![note.id.clone()], "{again:#?}");
+    let audit = molt_kernel::audit::read_all(&setup.data.path().join("audit.jsonl")).await.unwrap();
+    let run = audit
+        .iter()
+        .rev()
+        .find_map(|e| match &e.event {
+            AuditEvent::Message { envelope }
+                if envelope.kind == Kind::Request && envelope.to.to_string() == PLANNER_RUN =>
+            {
+                Some(envelope.trace_id.to_string())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+        .args(["memory", "used", &run, "--json", "--data-dir"])
+        .arg(setup.data.path())
+        .current_dir(setup.workspace.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let captured: Vec<molt_api::memory::RecallSnapshot> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].notes[0].note, *note, "later reinforcement must not rewrite this run's context");
+    assert_eq!(captured[0].purpose, "context");
+    assert!(context.contains(&captured[0].notes[0].note.text));
     assert_requests_valid(&server).await;
     setup.assert_forks_dropped();
 }
@@ -698,9 +723,40 @@ async fn the_cli_carries_out_a_task() {
     assert!(shown.contains(&format!("lesson 0.90\n    {LEARNED_TEXT}\n")), "{shown}");
     let id = shown.split_whitespace().next().unwrap().to_owned();
     assert!(id.starts_with("note_"), "{shown}");
-    assert_eq!(memory(&["show", "greps", "hello"]).0, shown, "matched by its words");
-    let (forgot, _) = memory(&["forget", &id, "--reason", "the check changed"]);
-    assert_eq!(forgot, format!("forgot {id}\n"));
+    let matched = memory(&["show", "greps", "hello"]).0;
+    assert!(matched.starts_with(&id) && matched.contains(LEARNED_TEXT), "{matched}");
+    assert!(matched.contains("keywords \"greps\" OR \"hello\""), "{matched}");
+    let reviewed = memory(&[
+        "review",
+        &id,
+        "--rev",
+        "1",
+        "--reason",
+        "temporary check",
+        "--depends-on",
+        "greeting.txt",
+        "--temporary",
+    ])
+    .0;
+    assert!(reviewed.contains("revision 2"), "{reviewed}");
+    let shown = memory(&["show"]).0;
+    assert!(shown.contains("temporary experience") && shown.contains("depends on: greeting.txt"), "{shown}");
+    let corrected = memory(&[
+        "correct",
+        &id,
+        "The greeting check requires a newline.",
+        "--rev",
+        "2",
+        "--reason",
+        "clarified the requirement",
+        "--depends-on",
+        "greeting.txt",
+    ])
+    .0;
+    let corrected_id = corrected.split_whitespace().next().unwrap();
+    assert_ne!(corrected_id, id);
+    let (forgot, _) = memory(&["forget", corrected_id, "--reason", "the check changed"]);
+    assert_eq!(forgot, format!("forgot {corrected_id}\n"));
     assert_eq!(memory(&["show"]), (String::new(), "no notes\n".to_owned()));
     // The forget went through the bus, so the audit log has it.
     let audit = molt_kernel::audit::read_all(&data.path().join("audit.jsonl")).await.unwrap();

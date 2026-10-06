@@ -150,6 +150,37 @@ async fn notes_are_recalled_forgotten_and_retracted() {
 }
 
 #[tokio::test]
+async fn capture_and_user_review_require_the_kernel_identified_caller() {
+    let s = Setup::new();
+    let note: RememberResponse = s.call("memory.remember", remember("app", "Build with cargo.")).await;
+    let payload = json!({"workspace":"app", "id":note.note.id, "expected_rev":note.note.rev, "reason":"checked", "depends_on":["src/lib.rs"], "temporary":true});
+    assert!(s.refused("memory.review", payload.clone()).await.contains("CLI"));
+    let reviewed: molt_api::memory::ReviewResponse =
+        serde_json::from_value(s.ask("cli", "memory.review", payload).await.unwrap()).unwrap();
+    assert!(reviewed.details.temporary);
+    assert_eq!(reviewed.details.dependencies[0].path, "src/lib.rs");
+    assert!(s
+        .ask("cli", "memory.recall", json!({"workspace":"app", "capture":"context"}))
+        .await
+        .unwrap_err()
+        .message
+        .contains("planner"));
+    assert!(s
+        .refused("memory.recall", json!({"workspace":"app", "capture":"other"}))
+        .await
+        .contains("context or tool"));
+    assert!(s
+        .refused("memory.recall", json!({"workspace":"app", "capture":"context", "include_review":true}))
+        .await
+        .contains("excludes"));
+    let mut changed_payload = json!({"workspace":"app", "id":note.note.id, "expected_rev":reviewed.note.rev, "reason":"checked", "depends_on":[".molt/inside"]});
+    assert!(s.ask("cli", "memory.review", changed_payload.clone()).await.is_err());
+    changed_payload["workspace"] = json!(".");
+    changed_payload["depends_on"] = json!([]);
+    assert!(s.ask("cli", "memory.review", changed_payload).await.unwrap_err().message.contains("another project"));
+}
+
+#[tokio::test]
 async fn the_project_model_follows_the_files_fs_reports() {
     let s = Setup::new();
     let lookup = |name: &str| json!({ "workspace": "app", "name": name });

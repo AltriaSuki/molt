@@ -50,6 +50,7 @@ pub(crate) async fn prepare(ctx: &Ctx) -> Memory {
         workspace: Some(workspace.clone()),
         k: Some(NOTES),
         min_confidence: Some(MIN_CONFIDENCE),
+        capture: Some("context".into()),
         ..Default::default()
     };
     let notes = match ctx.call::<RecallResponse>(memory::RECALL, recall, Budget::new(0, PROBE_MS, 0)).await {
@@ -100,7 +101,12 @@ pub(crate) async fn prepare(ctx: &Ctx) -> Memory {
         }
     };
     if !notes.is_empty() {
-        ctx.note(format!("recalled {} notes from earlier tasks", notes.len())).await;
+        ctx.note(format!(
+            "recalled {} notes from earlier tasks; inspect their snapshot with molt memory used {}",
+            notes.len(),
+            ctx.trace
+        ))
+        .await;
     }
     let map = map.filter(|m| !m.map.trim().is_empty());
     Memory { up: true, context: prompts::project_context(&notes, map.as_ref().map(|m| m.map.as_str())) }
@@ -113,7 +119,8 @@ pub(crate) fn note_lines(notes: &[Recalled]) -> String {
         .map(|r| {
             let n = &r.note;
             let disputed = if n.conflicts.is_empty() { "" } else { ", disputed" };
-            format!("- [{} {:.2}{disputed}] {}", n.kind.as_str(), n.confidence, n.text)
+            let temporary = if r.details.temporary { ", temporary experience; verify before reuse" } else { "" };
+            format!("- [{} {:.2}{disputed}{temporary}] {}", n.kind.as_str(), n.confidence, n.text)
         })
         .collect::<Vec<_>>()
         .join("\n")
