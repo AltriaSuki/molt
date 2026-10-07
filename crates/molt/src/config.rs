@@ -225,7 +225,7 @@ impl Config {
         let changed = format!("topic:{}", molt_api::fs::CHANGED);
         let mut fs = service("fs", Tier::Mutable, tools("fs")?)?;
         fs.requests = vec![request(&changed, Budget::new(0, 0, 100_000_000))?];
-        let shell = service("shell", Tier::Mutable, tools("shell")?)?;
+        let shell = service("shell", Tier::Protected, tools("shell")?)?;
         let mut memory_exec = bin("molt-memory")?;
         // The project model leaves out the data dir, with the forks in it, should it be inside the workspace.
         memory_exec.args = vec![

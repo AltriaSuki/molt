@@ -91,6 +91,12 @@ struct DoArgs {
     /// locale and a few more otherwise.
     #[arg(long, value_name = "NAME", value_parser = env_name)]
     pass_env: Vec<String>,
+    /// Explicitly run commands with the host user's files and network.
+    #[arg(long, conflicts_with = "sandbox_policy")]
+    no_sandbox: bool,
+    /// Trusted shell sandbox JSON policy outside the project and scratch.
+    #[arg(long)]
+    sandbox_policy: Option<PathBuf>,
     /// Run without memory: no project map or notes for the model, and
     /// nothing learned from the run.
     #[arg(long)]
@@ -242,6 +248,13 @@ async fn main() -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn cfg_scratch(args: &[String]) -> anyhow::Result<PathBuf> {
+    let path =
+        args.windows(2).find(|pair| pair[0] == "--scratch").context("molt-tools shell must declare --scratch")?;
+    let path = PathBuf::from(&path[1]);
+    Ok(path.canonicalize().unwrap_or(path))
+}
+
 async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode> {
     // From the start, so that no signal leaves services running.
     let stop = molt::stop_signal()?;
@@ -252,6 +265,28 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
         eprintln!("config: {}", agent::printable(&path.display().to_string()));
     }
     if let Some(shell) = cfg.service_mut("shell") {
+        let standard = shell
+            .exec
+            .as_ref()
+            .is_some_and(|exec| Path::new(&exec.command).file_name().is_some_and(|name| name == "molt-tools"));
+        anyhow::ensure!(
+            standard || (!args.no_sandbox && args.sandbox_policy.is_none() && args.pass_env.is_empty()),
+            "shell policy flags require the molt-tools shell service"
+        );
+        if let Some(exec) = shell.exec.as_mut().filter(|_| standard) {
+            if args.no_sandbox {
+                exec.args.push("--no-sandbox".into());
+            }
+            if let Some(path) = &args.sandbox_policy {
+                let roots = molt_tools::Roots { root: workspace.clone(), scratch: cfg_scratch(&exec.args)? };
+                let policy = molt_tools::SandboxPolicy::load(path, &roots)?;
+                shell.pass_env.extend(policy.environment);
+                exec.args.extend(["--sandbox-policy".into(), path.canonicalize()?.to_string_lossy().into_owned()]);
+            }
+            for name in &args.pass_env {
+                exec.args.extend(["--sandbox-env".into(), name.clone()]);
+            }
+        }
         shell.pass_env.extend(args.pass_env);
     }
     if args.no_memory {
