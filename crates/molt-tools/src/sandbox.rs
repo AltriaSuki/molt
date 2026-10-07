@@ -110,13 +110,41 @@ impl SandboxPolicy {
     pub fn probe(&self) -> anyhow::Result<()> {
         self.validate()?;
         let (mut command, _guard) = self.command(Path::new("/bin/true"), None, None)?;
-        let output =
-            command.as_std_mut().output().context("starting /usr/bin/bwrap; install bubblewrap 0.9 or newer")?;
-        ensure!(
-            output.status.success(),
-            "Linux sandbox unavailable: {}. Explicit --no-sandbox is required for unconfined execution",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        let command = command.as_std_mut();
+        command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().context("starting /usr/bin/bwrap; install bubblewrap 0.9 or newer")?;
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(5) {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("Linux sandbox capability probe timed out; no unconfined fallback");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        if !status.success() {
+            use std::io::Read;
+            use std::os::fd::AsRawFd;
+            let mut bytes = [0; 4096];
+            let n = if let Some(mut stderr) = child.stderr.take() {
+                // Never wait for EOF on a pipe retained by an executor or helper.
+                let fd = stderr.as_raw_fd();
+                unsafe {
+                    let flags = libc::fcntl(fd, libc::F_GETFL);
+                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+                stderr.read(&mut bytes).unwrap_or(0)
+            } else {
+                0
+            };
+            anyhow::bail!(
+                "Linux sandbox unavailable: {}. Explicit --no-sandbox is required for unconfined execution",
+                String::from_utf8_lossy(&bytes[..n]).trim()
+            );
+        }
         Ok(())
     }
 

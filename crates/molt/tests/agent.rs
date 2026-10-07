@@ -44,6 +44,7 @@ const LEARNED_TEXT: &str = "The done-check greps greeting.txt for hello.";
 enum Fake {
     /// Attempts write greeting.txt and say they are done.
     Greets,
+    ConcurrentEdit(PathBuf),
     /// The designer writes check.sh and submits it; attempts then greet.
     DesignsThenGreets,
     /// Attempts write the wrong greeting, then fix it after the check fails.
@@ -113,6 +114,11 @@ impl Respond for FakeApi {
             }
             (_, false, Turn::First | Turn::Feedback) => (vec![write("greeting.txt", "hello\n")], "tool_use"),
             (_, false, Turn::AfterTools) => {
+                if let Fake::ConcurrentEdit(original) = &self.0 {
+                    // A user edits the original outside the sandbox while the
+                    // attempt is working; its done-check cannot do this.
+                    std::fs::write(original, "theirs\n").unwrap();
+                }
                 (vec![json!({ "type": "text", "text": "Wrote greeting.txt." })], "end_turn")
             }
         };
@@ -751,13 +757,11 @@ async fn the_cli_runs_the_example_config_when_given_one() {
 
 #[tokio::test]
 async fn a_result_that_cannot_be_applied_exits_3_and_is_kept() {
-    let server = fake_api(Fake::Greets).await;
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
-    // The check changes the original's greeting.txt during the run, as a user editing it would.
     let original = workspace.path().canonicalize().unwrap().join("greeting.txt");
-    let check = format!("echo theirs > '{}' && {CHECK}", original.display());
-    let args = ["--check", &check, "--attempts", "1", "--json"];
+    let server = fake_api(Fake::ConcurrentEdit(original.clone())).await;
+    let args = ["--check", CHECK, "--attempts", "1", "--json"];
     let out = tokio::time::timeout(RUN_LIMIT, molt_do(&server, workspace.path(), data.path(), &args).output())
         .await
         .expect("molt do hung")
