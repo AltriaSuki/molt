@@ -223,7 +223,7 @@ a notice and pass; CI always runs them.
 - The kernel drops a message nested more than 100 levels deep, so every logged message can be read back.
 - After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
-- Cancellation tokens and call-cycle checks at the gate arrive with the services that need them.
+- Call-cycle checks at the gate remain future work.
 - Recall matches keywords (with stemming), not meaning: there is no vector index, since the Anthropic API has no embeddings endpoint. A note worded differently from the task can be missed; the strongest notes about the project are always shown.
 - Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. With the default setup, memory lives in the project's data dir, so nothing is shared between projects yet.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
@@ -233,6 +233,8 @@ a notice and pass; CI always runs them.
 ### Cancellation and model settlement
 
 Dropping an SDK `PendingReply` requests `kernel.cancel` for that request. The kernel verifies the original caller, sends a kernel-only control message, and keeps the request open for one final cleanup or settlement reply. Cancellation is idempotent and does not affect another request. SDK services can use `serve_cancellable` for cleanup; ordinary concurrent handlers stop locally on cancellation. Cancelled queued work does not start.
+
+Link loss ends concurrent admission immediately, even if every slot is occupied. Cooperative handlers get up to two seconds to clean up before they are aborted; queued work does not start after disconnection. Dropping a server cancels and removes its active request registrations. Shell shutdown closes command admission before sending TERM, and dropped shell request futures also abort their output readers.
 
 The planner gives each attempt its own cancellation token. A winner stops competing attempts; budget exhaustion or unknown model cost stops new actions throughout the run. Shell cancellation and timeout send TERM to the process group, allow 500 ms for cleanup, then send KILL and reap the leader before replying. Service shutdown uses the same grace. Process groups alone cannot contain a program that deliberately creates a new session; OS isolation is tracked by #9.
 

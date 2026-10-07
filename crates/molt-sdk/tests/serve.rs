@@ -306,3 +306,87 @@ async fn dropping_a_pending_call_sends_cancel_and_completed_calls_do_not() {
     tokio::task::yield_now().await;
     assert!(bus.from.try_recv().is_err());
 }
+
+#[tokio::test]
+async fn link_loss_finishes_cleanup_even_when_every_slot_is_occupied() {
+    struct Stopped(mpsc::UnboundedSender<()>);
+    impl Drop for Stopped {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    let (svc, bus) = service();
+    let (started, mut starts) = mpsc::unbounded_channel();
+    let (stopped, mut stops) = mpsc::unbounded_channel();
+    let task = tokio::spawn({
+        let svc = svc.clone();
+        async move {
+            svc.serve_cancellable(1, move |_, cancel| {
+                let (started, stopped) = (started.clone(), stopped.clone());
+                async move {
+                    let _stopped = Stopped(stopped);
+                    started.send(()).unwrap();
+                    cancel.cancelled().await;
+                    // A broken cooperative handler can ignore cancellation.
+                    std::future::pending::<Result<Value, RemoteError>>().await
+                }
+            })
+            .await;
+        }
+    });
+    bus.request(Value::Null);
+    tokio::time::timeout(Duration::from_secs(1), starts.recv()).await.unwrap().unwrap();
+    bus.request(json!("queued"));
+    drop(bus.to);
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .expect("link loss must reach the bounded cooperative cleanup even while waiting for a slot")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), stops.recv()).await.unwrap().unwrap();
+    assert!(starts.try_recv().is_err(), "queued requests must not start after link loss");
+}
+
+#[tokio::test]
+async fn sequential_serving_does_not_invoke_a_cancelled_queued_handler() {
+    let (svc, mut bus) = service();
+    let (open, gate) = watch::channel(false);
+    let (started, mut starts) = mpsc::unbounded_channel();
+    let task = tokio::spawn({
+        let svc = svc.clone();
+        async move {
+            svc.serve(move |req| {
+                started.send(req.payload.clone()).unwrap();
+                let mut gate = gate.clone();
+                async move {
+                    let _ = gate.wait_for(|open| *open).await;
+                    Ok(req.payload)
+                }
+            })
+            .await;
+        }
+    });
+    let first = bus.request(json!("first"));
+    assert_eq!(starts.recv().await, Some(json!("first")));
+    let queued = bus.request(json!("cancelled"));
+    let mut stop = Envelope::request(TraceId::random(), "svc.work".parse().unwrap(), CapId::random(), Value::Null);
+    stop.kind = Kind::Cancel;
+    stop.reply_to = Some(queued.clone());
+    stop.from = Some(ServiceId::kernel());
+    bus.to.send(stop).unwrap();
+    // The reply is a FIFO barrier: read_loop has processed the cancellation.
+    let barrier = svc.request("kernel.ping", Value::Null, CallOpts::default()).await.unwrap();
+    let ping = bus.recv().await;
+    bus.to.send(ping.reply(Value::Null)).unwrap();
+    barrier.wait().await.unwrap();
+    open.send(true).unwrap();
+    let reply = bus.recv().await;
+    assert_eq!(reply.reply_to, Some(first));
+    assert!(result(&reply).is_ok());
+    let reply = bus.recv().await;
+    assert_eq!(reply.reply_to, Some(queued));
+    assert_eq!(result(&reply).unwrap_err().code, ErrorCode::Cancelled);
+    assert!(starts.try_recv().is_err(), "even synchronous handler code must not run");
+    drop(bus.to);
+    task.await.unwrap();
+}

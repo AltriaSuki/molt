@@ -39,6 +39,70 @@ impl Env {
     }
 }
 
+#[tokio::test]
+async fn shutdown_refuses_commands_during_grace_and_after_it_returns() {
+    let env = Env::new();
+    let shutdown = env.shell.shutdown();
+    tokio::pin!(shutdown);
+    // Poll shutdown into its grace period before submitting another command.
+    tokio::select! {
+        biased;
+        () = &mut shutdown => panic!("shutdown should wait for graceful termination"),
+        () = tokio::task::yield_now() => {}
+    }
+    for marker in ["during-shutdown", "after-shutdown"] {
+        let err = env
+            .call(json!({"workspace":"ws", "command":format!("touch {marker}")}))
+            .await
+            .expect_err("shutdown must close admission before sending TERM");
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert!(!env.ws.join(marker).exists());
+        if marker == "during-shutdown" {
+            (&mut shutdown).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn dropping_a_request_closes_its_output_readers() {
+    struct Writer(i32);
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            if !dead(self.0) {
+                unsafe { libc::kill(self.0, libc::SIGKILL) };
+            }
+        }
+    }
+
+    let env = Env::new();
+    let ws = env.ws.clone();
+    let shell = std::sync::Arc::new(env.shell);
+    let task = tokio::spawn(async move {
+        shell.handle("run", json!({"workspace":"ws", "command":
+            "setsid sh -c 'trap \"exit 0\" PIPE; while :; do printf x || exit; sleep 0.02; done' & echo $! > writer.pid; wait"
+        })).await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !ws.join("writer.pid").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let writer = Writer(fs::read_to_string(ws.join("writer.pid")).unwrap().trim().parse().unwrap());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    // The escaped writer remains alive while detached drain tasks own its
+    // output pipe. Closing those readers makes its next write receive PIPE.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !dead(writer.0) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("request drop left output readers running");
+}
+
 /// True once `pid` has exited (gone, or a zombie nobody reaped yet).
 fn dead(pid: i32) -> bool {
     match fs::read_to_string(format!("/proc/{pid}/stat")) {
