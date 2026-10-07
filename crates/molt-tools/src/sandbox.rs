@@ -224,6 +224,15 @@ mod linux {
             instruction(load, 0, 0, 0), // syscall number
             instruction((libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16, 0, 1, 0x40000000),
             instruction(ret, 0, 0, libc::SECCOMP_RET_KILL_PROCESS), // reject x32 ABI
+            // io_uring socket operations do not pass through socket(2).
+            // Deny rings rather than letting asynchronous operations bypass
+            // the AF_UNIX policy on kernels without inherited ring filters.
+            instruction(equal, 0, 1, libc::SYS_io_uring_setup as u32),
+            instruction(ret, 0, 0, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
+            instruction(equal, 0, 1, libc::SYS_io_uring_enter as u32),
+            instruction(ret, 0, 0, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
+            instruction(equal, 0, 1, libc::SYS_io_uring_register as u32),
+            instruction(ret, 0, 0, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
             instruction(equal, 1, 0, libc::SYS_socket as u32),
             instruction(equal, 0, 3, libc::SYS_socketpair as u32),
             instruction(load, 0, 0, 16), // first socket argument
@@ -352,7 +361,7 @@ mod tests {
     #[test]
     fn seccomp_blocks_host_socket_access_and_preserves_files_and_ip_sockets() {
         let mut command = std::process::Command::new("/usr/bin/python3");
-        command.args(["-c", "import socket, errno\nfor call in [lambda: socket.socket(socket.AF_UNIX), socket.socketpair]:\n try: call(); raise AssertionError('unix socket allowed')\n except OSError as e: assert e.errno == errno.EPERM\nsocket.socket(socket.AF_INET).close()\nprint('ordinary stdout still works')"]);
+        command.args(["-c", "import socket, errno, ctypes\nfor call in [lambda: socket.socket(socket.AF_UNIX), socket.socketpair]:\n try: call(); raise AssertionError('unix socket allowed')\n except OSError as e: assert e.errno == errno.EPERM\nlibc = ctypes.CDLL(None, use_errno=True)\nfor number in [425, 426, 427]:\n assert libc.syscall(number, 0, 0, 0, 0, 0, 0) == -1\n assert ctypes.get_errno() == errno.EPERM, 'io_uring was not blocked'\nsocket.socket(socket.AF_INET).close()\nprint('ordinary stdout still works')"]);
         unsafe {
             command.pre_exec(|| {
                 if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
