@@ -584,7 +584,11 @@ async fn stopping_a_run_kills_the_commands_it_started() {
     let pids = tempfile::tempdir().unwrap();
     let pidfile = pids.path().join("sleep.pid");
     let server = fake_api(Fake::Hangs(pidfile.clone())).await;
-    let setup = Setup::new(&server);
+    let mut setup = Setup::new(&server);
+    // This legacy fixture writes a host PID marker outside the fork. Its
+    // process-group checks explicitly use the unconfined path; namespace
+    // lifecycle coverage lives in molt-tools/tests/sandbox.rs.
+    setup.cfg.service_mut("shell").unwrap().exec.as_mut().unwrap().args.push("--no-sandbox".into());
     let started = wait_for_pid(&pidfile);
     let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), false, |_| {}, async {
         started.await;
@@ -618,7 +622,11 @@ async fn a_planner_that_dies_mid_run_ends_the_run_rather_than_starting_it_again(
     let pids = tempfile::tempdir().unwrap();
     let pidfile = pids.path().join("sleep.pid");
     let server = fake_api(Fake::Hangs(pidfile.clone())).await;
-    let setup = Setup::new(&server);
+    let mut setup = Setup::new(&server);
+    // This legacy fixture writes a host PID marker outside the fork. Its
+    // process-group checks explicitly use the unconfined path; namespace
+    // lifecycle coverage lives in molt-tools/tests/sandbox.rs.
+    setup.cfg.service_mut("shell").unwrap().exec.as_mut().unwrap().args.push("--no-sandbox".into());
     let kill_planner = async {
         let sleep = wait_for_pid(&pidfile).await;
         let planner = started_pid(&setup.data.path().join("audit.jsonl"), "planner").await;
@@ -773,7 +781,8 @@ async fn ctrl_c_stops_molt_do_and_the_commands_it_started() {
     let server = fake_api(Fake::Hangs(pidfile.clone())).await;
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
-    let mut cmd = molt_do(&server, workspace.path(), data.path(), &["--check", CHECK, "--attempts", "1"]);
+    let mut cmd =
+        molt_do(&server, workspace.path(), data.path(), &["--check", CHECK, "--attempts", "1", "--no-sandbox"]);
     // A process group of its own, as a terminal gives a command, so the
     // signal below reaches molt and its services but not this test.
     cmd.process_group(0);
@@ -801,7 +810,9 @@ async fn sigterm_and_sighup_stop_molt_do_like_ctrl_c() {
         let workspace = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let child =
-            molt_do(&server, workspace.path(), data.path(), &["--check", CHECK, "--attempts", "1"]).spawn().unwrap();
+            molt_do(&server, workspace.path(), data.path(), &["--check", CHECK, "--attempts", "1", "--no-sandbox"])
+                .spawn()
+                .unwrap();
         let molt = child.id().unwrap() as i32;
         let pid = tokio::time::timeout(RUN_LIMIT, wait_for_pid(&pidfile)).await.expect("the command never started");
 

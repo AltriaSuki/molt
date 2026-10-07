@@ -221,7 +221,15 @@ mod linux {
         let info = Arc::new(memfd(c"molt-sandbox-info")?);
         let (filter_fd, info_fd) = (seccomp.as_raw_fd(), info.as_raw_fd());
         let mut command = Command::new("/usr/bin/bwrap");
-        command.args(["--unshare-all", "--die-with-parent", "--new-session", "--disable-userns", "--cap-drop", "ALL"]);
+        command.args([
+            "--unshare-all",
+            "--unshare-user",
+            "--die-with-parent",
+            "--new-session",
+            "--disable-userns",
+            "--cap-drop",
+            "ALL",
+        ]);
         if policy.network {
             command.arg("--share-net");
         }

@@ -105,7 +105,7 @@ async fn cancellation_and_exit_clean_up_children_that_create_sessions() {
     let ready = PathBuf::from(&env.fork).join("ready");
     tokio::select! {
         result = &mut work => panic!("early command completion: {result:?}"),
-        result = tokio::time::timeout(Duration::from_secs(5), async { while !ready.exists() { tokio::time::sleep(Duration::from_millis(5)).await; }}) => { result.unwrap(); }
+        result = tokio::time::timeout(Duration::from_secs(5), async { while !ready.exists() || !PathBuf::from(&env.fork).join("writes").exists() { tokio::time::sleep(Duration::from_millis(5)).await; }}) => { result.unwrap(); }
     }
     cancel.cancel();
     let response: RunResponse = serde_json::from_value(work.await.unwrap()).unwrap();
@@ -118,7 +118,7 @@ async fn cancellation_and_exit_clean_up_children_that_create_sessions() {
     let before = fs::read(&writes).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(fs::read(&writes).unwrap(), before, "setsid child escaped teardown");
-    let response = env.run("setsid sh -c 'while :; do echo x >> after; sleep 0.02; done' & sleep 0.05; exit 0").await;
+    let response = env.run("setsid sh -c 'while :; do echo x >> after; sleep 0.02; done' & while test ! -s after; do sleep 0.01; done; exit 0").await;
     assert!(response.success());
     let after = PathBuf::from(&env.fork).join("after");
     let before = fs::read(&after).unwrap();
@@ -143,4 +143,42 @@ fn repository_policy_and_invalid_permissions_cannot_relax_isolation() {
     assert!(SandboxPolicy::load(&trusted, &roots).is_err());
     fs::write(&trusted, "{\"network\":true}").unwrap();
     assert!(SandboxPolicy::load(&trusted, &roots).unwrap().network);
+}
+
+#[tokio::test]
+async fn timeout_and_service_shutdown_tear_down_the_namespace() {
+    let Some(env) = Env::new(SandboxPolicy::default()).await else { return };
+    let command = "setsid sh -c 'trap \"\" TERM; while :; do echo x >> timeout-writes; sleep 0.02; done' & wait";
+    let result: RunResponse = serde_json::from_value(
+        env.shell
+            .handle(
+                "run",
+                json!({
+                    "workspace": env.fork, "command": command, "timeout_ms":500
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(result.timed_out);
+    let writes = PathBuf::from(&env.fork).join("timeout-writes");
+    let before = fs::read(&writes).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(fs::read(&writes).unwrap(), before);
+
+    let command = "trap 'echo term > shutdown-grace' TERM; setsid sh -c 'trap \"\" TERM; while :; do echo x >> shutdown-writes; sleep 0.02; done' & wait";
+    let work = env.shell.handle("run", json!({"workspace": env.fork, "command": command}));
+    tokio::pin!(work);
+    let writes = PathBuf::from(&env.fork).join("shutdown-writes");
+    tokio::select! {
+        result = &mut work => panic!("early completion: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(5), async { while !writes.exists() { tokio::time::sleep(Duration::from_millis(5)).await; }}) => { result.unwrap(); }
+    }
+    env.shell.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(2), work).await.unwrap().unwrap();
+    assert!(PathBuf::from(&env.fork).join("shutdown-grace").exists());
+    let before = fs::read(&writes).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(fs::read(&writes).unwrap(), before);
 }
