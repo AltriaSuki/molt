@@ -308,6 +308,22 @@ async fn dropping_a_pending_call_sends_cancel_and_completed_calls_do_not() {
 }
 
 #[tokio::test]
+async fn dropping_a_service_wakes_and_cancels_its_pending_calls() {
+    let (svc, mut bus) = service();
+    let pending = svc.request("kernel.ping", Value::Null, CallOpts::default()).await.unwrap();
+    let request = bus.recv().await;
+    drop(svc);
+    let error = tokio::time::timeout(Duration::from_secs(1), pending.wait())
+        .await
+        .expect("dropping a service must close the call's waiter")
+        .unwrap_err();
+    assert!(matches!(error, molt_sdk::SdkError::Closed));
+    let cancel = bus.recv().await;
+    assert_eq!(cancel.to.to_string(), "kernel.cancel");
+    assert_eq!(cancel.payload["request"], json!(request.id));
+}
+
+#[tokio::test]
 async fn link_loss_finishes_cleanup_even_when_every_slot_is_occupied() {
     struct Stopped(mpsc::UnboundedSender<()>);
     impl Drop for Stopped {

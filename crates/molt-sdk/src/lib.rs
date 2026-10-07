@@ -118,13 +118,25 @@ impl PendingReply {
 impl Drop for PendingReply {
     fn drop(&mut self) {
         if self.waiters.lock().unwrap().remove(&self.id).is_some() {
-            let (link, id) = (self.link.clone(), self.id.clone());
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move {
-                    let _ = send_cancel(&link, &id).await;
-                });
-            }
+            cancel_after_drop(self.link.clone(), vec![self.id.clone()]);
         }
+    }
+}
+
+fn cancel_after_drop(link: Arc<dyn Link>, requests: Vec<MsgId>) {
+    if requests.is_empty() {
+        return;
+    }
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(async move {
+            // A stalled transport must not retain a dropped call's link forever.
+            let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                for id in requests {
+                    let _ = send_cancel(&link, &id).await;
+                }
+            })
+            .await;
+        });
     }
 }
 
@@ -185,6 +197,8 @@ impl Drop for Service {
     fn drop(&mut self) {
         self.closed.cancel();
         self.reader.abort();
+        let requests = self.waiters.lock().unwrap().drain().map(|(id, _)| id).collect();
+        cancel_after_drop(self.link.clone(), requests);
         for token in self.cancellations.lock().unwrap().values() {
             token.cancel();
         }
@@ -700,5 +714,37 @@ mod tests {
         .await
         .unwrap();
         assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_drop_releases_a_stalled_transport() {
+        struct StalledLink(mpsc::UnboundedSender<()>);
+        impl Drop for StalledLink {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        #[async_trait]
+        impl Link for StalledLink {
+            async fn send(&self, msg: &Envelope) -> Result<(), TransportError> {
+                if msg.to.to_string() == "kernel.cancel" {
+                    std::future::pending().await
+                } else {
+                    Ok(())
+                }
+            }
+            async fn recv(&self) -> Option<Envelope> {
+                std::future::pending().await
+            }
+        }
+        let (dropped, mut drop_notice) = mpsc::unbounded_channel();
+        let svc = Service::new(ServiceId::new("svc").unwrap(), Box::new(StalledLink(dropped)), HashMap::new());
+        let pending = svc.request("kernel.ping", Value::Null, CallOpts::default()).await.unwrap();
+        drop(pending);
+        drop(svc);
+        tokio::time::timeout(Duration::from_secs(2), drop_notice.recv())
+            .await
+            .expect("background cancellation retained the stalled link")
+            .unwrap();
     }
 }
