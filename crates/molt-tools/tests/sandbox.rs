@@ -179,4 +179,43 @@ async fn timeout_and_service_shutdown_tear_down_the_namespace() {
     let before = fs::read(&writes).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(fs::read(&writes).unwrap(), before);
+    let err =
+        env.shell.handle("run", json!({"workspace":env.fork,"command":"touch after-shutdown"})).await.unwrap_err();
+    assert_eq!(err.code, molt_proto::ErrorCode::Unavailable);
+    assert!(!PathBuf::from(&env.fork).join("after-shutdown").exists());
+}
+
+#[tokio::test]
+async fn dropping_a_request_tears_down_its_namespace_without_stopping_other_requests() {
+    let Some(env) = Env::new(SandboxPolicy::default()).await else { return };
+    let fork = env.fork.clone();
+    let shell = std::sync::Arc::new(env.shell);
+    let request =
+        tokio::spawn({
+            let (fork, shell) = (fork.clone(), shell.clone());
+            async move {
+                shell.handle("run", json!({"workspace":fork,"command":
+                "setsid sh -c 'trap \"\" TERM; while :; do echo x >> dropped-writes; sleep 0.02; done' & wait"
+            })).await
+            }
+        });
+    let writes = PathBuf::from(&fork).join("dropped-writes");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !writes.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let before = fs::read(&writes).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(fs::read(&writes).unwrap(), before, "dropped request left its setsid child running");
+    let next: RunResponse = serde_json::from_value(
+        shell.handle("run", json!({"workspace":fork,"command":"echo next > unaffected"})).await.unwrap(),
+    )
+    .unwrap();
+    assert!(next.success(), "{}", next.stderr);
 }

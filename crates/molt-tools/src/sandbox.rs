@@ -7,6 +7,8 @@ use tokio::process::Command;
 
 use crate::{fork, Roots};
 
+const MAX_POLICY_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Debug, Default)]
 pub enum ExecutionPolicy {
     #[default]
@@ -49,18 +51,17 @@ impl Default for SandboxPolicy {
 
 impl SandboxPolicy {
     pub fn load(path: &Path, roots: &Roots) -> anyhow::Result<Self> {
-        use std::os::unix::fs::MetadataExt;
         let path = path.canonicalize().context("sandbox policy path")?;
+        let roots = Roots {
+            root: roots.root.canonicalize().context("sandbox policy project root")?,
+            scratch: match roots.scratch.canonicalize() {
+                Ok(path) => path,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::path::absolute(&roots.scratch)?,
+                Err(e) => return Err(e.into()),
+            },
+        };
         ensure!(!roots.contains(&path), "sandbox policy must be outside the project and scratch roots");
-        let meta = std::fs::metadata(&path)?;
-        ensure!(meta.is_file() && meta.len() <= 64 * 1024, "sandbox policy must be a regular file of at most 64 KiB");
-        ensure!(
-            meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o022 == 0,
-            "sandbox policy must be owned by this user and not writable by others"
-        );
-        let policy: Self = serde_json::from_slice(&std::fs::read(path)?)?;
-        policy.validate()?;
-        Ok(policy)
+        read_policy(open_policy(&path).context("opening trusted sandbox policy")?)
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -180,6 +181,60 @@ impl SandboxPolicy {
             anyhow::bail!("sandbox requires Linux x86_64; explicit unconfined mode is required on this platform")
         }
     }
+}
+
+/// Pin every canonical path component. A directory or file replaced by a
+/// symlink between canonicalization and opening must not redirect the read.
+fn open_policy(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let mut file = std::fs::File::open("/")?;
+    let mut parts = path.components().peekable();
+    if parts.next() != Some(Component::RootDir) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "policy path must be absolute"));
+    }
+    while let Some(part) = parts.next() {
+        let Component::Normal(name) = part else {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "policy path must be canonical"));
+        };
+        let name = CString::new(name.as_bytes())?;
+        let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        if parts.peek().is_some() {
+            flags |= libc::O_DIRECTORY;
+        }
+        let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        file = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(file)
+}
+
+/// Check and read the same descriptor, with a bound that still applies if
+/// its file grows after metadata was checked.
+fn read_policy(file: std::fs::File) -> anyhow::Result<SandboxPolicy> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = file.metadata()?;
+    ensure!(
+        meta.is_file() && meta.len() <= MAX_POLICY_BYTES as u64,
+        "sandbox policy must be a regular file of at most 64 KiB"
+    );
+    ensure!(
+        meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o022 == 0,
+        "sandbox policy must be owned by this user and not writable by others"
+    );
+    let mut bytes = Vec::new();
+    file.take((MAX_POLICY_BYTES + 1) as u64).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= MAX_POLICY_BYTES, "sandbox policy exceeds 64 KiB");
+    let policy: SandboxPolicy = serde_json::from_slice(&bytes)?;
+    policy.validate()?;
+    Ok(policy)
 }
 
 pub(crate) struct Guard {
@@ -357,6 +412,60 @@ mod linux {
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn policy_checks_and_reads_the_opened_file_after_path_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("policy.json");
+        std::fs::write(&path, "{\"network\":false}").unwrap();
+        let file = open_policy(&path).unwrap();
+        std::fs::rename(&path, tmp.path().join("original.json")).unwrap();
+        std::fs::write(&path, "{\"network\":true}").unwrap();
+        assert!(!read_policy(file).unwrap().network, "replacement policy must not be read");
+    }
+
+    #[test]
+    fn policy_rejects_file_and_ancestor_symlinks_swapped_after_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trusted = tmp.path().join("trusted");
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&trusted).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(trusted.join("policy.json"), "{}").unwrap();
+        std::fs::write(project.join("policy.json"), "{\"network\":true}").unwrap();
+        let resolved = trusted.join("policy.json").canonicalize().unwrap();
+        std::fs::rename(&trusted, tmp.path().join("saved")).unwrap();
+        std::os::unix::fs::symlink(&project, &trusted).unwrap();
+        assert!(open_policy(&resolved).is_err(), "ancestor replacement must not redirect the read");
+        std::fs::remove_file(&trusted).unwrap();
+        std::fs::rename(tmp.path().join("saved"), &trusted).unwrap();
+        std::fs::remove_file(&resolved).unwrap();
+        std::os::unix::fs::symlink(project.join("policy.json"), &resolved).unwrap();
+        assert!(open_policy(&resolved).is_err(), "file replacement must not redirect the read");
+    }
+
+    #[test]
+    fn policy_uses_canonical_roots_and_checks_permissions_and_size() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        let roots = Roots { root: alias, scratch: tmp.path().join("scratch") };
+        let in_project = project.join("policy.json");
+        std::fs::write(&in_project, "{}").unwrap();
+        assert!(SandboxPolicy::load(&in_project, &roots).is_err());
+        let path = tmp.path().join("policy.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(SandboxPolicy::load(&path, &roots).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, vec![b' '; MAX_POLICY_BYTES + 1]).unwrap();
+        assert!(SandboxPolicy::load(&path, &roots).is_err());
+        std::fs::write(&path, "{\"network\":true}").unwrap();
+        assert!(SandboxPolicy::load(&path, &roots).unwrap().network);
+    }
 
     #[test]
     fn seccomp_blocks_host_socket_access_and_preserves_files_and_ip_sockets() {

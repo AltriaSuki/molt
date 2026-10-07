@@ -83,23 +83,23 @@ async fn dropping_a_request_closes_its_output_readers() {
     let shell = std::sync::Arc::new(env.shell);
     let task = tokio::spawn(async move {
         shell.handle("run", json!({"workspace":"ws", "command":
-            "setsid sh -c 'trap \"exit 0\" PIPE; while :; do printf x || exit; sleep 0.02; done' & echo $! > writer.pid; wait"
+            "setsid sh -c 'trap \"echo stopped > writer.stopped; exit 0\" PIPE; echo ready > writer.ready; while :; do printf x || exit; sleep 0.02; done' & echo $! > writer.pid; wait"
         })).await
     });
     tokio::time::timeout(Duration::from_secs(3), async {
-        while !ws.join("writer.pid").exists() {
+        while !ws.join("writer.pid").exists() || !ws.join("writer.ready").exists() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
     .unwrap();
-    let writer = Writer(fs::read_to_string(ws.join("writer.pid")).unwrap().trim().parse().unwrap());
+    let _writer = Writer(fs::read_to_string(ws.join("writer.pid")).unwrap().trim().parse().unwrap());
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     // The escaped writer remains alive while detached drain tasks own its
     // output pipe. Closing those readers makes its next write receive PIPE.
     tokio::time::timeout(Duration::from_secs(3), async {
-        while !dead(writer.0) {
+        while !ws.join("writer.stopped").exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
