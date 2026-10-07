@@ -68,6 +68,7 @@ async fn shutdown_refuses_commands_during_grace_and_after_it_returns() {
 }
 
 #[tokio::test]
+#[cfg(target_os = "linux")]
 async fn dropping_a_request_closes_its_output_readers() {
     struct Writer(i32);
     impl Drop for Writer {
