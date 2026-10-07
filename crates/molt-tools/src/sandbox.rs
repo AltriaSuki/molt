@@ -275,7 +275,7 @@ mod linux {
                 command.args(["--ro-bind", path, path]);
             }
         }
-        for path in ["/etc/ld.so.cache", "/etc/ssl/certs"] {
+        for path in ["/etc/ld.so.cache", "/etc/ssl/certs", "/etc/alternatives"] {
             if Path::new(path).exists() {
                 command.args(["--ro-bind", path, path]);
             }

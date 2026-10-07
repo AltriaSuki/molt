@@ -62,10 +62,8 @@ async fn mounts_confine_writes_including_symlinks_and_children() {
     assert_eq!(fs::read_to_string(env.roots.root.join("original")).unwrap(), "host");
     assert_eq!(fs::read_to_string(env.roots.root.join("ignored/value")).unwrap(), "dependency");
     assert_eq!(fs::read_to_string(PathBuf::from(&env.fork).join("local")).unwrap(), "fork\n");
-    assert!(env
-        .run("printf 'int main(void) { return 0; }\\n' > tiny.c && cc tiny.c -o tiny && ./tiny")
-        .await
-        .success());
+    let compiled = env.run("printf 'int main(void) { return 0; }\\n' > tiny.c && cc tiny.c -o tiny && ./tiny").await;
+    assert!(compiled.success(), "C build failed: {compiled:?}");
     assert!(env.shell.handle("run", json!({"workspace":base, "command":"touch must-not-exist"})).await.is_err());
     assert!(!env.roots.root.join("must-not-exist").exists());
 }
