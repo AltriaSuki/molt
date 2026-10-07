@@ -71,7 +71,7 @@ impl End {
     }
 
     fn cancelled() -> Self {
-        Self::new(AttemptStatus::Cancelled, "another attempt passed first")
+        Self::new(AttemptStatus::Cancelled, "attempt cancelled")
     }
 }
 
@@ -128,7 +128,7 @@ impl Attempt {
         let fork = ctx.fork().await.map_err(|e| End::error(format!("could not fork the workspace: {e}")))?;
         self.fork = Some(fork.clone());
         if self.cancel.is_cancelled() {
-            return Err(End::cancelled());
+            return Err(if ctx.over_budget() { End::from(Stop::Budget) } else { End::cancelled() });
         }
         if let Some(check) = &self.check {
             for (path, content) in &check.files {
@@ -219,10 +219,16 @@ impl Attempt {
     }
 
     async fn or_cancel<T>(&self, work: impl Future<Output = T>) -> Result<T, End> {
+        tokio::pin!(work);
         tokio::select! {
             biased;
-            out = work => Ok(out),
-            _ = self.cancel.cancelled() => Err(End::cancelled()),
+            out = &mut work => Ok(out),
+            _ = self.cancel.cancelled() => {
+                // The context's token propagates to the shell. Wait for its
+                // cleanup reply before the race drops this attempt's fork.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), &mut work).await;
+                Err(if self.ctx.over_budget() { End::from(Stop::Budget) } else { End::cancelled() })
+            }
         }
     }
 }

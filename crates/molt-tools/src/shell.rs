@@ -17,9 +17,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use molt_api::shell::{RunRequest, RunResponse};
-use molt_proto::RemoteError;
+use molt_proto::{ErrorCode, RemoteError};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::failed;
 use crate::Roots;
@@ -59,6 +60,14 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 pub(crate) struct Groups(Mutex<HashSet<libc::pid_t>>);
 
 impl Groups {
+    pub fn terminate_all(&self) {
+        for &pgid in lock(&self.0).iter() {
+            unsafe {
+                libc::killpg(pgid, libc::SIGTERM);
+            }
+        }
+    }
+
     pub fn kill_all(&self) {
         for &pgid in lock(&self.0).iter() {
             killpg(pgid);
@@ -71,6 +80,7 @@ pub(crate) async fn run(
     program: &Path,
     groups: &Arc<Groups>,
     req: RunRequest,
+    cancel: CancellationToken,
 ) -> Result<RunResponse, RemoteError> {
     let ws = {
         let (roots, ws) = (roots.clone(), req.workspace.clone());
@@ -78,6 +88,9 @@ pub(crate) async fn run(
             .await
             .map_err(|e| failed(format!("shell.run failed: {e}")))??
     };
+    if cancel.is_cancelled() {
+        return Err(RemoteError { code: ErrorCode::Cancelled, message: "command cancelled before start".into() });
+    }
     let limit = Duration::from_millis(req.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1, MAX_TIMEOUT_MS));
 
     let mut cmd = Command::new(program);
@@ -101,12 +114,12 @@ pub(crate) async fn run(
         tokio::spawn(drain(child.stderr.take(), stderr.clone())),
     ];
 
-    let (status, timed_out) = match tokio::time::timeout(limit, child.wait()).await {
-        Ok(status) => (status, false),
-        Err(_) => {
-            group.kill();
-            (child.wait().await, true)
-        }
+    // Prefer an already-finished command in a cancellation/completion tie.
+    let (status, timed_out, cancelled) = tokio::select! {
+        biased;
+        status = child.wait() => (status, false, false),
+        _ = cancel.cancelled() => (terminate(&group, &mut child).await, false, true),
+        _ = tokio::time::sleep(limit) => (terminate(&group, &mut child).await, true, false),
     };
     let duration = started.elapsed();
     group.kill();
@@ -128,11 +141,24 @@ pub(crate) async fn run(
         exit_code: status.code(),
         signal: status.signal(),
         timed_out,
+        cancelled,
         stdout,
         stderr,
         truncated: out_cut || err_cut,
         duration_ms: duration.as_millis() as u64,
     })
+}
+
+async fn terminate(group: &Group, child: &mut tokio::process::Child) -> std::io::Result<std::process::ExitStatus> {
+    if let Some(pgid) = group.pgid {
+        unsafe {
+            libc::killpg(pgid, libc::SIGTERM);
+        }
+    }
+    // Keep the leader unreaped during grace so its process-group id cannot be reused.
+    tokio::time::sleep(GRACE).await;
+    group.kill();
+    child.wait().await
 }
 
 /// The service's environment without its secrets, plus [`FIXED_ENV`].

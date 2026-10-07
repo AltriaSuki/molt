@@ -35,6 +35,8 @@ pub enum Kind {
     Reply,
     /// Published to a topic; no reply.
     Event,
+    /// Kernel-only control message. `reply_to` names the request to stop.
+    Cancel,
 }
 
 /// Deepest nesting of arrays and objects a message may arrive at the kernel
@@ -193,6 +195,8 @@ pub enum ErrorCode {
     Unavailable,
     /// No reply arrived before the deadline.
     Timeout,
+    /// Local work stopped; remote side effects and billing may remain unknown.
+    Cancelled,
     /// The message itself is malformed.
     Invalid,
     /// The receiving service failed while handling the request.

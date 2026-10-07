@@ -253,3 +253,56 @@ async fn time_spent_waiting_for_a_slot_counts_against_the_deadline() {
     assert!(ms > 0 && ms <= 10_000 - WAIT.as_millis() as u64, "the handler saw {ms} ms left");
     assert!(seen.try_recv().is_err(), "a request past its deadline never reaches the handler");
 }
+
+#[tokio::test]
+async fn cancellation_is_authenticated_and_does_not_stop_other_requests() {
+    let (svc, mut bus) = service();
+    let task = tokio::spawn({
+        let svc = svc.clone();
+        async move {
+            svc.serve_concurrent(2, |req| async move {
+                if req.payload == json!("slow") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+                Ok(req.payload)
+            })
+            .await;
+        }
+    });
+    let id = bus.request(json!("slow"));
+    let mut stop = Envelope::request(TraceId::random(), "svc.work".parse().unwrap(), CapId::random(), Value::Null);
+    stop.kind = Kind::Cancel;
+    stop.reply_to = Some(id.clone());
+    stop.from = Some(ServiceId::new("rogue").unwrap());
+    bus.to.send(stop.clone()).unwrap();
+    let other = bus.request(json!("other"));
+    let reply = bus.recv().await;
+    assert_eq!(reply.reply_to, Some(other));
+    assert_eq!(result(&reply).unwrap(), json!("other"));
+    assert!(bus.from.try_recv().is_err());
+    stop.from = Some(ServiceId::kernel());
+    bus.to.send(stop).unwrap();
+    let reply = bus.recv().await;
+    assert_eq!(reply.reply_to, Some(id));
+    assert_eq!(result(&reply).unwrap_err().code, ErrorCode::Cancelled);
+    drop(bus.to);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_a_pending_call_sends_cancel_and_completed_calls_do_not() {
+    let (svc, mut bus) = service();
+    let pending = svc.request("kernel.ping", Value::Null, CallOpts::default()).await.unwrap();
+    let request = bus.recv().await;
+    assert_eq!(pending.id(), &request.id);
+    drop(pending);
+    let control = bus.recv().await;
+    assert_eq!(control.to.to_string(), "kernel.cancel");
+    assert_eq!(control.payload["request"], json!(request.id));
+    let pending = svc.request("kernel.ping", Value::Null, CallOpts::default()).await.unwrap();
+    let request = bus.recv().await;
+    bus.to.send(request.reply(json!(true))).unwrap();
+    assert_eq!(pending.wait().await.unwrap(), json!(true));
+    tokio::task::yield_now().await;
+    assert!(bus.from.try_recv().is_err());
+}

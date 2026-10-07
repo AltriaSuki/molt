@@ -221,8 +221,6 @@ a notice and pass; CI always runs them.
 - The audit log records every message, file contents and model conversations included, and is never rotated; it grows with every run in a data dir.
 - Reading one trace back from the audit log scans the log from the start: there is no index yet. One read looks through at most 256 MiB and keeps to its deadline, and two run at once.
 - The kernel drops a message nested more than 100 levels deep, so every logged message can be read back.
-- A cancelled attempt's running command is not stopped: it runs until it ends, times out (2 minutes unless the model asks for up to 30; `MOLT_CHECK_TIMEOUT_S` for a check) or `molt do` exits.
-- Nor is a cancelled attempt's model call: it is billed all the same. Its cost is counted if the reply lands within 2 seconds of the last attempt stopping; the report gives the number of calls it could not count.
 - After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Cancellation tokens and call-cycle checks at the gate arrive with the services that need them.
@@ -231,3 +229,13 @@ a notice and pass; CI always runs them.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - A topic capability currently allows both publishing and subscribing.
 - No license has been chosen yet.
+
+### Cancellation and model settlement
+
+Dropping an SDK `PendingReply` requests `kernel.cancel` for that request. The kernel verifies the original caller, sends a kernel-only control message, and keeps the request open for one final cleanup or settlement reply. Cancellation is idempotent and does not affect another request. SDK services can use `serve_cancellable` for cleanup; ordinary concurrent handlers stop locally on cancellation. Cancelled queued work does not start.
+
+The planner gives each attempt its own cancellation token. A winner stops competing attempts; budget exhaustion or unknown model cost stops new actions throughout the run. Shell cancellation and timeout send TERM to the process group, allow 500 ms for cleanup, then send KILL and reap the leader before replying. Service shutdown uses the same grace. Process groups alone cannot contain a program that deliberately creates a new session; OS isolation is tracked by #9.
+
+The gateway closes its local HTTP request on cancellation and audits a correlated settlement record with `local_stopped`, `remote_cancel_confirmed`, `usage` and `cost_usd`. Anthropic Messages has no remote cancellation acknowledgement here, so remote cancellation and missing usage remain unknown. A completion already received wins the race and is counted once. After a kernel timeout, one authenticated late model reply can still be audited for up to one hour, without delivering a second run result; the late-settlement registry is bounded and temporary, while accepted records persist in the audit log. `molt audit --help` describes querying the log.
+
+Run `cost_usd` is the known subtotal. `uncounted_calls` now includes pending calls, errors without usage, and replies without a known price. The terminal explicitly labels the known cost and incomplete settlement; automatic memory learning is skipped when settlement is incomplete. This is an estimated spending limit, not a provider-enforced dollar ceiling.

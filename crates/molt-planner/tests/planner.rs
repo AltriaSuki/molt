@@ -411,6 +411,7 @@ fn exit(code: i32, stderr: &str) -> shell::RunResponse {
         exit_code: Some(code),
         signal: None,
         timed_out: false,
+        cancelled: false,
         stdout: String::new(),
         stderr: stderr.to_owned(),
         truncated: false,
@@ -624,7 +625,7 @@ async fn the_first_attempt_to_pass_wins_and_the_others_are_cancelled() {
     assert_eq!(resp.summary, "Mine passed.");
     let statuses: Vec<AttemptStatus> = resp.attempts.iter().map(|a| a.status).collect();
     assert_eq!(statuses, [AttemptStatus::Passed, AttemptStatus::Cancelled, AttemptStatus::Cancelled]);
-    assert_eq!(resp.attempts[1].note, "another attempt passed first");
+    assert_eq!(resp.attempts[1].note, "attempt cancelled");
     assert_eq!(fake.calls_to("fs.fork").len(), 3);
     assert!(fake.forks_alive().is_empty());
     assert_eq!(fake.workspace()["hello.txt"], "hi\n");
@@ -1326,4 +1327,23 @@ async fn memory_gives_every_conversation_the_project_context_and_its_tools() {
     assert_eq!(hung.requests()[0].tools.len(), 6);
     assert!(hung.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
         if message == "running without memory: memory.recall did not answer")));
+}
+
+#[tokio::test]
+async fn unknown_model_prices_are_reported_and_stop_further_actions() {
+    let fake = Fake::new(
+        |req| {
+            let mut reply = write_hello(req, "hi\n");
+            reply.resp.as_mut().unwrap().cost_usd = None;
+            reply
+        },
+        hello_check,
+    );
+    let resp = run(&fake, request(Some("check"), 1)).await;
+    assert_eq!(resp.outcome, Outcome::Failed);
+    assert_eq!(resp.uncounted_calls, 1);
+    assert_eq!(resp.cost_usd, 0.0); // Known subtotal, explicitly incomplete.
+    assert!(!resp.applied);
+    assert!(fake.calls_to("fs.write").is_empty());
+    assert!(fake.calls_to("shell.run").is_empty());
 }

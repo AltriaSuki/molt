@@ -84,7 +84,8 @@ async fn a_timeout_kills_the_whole_group_quickly() {
     let r = env.run("sleep 30 & echo $! > bg.pid; echo before; sleep 30", Some(300)).await;
     assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
     assert!(r.timed_out && !r.success());
-    assert_eq!((r.exit_code, r.signal), (None, Some(9)));
+    assert_eq!(r.exit_code, None);
+    assert!(matches!(r.signal, Some(9 | 15)));
     assert_eq!(r.stdout, "before\n");
     let pid: i32 = fs::read_to_string(env.ws.join("bg.pid")).unwrap().trim().parse().unwrap();
     assert!(wait_dead(pid), "the background sleep {pid} survived");
@@ -179,4 +180,34 @@ async fn hangup_and_quit_stop_the_service_too() {
         assert_eq!(unsafe { libc::kill(libc::getpid(), sig) }, 0);
         tokio::time::timeout(Duration::from_secs(5), stop).await.unwrap_or_else(|_| panic!("signal {sig} was missed"));
     }
+}
+
+#[tokio::test]
+async fn cancellation_terminates_children_and_escalates_after_grace() {
+    use tokio_util::sync::CancellationToken;
+    let env = Env::new();
+    let cancel = CancellationToken::new();
+    let command = "trap 'echo graceful > term' TERM; (trap '' TERM; while :; do echo x >> writes; sleep 0.02; done) & echo $! > writer.pid; wait";
+    let work = env.shell.handle_cancellable("run", json!({"workspace":"ws", "command": command}), cancel.clone());
+    tokio::pin!(work);
+    tokio::select! {
+        result = &mut work => panic!("finished before cancellation: {result:?}"),
+        _ = async { while !env.ws.join("writer.pid").exists() { tokio::time::sleep(Duration::from_millis(10)).await; } } => {}
+    }
+    cancel.cancel();
+    let response: RunResponse = serde_json::from_value(work.await.unwrap()).unwrap();
+    assert!(response.cancelled && !response.success() && !response.timed_out);
+    assert!(env.ws.join("term").exists(), "TERM handler ran before KILL");
+    let pid = fs::read_to_string(env.ws.join("writer.pid")).unwrap().trim().parse().unwrap();
+    assert!(wait_dead(pid));
+    let contents = fs::read(env.ws.join("writes")).unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(contents, fs::read(env.ws.join("writes")).unwrap());
+    let response = env
+        .shell
+        .handle_cancellable("run", json!({"workspace":"ws", "command":"touch forbidden"}), cancel)
+        .await
+        .unwrap_err();
+    assert_eq!(response.code, ErrorCode::Cancelled);
+    assert!(!env.ws.join("forbidden").exists());
 }

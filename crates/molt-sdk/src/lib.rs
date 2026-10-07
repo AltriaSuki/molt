@@ -22,6 +22,7 @@ use molt_transport::{Link, TransportError};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// Same as `molt_kernel::ENV_CAPS`; duplicated so services need not depend on the kernel.
 pub const ENV_CAPS: &str = "MOLT_CAPS";
@@ -60,7 +61,8 @@ pub struct CallOpts {
 
 /// A request that has been sent and whose reply has not been awaited yet.
 pub struct PendingReply {
-    rx: oneshot::Receiver<Envelope>,
+    rx: Option<oneshot::Receiver<Envelope>>,
+    link: Arc<dyn Link>,
     id: MsgId,
     waiters: Waiters,
     /// When to stop waiting: a while after the request's deadline, by which
@@ -76,26 +78,76 @@ const REPLY_GRACE: Duration = Duration::from_secs(5);
 const REPLY_GRACE: Duration = Duration::from_millis(50);
 
 impl PendingReply {
-    /// The reply payload, or the error the callee or the kernel sent back.
+    pub fn id(&self) -> &MsgId {
+        &self.id
+    }
+
+    /// Request cancellation. Keep waiting for the callee's final settlement;
+    /// acceptance by the kernel is not confirmation of remote cancellation.
+    pub async fn cancel(&self) -> Result<(), SdkError> {
+        send_cancel(&self.link, &self.id).await
+    }
+
     pub async fn wait(self) -> Result<Value, SdkError> {
-        let reply = match self.give_up {
-            None => self.rx.await,
-            Some(at) => match tokio::time::timeout_at(at.into(), self.rx).await {
-                Ok(reply) => reply,
-                Err(_) => {
-                    self.waiters.lock().unwrap().remove(&self.id);
-                    let message = "no reply arrived by the deadline; it was lost on the way".to_owned();
-                    return Err(SdkError::Remote(RemoteError { code: ErrorCode::Timeout, message }));
-                }
-            },
-        };
-        let reply = reply.map_err(|_| SdkError::Closed)?;
+        let reply = self.wait_envelope().await?;
         match reply.error() {
             Some(err) => Err(SdkError::Remote(err)),
             None => Ok(reply.payload),
         }
     }
+
+    async fn wait_envelope(mut self) -> Result<Envelope, SdkError> {
+        let rx = self.rx.take().expect("reply awaited once");
+        let reply = match self.give_up {
+            None => rx.await,
+            Some(at) => match tokio::time::timeout_at(at.into(), rx).await {
+                Ok(reply) => reply,
+                Err(_) => {
+                    // Drop removes the waiter and sends cancellation.
+                    return Err(SdkError::Remote(RemoteError {
+                        code: ErrorCode::Timeout,
+                        message: "no reply arrived by the deadline; settlement is unknown".into(),
+                    }));
+                }
+            },
+        };
+        reply.map_err(|_| SdkError::Closed)
+    }
 }
+
+impl Drop for PendingReply {
+    fn drop(&mut self) {
+        if self.waiters.lock().unwrap().remove(&self.id).is_some() {
+            let (link, id) = (self.link.clone(), self.id.clone());
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = send_cancel(&link, &id).await;
+                });
+            }
+        }
+    }
+}
+
+async fn send_cancel(link: &Arc<dyn Link>, id: &MsgId) -> Result<(), SdkError> {
+    let mut msg = Envelope::request(
+        TraceId::random(),
+        "kernel.cancel".parse().unwrap(),
+        CapId::from_raw(""),
+        json!({ "request": id }),
+    );
+    msg.cap = None;
+    link.send(&msg).await?;
+    Ok(())
+}
+
+struct AbortWork(tokio::task::AbortHandle);
+impl Drop for AbortWork {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+type Cancellations = Arc<Mutex<HashMap<MsgId, CancellationToken>>>;
 
 type Waiters = Arc<Mutex<HashMap<MsgId, oneshot::Sender<Envelope>>>>;
 
@@ -109,11 +161,15 @@ pub struct Service {
     /// Requests and events, with when each arrived.
     incoming: tokio::sync::Mutex<mpsc::Receiver<(Envelope, Instant)>>,
     reader: JoinHandle<()>,
+    cancellations: Cancellations,
 }
 
 impl Drop for Service {
     fn drop(&mut self) {
         self.reader.abort();
+        for token in self.cancellations.lock().unwrap().values() {
+            token.cancel();
+        }
     }
 }
 
@@ -135,8 +191,18 @@ impl Service {
         let link: Arc<dyn Link> = Arc::from(link);
         let waiters: Waiters = Arc::default();
         let (tx, rx) = mpsc::channel(QUEUE);
-        let reader = tokio::spawn(read_loop(link.clone(), waiters.clone(), tx));
-        Self { id, version: None, link, caps: Mutex::new(caps), waiters, incoming: tokio::sync::Mutex::new(rx), reader }
+        let cancellations: Cancellations = Arc::default();
+        let reader = tokio::spawn(read_loop(link.clone(), waiters.clone(), tx, cancellations.clone()));
+        Self {
+            id,
+            version: None,
+            link,
+            caps: Mutex::new(caps),
+            waiters,
+            incoming: tokio::sync::Mutex::new(rx),
+            reader,
+            cancellations,
+        }
     }
 
     pub fn id(&self) -> &ServiceId {
@@ -195,18 +261,25 @@ impl Service {
 
     /// Send a fully built request and wait for the reply envelope.
     pub async fn send_request(&self, msg: Envelope) -> Result<Envelope, SdkError> {
-        self.send_raw_request(msg).await?.rx.await.map_err(|_| SdkError::Closed)
+        self.send_raw_request(msg).await?.wait_envelope().await
     }
 
     async fn send_raw_request(&self, msg: Envelope) -> Result<PendingReply, SdkError> {
         let (tx, rx) = oneshot::channel();
         self.waiters.lock().unwrap().insert(msg.id.clone(), tx);
+        let give_up = (msg.budget.ms > 0).then(|| Instant::now() + Duration::from_millis(msg.budget.ms) + REPLY_GRACE);
+        let pending = PendingReply {
+            rx: Some(rx),
+            link: self.link.clone(),
+            id: msg.id.clone(),
+            waiters: self.waiters.clone(),
+            give_up,
+        };
         if let Err(e) = self.link.send(&msg).await {
             self.waiters.lock().unwrap().remove(&msg.id);
             return Err(e.into());
         }
-        let give_up = (msg.budget.ms > 0).then(|| Instant::now() + Duration::from_millis(msg.budget.ms) + REPLY_GRACE);
-        Ok(PendingReply { rx, id: msg.id, waiters: self.waiters.clone(), give_up })
+        Ok(pending)
     }
 
     /// Call a kernel method (`ping`, `cap.delegate`, `subscribe`, `registry.*`).
@@ -267,6 +340,7 @@ impl Service {
                 msg.budget.ms -= waited;
                 return Some(msg);
             }
+            self.cancellations.lock().unwrap().remove(&msg.id);
             let reason = format!("the request waited {waited} ms for the service, past its deadline");
             if let Err(e) = self.reply_error(&msg, ErrorCode::Timeout, &reason).await {
                 tracing::debug!(error = %e, "could not answer a request that timed out in the queue");
@@ -298,8 +372,14 @@ impl Service {
         Fut: Future<Output = Result<Value, RemoteError>>,
     {
         while let Some(msg) = self.next().await {
-            let result = handler(msg.clone()).await;
+            let cancel = self.cancellations.lock().unwrap().get(&msg.id).cloned().unwrap_or_default();
+            let result = tokio::select! {
+                biased;
+                result = handler(msg.clone()) => result,
+                _ = cancel.cancelled() => Err(RemoteError { code: ErrorCode::Cancelled, message: "local work stopped".into() }),
+            };
             self.answer(&msg, result).await;
+            self.cancellations.lock().unwrap().remove(&msg.id);
         }
     }
 
@@ -315,24 +395,63 @@ impl Service {
         F: Fn(Envelope) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value, RemoteError>> + Send + 'static,
     {
+        let handler = Arc::new(handler);
+        self.serve_cancellable(max_in_flight, move |msg, cancel| {
+            let handler = handler.clone();
+            async move {
+                if cancel.is_cancelled() {
+                    return Err(RemoteError {
+                        code: ErrorCode::Cancelled,
+                        message: "request cancelled before start".into(),
+                    });
+                }
+                let work = handler(msg);
+                tokio::select! {
+                    biased;
+                    result = work => result,
+                    _ = cancel.cancelled() => Err(RemoteError { code: ErrorCode::Cancelled,
+                        message: "local work stopped; remote cancellation and usage are unknown".into() }),
+                }
+            }
+        })
+        .await;
+    }
+
+    /// A cooperative handler receives a token even if cancelled while queued.
+    /// It must stop starting work and finish cleanup before returning.
+    pub async fn serve_cancellable<F, Fut>(self: &Arc<Self>, max_in_flight: usize, handler: F)
+    where
+        F: Fn(Envelope, CancellationToken) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value, RemoteError>> + Send + 'static,
+    {
         let slots = Arc::new(tokio::sync::Semaphore::new(max_in_flight.max(1)));
         let handler = Arc::new(handler);
         let mut tasks = tokio::task::JoinSet::new();
         loop {
             let Ok(slot) = slots.clone().acquire_owned().await else { break };
             let Some(msg) = self.next().await else { break };
+            let cancel = self.cancellations.lock().unwrap().get(&msg.id).cloned().unwrap_or_default();
             let (svc, handler) = (self.clone(), handler.clone());
             tasks.spawn(async move {
                 let _slot = slot;
                 let request = msg.clone();
-                let work = tokio::spawn(async move { handler(request).await });
+                let work = tokio::spawn(async move { handler(request, cancel).await });
+                let _abort = AbortWork(work.abort_handle());
                 let result = match work.await {
                     Ok(r) => r,
                     Err(e) => Err(RemoteError { code: ErrorCode::Failed, message: format!("the handler failed: {e}") }),
                 };
                 svc.answer(&msg, result).await;
+                svc.cancellations.lock().unwrap().remove(&msg.id);
             });
             while tasks.try_join_next().is_some() {}
+        }
+        // Link loss cancels every token in read_loop; allow cooperative cleanup.
+        if tokio::time::timeout(Duration::from_secs(2), async { while tasks.join_next().await.is_some() {} })
+            .await
+            .is_err()
+        {
+            tasks.abort_all();
         }
     }
 
@@ -362,8 +481,25 @@ impl Service {
 /// Route replies to their calls and queue everything else for [`Service::next`].
 /// It never waits for queue space: a request handler waiting on a call would
 /// then never see its reply, which arrives behind the queued requests.
-async fn read_loop(link: Arc<dyn Link>, waiters: Waiters, incoming: mpsc::Sender<(Envelope, Instant)>) {
+async fn read_loop(
+    link: Arc<dyn Link>,
+    waiters: Waiters,
+    incoming: mpsc::Sender<(Envelope, Instant)>,
+    cancellations: Cancellations,
+) {
     while let Some(msg) = link.recv().await {
+        if msg.kind == Kind::Cancel {
+            if msg.from.as_ref().is_some_and(|from| from.as_str() == molt_proto::KERNEL) {
+                if let Some(token) = msg.reply_to.as_ref().and_then(|id| cancellations.lock().unwrap().get(id).cloned())
+                {
+                    token.cancel();
+                }
+            }
+            continue;
+        }
+        if msg.kind == Kind::Request {
+            cancellations.lock().unwrap().insert(msg.id.clone(), CancellationToken::new());
+        }
         if msg.kind == Kind::Reply {
             let waiter = msg.reply_to.as_ref().and_then(|id| waiters.lock().unwrap().remove(id));
             match waiter {
@@ -377,6 +513,7 @@ async fn read_loop(link: Arc<dyn Link>, waiters: Waiters, incoming: mpsc::Sender
         match incoming.try_send((msg, Instant::now())) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full((msg, _))) if msg.kind == Kind::Request => {
+                cancellations.lock().unwrap().remove(&msg.id);
                 let busy = msg
                     .error_reply(ErrorCode::Busy, format!("the service is busy: {QUEUE} requests are already waiting"));
                 if let Err(e) = link.send(&busy).await {
@@ -391,6 +528,9 @@ async fn read_loop(link: Arc<dyn Link>, waiters: Waiters, incoming: mpsc::Sender
     }
     // The link closed: wake every waiting call with an error.
     waiters.lock().unwrap().clear();
+    for token in cancellations.lock().unwrap().values() {
+        token.cancel();
+    }
 }
 
 #[cfg(test)]
