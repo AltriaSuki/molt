@@ -149,6 +149,22 @@ impl Drop for AbortWork {
 
 type Cancellations = Arc<Mutex<HashMap<MsgId, CancellationToken>>>;
 
+/// Forget active requests even when the serving future is dropped or aborted.
+struct ActiveRequest {
+    id: Option<MsgId>,
+    cancellations: Cancellations,
+    cancel: CancellationToken,
+}
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(id) = &self.id {
+            self.cancellations.lock().unwrap().remove(id);
+        }
+    }
+}
+
 type Waiters = Arc<Mutex<HashMap<MsgId, oneshot::Sender<Envelope>>>>;
 
 pub struct Service {
@@ -162,10 +178,12 @@ pub struct Service {
     incoming: tokio::sync::Mutex<mpsc::Receiver<(Envelope, Instant)>>,
     reader: JoinHandle<()>,
     cancellations: Cancellations,
+    closed: CancellationToken,
 }
 
 impl Drop for Service {
     fn drop(&mut self) {
+        self.closed.cancel();
         self.reader.abort();
         for token in self.cancellations.lock().unwrap().values() {
             token.cancel();
@@ -192,7 +210,8 @@ impl Service {
         let waiters: Waiters = Arc::default();
         let (tx, rx) = mpsc::channel(QUEUE);
         let cancellations: Cancellations = Arc::default();
-        let reader = tokio::spawn(read_loop(link.clone(), waiters.clone(), tx, cancellations.clone()));
+        let closed = CancellationToken::new();
+        let reader = tokio::spawn(read_loop(link.clone(), waiters.clone(), tx, cancellations.clone(), closed.clone()));
         Self {
             id,
             version: None,
@@ -202,6 +221,7 @@ impl Service {
             incoming: tokio::sync::Mutex::new(rx),
             reader,
             cancellations,
+            closed,
         }
     }
 
@@ -372,15 +392,25 @@ impl Service {
         Fut: Future<Output = Result<Value, RemoteError>>,
     {
         while let Some(msg) = self.next().await {
-            let cancel = self.cancellations.lock().unwrap().get(&msg.id).cloned().unwrap_or_default();
-            let result = tokio::select! {
-                biased;
-                result = handler(msg.clone()) => result,
-                _ = cancel.cancelled() => Err(RemoteError { code: ErrorCode::Cancelled, message: "local work stopped".into() }),
+            let active = self.active_request(&msg);
+            let cancel = &active.cancel;
+            let result = if cancel.is_cancelled() {
+                Err(RemoteError { code: ErrorCode::Cancelled, message: "request cancelled before start".into() })
+            } else {
+                tokio::select! {
+                    biased;
+                    result = handler(msg.clone()) => result,
+                    _ = cancel.cancelled() => Err(RemoteError { code: ErrorCode::Cancelled, message: "local work stopped".into() }),
+                }
             };
             self.answer(&msg, result).await;
-            self.cancellations.lock().unwrap().remove(&msg.id);
         }
+    }
+
+    fn active_request(&self, msg: &Envelope) -> ActiveRequest {
+        let id = (msg.kind == Kind::Request).then(|| msg.id.clone());
+        let cancel = id.as_ref().and_then(|id| self.cancellations.lock().unwrap().get(id).cloned()).unwrap_or_default();
+        ActiveRequest { id, cancellations: self.cancellations.clone(), cancel }
     }
 
     /// Handle up to `max_in_flight` requests at once until the link closes.
@@ -428,11 +458,23 @@ impl Service {
         let handler = Arc::new(handler);
         let mut tasks = tokio::task::JoinSet::new();
         loop {
-            let Ok(slot) = slots.clone().acquire_owned().await else { break };
-            let Some(msg) = self.next().await else { break };
-            let cancel = self.cancellations.lock().unwrap().get(&msg.id).cloned().unwrap_or_default();
+            let slot = tokio::select! {
+                biased;
+                _ = self.closed.cancelled() => break,
+                slot = slots.clone().acquire_owned() => slot,
+            };
+            let Ok(slot) = slot else { break };
+            let msg = tokio::select! {
+                biased;
+                _ = self.closed.cancelled() => break,
+                msg = self.next() => msg,
+            };
+            let Some(msg) = msg else { break };
+            let active = self.active_request(&msg);
+            let cancel = active.cancel.clone();
             let (svc, handler) = (self.clone(), handler.clone());
             tasks.spawn(async move {
+                let _active = active;
                 let _slot = slot;
                 let request = msg.clone();
                 let work = tokio::spawn(async move { handler(request, cancel).await });
@@ -442,7 +484,6 @@ impl Service {
                     Err(e) => Err(RemoteError { code: ErrorCode::Failed, message: format!("the handler failed: {e}") }),
                 };
                 svc.answer(&msg, result).await;
-                svc.cancellations.lock().unwrap().remove(&msg.id);
             });
             while tasks.try_join_next().is_some() {}
         }
@@ -451,8 +492,9 @@ impl Service {
             .await
             .is_err()
         {
-            tasks.abort_all();
+            tasks.shutdown().await;
         }
+        self.cancellations.lock().unwrap().clear();
     }
 
     /// Send the reply for a handled message; events get none.
@@ -486,7 +528,9 @@ async fn read_loop(
     waiters: Waiters,
     incoming: mpsc::Sender<(Envelope, Instant)>,
     cancellations: Cancellations,
+    closed: CancellationToken,
 ) {
+    let _closed = closed.drop_guard();
     while let Some(msg) = link.recv().await {
         if msg.kind == Kind::Cancel {
             if msg.from.as_ref().is_some_and(|from| from.as_str() == molt_proto::KERNEL) {
@@ -570,16 +614,20 @@ mod tests {
         let svc = Service::new(ServiceId::new("svc").unwrap(), Box::new(link), HashMap::new());
         let req = Envelope::request(TraceId::random(), "svc.deep".parse().unwrap(), CapId::random(), Value::Null);
         to_service.send(req.clone()).await.unwrap();
-        drop(to_service);
         let deep: Value =
             serde_json::from_str(&format!("{}1{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH))).unwrap();
-        svc.serve(move |_| {
+        let serving = svc.serve(move |_| {
             let deep = deep.clone();
             async move { Ok(deep) }
-        })
-        .await;
-        drop(svc);
-        let err = from_service.recv().await.expect("a reply").error().expect("an error reply");
+        });
+        tokio::pin!(serving);
+        let reply = tokio::select! {
+            reply = from_service.recv() => reply.expect("a reply"),
+            () = &mut serving => panic!("service stopped before replying"),
+        };
+        drop(to_service);
+        serving.await;
+        let err = reply.error().expect("an error reply");
         assert!(err.message.contains("nested"), "{}", err.message);
     }
 
@@ -606,14 +654,51 @@ mod tests {
         let svc = Service::new(ServiceId::new("svc").unwrap(), Box::new(link), HashMap::new());
         let req = Envelope::request(TraceId::random(), "svc.big".parse().unwrap(), CapId::random(), Value::Null);
         to_service.send(req.clone()).await.unwrap();
+        let serving = svc.serve(|_| async { Ok(json!("x".repeat(4096))) });
+        tokio::pin!(serving);
+        let reply = tokio::select! {
+            reply = from_service.recv() => reply.expect("a reply"),
+            () = &mut serving => panic!("service stopped before replying"),
+        };
         drop(to_service);
-        svc.serve(|_| async { Ok(json!("x".repeat(4096))) }).await;
-        drop(svc);
-
-        let reply = from_service.recv().await.expect("a reply");
+        serving.await;
         assert_eq!(reply.reply_to.as_ref(), Some(&req.id));
         let err = reply.error().expect("an error reply");
         assert_eq!(err.code, ErrorCode::Failed);
         assert!(err.message.contains("too big"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_server_cancels_and_forgets_its_active_request() {
+        let (to_service, inbox) = mpsc::channel(4);
+        let (sent, _from_service) = mpsc::channel(4);
+        let link = SmallLink { max: usize::MAX, inbox: tokio::sync::Mutex::new(inbox), sent };
+        let svc = Arc::new(Service::new(ServiceId::new("svc").unwrap(), Box::new(link), HashMap::new()));
+        let (started, start) = oneshot::channel();
+        let started = Arc::new(Mutex::new(Some(started)));
+        let task = tokio::spawn({
+            let svc = svc.clone();
+            async move {
+                svc.serve_cancellable(1, move |_, cancel| {
+                    started.lock().unwrap().take().unwrap().send(cancel).unwrap();
+                    std::future::pending::<Result<Value, RemoteError>>()
+                })
+                .await;
+            }
+        });
+        let req = Envelope::request(TraceId::random(), "svc.work".parse().unwrap(), CapId::random(), Value::Null);
+        to_service.send(req).await.unwrap();
+        let cancel = start.await.unwrap();
+        assert_eq!(svc.cancellations.lock().unwrap().len(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !svc.cancellations.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(cancel.is_cancelled());
     }
 }
