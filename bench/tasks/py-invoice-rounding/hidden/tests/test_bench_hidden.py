@@ -75,6 +75,11 @@ class MoneyTests(unittest.TestCase):
                 self.assertIsInstance(result, Decimal)
                 self.assertEqual(result, expected)
 
+    def test_to_amount_rejects_non_finite_decimals(self):
+        for value in (D("NaN"), D("Infinity"), D("-Infinity")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                to_amount(value)
+
     def test_round_cents_rounds_halves_up(self):
         cases = {
             "0.125": "0.13",

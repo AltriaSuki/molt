@@ -76,6 +76,14 @@ describe('named parameters', () => {
     assert.equal(found.handler.name, 'team');
     assert.deepEqual(Object.keys(found.params), []);
   });
+
+  test('static segments are compared literally', () => {
+    const router = new Router().get('/v1.0/items/:id', h('item')).get('/tags/a+b', h('tag'));
+    assert.deepEqual(paramsOf(router, 'GET', '/v1.0/items/7'), { id: '7' });
+    assert.equal(router.match('GET', '/v1x0/items/7'), null);
+    assert.equal(winner(router, 'GET', '/tags/a+b'), 'tag');
+    assert.equal(router.match('GET', '/tags/aab'), null);
+  });
 });
 
 describe('optional parameters', () => {
@@ -180,6 +188,11 @@ describe('trailing slash', () => {
     const router = new Router().get('/about', h('about')).get('/users/:id', h('user'));
     assert.equal(winner(router, 'GET', '/about/'), 'about');
     assert.deepEqual(paramsOf(router, 'GET', '/users/42/'), { id: '42' });
+  });
+
+  test('only one trailing slash is ignored', () => {
+    const router = new Router().get('/users/:id', h('user'));
+    assert.equal(router.match('GET', '/users/42//'), null);
   });
 
   test('/ stays /', () => {

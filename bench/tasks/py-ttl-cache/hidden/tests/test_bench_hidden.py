@@ -171,6 +171,18 @@ class PerEntryTtlTests(unittest.TestCase):
             cache.put("a", 2, ttl=0)
         self.assertEqual(cache.get("a"), 1)
 
+    def test_rejected_put_leaves_a_full_cache_as_it_was(self):
+        cache = LRUCache(2, ttl=10, clock=self.clock)
+        cache.put("a", 1)
+        cache.put("b", 2)
+        with self.assertRaises(ValueError):
+            cache.put("c", 3, ttl=0)
+        with self.assertRaises(ValueError):
+            cache.put("a", 4, ttl=-1)
+        self.assertEqual(cache.keys(), ["a", "b"])
+        self.assertEqual(cache.get("a"), 1)
+        self.assertEqual(cache.stats(), counters(hits=1))
+
 
 class OverwriteTests(unittest.TestCase):
     def setUp(self):
