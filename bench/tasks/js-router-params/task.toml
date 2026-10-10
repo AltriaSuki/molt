@@ -1,0 +1,86 @@
+title = "Add route parameters, wildcards and HEAD fallback to the router"
+language = "javascript"
+kind = "feature"
+difficulty = "medium"
+split = "dev"
+tests = "node --test test/router.test.js test/dispatcher.test.js"
+check = "node --test test/router.test.js test/dispatcher.test.js test/bench_hidden.test.js"
+timeout_s = 120
+prompt = """
+minirouter's `Router` (src/router.js) only matches exact static paths, so every
+service using it ends up parsing ids out of `ctx.path` by hand. Please add route
+parameters to it. The dispatcher already passes `match()`'s `params` through as
+`ctx.params` and uses `allowedMethods()` for the 405 `allow` header, so it
+should pick all of this up; please check it does.
+
+Patterns (the second argument of `add`, `get`, `post`, ...) are split into
+segments on "/":
+
+- `:name` matches exactly one non-empty path segment and captures it as
+  `params.name`. `/users/:id` matches `/users/42` but not `/users`,
+  `/users/42/x` or `/users//posts`-style empty segments.
+- `:name?` is an optional parameter, allowed only as the last segment:
+  `/users/:id?` matches `/users` and `/users/42` (but not `/users/42/x`). When
+  the segment is absent, `params` has no `id` key at all.
+- `*` is allowed only as the last segment and matches the rest of the path,
+  which may be empty. The captured value goes in `params["*"]` without a
+  leading slash: `/files/*` gives `"a/b.txt"` for `/files/a/b.txt` and `""`
+  for `/files` and `/files/`. `/*` matches every path, including `/`.
+- Anything else is a static segment and is compared with the raw path segment
+  exactly (case-sensitive, not decoded), as today.
+
+`add` must throw an `Error` (any message) for a pattern with two parameters of
+the same name (`/a/:id/b/:id`, also `/a/:id/:id?`), for a `*` that is not the
+last segment, and for a `:name?` that is not the last segment.
+
+Decoding: captured values, including `*`, are percent-decoded with
+`decodeURIComponent`. Split the path into segments first and decode after, so
+`/users/a%2Fb` matches `/users/:id` with `id = "a/b"`. For `*`, decode the
+whole captured rest at once (`/files/my%20docs/x` gives `"my docs/x"`). If
+decoding throws (malformed escapes such as `%zz` or `%E0%A4%A`), that route
+simply does not match: `match` must not throw, and any other route that does
+match can still be chosen.
+
+Trailing slash: one trailing slash on the request path is ignored
+(`/users/42/` behaves exactly like `/users/42`), except that `/` stays `/`.
+
+`match(method, path)` still returns `{ handler, params }` or `null`. `params`
+must hold exactly the captured values as own string properties and nothing
+else; a parameter named like a built-in (`:constructor`, `:toString`,
+`:__proto__`) must come back as an ordinary own property holding the captured
+value. A null-prototype object is fine. A route without parameters gets an
+empty `params`. Each call returns a fresh `params` object.
+
+Which route wins when several routes for the method match: compare their
+patterns segment by segment from the left. At the first position where the
+two segment kinds differ, a static segment beats a parameter (`:name` and
+`:name?` count as the same kind), and a parameter beats `*`. If one pattern
+has no segment left at that position (which can only happen when the other
+matched there with an absent `:name?` or an empty `*`), the pattern that ended
+wins. If the kinds never differ, the route added first wins. For example:
+
+- `/users/me` beats `/users/:id` for `/users/me`, whichever was added first.
+- `/a/:x` beats `/:y/b` for `/a/b`: the first segment decides, even if a later
+  one has more static segments.
+- `/files/:name` beats `/files/*` for `/files/a`; for `/files/a/b` only the
+  wildcard matches.
+- `/files` beats `/files/*` and `/files/:name?` for `/files`, and
+  `/files/:name?` beats `/files/*` there too.
+- `/x/:a` and `/x/:b`: the one added first.
+
+HEAD: `match("HEAD", path)` looks at the HEAD routes first. Only when no HEAD
+route matches does it pick among the GET routes (returning that GET route's
+handler and params). A matching HEAD route wins even if a GET route would be
+more specific. GET never falls back to HEAD. (The dispatcher already strips
+the body from HEAD responses.)
+
+`allowedMethods(path)` returns every method that has at least one route
+matching `path` under the rules above (parameters, wildcards, trailing slash,
+decoding failures), sorted alphabetically and without duplicates. If GET is
+in the list, HEAD is too. It returns `[]` when nothing matches.
+
+Methods stay case-insensitive and everything else about `add`, `match` and the
+dispatcher stays as it is. Tests: `npm test` (or `node --test
+test/router.test.js test/dispatcher.test.js`); please add coverage for the new
+behaviour.
+"""

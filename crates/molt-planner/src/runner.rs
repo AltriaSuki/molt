@@ -32,6 +32,7 @@ pub(crate) async fn run(
 
     let check = match &req.check {
         Some(command) => Some(Check { command: command.clone(), files: Vec::new() }),
+        None if req.no_check => None,
         None => match designer::design(&ctx).await? {
             Design::Check { command, files } => Some(Check { command, files }),
             Design::Unverified(reason) => {
@@ -50,7 +51,7 @@ pub(crate) async fn run(
         run: ctx.run_id(),
         command: spec.as_ref().map(|s| s.command.clone()),
         files: spec.as_ref().map(|s| s.files.clone()).unwrap_or_default(),
-        designed: req.check.is_none(),
+        designed: req.check.is_none() && !req.no_check,
     })
     .await;
 
@@ -83,6 +84,8 @@ fn validate(req: &RunRequest) -> Result<(), RemoteError> {
         format!("attempts must be 1 to {MAX_ATTEMPTS}, not {}", req.attempts)
     } else if req.check.as_ref().is_some_and(|c| c.trim().is_empty()) {
         "check is empty: leave it out to have one designed".to_owned()
+    } else if req.no_check && req.check.is_some() {
+        "check and no_check cannot both be given".to_owned()
     } else if req.max_turns == Some(0) {
         "max_turns must be at least 1".to_owned()
     } else if req.max_check_rounds == Some(0) {
@@ -267,6 +270,7 @@ mod tests {
             RunRequest { attempts: 0, ..ok.clone() },
             RunRequest { attempts: 9, ..ok.clone() },
             RunRequest { check: Some(" ".into()), ..ok.clone() },
+            RunRequest { check: Some("make test".into()), no_check: true, ..ok.clone() },
             RunRequest { max_turns: Some(0), ..ok.clone() },
             RunRequest { max_check_rounds: Some(0), ..ok.clone() },
             RunRequest { budget_usd: Some(0.0), ..ok.clone() },

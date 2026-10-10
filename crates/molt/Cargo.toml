@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 molt-api.workspace = true
+molt-bench.workspace = true
 molt-gateway.workspace = true
 molt-kernel.workspace = true
 molt-memory.workspace = true

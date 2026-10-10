@@ -539,8 +539,11 @@ pub fn describe(event: &Progress) -> String {
             }
             line
         }
-        Progress::CheckReady { command: None, .. } => {
+        Progress::CheckReady { command: None, designed: true, .. } => {
             "no automated check fits this task; the result will be unverified".to_owned()
+        }
+        Progress::CheckReady { command: None, designed: false, .. } => {
+            "running without a done-check, as asked; the result will be unverified".to_owned()
         }
         Progress::AttemptStarted { attempt, .. } => format!("attempt {attempt}: started"),
         Progress::ToolCall { attempt, detail, .. } => format!("attempt {attempt}: {detail}"),
@@ -809,6 +812,7 @@ mod tests {
                 designed: true,
             },
             Progress::CheckReady { run: run.clone(), command: None, files: vec![], designed: true },
+            Progress::CheckReady { run: run.clone(), command: None, files: vec![], designed: false },
             Progress::ToolCall {
                 run: run.clone(),
                 attempt: 1,
@@ -827,6 +831,7 @@ mod tests {
             [
                 "check: sh check.sh (designed by the planner; uses check.sh)",
                 "no automated check fits this task; the result will be unverified",
+                "running without a done-check, as asked; the result will be unverified",
                 "attempt 1: read a.rs",
                 "attempt 0: check failed (exit code 1)",
                 "attempt 1: cancelled",

@@ -1,0 +1,33 @@
+title = "Move invoice money to Decimal and round half up to the cent"
+language = "python"
+kind = "bugfix"
+difficulty = "medium"
+split = "dev"
+tests = "python3 -m unittest -q tests.test_money tests.test_models tests.test_tax tests.test_report"
+check = "python3 -m unittest -q tests.test_money tests.test_models tests.test_tax tests.test_report tests.test_bench_hidden"
+timeout_s = 120
+prompt = """
+Finance flagged two problems with the `invoicing` package. Some invoice totals are a cent off from what their spreadsheet says: a line of 1 x 0.125 bills 0.12 where they expect 0.13, and the tax on a couple of invoices is off too. And the text invoice sometimes prints amounts like `0.30000000000000004` or `1,234.5`. The cause is that all money is float, and rounding uses `round()`, which rounds halves to even. Please move all money to `decimal.Decimal` and fix the rounding. Here's exactly what we need.
+
+**Inputs.** Everything that takes an amount accepts an `int`, a `str` (e.g. `"19.99"`) or a `Decimal`: `to_amount`, `round_cents` and `format_amount` in `invoicing/money.py`, `LineItem`'s `unit_price` and `discount_percent` (so also `Invoice.add`), the rates passed to `TaxTable(...)` and `TaxTable.set_rate`, and the amount passed to `TaxTable.tax_on`.
+- A `float` must raise `TypeError` right where it is passed in, and the message has to tell the caller to pass a `str` or `Decimal` instead (for example `"float amounts are not accepted; pass a str or Decimal instead"`).
+- `to_amount(value)` returns a `Decimal` equal to the input, not rounded (`to_amount("0.125") == Decimal("0.125")`).
+- After construction, `LineItem.unit_price` and `LineItem.discount_percent` are `Decimal`s, and `TaxTable.rate(category)` returns a `Decimal`.
+- The existing validation stays as it is: bools and other types raise `TypeError`; strings that are not numbers, NaN and infinity raise `ValueError`; and so on.
+
+**Rounding.** "Rounded to the cent" means quantized to two decimal places with halves rounded up: 0.125 -> 0.13, 0.625 -> 0.63, 2.675 -> 2.68. Every rounded money value is a `Decimal` with exactly two decimal places, so `str()` gives `"40.00"`, never `"40"` or `"40.0000"`. That covers `round_cents`, `LineItem.total`, `TaxTable.tax_on`, the values of `Invoice.tax_by_category()`, and `Invoice.subtotal`, `Invoice.tax` and `Invoice.total`. An invoice with no items has subtotal, tax and total of `Decimal("0.00")`.
+- `round_cents(value)` returns the value rounded to the cent.
+- `LineItem.total` is quantity x unit price, less `discount_percent` percent of that, rounded to the cent once at the end. Don't round the gross amount or the discount on their own: 1 x 10.05 at 50% off is 5.025, which bills 5.03.
+
+**Tax is per line.** A line's tax is its rounded total x its category's rate / 100, rounded to the cent. `TaxTable.tax_on(amount, category)` returns `amount` x rate / 100 rounded to the cent. Today the invoice adds up each category first and then taxes the sum. Instead:
+- `Invoice.tax_by_category()` returns `{category: sum of the tax of that category's lines}`, for the categories that appear on the invoice.
+- `Invoice.tax` is the sum of all line taxes, `Invoice.subtotal` the sum of the line totals, and `Invoice.total` is subtotal + tax.
+
+For example, two reduced-rate (5%) lines of 10.50 each have 0.525 -> 0.53 tax each, so the invoice tax is 1.06, not 1.05.
+
+**Display.** `format_amount(value)` rounds the value to the cent (half up, as above) and formats it with exactly two decimals and a comma thousands separator: `"1,234.50"`, `"0.30"`, `"0.00"`, `"1,234,567.89"`, and `"999.995"` gives `"1,000.00"`. In `invoicing/report.py`, `render(invoice)` and `summary(invoice)` keep their current layout, but every amount they print goes through `format_amount`. That means unit prices, line amounts, the subtotal, the per-category tax rows, the tax and the total (and the total in `summary`). Percentages (the discount column and the rates in the tax rows) are not amounts, so leave them as they are.
+
+Some of the existing tests pass floats. Update them to strings or `Decimal`s. Run the tests with:
+
+    python3 -m unittest -q tests.test_money tests.test_models tests.test_tax tests.test_report
+"""

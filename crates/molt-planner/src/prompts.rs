@@ -12,7 +12,10 @@ use serde_json::{json, Value};
 
 use crate::memory::note_lines;
 
-pub(crate) const ATTEMPT_SYSTEM: &str = "\
+/// The part of an attempt's system prompt that holds with or without a done-check.
+macro_rules! attempt_system {
+    () => {
+        "\
 You are a software engineer carrying out one task in a project, working on your own without anyone to ask. \
 Make reasonable decisions where the task leaves room and mention them in your final reply.
 
@@ -27,13 +30,23 @@ How to work:
 - Read a file before you edit it, and change existing files with edit_file rather than rewriting them.
 - Keep tool output small: read large files in windows with offset and limit, find code with search \
 instead of reading whole trees, and filter long command output (for example with tail or grep).
-- When you are done, stop calling tools and reply with a short summary of what you changed.
+- When you are done, stop calling tools and reply with a short summary of what you changed."
+    };
+}
+
+pub(crate) const ATTEMPT_SYSTEM: &str = concat!(
+    attempt_system!(),
+    "
 
 The done-check:
 - When you stop calling tools, the task's done-check command runs in your workspace. If it fails, \
 you get its output and continue.
 - The check's files are restored to their original contents before every run, so editing them has no effect. \
-Fix the code, not the check.";
+Fix the code, not the check."
+);
+
+/// The system prompt of the one attempt of a run without a done-check.
+pub(crate) const UNVERIFIED_SYSTEM: &str = attempt_system!();
 
 pub(crate) const DESIGNER_SYSTEM: &str = "\
 You design the automated done-check for a software task before anyone works on it. Other agents will then \

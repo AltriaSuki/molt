@@ -1,0 +1,83 @@
+title = "Implement cron expression parsing and next fire time"
+language = "python"
+kind = "build"
+difficulty = "hard"
+split = "heldout"
+tests = "python3 -m unittest -q tests.test_jobs tests.test_config tests.test_runner tests.test_cron tests.test_cli"
+check = "python3 -m unittest -q tests.test_jobs tests.test_config tests.test_runner tests.test_cron tests.test_cli tests.test_bench_hidden"
+timeout_s = 120
+prompt = """
+The scheduler can load jobs and has a runner, but `scheduler/cron.py` is still a
+stub: `parse()` and `next_fire()` raise `NotImplementedError`, so nothing can
+actually be scheduled. Please implement both. Keep the existing names in
+`cron.py` (`CronError`, `Field`, `FIELDS`, `Schedule` and its attributes) as they
+are; the runner and the CLI rely on them. Standard library only.
+
+## `parse(expr: str) -> Schedule`
+
+An expression has five fields, in this order: minute (0-59), hour (0-23),
+day-of-month (1-31), month (1-12) and day-of-week (0-7, where both 0 and 7 mean
+Sunday).
+
+- Fields are separated by any run of spaces and/or tabs. Leading and trailing
+  whitespace is ignored.
+- Each field is a comma-separated list of one or more items. An item is one of:
+  - `*`: every value of the field;
+  - a single value `a`;
+  - a range `a-b`, inclusive (`a-a` is fine; `b` smaller than `a` is an error);
+  - any of those three followed by a step `/n`: `*/n` is every n-th value
+    starting at the field's minimum, `a-b/n` is a, a+n, a+2n, ... up to b, and
+    `a/n` means from a up to the field's maximum (59, 23, 31, 12 or 7), every n.
+    A step larger than the span just selects the start value (`*/100` in the
+    minute field is minute 0).
+- A value is a decimal integer within the field's bounds. In the month field the
+  names JAN-DEC (1-12) may be used anywhere a value can, and in the day-of-week
+  field the names SUN-SAT (SUN=0, MON=1, ..., SAT=6). Names are case-insensitive,
+  only the three-letter abbreviations exist (`MONDAY` or `SEPT` are errors), and
+  each name is only valid in its own field. A step `n` is always a decimal
+  integer of at least 1.
+- Aliases replace the whole expression (surrounding whitespace is still ignored)
+  and are case-insensitive: `@yearly` and `@annually` mean `0 0 1 1 *`,
+  `@monthly` is `0 0 1 * *`, `@weekly` is `0 0 * * 0`, `@daily` and `@midnight`
+  are `0 0 * * *`, and `@hourly` is `0 * * * *`. Any other `@...` is an error.
+
+The returned `Schedule` holds the allowed values of each field as sets:
+`minutes`, `hours`, `days` (day of month), `months` and `weekdays`. `weekdays`
+uses 0-6 with Sunday as 0, so a 7 in the expression shows up as 0.
+`dom_restricted` / `dow_restricted` are True unless the day-of-month /
+day-of-week field is literally `*`. Only a bare `*` counts as unrestricted:
+`*/1`, `1-31` or `0-7` are restricted even though they allow every day.
+
+Anything invalid raises `CronError` (already defined; a subclass of
+`ValueError`): the wrong number of fields (an empty or blank string included), a
+value out of range, a step that is 0, missing or not a number, a reversed range,
+an unknown or misplaced name, an empty list item (`1,,2` or `1,`), or any other
+malformed item.
+
+## `next_fire(expr, after: datetime) -> datetime`
+
+`expr` is either an expression string or a `Schedule` returned by `parse()`.
+Return the first whole minute strictly after `after` at which the schedule fires,
+with seconds and microseconds zero. Datetimes are naive (no time zones). For
+example, with `30 10 * * *`, after 10:29:59 the answer is 10:30 that day, but
+after 10:30:15 (or exactly 10:30:00) it is 10:30 the next day.
+
+A minute fires when its minute, hour and month are allowed and its day matches.
+Days: when both day-of-month and day-of-week are restricted, a day matches if
+either field matches (so `0 0 13 * FRI` fires on every 13th and on every Friday).
+Otherwise both must match, where an unrestricted `*` matches any day (so
+`0 9 * * MON-FRI` is weekdays only and `0 0 1 * *` is the 1st only).
+
+An invalid expression raises `CronError`. A schedule that can never fire, like
+`0 0 30 2 *` or `0 0 31 4,6,9,11 *`, also raises `CronError`. Rare schedules must
+still be found: `0 0 29 2 *` after 2096-03-01 next fires on 2104-02-29, because
+2100 is not a leap year. Anything that can fire at all fires within 8 calendar
+years of any starting point, so search at least that far (a bit more doesn't
+hurt) before giving up. The runner calls this for every job, so it has to stay
+fast: well under a second per call, even when the answer is years away or there
+is none.
+
+Run the tests with:
+
+    python3 -m unittest -q tests.test_jobs tests.test_config tests.test_runner tests.test_cron tests.test_cli
+"""
