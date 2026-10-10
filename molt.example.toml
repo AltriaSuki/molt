@@ -26,6 +26,7 @@ name = "model"
 tier = "protected"
 exec = { command = "molt-gateway" }
 provides = ["model.*"]
+requests = [{ target = "topic:progress", budget = { calls = 10000000 } }]
 pass_env = [
   "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "MOLT_MODEL", "MOLT_EFFORT", "MOLT_MAX_TOKENS",
   "MOLT_MODEL_TIMEOUT_S", "MOLT_MODEL_RETRIES", "MOLT_MODEL_CONCURRENCY", "MOLT_FALLBACKS",

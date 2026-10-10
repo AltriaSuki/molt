@@ -61,6 +61,9 @@ pub struct RunRequest {
     /// fork is kept and its path returned.
     #[serde(default = "yes")]
     pub apply: bool,
+    /// Publish model text previews while calls are in flight.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream: bool,
 }
 
 impl RunRequest {
@@ -76,6 +79,7 @@ impl RunRequest {
             max_check_rounds: None,
             budget_usd: None,
             apply: true,
+            stream: false,
         }
     }
 }

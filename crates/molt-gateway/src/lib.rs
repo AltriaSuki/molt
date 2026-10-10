@@ -10,6 +10,7 @@
 mod api;
 mod body;
 mod profile;
+mod stream;
 
 use std::fmt;
 use std::str::FromStr;
@@ -18,9 +19,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, ensure, Context};
 use molt_api::model::{CompleteRequest, CompleteResponse, Effort, Usage, STOP_REFUSAL};
+use molt_api::progress::{self, ModelCall, Progress};
 use molt_proto::{Envelope, ErrorCode, RemoteError, Target};
 use molt_sdk::Service;
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::profile::profile;
@@ -169,6 +172,30 @@ impl Gateway {
         req: CompleteRequest,
         within: Option<Duration>,
     ) -> Result<CompleteResponse, RemoteError> {
+        self.complete_observed(req, within, None).await
+    }
+
+    /// Stream text previews to a bounded observer while keeping tool input,
+    /// signatures, usage and the final message in the authoritative reply.
+    /// The observer must not block; serving over the bus uses a bounded queue.
+    pub async fn complete_streamed(
+        &self,
+        req: CompleteRequest,
+        within: Option<Duration>,
+        mut on_text: impl FnMut(String) + Send,
+    ) -> Result<CompleteResponse, RemoteError> {
+        if req.stream.is_none() {
+            return Err(RemoteError { code: ErrorCode::Invalid, message: "stream context is required".into() });
+        }
+        self.complete_observed(req, within, Some(&mut on_text)).await
+    }
+
+    async fn complete_observed(
+        &self,
+        req: CompleteRequest,
+        within: Option<Duration>,
+        on_text: Option<&mut (dyn FnMut(String) + Send)>,
+    ) -> Result<CompleteResponse, RemoteError> {
         // A deadline too far off to represent is no deadline.
         let deadline = within.and_then(|d| Instant::now().checked_add(d));
         let named = req.model.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or(&self.cfg.default_model);
@@ -183,7 +210,11 @@ impl Gateway {
             "calling the Messages API"
         );
 
-        let msg = self.api.create(&call.body, call.fallbacks, deadline).await?;
+        let msg = if on_text.is_some() {
+            self.api.create_observed(&call.body, call.fallbacks, deadline, on_text).await?
+        } else {
+            self.api.create(&call.body, call.fallbacks, deadline).await?
+        };
         if !msg.usage.known() {
             return Err(RemoteError {
                 code: ErrorCode::Failed,
@@ -225,27 +256,35 @@ impl Gateway {
 /// stops in time to answer within it.
 pub async fn serve(svc: Arc<Service>, gateway: Arc<Gateway>) {
     let max_in_flight = gateway.cfg.max_in_flight;
+    let events = svc.clone();
     svc.serve_cancellable(max_in_flight, move |req, cancel| {
         let gateway = gateway.clone();
-        async move { handle_cancellable(&gateway, req, cancel).await }
+        let events = events.clone();
+        async move { handle_observed(&gateway, req, Some(events), cancel).await }
     })
     .await;
 }
 
 #[cfg(test)]
 async fn handle(gateway: &Gateway, req: Envelope) -> Result<Value, RemoteError> {
-    handle_cancellable(gateway, req, CancellationToken::new()).await
+    handle_observed(gateway, req, None, CancellationToken::new()).await
 }
 
-async fn handle_cancellable(gateway: &Gateway, req: Envelope, cancel: CancellationToken) -> Result<Value, RemoteError> {
+async fn handle_observed(
+    gateway: &Gateway,
+    req: Envelope,
+    events: Option<Arc<Service>>,
+    cancel: CancellationToken,
+) -> Result<Value, RemoteError> {
     let method = match &req.to {
         Target::Method { method, .. } => method.as_str(),
         _ => "",
     };
     match method {
         "complete" => {
+            let started = Instant::now();
             let within = reply_window(req.budget.ms);
-            let call_id = req.id;
+            let call_id = req.id.clone();
             if cancel.is_cancelled() {
                 return Ok(cancelled_settlement(call_id, false));
             }
@@ -253,9 +292,67 @@ async fn handle_cancellable(gateway: &Gateway, req: Envelope, cancel: Cancellati
                 code: ErrorCode::Invalid,
                 message: format!("bad model.complete request: {e}"),
             })?;
+            let call = async {
+                if let (Some(context), Some(events)) = (request.stream.clone(), events) {
+                    let mut call = ModelCall {
+                        run: req.trace_id.to_string(),
+                        attempt: context.attempt,
+                        turn: context.turn,
+                        call: call_id.to_string(),
+                        seq: 0,
+                    };
+                    publish(&events, &req.trace_id, Progress::ModelStarted { context: call.clone() }).await;
+                    // A slow event consumer cannot block the model response or
+                    // build an unbounded queue. Missing previews produce seq gaps.
+                    let (tx, mut rx) = mpsc::channel::<(u64, String)>(32);
+                    let mut publisher = {
+                        let events = events.clone();
+                        let trace = req.trace_id.clone();
+                        let context = call.clone();
+                        tokio::spawn(async move {
+                            while let Some((seq, text)) = rx.recv().await {
+                                let mut context = context.clone();
+                                context.seq = seq;
+                                publish(&events, &trace, Progress::ModelText { context, text }).await;
+                            }
+                        })
+                    };
+                    let response = gateway
+                        .complete_streamed(
+                            request,
+                            within.map(|limit| limit.saturating_sub(started.elapsed())),
+                            |text| {
+                                call.seq += 1;
+                                let _ = tx.try_send((call.seq, text));
+                            },
+                        )
+                        .await;
+                    drop(tx);
+                    let drain =
+                        within.map_or(Duration::from_millis(400), |limit| limit.saturating_sub(started.elapsed()));
+                    if tokio::time::timeout(drain, &mut publisher).await.is_err() {
+                        publisher.abort();
+                        let _ = publisher.await;
+                    }
+                    call.seq += 1;
+                    let (usage, cost_usd, error) = match &response {
+                        Ok(resp) => (
+                            Some(resp.usage),
+                            resp.cost_usd,
+                            resp.is_refusal().then(|| "the model declined; preview is not a result".into()),
+                        ),
+                        Err(e) => (None, None, Some(e.to_string())),
+                    };
+                    publish(&events, &req.trace_id, Progress::ModelFinished { context: call, usage, cost_usd, error })
+                        .await;
+                    response
+                } else {
+                    gateway.complete_within(request, within).await
+                }
+            };
             let response = tokio::select! {
                 biased;
-                response = gateway.complete_within(request, within) => response?,
+                response = call => response?,
                 _ = cancel.cancelled() => return Ok(cancelled_settlement(call_id, true)),
             };
             serde_json::to_value(response)
@@ -274,6 +371,19 @@ fn cancelled_settlement(call: molt_proto::MsgId, may_have_started: bool) -> Valu
             "remote_cancel_confirmed": null, "may_have_started": may_have_started,
             "usage": null, "cost_usd": null}
     })
+}
+
+async fn publish(service: &Service, trace: &molt_proto::TraceId, event: Progress) {
+    if let Ok(payload) = serde_json::to_value(event) {
+        // Progress is best effort, even when the transport's outgoing queue
+        // is full. This bound also keeps draining 32 previews within the
+        // gateway's normal reply margin.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(10),
+            service.publish_traced(progress::TOPIC, payload, trace.clone()),
+        )
+        .await;
+    }
 }
 
 /// How long to work on a request whose caller waits `ms` (0: no deadline).
@@ -446,7 +556,7 @@ mod tests {
         );
         let id = request.id.clone();
         let cancel = CancellationToken::new();
-        let work = handle_cancellable(&gateway, request, cancel.clone());
+        let work = handle_observed(&gateway, request, None, cancel.clone());
         tokio::pin!(work);
         tokio::select! {
             result = &mut work => panic!("HTTP finished early: {result:?}"),

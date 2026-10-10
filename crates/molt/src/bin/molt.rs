@@ -86,6 +86,9 @@ struct DoArgs {
     /// Print the result as JSON.
     #[arg(long)]
     json: bool,
+    /// Show model text previews on stderr while replies are generated.
+    #[arg(long)]
+    stream: bool,
     /// Where kernel state and forks go. Default: ~/.cache/molt/<project>-<hash>.
     #[arg(long)]
     data_dir: Option<PathBuf>,
@@ -342,6 +345,7 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     req.max_turns = args.max_turns;
     req.budget_usd = args.budget_usd;
     req.apply = !args.no_apply;
+    req.stream = args.stream;
     let apply = req.apply;
 
     let mut signal = None;

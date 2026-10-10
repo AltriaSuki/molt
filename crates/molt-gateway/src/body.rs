@@ -28,6 +28,9 @@ pub(crate) fn build(cfg: &Config, model: &str, req: CompleteRequest) -> Result<C
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
     body.insert("max_tokens".into(), json!(max_tokens));
+    if req.stream.is_some() {
+        body.insert("stream".into(), json!(true));
+    }
     // The API puts this breakpoint on the last cacheable block, so each turn
     // of an agent loop reads the turn before it from cache.
     body.insert("cache_control".into(), json!({ "type": "ephemeral" }));

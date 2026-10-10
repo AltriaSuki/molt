@@ -349,10 +349,15 @@ impl Service {
     }
 
     pub async fn publish(&self, topic: &str, payload: Value) -> Result<(), SdkError> {
+        self.publish_traced(topic, payload, TraceId::random()).await
+    }
+
+    /// Publish an event as part of an existing trace, so progress is grouped
+    /// with the request that produced it in the audit log.
+    pub async fn publish_traced(&self, topic: &str, payload: Value, trace: TraceId) -> Result<(), SdkError> {
         let target: Target = format!("topic:{topic}").parse().map_err(|_| SdkError::Target(topic.to_owned()))?;
         let cap = self.cap_for(&target).ok_or_else(|| SdkError::NoCapability(target.to_string()))?;
-        let msg =
-            Envelope::event(TraceId::random(), topic, cap, payload).map_err(|e| SdkError::Target(e.to_string()))?;
+        let msg = Envelope::event(trace, topic, cap, payload).map_err(|e| SdkError::Target(e.to_string()))?;
         Ok(self.link.send(&msg).await?)
     }
 

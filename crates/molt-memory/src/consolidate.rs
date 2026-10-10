@@ -551,6 +551,7 @@ pub(crate) async fn consolidate(
     let (task, w) = (digest.task.clone(), ws.clone());
     let known = blocking(db, move |db| known(db, &task, &w, now)).await?;
     let request = CompleteRequest {
+        stream: None,
         model: Some(req.model.clone().unwrap_or_else(|| cfg.model.clone())),
         system: Some(SYSTEM.to_owned()),
         messages: vec![model::user_text(prompt(&known, &digest.text))],

@@ -71,6 +71,20 @@ fn result(reply: &Envelope) -> Result<Value, RemoteError> {
 }
 
 #[tokio::test]
+async fn publishing_with_an_existing_trace_preserves_its_identity() {
+    let (svc, mut bus) = service();
+    let trace = TraceId::random();
+    let cap = CapId::random();
+    svc.add_cap("topic:progress", cap.clone());
+    svc.publish_traced("progress", json!({"text":"preview"}), trace.clone()).await.unwrap();
+    let event = bus.recv().await;
+    assert_eq!(event.kind, Kind::Event);
+    assert_eq!(event.trace_id, trace);
+    assert_eq!(event.cap, Some(cap));
+    assert_eq!(event.payload, json!({"text":"preview"}));
+}
+
+#[tokio::test]
 async fn serve_concurrent_runs_at_most_max_in_flight_and_answers_every_request() {
     const MAX: usize = 3;
     const N: usize = 10;

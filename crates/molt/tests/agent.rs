@@ -77,6 +77,7 @@ impl Respond for FakeApi {
         let messages = body["messages"].as_array().cloned().unwrap_or_default();
         let n = messages.len();
         let model = body["model"].as_str().unwrap_or("unknown");
+        let stream = body["stream"] == true;
         // Memory learning from a finished run asks for JSON in a fixed shape.
         if body["output_config"]["format"]["type"] == "json_schema" {
             let note =
@@ -86,7 +87,7 @@ impl Respond for FakeApi {
                 json!({ "type": "thinking", "thinking": "", "signature": signature(n) }),
                 json!({ "type": "text", "text": text }),
             ];
-            return message(n, model, content, "end_turn");
+            return message(n, model, content, "end_turn", stream);
         }
         let designer = body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_CHECK));
         let last = messages.last().cloned().unwrap_or(Value::Null);
@@ -98,7 +99,7 @@ impl Respond for FakeApi {
         };
         let write = |path: &str, content: &str| tool_use(n, WRITE_FILE, json!({ "path": path, "content": content }));
         let (mut content, stop) = match (&self.0, designer, turn) {
-            (Fake::Refuses, ..) => return refusal(n, model),
+            (Fake::Refuses, ..) => return message(n, model, vec![], "refusal", stream),
             (_, true, Turn::First) => (vec![write("check.sh", &format!("{CHECK}\n"))], "tool_use"),
             (_, true, _) => {
                 let input = json!({ "command": "sh check.sh", "files": ["check.sh"], "rationale": "Greets." });
@@ -127,12 +128,12 @@ impl Respond for FakeApi {
         // turn's place in the conversation, so check_request can tell that
         // it came back unmodified.
         content.insert(0, json!({ "type": "thinking", "thinking": "", "signature": signature(n) }));
-        message(n, model, content, stop)
+        message(n, model, content, stop, stream)
     }
 }
 
-fn message(n: usize, model: &str, content: Vec<Value>, stop: &str) -> ResponseTemplate {
-    ResponseTemplate::new(200).set_body_json(json!({
+fn message(n: usize, model: &str, content: Vec<Value>, stop: &str, stream: bool) -> ResponseTemplate {
+    let body = json!({
         "id": format!("msg_{n:03}"),
         "type": "message",
         "role": "assistant",
@@ -146,11 +147,45 @@ fn message(n: usize, model: &str, content: Vec<Value>, stop: &str) -> ResponseTe
             "cache_creation_input_tokens": 0,
             "cache_read_input_tokens": 0
         }
-    }))
-}
-
-fn refusal(n: usize, model: &str) -> ResponseTemplate {
-    message(n, model, vec![], "refusal")
+    });
+    if !stream {
+        return ResponseTemplate::new(200).set_body_json(body);
+    }
+    let event = |value: Value| format!("event: {}\ndata: {value}\n\n", value["type"].as_str().unwrap());
+    let mut start = body.clone();
+    start["content"] = json!([]);
+    start["stop_reason"] = Value::Null;
+    let mut wire = event(json!({"type":"message_start","message":start}));
+    for (index, block) in body["content"].as_array().unwrap().iter().enumerate() {
+        let mut initial = block.clone();
+        let deltas = match block["type"].as_str().unwrap() {
+            "text" => {
+                initial["text"] = json!("");
+                vec![json!({"type":"text_delta","text":block["text"]})]
+            }
+            "thinking" => {
+                initial["thinking"] = json!("");
+                initial["signature"] = json!("");
+                vec![
+                    json!({"type":"thinking_delta","thinking":block["thinking"]}),
+                    json!({"type":"signature_delta","signature":block["signature"]}),
+                ]
+            }
+            "tool_use" => {
+                initial["input"] = json!({});
+                vec![json!({"type":"input_json_delta","partial_json":block["input"].to_string()})]
+            }
+            _ => unreachable!(),
+        };
+        wire.push_str(&event(json!({"type":"content_block_start","index":index,"content_block":initial})));
+        for delta in deltas {
+            wire.push_str(&event(json!({"type":"content_block_delta","index":index,"delta":delta})));
+        }
+        wire.push_str(&event(json!({"type":"content_block_stop","index":index})));
+    }
+    wire.push_str(&event(json!({"type":"message_delta","delta":{"stop_reason":stop},"usage":body["usage"]})));
+    wire.push_str(&event(json!({"type":"message_stop"})));
+    ResponseTemplate::new(200).set_body_raw(wire, "text/event-stream")
 }
 
 /// Ids follow from the conversation's length, so replies are reproducible.
@@ -782,6 +817,67 @@ async fn the_cli_carries_out_a_task() {
     assert!(data.path().join("audit.jsonl").exists());
     assert_requests_valid(&server).await;
     assert_forks_dropped(data.path());
+}
+
+#[tokio::test]
+async fn streamed_calls_keep_tools_signatures_and_parallel_call_identity() {
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let mut req = setup.request(Some(CHECK), 2);
+    req.stream = true;
+    let (response, events) = setup.run(req).await;
+    assert_eq!(response.outcome, Outcome::Passed);
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    let mut calls = std::collections::HashMap::new();
+    let mut saw_preview = false;
+    for event in &events {
+        if let Some(context) = event.model_call() {
+            let key = (context.run.clone(), context.attempt, context.turn);
+            let previous = calls.entry(context.call.clone()).or_insert((key.clone(), None));
+            assert_eq!(previous.0, key);
+            assert!(previous.1.is_none_or(|seq| context.seq > seq));
+            previous.1 = Some(context.seq);
+        }
+        if let Progress::ModelText { text, .. } = event {
+            assert_eq!(text, "Wrote greeting.txt.");
+            saw_preview = true;
+        }
+    }
+    assert!(saw_preview, "{events:?}");
+    assert!(calls.len() >= 2);
+    assert_requests_valid(&server).await;
+    let audit = molt_kernel::audit::read_all(&setup.data.path().join("audit.jsonl")).await.unwrap();
+    assert!(audit.iter().any(|e| matches!(&e.event, AuditEvent::Message { envelope }
+        if envelope.kind == Kind::Event && envelope.payload["event"] == "model_text"
+        && envelope.payload["run"] == envelope.trace_id.as_str())));
+}
+
+#[tokio::test]
+async fn streaming_keeps_json_stdout_complete_and_previews_on_stderr() {
+    let server = fake_api(Fake::Greets).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let out = tokio::time::timeout(
+        RUN_LIMIT,
+        molt_do(
+            &server,
+            workspace.path(),
+            data.path(),
+            &["--check", CHECK, "--attempts", "1", "--stream", "--json", "--no-learn"],
+        )
+        .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["outcome"], "passed");
+    assert_eq!(result["summary"], "Wrote greeting.txt.");
+    assert!(stderr.contains("preview: Wrote greeting.txt."), "{stderr}");
+    assert!(stderr.contains("model finished (cost $"), "{stderr}");
+    assert_requests_valid(&server).await;
 }
 
 #[tokio::test]

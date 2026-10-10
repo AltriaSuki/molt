@@ -65,6 +65,7 @@ pub(crate) struct Ctx {
     pub max_turns: u32,
     pub max_check_rounds: u32,
     pub budget_usd: f64,
+    pub stream: bool,
     /// What memory knows about the workspace; empty when memory is not up.
     pub memory: Memory,
     tally: watch::Sender<Tally>,
@@ -81,11 +82,12 @@ pub(crate) struct Conversation {
     system: &'static str,
     tools: Arc<Vec<Value>>,
     messages: Vec<Value>,
+    attempt: Option<u32>,
 }
 
 impl Conversation {
-    pub fn new(system: &'static str, tools: Arc<Vec<Value>>, first: Value) -> Self {
-        Self { system, tools, messages: vec![first] }
+    pub fn new(system: &'static str, tools: Arc<Vec<Value>>, first: Value, attempt: Option<u32>) -> Self {
+        Self { system, tools, messages: vec![first], attempt }
     }
 
     pub fn push(&mut self, message: Value) {
@@ -107,6 +109,7 @@ impl Ctx {
             max_turns: req.max_turns.unwrap_or(cfg.max_turns),
             max_check_rounds: req.max_check_rounds.unwrap_or(cfg.max_check_rounds),
             budget_usd: req.budget_usd.unwrap_or(cfg.budget_usd),
+            stream: req.stream,
             memory: Memory::default(),
             cfg,
             tally: watch::Sender::new(Tally::default()),
@@ -187,7 +190,7 @@ impl Ctx {
     /// One model call; its usage counts against the run. The call runs in its
     /// own task: the gateway bills it whether or not the caller still waits,
     /// so a caller that stops waiting leaves it pending until the reply lands.
-    pub async fn complete(self: &Arc<Self>, conv: &Conversation) -> Result<CompleteResponse, RemoteError> {
+    pub async fn complete(self: &Arc<Self>, conv: &Conversation, turn: u32) -> Result<CompleteResponse, RemoteError> {
         let req = CompleteRequest {
             model: self.model.clone(),
             system: Some(conv.system.to_owned()),
@@ -196,6 +199,7 @@ impl Ctx {
             max_tokens: Some(self.cfg.max_tokens),
             effort: self.effort,
             output_schema: None,
+            stream: self.stream.then_some(model::StreamContext { attempt: conv.attempt, turn }),
         };
         let ms = u64::try_from(self.cfg.model_timeout.as_millis()).unwrap_or(u64::MAX);
         let budget = Budget::new(self.cfg.max_tokens.into(), ms, 0);
