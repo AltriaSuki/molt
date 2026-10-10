@@ -8,6 +8,7 @@
 //! failed check's feedback. It answers `400` to anything the real API would
 //! refuse (see [`check_request`]), and every test checks that it never had to.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -44,6 +45,7 @@ const LEARNED_TEXT: &str = "The done-check greps greeting.txt for hello.";
 enum Fake {
     /// Attempts write greeting.txt and say they are done.
     Greets,
+    ConcurrentEdit(PathBuf),
     /// The designer writes check.sh and submits it; attempts then greet.
     DesignsThenGreets,
     /// Attempts write the wrong greeting, then fix it after the check fails.
@@ -114,6 +116,11 @@ impl Respond for FakeApi {
             }
             (_, false, Turn::First | Turn::Feedback) => (vec![write("greeting.txt", "hello\n")], "tool_use"),
             (_, false, Turn::AfterTools) => {
+                if let Fake::ConcurrentEdit(original) = &self.0 {
+                    // A user edits the original outside the sandbox while the
+                    // attempt is working; its done-check cannot do this.
+                    std::fs::write(original, "theirs\n").unwrap();
+                }
                 (vec![json!({ "type": "text", "text": "Wrote greeting.txt." })], "end_turn")
             }
         };
@@ -541,6 +548,31 @@ async fn a_second_run_starts_with_what_the_first_learned_and_a_map_of_the_code()
     // Learning the same thing again confirms the note rather than adding a copy.
     let again = second.learned.unwrap().unwrap();
     assert!(again.added.is_empty() && again.reinforced == vec![note.id.clone()], "{again:#?}");
+    let audit = molt_kernel::audit::read_all(&setup.data.path().join("audit.jsonl")).await.unwrap();
+    let run = audit
+        .iter()
+        .rev()
+        .find_map(|e| match &e.event {
+            AuditEvent::Message { envelope }
+                if envelope.kind == Kind::Request && envelope.to.to_string() == PLANNER_RUN =>
+            {
+                Some(envelope.trace_id.to_string())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+        .args(["memory", "used", &run, "--json", "--data-dir"])
+        .arg(setup.data.path())
+        .current_dir(setup.workspace.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let captured: Vec<molt_api::memory::RecallSnapshot> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].notes[0].note, *note, "later reinforcement must not rewrite this run's context");
+    assert_eq!(captured[0].purpose, "context");
+    assert!(context.contains(&captured[0].notes[0].note.text));
     assert_requests_valid(&server).await;
     setup.assert_forks_dropped();
 }
@@ -619,7 +651,11 @@ async fn stopping_a_run_kills_the_commands_it_started() {
     let pids = tempfile::tempdir().unwrap();
     let pidfile = pids.path().join("sleep.pid");
     let server = fake_api(Fake::Hangs(pidfile.clone())).await;
-    let setup = Setup::new(&server);
+    let mut setup = Setup::new(&server);
+    // This legacy fixture writes a host PID marker outside the fork. Its
+    // process-group checks explicitly use the unconfined path; namespace
+    // lifecycle coverage lives in molt-tools/tests/sandbox.rs.
+    setup.cfg.service_mut("shell").unwrap().exec.as_mut().unwrap().args.push("--no-sandbox".into());
     let started = wait_for_pid(&pidfile);
     let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), false, |_| {}, async {
         started.await;
@@ -653,7 +689,11 @@ async fn a_planner_that_dies_mid_run_ends_the_run_rather_than_starting_it_again(
     let pids = tempfile::tempdir().unwrap();
     let pidfile = pids.path().join("sleep.pid");
     let server = fake_api(Fake::Hangs(pidfile.clone())).await;
-    let setup = Setup::new(&server);
+    let mut setup = Setup::new(&server);
+    // This legacy fixture writes a host PID marker outside the fork. Its
+    // process-group checks explicitly use the unconfined path; namespace
+    // lifecycle coverage lives in molt-tools/tests/sandbox.rs.
+    setup.cfg.service_mut("shell").unwrap().exec.as_mut().unwrap().args.push("--no-sandbox".into());
     let kill_planner = async {
         let sleep = wait_for_pid(&pidfile).await;
         let planner = started_pid(&setup.data.path().join("audit.jsonl"), "planner").await;
@@ -697,6 +737,7 @@ async fn the_cli_carries_out_a_task() {
     let server = fake_api(Fake::Greets).await;
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     // A project's own molt.toml is never read unless asked for: it could run anything with the user's key.
     std::fs::write(workspace.path().join("molt.toml"), "[[service]]\nname = \"model\"\nexec = 'not toml\n").unwrap();
     // The check fails if the API key reached the commands the agent runs, or the passed variable did not.
@@ -733,9 +774,40 @@ async fn the_cli_carries_out_a_task() {
     assert!(shown.contains(&format!("lesson 0.90\n    {LEARNED_TEXT}\n")), "{shown}");
     let id = shown.split_whitespace().next().unwrap().to_owned();
     assert!(id.starts_with("note_"), "{shown}");
-    assert_eq!(memory(&["show", "greps", "hello"]).0, shown, "matched by its words");
-    let (forgot, _) = memory(&["forget", &id, "--reason", "the check changed"]);
-    assert_eq!(forgot, format!("forgot {id}\n"));
+    let matched = memory(&["show", "greps", "hello"]).0;
+    assert!(matched.starts_with(&id) && matched.contains(LEARNED_TEXT), "{matched}");
+    assert!(matched.contains("keywords \"greps\" OR \"hello\""), "{matched}");
+    let reviewed = memory(&[
+        "review",
+        &id,
+        "--rev",
+        "1",
+        "--reason",
+        "temporary check",
+        "--depends-on",
+        "greeting.txt",
+        "--temporary",
+    ])
+    .0;
+    assert!(reviewed.contains("revision 2"), "{reviewed}");
+    let shown = memory(&["show"]).0;
+    assert!(shown.contains("temporary experience") && shown.contains("depends on: greeting.txt"), "{shown}");
+    let corrected = memory(&[
+        "correct",
+        &id,
+        "The greeting check requires a newline.",
+        "--rev",
+        "2",
+        "--reason",
+        "clarified the requirement",
+        "--depends-on",
+        "greeting.txt",
+    ])
+    .0;
+    let corrected_id = corrected.split_whitespace().next().unwrap();
+    assert_ne!(corrected_id, id);
+    let (forgot, _) = memory(&["forget", corrected_id, "--reason", "the check changed"]);
+    assert_eq!(forgot, format!("forgot {corrected_id}\n"));
     assert_eq!(memory(&["show"]), (String::new(), "no notes\n".to_owned()));
     // The forget went through the bus, so the audit log has it.
     let audit = molt_kernel::audit::read_all(&data.path().join("audit.jsonl")).await.unwrap();
@@ -839,13 +911,11 @@ async fn the_cli_runs_the_example_config_when_given_one() {
 
 #[tokio::test]
 async fn a_result_that_cannot_be_applied_exits_3_and_is_kept() {
-    let server = fake_api(Fake::Greets).await;
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
-    // The check changes the original's greeting.txt during the run, as a user editing it would.
     let original = workspace.path().canonicalize().unwrap().join("greeting.txt");
-    let check = format!("echo theirs > '{}' && {CHECK}", original.display());
-    let args = ["--check", &check, "--attempts", "1", "--json"];
+    let server = fake_api(Fake::ConcurrentEdit(original.clone())).await;
+    let args = ["--check", CHECK, "--attempts", "1", "--json"];
     let out = tokio::time::timeout(RUN_LIMIT, molt_do(&server, workspace.path(), data.path(), &args).output())
         .await
         .expect("molt do hung")
@@ -869,7 +939,8 @@ async fn ctrl_c_stops_molt_do_and_the_commands_it_started() {
     let server = fake_api(Fake::Hangs(pidfile.clone())).await;
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
-    let mut cmd = molt_do(&server, workspace.path(), data.path(), &["--check", CHECK, "--attempts", "1"]);
+    let mut cmd =
+        molt_do(&server, workspace.path(), data.path(), &["--check", CHECK, "--attempts", "1", "--no-sandbox"]);
     // A process group of its own, as a terminal gives a command, so the
     // signal below reaches molt and its services but not this test.
     cmd.process_group(0);
@@ -897,7 +968,9 @@ async fn sigterm_and_sighup_stop_molt_do_like_ctrl_c() {
         let workspace = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let child =
-            molt_do(&server, workspace.path(), data.path(), &["--check", CHECK, "--attempts", "1"]).spawn().unwrap();
+            molt_do(&server, workspace.path(), data.path(), &["--check", CHECK, "--attempts", "1", "--no-sandbox"])
+                .spawn()
+                .unwrap();
         let molt = child.id().unwrap() as i32;
         let pid = tokio::time::timeout(RUN_LIMIT, wait_for_pid(&pidfile)).await.expect("the command never started");
 

@@ -13,6 +13,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::memory::Memory;
 use crate::{Bus, Config};
@@ -29,12 +30,16 @@ pub(crate) const SHELL_GRACE_MS: u64 = 30_000;
 pub(crate) struct Spend {
     pub usage: Usage,
     pub cost_usd: f64,
+    pub unknown_calls: u32,
 }
 
 impl Spend {
     pub fn add(&mut self, resp: &CompleteResponse) {
         self.usage.add(&resp.usage);
-        // Unknown prices count as free; the token totals still show the spend.
+        if resp.cost_usd.is_none() {
+            self.unknown_calls += 1;
+        }
+        // This is the known subtotal; unknown calls are reported separately.
         self.cost_usd += resp.cost_usd.unwrap_or(0.0);
     }
 }
@@ -45,8 +50,10 @@ impl Spend {
 pub(crate) struct Tally {
     pub spend: Spend,
     pub pending: u32,
+    pub unsettled: u32,
 }
 
+#[derive(Clone)]
 pub(crate) struct Ctx {
     bus: Arc<dyn Bus>,
     pub cfg: Arc<Config>,
@@ -63,7 +70,9 @@ pub(crate) struct Ctx {
     pub memory: Memory,
     tally: watch::Sender<Tally>,
     /// Forks created and not yet dropped or merged, so none outlives the run by accident.
-    forks: Mutex<Vec<String>>,
+    forks: Arc<Mutex<Vec<String>>>,
+    pub cancel: CancellationToken,
+    pub run_cancel: CancellationToken,
 }
 
 /// A conversation that only ever grows. `system` and `tools` stay the same
@@ -104,8 +113,16 @@ impl Ctx {
             memory: Memory::default(),
             cfg,
             tally: watch::Sender::new(Tally::default()),
-            forks: Mutex::default(),
+            forks: Arc::default(),
+            cancel: CancellationToken::new(),
+            run_cancel: CancellationToken::new(),
         }
+    }
+
+    pub fn scoped(&self, cancel: CancellationToken) -> Arc<Self> {
+        let mut scoped = self.clone();
+        scoped.cancel = cancel;
+        Arc::new(scoped)
     }
 
     pub fn run_id(&self) -> String {
@@ -122,7 +139,19 @@ impl Ctx {
             code: ErrorCode::Invalid,
             message: format!("encoding a {target} request: {e}"),
         })?;
-        let reply = self.bus.call(target, payload, budget, &self.trace).await?;
+        // Cleanup and fork bookkeeping must finish even after cancellation.
+        let cleanup = matches!(target, fs::FORK | fs::DROP | fs::DIFF);
+        if !cleanup && self.cancel.is_cancelled() {
+            return Err(RemoteError {
+                code: ErrorCode::Cancelled,
+                message: "attempt stopped before starting a new action".into(),
+            });
+        }
+        let reply = if matches!(target, model::COMPLETE | molt_api::shell::RUN) {
+            self.bus.call_cancellable(target, payload, budget, &self.trace, &self.cancel).await?
+        } else {
+            self.bus.call(target, payload, budget, &self.trace).await?
+        };
         serde_json::from_value(reply)
             .map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("bad {target} reply: {e}") })
     }
@@ -144,7 +173,10 @@ impl Ctx {
     }
 
     pub fn over_budget(&self) -> bool {
-        self.tally().spend.cost_usd >= self.budget_usd
+        {
+            let t = self.tally();
+            t.spend.cost_usd >= self.budget_usd || t.spend.unknown_calls > 0 || t.unsettled > 0
+        }
     }
 
     /// [`Ctx::tally`] once every model call is answered, or after `limit`.
@@ -177,10 +209,14 @@ impl Ctx {
             let resp = ctx.call::<CompleteResponse>(model::COMPLETE, req, budget).await;
             ctx.tally.send_modify(|t| {
                 t.pending -= 1;
-                if let Ok(resp) = &resp {
-                    t.spend.add(resp);
+                match &resp {
+                    Ok(resp) => t.spend.add(resp),
+                    Err(_) => t.unsettled += 1,
                 }
             });
+            if ctx.over_budget() && !ctx.cancel.is_cancelled() {
+                ctx.run_cancel.cancel();
+            }
             resp
         });
         call.await.unwrap_or_else(|e| {

@@ -55,7 +55,7 @@ requests = [{ target = "topic:fs.changed", budget = { calls = 100000000 } }]
 # same for the default setup). MOLT_* and ANTHROPIC_* never reach them.
 [[service]]
 name = "shell"
-tier = "mutable"
+tier = "protected"
 exec = { command = "molt-tools", args = ["shell", "--root", ".", "--scratch", "/home/you/.cache/molt/work"] }
 provides = ["shell.*"]
 

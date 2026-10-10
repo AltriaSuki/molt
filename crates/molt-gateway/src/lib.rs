@@ -22,8 +22,9 @@ use molt_api::model::{CompleteRequest, CompleteResponse, Effort, Usage, STOP_REF
 use molt_api::progress::{self, ModelCall, Progress};
 use molt_proto::{Envelope, ErrorCode, RemoteError, Target};
 use molt_sdk::Service;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::profile::profile;
 
@@ -214,6 +215,12 @@ impl Gateway {
         } else {
             self.api.create(&call.body, call.fallbacks, deadline).await?
         };
+        if !msg.usage.known() {
+            return Err(RemoteError {
+                code: ErrorCode::Failed,
+                message: "model finished without token usage; usage and cost are unknown".into(),
+            });
+        }
         let usage = Usage::from(msg.usage);
         // After a fallback another model answered, and its prices apply.
         let cost_usd = profile(&msg.model).prices.or(profile(&model).prices).map(|p| p.cost(&usage));
@@ -250,20 +257,25 @@ impl Gateway {
 pub async fn serve(svc: Arc<Service>, gateway: Arc<Gateway>) {
     let max_in_flight = gateway.cfg.max_in_flight;
     let events = svc.clone();
-    svc.serve_concurrent(max_in_flight, move |req| {
+    svc.serve_cancellable(max_in_flight, move |req, cancel| {
         let gateway = gateway.clone();
         let events = events.clone();
-        async move { handle_observed(&gateway, req, Some(events)).await }
+        async move { handle_observed(&gateway, req, Some(events), cancel).await }
     })
     .await;
 }
 
 #[cfg(test)]
 async fn handle(gateway: &Gateway, req: Envelope) -> Result<Value, RemoteError> {
-    handle_observed(gateway, req, None).await
+    handle_observed(gateway, req, None, CancellationToken::new()).await
 }
 
-async fn handle_observed(gateway: &Gateway, req: Envelope, events: Option<Arc<Service>>) -> Result<Value, RemoteError> {
+async fn handle_observed(
+    gateway: &Gateway,
+    req: Envelope,
+    events: Option<Arc<Service>>,
+    cancel: CancellationToken,
+) -> Result<Value, RemoteError> {
     let method = match &req.to {
         Target::Method { method, .. } => method.as_str(),
         _ => "",
@@ -272,66 +284,93 @@ async fn handle_observed(gateway: &Gateway, req: Envelope, events: Option<Arc<Se
         "complete" => {
             let started = Instant::now();
             let within = reply_window(req.budget.ms);
+            let call_id = req.id.clone();
+            if cancel.is_cancelled() {
+                return Ok(cancelled_settlement(call_id, false));
+            }
             let request: CompleteRequest = serde_json::from_value(req.payload).map_err(|e| RemoteError {
                 code: ErrorCode::Invalid,
                 message: format!("bad model.complete request: {e}"),
             })?;
-            let response = if let (Some(context), Some(events)) = (request.stream.clone(), events) {
-                let mut call = ModelCall {
-                    run: req.trace_id.to_string(),
-                    attempt: context.attempt,
-                    turn: context.turn,
-                    call: req.id.to_string(),
-                    seq: 0,
-                };
-                publish(&events, &req.trace_id, Progress::ModelStarted { context: call.clone() }).await;
-                // A slow event consumer cannot block the model response or
-                // build an unbounded queue. Missing previews produce seq gaps.
-                let (tx, mut rx) = mpsc::channel::<(u64, String)>(32);
-                let mut publisher = {
-                    let events = events.clone();
-                    let trace = req.trace_id.clone();
-                    let context = call.clone();
-                    tokio::spawn(async move {
-                        while let Some((seq, text)) = rx.recv().await {
-                            let mut context = context.clone();
-                            context.seq = seq;
-                            publish(&events, &trace, Progress::ModelText { context, text }).await;
-                        }
-                    })
-                };
-                let response = gateway
-                    .complete_streamed(request, within.map(|limit| limit.saturating_sub(started.elapsed())), |text| {
-                        call.seq += 1;
-                        let _ = tx.try_send((call.seq, text));
-                    })
-                    .await;
-                drop(tx);
-                let drain = within.map_or(Duration::from_millis(400), |limit| limit.saturating_sub(started.elapsed()));
-                if tokio::time::timeout(drain, &mut publisher).await.is_err() {
-                    publisher.abort();
-                    let _ = publisher.await;
+            let call = async {
+                if let (Some(context), Some(events)) = (request.stream.clone(), events) {
+                    let mut call = ModelCall {
+                        run: req.trace_id.to_string(),
+                        attempt: context.attempt,
+                        turn: context.turn,
+                        call: call_id.to_string(),
+                        seq: 0,
+                    };
+                    publish(&events, &req.trace_id, Progress::ModelStarted { context: call.clone() }).await;
+                    // A slow event consumer cannot block the model response or
+                    // build an unbounded queue. Missing previews produce seq gaps.
+                    let (tx, mut rx) = mpsc::channel::<(u64, String)>(32);
+                    let mut publisher = {
+                        let events = events.clone();
+                        let trace = req.trace_id.clone();
+                        let context = call.clone();
+                        tokio::spawn(async move {
+                            while let Some((seq, text)) = rx.recv().await {
+                                let mut context = context.clone();
+                                context.seq = seq;
+                                publish(&events, &trace, Progress::ModelText { context, text }).await;
+                            }
+                        })
+                    };
+                    let response = gateway
+                        .complete_streamed(
+                            request,
+                            within.map(|limit| limit.saturating_sub(started.elapsed())),
+                            |text| {
+                                call.seq += 1;
+                                let _ = tx.try_send((call.seq, text));
+                            },
+                        )
+                        .await;
+                    drop(tx);
+                    let drain =
+                        within.map_or(Duration::from_millis(400), |limit| limit.saturating_sub(started.elapsed()));
+                    if tokio::time::timeout(drain, &mut publisher).await.is_err() {
+                        publisher.abort();
+                        let _ = publisher.await;
+                    }
+                    call.seq += 1;
+                    let (usage, cost_usd, error) = match &response {
+                        Ok(resp) => (
+                            Some(resp.usage),
+                            resp.cost_usd,
+                            resp.is_refusal().then(|| "the model declined; preview is not a result".into()),
+                        ),
+                        Err(e) => (None, None, Some(e.to_string())),
+                    };
+                    publish(&events, &req.trace_id, Progress::ModelFinished { context: call, usage, cost_usd, error })
+                        .await;
+                    response
+                } else {
+                    gateway.complete_within(request, within).await
                 }
-                call.seq += 1;
-                let (usage, cost_usd, error) = match &response {
-                    Ok(resp) => (
-                        Some(resp.usage),
-                        resp.cost_usd,
-                        resp.is_refusal().then(|| "the model declined; preview is not a result".into()),
-                    ),
-                    Err(e) => (None, None, Some(e.to_string())),
-                };
-                publish(&events, &req.trace_id, Progress::ModelFinished { context: call, usage, cost_usd, error })
-                    .await;
-                response?
-            } else {
-                gateway.complete_within(request, within).await?
+            };
+            let response = tokio::select! {
+                biased;
+                response = call => response?,
+                _ = cancel.cancelled() => return Ok(cancelled_settlement(call_id, true)),
             };
             serde_json::to_value(response)
                 .map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("encoding the response: {e}") })
         }
         other => Err(RemoteError { code: ErrorCode::Invalid, message: format!("no method {other:?}") }),
     }
+}
+
+fn cancelled_settlement(call: molt_proto::MsgId, may_have_started: bool) -> Value {
+    // Anthropic Messages has no cancellation acknowledgement. Dropping HTTP
+    // stops local work only; never invent zero usage for a started request.
+    json!({
+        "error": {"code": "cancelled", "message": "local request stopped; remote cancellation and billing remain unknown"},
+        "settlement": {"request_id": call, "local_stopped": true,
+            "remote_cancel_confirmed": null, "may_have_started": may_have_started,
+            "usage": null, "cost_usd": null}
+    })
 }
 
 async fn publish(service: &Service, trace: &molt_proto::TraceId, event: Progress) {
@@ -499,5 +538,60 @@ mod tests {
         let mut cfg = from(&[("ANTHROPIC_API_KEY", "k")]).unwrap();
         cfg.base_url = "not a url".into();
         assert!(Gateway::new(cfg).is_err());
+    }
+    #[tokio::test]
+    async fn cancellation_stops_local_http_without_inventing_usage_or_retrying() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .mount(&server)
+            .await;
+        let mut cfg = from(&[("ANTHROPIC_API_KEY", "k"), ("MOLT_MODEL_RETRIES", "4")]).unwrap();
+        cfg.base_url = server.uri();
+        let gateway = Gateway::new(cfg).unwrap();
+        let request = envelope(
+            "model.complete",
+            serde_json::to_value(CompleteRequest { messages: vec![user_text("hi")], ..Default::default() }).unwrap(),
+        );
+        let id = request.id.clone();
+        let cancel = CancellationToken::new();
+        let work = handle_observed(&gateway, request, None, cancel.clone());
+        tokio::pin!(work);
+        tokio::select! {
+            result = &mut work => panic!("HTTP finished early: {result:?}"),
+            _ = async { while server.received_requests().await.unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }} => {}
+        }
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), work).await.unwrap().unwrap();
+        assert_eq!(result["error"]["code"], "cancelled");
+        assert_eq!(result["settlement"]["request_id"], json!(id));
+        assert_eq!(result["settlement"]["local_stopped"], true);
+        assert!(result["settlement"]["remote_cancel_confirmed"].is_null());
+        assert!(result["settlement"]["usage"].is_null());
+        assert!(result["settlement"]["cost_usd"].is_null());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn missing_usage_is_unknown_and_is_not_priced_as_zero() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg", "model": "claude-opus-5-5", "content": []
+            })))
+            .mount(&server)
+            .await;
+        let mut cfg = from(&[("ANTHROPIC_API_KEY", "k")]).unwrap();
+        cfg.base_url = server.uri();
+        let gateway = Gateway::new(cfg).unwrap();
+        let error = gateway
+            .complete(CompleteRequest { messages: vec![user_text("hi")], ..Default::default() })
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("usage and cost are unknown"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

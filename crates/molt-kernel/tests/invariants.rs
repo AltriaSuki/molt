@@ -520,3 +520,55 @@ async fn a_reply_only_comes_from_the_callee() {
     memory.reply(&req, json!("real answer")).await.unwrap();
     assert_eq!(call.await.unwrap().unwrap(), json!("real answer"));
 }
+
+#[tokio::test]
+async fn only_a_requests_caller_can_cancel_it_and_settlement_is_correlated() {
+    use std::sync::Arc;
+    let w = World::new().await;
+    let caller = w.join("caller").await;
+    let rogue = w.join("rogue").await;
+    let worker = Arc::new(w.join("worker").await);
+    w.grant(&caller, "worker.work", Budget::new(0, 0, 10)).await;
+    let pending = caller.request("worker.work", json!(1), CallOpts::default()).await.unwrap();
+    let request = worker.next().await.unwrap();
+    assert_eq!(request.id, *pending.id());
+    assert_eq!(code(rogue.kernel("cancel", None, json!({"request": pending.id()})).await), ErrorCode::Denied);
+    let mut forged = request.reply(Value::Null);
+    forged.kind = molt_proto::Kind::Cancel;
+    forged.from = Some(molt_proto::ServiceId::kernel());
+    assert_eq!(rogue.send_request(forged).await.unwrap().error().unwrap().code, ErrorCode::Denied);
+    pending.cancel().await.unwrap();
+    pending.cancel().await.unwrap();
+    // A real completion that races cancellation remains a single final reply.
+    worker.reply(&request, json!({"usage": 7})).await.unwrap();
+    assert_eq!(pending.wait().await.unwrap(), json!({"usage":7}));
+    assert_eq!(w.kernel.pending_count(), 0);
+    w.kernel.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_late_model_reply_is_audited_once_without_a_second_result() {
+    let w = World::new().await;
+    let caller = w.join("caller").await;
+    let model = w.join("model").await;
+    w.grant(&caller, "model.complete", Budget::new(0, 0, 10)).await;
+    let pending = caller
+        .request("model.complete", Value::Null, CallOpts { budget: Budget::new(0, 50, 0), ..Default::default() })
+        .await
+        .unwrap();
+    let request = model.next().await.unwrap();
+    assert_eq!(code(pending.wait().await), ErrorCode::Timeout);
+    model.reply(&request, json!({"usage": {"input_tokens":7}, "cost_usd":0.01})).await.unwrap();
+    model.reply(&request, json!({"usage": {"input_tokens":7}, "cost_usd":0.01})).await.unwrap();
+    // A barrier from the same link ensures both replies have been dispatched.
+    model.kernel("ping", None, Value::Null).await.unwrap();
+    let entries = audit::read_all(w.kernel.audit_path()).await.unwrap();
+    let settled = entries.iter().filter(|entry| {
+        matches!(&entry.event,
+        AuditEvent::Message { envelope } if envelope.reply_to.as_ref() == Some(&request.id)
+            && envelope.from.as_ref() == Some(model.id()) && envelope.payload.get("usage").is_some())
+    });
+    assert_eq!(settled.count(), 1);
+    assert_eq!(w.kernel.pending_count(), 0);
+    w.kernel.shutdown().await;
+}

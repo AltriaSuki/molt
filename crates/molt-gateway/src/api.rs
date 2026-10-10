@@ -55,6 +55,12 @@ pub(crate) struct ApiUsage {
     cache_read_input_tokens: Option<u64>,
 }
 
+impl ApiUsage {
+    pub fn known(&self) -> bool {
+        self.input_tokens.is_some() && self.output_tokens.is_some()
+    }
+}
+
 impl From<ApiUsage> for Usage {
     fn from(u: ApiUsage) -> Self {
         Usage {

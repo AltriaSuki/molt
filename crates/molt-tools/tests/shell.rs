@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use molt_api::shell::RunResponse;
 use molt_proto::{ErrorCode, RemoteError};
-use molt_tools::{Roots, Shell};
+use molt_tools::{ExecutionPolicy, Roots, Shell};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -22,7 +22,11 @@ impl Env {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         fs::create_dir_all(root.join("ws")).unwrap();
-        let shell = Shell::new(Roots { root: root.clone(), scratch: tmp.path().join("scratch") }).unwrap();
+        let shell = Shell::with_policy(
+            Roots { root: root.clone(), scratch: tmp.path().join("scratch") },
+            ExecutionPolicy::Unconfined,
+        )
+        .unwrap();
         Env { ws: root.join("ws").canonicalize().unwrap(), shell, _tmp: tmp }
     }
 
@@ -37,6 +41,71 @@ impl Env {
         }
         serde_json::from_value(self.call(payload).await.unwrap()).unwrap()
     }
+}
+
+#[tokio::test]
+async fn shutdown_refuses_commands_during_grace_and_after_it_returns() {
+    let env = Env::new();
+    let shutdown = env.shell.shutdown();
+    tokio::pin!(shutdown);
+    // Poll shutdown into its grace period before submitting another command.
+    tokio::select! {
+        biased;
+        () = &mut shutdown => panic!("shutdown should wait for graceful termination"),
+        () = tokio::task::yield_now() => {}
+    }
+    for marker in ["during-shutdown", "after-shutdown"] {
+        let err = env
+            .call(json!({"workspace":"ws", "command":format!("touch {marker}")}))
+            .await
+            .expect_err("shutdown must close admission before sending TERM");
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert!(!env.ws.join(marker).exists());
+        if marker == "during-shutdown" {
+            (&mut shutdown).await;
+        }
+    }
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn dropping_a_request_closes_its_output_readers() {
+    struct Writer(i32);
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            if !dead(self.0) {
+                unsafe { libc::kill(self.0, libc::SIGKILL) };
+            }
+        }
+    }
+
+    let env = Env::new();
+    let ws = env.ws.clone();
+    let shell = std::sync::Arc::new(env.shell);
+    let task = tokio::spawn(async move {
+        shell.handle("run", json!({"workspace":"ws", "command":
+            "setsid sh -c 'trap \"echo stopped > writer.stopped; exit 0\" PIPE; echo ready > writer.ready; while :; do printf x || exit; sleep 0.02; done' & echo $! > writer.pid; wait"
+        })).await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !ws.join("writer.pid").exists() || !ws.join("writer.ready").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let _writer = Writer(fs::read_to_string(ws.join("writer.pid")).unwrap().trim().parse().unwrap());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    // The escaped writer remains alive while detached drain tasks own its
+    // output pipe. Closing those readers makes its next write receive PIPE.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !ws.join("writer.stopped").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("request drop left output readers running");
 }
 
 /// True once `pid` has exited (gone, or a zombie nobody reaped yet).
@@ -84,7 +153,8 @@ async fn a_timeout_kills_the_whole_group_quickly() {
     let r = env.run("sleep 30 & echo $! > bg.pid; echo before; sleep 30", Some(300)).await;
     assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
     assert!(r.timed_out && !r.success());
-    assert_eq!((r.exit_code, r.signal), (None, Some(9)));
+    assert_eq!(r.exit_code, None);
+    assert!(matches!(r.signal, Some(9 | 15)));
     assert_eq!(r.stdout, "before\n");
     let pid: i32 = fs::read_to_string(env.ws.join("bg.pid")).unwrap().trim().parse().unwrap();
     assert!(wait_dead(pid), "the background sleep {pid} survived");
@@ -179,4 +249,34 @@ async fn hangup_and_quit_stop_the_service_too() {
         assert_eq!(unsafe { libc::kill(libc::getpid(), sig) }, 0);
         tokio::time::timeout(Duration::from_secs(5), stop).await.unwrap_or_else(|_| panic!("signal {sig} was missed"));
     }
+}
+
+#[tokio::test]
+async fn cancellation_terminates_children_and_escalates_after_grace() {
+    use tokio_util::sync::CancellationToken;
+    let env = Env::new();
+    let cancel = CancellationToken::new();
+    let command = "trap 'echo graceful > term' TERM; (trap '' TERM; while :; do echo x >> writes; sleep 0.02; done) & echo $! > writer.pid; wait";
+    let work = env.shell.handle_cancellable("run", json!({"workspace":"ws", "command": command}), cancel.clone());
+    tokio::pin!(work);
+    tokio::select! {
+        result = &mut work => panic!("finished before cancellation: {result:?}"),
+        _ = async { while !env.ws.join("writer.pid").exists() { tokio::time::sleep(Duration::from_millis(10)).await; } } => {}
+    }
+    cancel.cancel();
+    let response: RunResponse = serde_json::from_value(work.await.unwrap()).unwrap();
+    assert!(response.cancelled && !response.success() && !response.timed_out);
+    assert!(env.ws.join("term").exists(), "TERM handler ran before KILL");
+    let pid = fs::read_to_string(env.ws.join("writer.pid")).unwrap().trim().parse().unwrap();
+    assert!(wait_dead(pid));
+    let contents = fs::read(env.ws.join("writes")).unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(contents, fs::read(env.ws.join("writes")).unwrap());
+    let response = env
+        .shell
+        .handle_cancellable("run", json!({"workspace":"ws", "command":"touch forbidden"}), cancel)
+        .await
+        .unwrap_err();
+    assert_eq!(response.code, ErrorCode::Cancelled);
+    assert!(!env.ws.join("forbidden").exists());
 }

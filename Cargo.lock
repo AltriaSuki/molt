@@ -1301,6 +1301,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "wiremock",
 ]
@@ -1396,6 +1397,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -1419,6 +1421,7 @@ dependencies = [
  "similar",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
