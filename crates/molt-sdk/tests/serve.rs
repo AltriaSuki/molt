@@ -71,6 +71,20 @@ fn result(reply: &Envelope) -> Result<Value, RemoteError> {
 }
 
 #[tokio::test]
+async fn publishing_with_an_existing_trace_preserves_its_identity() {
+    let (svc, mut bus) = service();
+    let trace = TraceId::random();
+    let cap = CapId::random();
+    svc.add_cap("topic:progress", cap.clone());
+    svc.publish_traced("progress", json!({"text":"preview"}), trace.clone()).await.unwrap();
+    let event = bus.recv().await;
+    assert_eq!(event.kind, Kind::Event);
+    assert_eq!(event.trace_id, trace);
+    assert_eq!(event.cap, Some(cap));
+    assert_eq!(event.payload, json!({"text":"preview"}));
+}
+
+#[tokio::test]
 async fn serve_concurrent_runs_at_most_max_in_flight_and_answers_every_request() {
     const MAX: usize = 3;
     const N: usize = 10;
@@ -252,4 +266,157 @@ async fn time_spent_waiting_for_a_slot_counts_against_the_deadline() {
     assert_eq!(payload, json!("later"));
     assert!(ms > 0 && ms <= 10_000 - WAIT.as_millis() as u64, "the handler saw {ms} ms left");
     assert!(seen.try_recv().is_err(), "a request past its deadline never reaches the handler");
+}
+
+#[tokio::test]
+async fn cancellation_is_authenticated_and_does_not_stop_other_requests() {
+    let (svc, mut bus) = service();
+    let task = tokio::spawn({
+        let svc = svc.clone();
+        async move {
+            svc.serve_concurrent(2, |req| async move {
+                if req.payload == json!("slow") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+                Ok(req.payload)
+            })
+            .await;
+        }
+    });
+    let id = bus.request(json!("slow"));
+    let mut stop = Envelope::request(TraceId::random(), "svc.work".parse().unwrap(), CapId::random(), Value::Null);
+    stop.kind = Kind::Cancel;
+    stop.reply_to = Some(id.clone());
+    stop.from = Some(ServiceId::new("rogue").unwrap());
+    bus.to.send(stop.clone()).unwrap();
+    let other = bus.request(json!("other"));
+    let reply = bus.recv().await;
+    assert_eq!(reply.reply_to, Some(other));
+    assert_eq!(result(&reply).unwrap(), json!("other"));
+    assert!(bus.from.try_recv().is_err());
+    stop.from = Some(ServiceId::kernel());
+    bus.to.send(stop).unwrap();
+    let reply = bus.recv().await;
+    assert_eq!(reply.reply_to, Some(id));
+    assert_eq!(result(&reply).unwrap_err().code, ErrorCode::Cancelled);
+    drop(bus.to);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_a_pending_call_sends_cancel_and_completed_calls_do_not() {
+    let (svc, mut bus) = service();
+    let pending = svc.request("kernel.ping", Value::Null, CallOpts::default()).await.unwrap();
+    let request = bus.recv().await;
+    assert_eq!(pending.id(), &request.id);
+    drop(pending);
+    let control = bus.recv().await;
+    assert_eq!(control.to.to_string(), "kernel.cancel");
+    assert_eq!(control.payload["request"], json!(request.id));
+    let pending = svc.request("kernel.ping", Value::Null, CallOpts::default()).await.unwrap();
+    let request = bus.recv().await;
+    bus.to.send(request.reply(json!(true))).unwrap();
+    assert_eq!(pending.wait().await.unwrap(), json!(true));
+    tokio::task::yield_now().await;
+    assert!(bus.from.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn dropping_a_service_wakes_and_cancels_its_pending_calls() {
+    let (svc, mut bus) = service();
+    let pending = svc.request("kernel.ping", Value::Null, CallOpts::default()).await.unwrap();
+    let request = bus.recv().await;
+    drop(svc);
+    let error = tokio::time::timeout(Duration::from_secs(1), pending.wait())
+        .await
+        .expect("dropping a service must close the call's waiter")
+        .unwrap_err();
+    assert!(matches!(error, molt_sdk::SdkError::Closed));
+    let cancel = bus.recv().await;
+    assert_eq!(cancel.to.to_string(), "kernel.cancel");
+    assert_eq!(cancel.payload["request"], json!(request.id));
+}
+
+#[tokio::test]
+async fn link_loss_finishes_cleanup_even_when_every_slot_is_occupied() {
+    struct Stopped(mpsc::UnboundedSender<()>);
+    impl Drop for Stopped {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    let (svc, bus) = service();
+    let (started, mut starts) = mpsc::unbounded_channel();
+    let (stopped, mut stops) = mpsc::unbounded_channel();
+    let task = tokio::spawn({
+        let svc = svc.clone();
+        async move {
+            svc.serve_cancellable(1, move |_, cancel| {
+                let (started, stopped) = (started.clone(), stopped.clone());
+                async move {
+                    let _stopped = Stopped(stopped);
+                    started.send(()).unwrap();
+                    cancel.cancelled().await;
+                    // A broken cooperative handler can ignore cancellation.
+                    std::future::pending::<Result<Value, RemoteError>>().await
+                }
+            })
+            .await;
+        }
+    });
+    bus.request(Value::Null);
+    tokio::time::timeout(Duration::from_secs(1), starts.recv()).await.unwrap().unwrap();
+    bus.request(json!("queued"));
+    drop(bus.to);
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .expect("link loss must reach the bounded cooperative cleanup even while waiting for a slot")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), stops.recv()).await.unwrap().unwrap();
+    assert!(starts.try_recv().is_err(), "queued requests must not start after link loss");
+}
+
+#[tokio::test]
+async fn sequential_serving_does_not_invoke_a_cancelled_queued_handler() {
+    let (svc, mut bus) = service();
+    let (open, gate) = watch::channel(false);
+    let (started, mut starts) = mpsc::unbounded_channel();
+    let task = tokio::spawn({
+        let svc = svc.clone();
+        async move {
+            svc.serve(move |req| {
+                started.send(req.payload.clone()).unwrap();
+                let mut gate = gate.clone();
+                async move {
+                    let _ = gate.wait_for(|open| *open).await;
+                    Ok(req.payload)
+                }
+            })
+            .await;
+        }
+    });
+    let first = bus.request(json!("first"));
+    assert_eq!(starts.recv().await, Some(json!("first")));
+    let queued = bus.request(json!("cancelled"));
+    let mut stop = Envelope::request(TraceId::random(), "svc.work".parse().unwrap(), CapId::random(), Value::Null);
+    stop.kind = Kind::Cancel;
+    stop.reply_to = Some(queued.clone());
+    stop.from = Some(ServiceId::kernel());
+    bus.to.send(stop).unwrap();
+    // The reply is a FIFO barrier: read_loop has processed the cancellation.
+    let barrier = svc.request("kernel.ping", Value::Null, CallOpts::default()).await.unwrap();
+    let ping = bus.recv().await;
+    bus.to.send(ping.reply(Value::Null)).unwrap();
+    barrier.wait().await.unwrap();
+    open.send(true).unwrap();
+    let reply = bus.recv().await;
+    assert_eq!(reply.reply_to, Some(first));
+    assert!(result(&reply).is_ok());
+    let reply = bus.recv().await;
+    assert_eq!(reply.reply_to, Some(queued));
+    assert_eq!(result(&reply).unwrap_err().code, ErrorCode::Cancelled);
+    assert!(starts.try_recv().is_err(), "even synchronous handler code must not run");
+    drop(bus.to);
+    task.await.unwrap();
 }

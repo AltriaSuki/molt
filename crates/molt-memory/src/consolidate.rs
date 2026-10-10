@@ -451,6 +451,9 @@ fn apply(db: &Db, episode: &str, writer: &Writer, changes: &Changes, now: u64) -
             }
         }
         for (new, corrects) in &changes.new {
+            if notes::withdrawn(&tx, new)? {
+                continue;
+            }
             if let Some(old) = corrects {
                 match notes::contradict(&tx, old, new, now)? {
                     Correction::Added(id) => {
@@ -548,6 +551,7 @@ pub(crate) async fn consolidate(
     let (task, w) = (digest.task.clone(), ws.clone());
     let known = blocking(db, move |db| known(db, &task, &w, now)).await?;
     let request = CompleteRequest {
+        stream: None,
         model: Some(req.model.clone().unwrap_or_else(|| cfg.model.clone())),
         system: Some(SYSTEM.to_owned()),
         messages: vec![model::user_text(prompt(&known, &digest.text))],

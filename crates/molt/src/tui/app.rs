@@ -792,6 +792,8 @@ impl App {
                     self.log.push(Line::from(span(format!("  and {} more", notes.len() - 5), Tone::Dim)));
                 }
             }
+            // Model streaming is opt-in and the terminal interface does not ask for it.
+            Progress::ModelStarted { .. } | Progress::ModelText { .. } | Progress::ModelFinished { .. } => {}
             Progress::Note { message, .. } => {
                 if task.notes_seen.insert(message.clone()) {
                     self.log.push(Line::from(span(format!("  {}", clean_line(&message)), Tone::Dim)));
@@ -1510,6 +1512,8 @@ mod tests {
             }))
             .unwrap(),
             score: 1.0,
+            reason: Default::default(),
+            details: Default::default(),
         };
         app.update(Msg::Notes(Ok(vec![note("note_a"), note("note_b")])));
         app.update(key(KeyCode::Down));

@@ -24,8 +24,20 @@ pub(crate) async fn run(
     req: RunRequest,
     trace: TraceId,
 ) -> Result<RunResponse, RemoteError> {
+    run_cancellable(bus, cfg, req, trace, CancellationToken::new()).await
+}
+
+pub(crate) async fn run_cancellable(
+    bus: Arc<dyn Bus>,
+    cfg: Arc<Config>,
+    req: RunRequest,
+    trace: TraceId,
+    cancel: CancellationToken,
+) -> Result<RunResponse, RemoteError> {
     validate(&req)?;
     let mut ctx = Ctx::new(bus, cfg, trace, &req);
+    ctx.cancel = cancel.clone();
+    ctx.run_cancel = cancel;
     ctx.memory = memory::prepare(&ctx).await;
     let ctx = Arc::new(ctx);
     tracing::info!(run = %ctx.trace, workspace = %ctx.workspace, attempts = req.attempts, "run started");
@@ -68,7 +80,7 @@ pub(crate) async fn run(
         tokio::join!(conclude(&ctx, &req, spec, finished, winner), ctx.settle(ctx.cfg.late_reply_wait));
     resp.usage = tally.spend.usage;
     resp.cost_usd = tally.spend.cost_usd;
-    resp.uncounted_calls = tally.pending;
+    resp.uncounted_calls = tally.pending + tally.unsettled + tally.spend.unknown_calls;
     tracing::info!(
         run = %ctx.trace,
         outcome = ?resp.outcome,
@@ -87,12 +99,24 @@ pub(crate) async fn design(
     req: RunRequest,
     trace: TraceId,
 ) -> Result<DesignResponse, RemoteError> {
+    design_cancellable(bus, cfg, req, trace, CancellationToken::new()).await
+}
+
+pub(crate) async fn design_cancellable(
+    bus: Arc<dyn Bus>,
+    cfg: Arc<Config>,
+    req: RunRequest,
+    trace: TraceId,
+    cancel: CancellationToken,
+) -> Result<DesignResponse, RemoteError> {
     validate(&req)?;
     if req.check.is_some() || !req.verify {
         let message = "planner.design designs a check: leave out check, and keep verify".to_owned();
         return Err(RemoteError { code: ErrorCode::Invalid, message });
     }
     let mut ctx = Ctx::new(bus, cfg, trace, &req);
+    ctx.cancel = cancel.clone();
+    ctx.run_cancel = cancel;
     ctx.memory = memory::prepare(&ctx).await;
     let ctx = Arc::new(ctx);
     let design = designer::design(&ctx, true).await?;
@@ -151,11 +175,12 @@ fn validate(req: &RunRequest) -> Result<(), RemoteError> {
 /// Run `count` attempts at once. The first to pass wins and cancels the
 /// rest; every attempt is waited for. Reports come back in index order.
 async fn race(ctx: &Arc<Ctx>, count: u32, check: Option<Arc<Check>>) -> (Vec<Finished>, Option<u32>) {
-    let cancel = CancellationToken::new();
+    let cancel = ctx.cancel.child_token();
     let mut tasks = JoinSet::new();
     let mut indices = HashMap::new();
     for index in 0..count {
-        let handle = tasks.spawn(attempt::run(ctx.clone(), index, check.clone(), cancel.child_token()));
+        let token = cancel.child_token();
+        let handle = tasks.spawn(attempt::run(ctx.scoped(token.clone()), index, check.clone(), token));
         indices.insert(handle.id(), index);
     }
     let mut finished = Vec::new();
@@ -187,8 +212,10 @@ async fn conclude(
     finished: Vec<Finished>,
     winner: Option<u32>,
 ) -> RunResponse {
-    let won =
-        winner.and_then(|w| finished.iter().find(|f| f.report.index == w)).and_then(|f| Some((f, f.fork.clone()?)));
+    let won = winner
+        .filter(|_| !ctx.run_cancel.is_cancelled())
+        .and_then(|w| finished.iter().find(|f| f.report.index == w))
+        .and_then(|f| Some((f, f.fork.clone()?)));
     let mut resp = RunResponse {
         outcome: Outcome::Failed,
         check: spec.clone(),
@@ -302,7 +329,7 @@ fn not_designed(ctx: &Ctx, reason: &str) -> RunResponse {
         attempts: Vec::new(),
         usage: tally.spend.usage,
         cost_usd: tally.spend.cost_usd,
-        uncounted_calls: tally.pending,
+        uncounted_calls: tally.pending + tally.unsettled + tally.spend.unknown_calls,
     }
 }
 

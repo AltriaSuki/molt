@@ -51,6 +51,7 @@ pub(crate) async fn prepare(ctx: &Ctx) -> Memory {
         workspace: Some(workspace.clone()),
         k: Some(NOTES),
         min_confidence: Some(MIN_CONFIDENCE),
+        capture: Some("context".into()),
         ..Default::default()
     };
     let notes = match ctx.call::<RecallResponse>(memory::RECALL, recall, Budget::new(0, PROBE_MS, 0)).await {
@@ -119,7 +120,8 @@ pub(crate) fn note_lines(notes: &[Recalled]) -> String {
         .map(|r| {
             let n = &r.note;
             let disputed = if n.conflicts.is_empty() { "" } else { ", disputed" };
-            format!("- [{} {:.2}{disputed}] {}", n.kind.as_str(), n.confidence, n.text)
+            let temporary = if r.details.temporary { ", temporary experience; verify before reuse" } else { "" };
+            format!("- [{} {:.2}{disputed}{temporary}] {}", n.kind.as_str(), n.confidence, n.text)
         })
         .collect::<Vec<_>>()
         .join("\n")

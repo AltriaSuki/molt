@@ -222,10 +222,11 @@ impl Config {
         // The gateway is the only holder of the API key, so only a human may change it.
         let mut model = service("model", Tier::Protected, bin("molt-gateway")?)?;
         model.pass_env = names(GATEWAY_ENV);
+        model.requests = vec![request(&format!("topic:{}", molt_api::progress::TOPIC), Budget::new(0, 0, 10_000_000))?];
         let changed = format!("topic:{}", molt_api::fs::CHANGED);
         let mut fs = service("fs", Tier::Mutable, tools("fs")?)?;
         fs.requests = vec![request(&changed, Budget::new(0, 0, 100_000_000))?];
-        let shell = service("shell", Tier::Mutable, tools("shell")?)?;
+        let shell = service("shell", Tier::Protected, tools("shell")?)?;
         let mut memory_exec = bin("molt-memory")?;
         // The project model leaves out the data dir, with the forks in it, should it be inside the workspace.
         memory_exec.args = vec![
@@ -424,7 +425,7 @@ mod tests {
         let model = cfg.service("model").unwrap();
         assert_eq!(model.exec.as_ref().unwrap().command, "/opt/molt/bin/molt-gateway");
         assert_eq!(model.tier, Tier::Protected);
-        assert!(model.requests.is_empty());
+        assert_eq!(model.requests.iter().map(|r| r.target.to_string()).collect::<Vec<_>>(), ["topic:progress"]);
         assert!(model.pass_env.iter().any(|v| v == "ANTHROPIC_API_KEY"));
         assert!(model.pass_env.iter().any(|v| v == "ANTHROPIC_BASE_URL"));
 

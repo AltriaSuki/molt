@@ -335,7 +335,7 @@ pub(crate) fn build(entries: &[Logged], workspace: &Path, cut_short: bool) -> Di
                     steps[i].evidence.push(msg.id.to_string());
                 }
             }
-            Kind::Event => {}
+            Kind::Event | Kind::Cancel => {}
         }
     }
     if head.is_empty() && foot.is_empty() && steps.is_empty() {

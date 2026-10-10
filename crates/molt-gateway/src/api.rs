@@ -13,6 +13,7 @@ use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::stream::{Accumulator, Decoder};
 use crate::Config;
 
 const API_VERSION: &str = "2023-06-01";
@@ -54,6 +55,12 @@ pub(crate) struct ApiUsage {
     cache_read_input_tokens: Option<u64>,
 }
 
+impl ApiUsage {
+    pub fn known(&self) -> bool {
+        self.input_tokens.is_some() && self.output_tokens.is_some()
+    }
+}
+
 impl From<ApiUsage> for Usage {
     fn from(u: ApiUsage) -> Self {
         Usage {
@@ -90,6 +97,9 @@ enum Failure {
     Transport(String),
     /// A success status with a body that is not a Messages API response.
     BadBody(String),
+    /// Once a successful streaming response begins, never retry it: some
+    /// previews may already have been displayed and billing is uncertain.
+    Stream(RemoteError),
 }
 
 impl Failure {
@@ -97,7 +107,7 @@ impl Failure {
         match self {
             Failure::Status { status, .. } => matches!(status.as_u16(), 408 | 409 | 429) || status.is_server_error(),
             Failure::Timeout | Failure::Transport(_) => true,
-            Failure::BadBody(_) => false,
+            Failure::BadBody(_) | Failure::Stream(_) => false,
         }
     }
 
@@ -105,6 +115,7 @@ impl Failure {
     fn into_error(self, attempts: u32, timeout: Duration, cut: bool) -> RemoteError {
         let tries = if attempts > 1 { format!(" ({attempts} attempts)") } else { String::new() };
         let (code, message) = match self {
+            Failure::Stream(error) => (error.code, error.message),
             Failure::Status { status, detail, .. } => {
                 let code = match status.as_u16() {
                     400 | 404 | 413 | 422 => ErrorCode::Invalid,
@@ -177,6 +188,17 @@ impl Api {
         fallbacks: bool,
         deadline: Option<Instant>,
     ) -> Result<Message, RemoteError> {
+        self.create_observed(body, fallbacks, deadline, None).await
+    }
+
+    pub async fn create_observed(
+        &self,
+        body: &Value,
+        fallbacks: bool,
+        deadline: Option<Instant>,
+        mut on_text: Option<&mut (dyn FnMut(String) + Send)>,
+    ) -> Result<Message, RemoteError> {
+        let streaming = body["stream"] == true;
         let bytes = serde_json::to_vec(body)
             .map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("encoding the request: {e}") })?;
         let left = || deadline.map(|d| d.saturating_duration_since(Instant::now()));
@@ -187,7 +209,7 @@ impl Api {
                 let message = "the caller's deadline passed before the Messages API was called".to_owned();
                 return Err(RemoteError { code: ErrorCode::Timeout, message });
             }
-            let failure = match self.attempt(bytes.clone(), fallbacks, timeout).await {
+            let failure = match self.attempt(bytes.clone(), fallbacks, timeout, streaming, &mut on_text).await {
                 Ok(msg) => return Ok(msg),
                 Err(f) => f,
             };
@@ -213,7 +235,14 @@ impl Api {
         }
     }
 
-    async fn attempt(&self, body: Vec<u8>, fallbacks: bool, timeout: Duration) -> Result<Message, Failure> {
+    async fn attempt(
+        &self,
+        body: Vec<u8>,
+        fallbacks: bool,
+        timeout: Duration,
+        streaming: bool,
+        on_text: &mut Option<&mut (dyn FnMut(String) + Send)>,
+    ) -> Result<Message, Failure> {
         let mut req = self.http.post(self.url.clone()).headers(self.headers.clone()).timeout(timeout).body(body);
         if fallbacks {
             req = req.header("anthropic-beta", FALLBACK_BETA);
@@ -224,6 +253,9 @@ impl Api {
         let header = |name| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
         let request_id = header("request-id");
         let location = header("location").filter(|_| status.is_redirection());
+        if status.is_success() && streaming {
+            return read_stream(resp, on_text).await;
+        }
         let bytes = resp.bytes().await.map_err(transport)?;
         if status.is_success() {
             return serde_json::from_slice(&bytes).map_err(|e| Failure::BadBody(e.to_string()));
@@ -240,6 +272,67 @@ impl Api {
             detail.push_str(&format!(" [request-id {id}]"));
         }
         Err(Failure::Status { status, retry_after, detail })
+    }
+}
+
+async fn read_stream(
+    mut response: reqwest::Response,
+    on_text: &mut Option<&mut (dyn FnMut(String) + Send)>,
+) -> Result<Message, Failure> {
+    let bad = |e: String| Failure::BadBody(format!("invalid Messages API stream: {e}"));
+    let content_type = response.headers().get(CONTENT_TYPE).and_then(|h| h.to_str().ok()).unwrap_or("");
+    if content_type.split(';').next().unwrap_or("").trim() != "text/event-stream" {
+        return Err(bad("expected text/event-stream".into()));
+    }
+    let mut decoder = Decoder::default();
+    let mut accumulator = Accumulator::default();
+    let mut preview = String::new();
+    let mut last_flush = Instant::now() - Duration::from_secs(1);
+    loop {
+        let chunk = tokio::select! {
+            chunk = response.chunk() => chunk.map_err(|e| {
+                Failure::Stream(RemoteError {
+                    code: if e.is_timeout() { ErrorCode::Timeout } else { ErrorCode::Unavailable },
+                    message: "the Messages API stream was interrupted; partial content was not used and cost is unknown".into(),
+                })
+            })?,
+            _ = tokio::time::sleep_until((last_flush + Duration::from_millis(100)).into()), if !preview.is_empty() => {
+                flush_preview(&mut preview, on_text);
+                last_flush = Instant::now();
+                continue;
+            }
+        };
+        let Some(chunk) = chunk else { break };
+        for event in decoder.feed(&chunk).map_err(bad)? {
+            if let Some(text) = accumulator.event(event).map_err(bad)? {
+                preview.push_str(&text);
+            }
+            // Coalesce token-sized deltas. The first preview is immediate;
+            // later ones are capped at 4 KiB and flushed at most every 100 ms
+            // unless their size requires an earlier flush.
+            if !preview.is_empty() && (preview.len() >= 4096 || last_flush.elapsed() >= Duration::from_millis(100)) {
+                flush_preview(&mut preview, on_text);
+                last_flush = Instant::now();
+            }
+        }
+    }
+    decoder.finish().map_err(bad)?;
+    let message = accumulator.finish().map_err(bad)?;
+    flush_preview(&mut preview, on_text);
+    Ok(message)
+}
+
+fn flush_preview(preview: &mut String, on_text: &mut Option<&mut (dyn FnMut(String) + Send)>) {
+    if let Some(on_text) = on_text.as_mut() {
+        while !preview.is_empty() {
+            let mut end = preview.len().min(4096);
+            while !preview.is_char_boundary(end) {
+                end -= 1;
+            }
+            on_text(preview.drain(..end).collect());
+        }
+    } else {
+        preview.clear();
     }
 }
 

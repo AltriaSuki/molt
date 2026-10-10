@@ -13,6 +13,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::memory::Memory;
 use crate::{Bus, Config};
@@ -29,12 +30,16 @@ pub(crate) const SHELL_GRACE_MS: u64 = 30_000;
 pub(crate) struct Spend {
     pub usage: Usage,
     pub cost_usd: f64,
+    pub unknown_calls: u32,
 }
 
 impl Spend {
     pub fn add(&mut self, resp: &CompleteResponse) {
         self.usage.add(&resp.usage);
-        // Unknown prices count as free; the token totals still show the spend.
+        if resp.cost_usd.is_none() {
+            self.unknown_calls += 1;
+        }
+        // This is the known subtotal; unknown calls are reported separately.
         self.cost_usd += resp.cost_usd.unwrap_or(0.0);
     }
 }
@@ -45,8 +50,10 @@ impl Spend {
 pub(crate) struct Tally {
     pub spend: Spend,
     pub pending: u32,
+    pub unsettled: u32,
 }
 
+#[derive(Clone)]
 pub(crate) struct Ctx {
     bus: Arc<dyn Bus>,
     pub cfg: Arc<Config>,
@@ -58,11 +65,14 @@ pub(crate) struct Ctx {
     pub max_turns: u32,
     pub max_check_rounds: u32,
     pub budget_usd: f64,
+    pub stream: bool,
     /// What memory knows about the workspace; empty when memory is not up.
     pub memory: Memory,
     tally: watch::Sender<Tally>,
     /// Forks created and not yet dropped or merged, so none outlives the run by accident.
-    forks: Mutex<Vec<String>>,
+    forks: Arc<Mutex<Vec<String>>>,
+    pub cancel: CancellationToken,
+    pub run_cancel: CancellationToken,
 }
 
 /// A conversation that only ever grows. `system` and `tools` stay the same
@@ -72,11 +82,12 @@ pub(crate) struct Conversation {
     system: &'static str,
     tools: Arc<Vec<Value>>,
     messages: Vec<Value>,
+    attempt: Option<u32>,
 }
 
 impl Conversation {
-    pub fn new(system: &'static str, tools: Arc<Vec<Value>>, first: Value) -> Self {
-        Self { system, tools, messages: vec![first] }
+    pub fn new(system: &'static str, tools: Arc<Vec<Value>>, first: Value, attempt: Option<u32>) -> Self {
+        Self { system, tools, messages: vec![first], attempt }
     }
 
     pub fn push(&mut self, message: Value) {
@@ -98,11 +109,20 @@ impl Ctx {
             max_turns: req.max_turns.unwrap_or(cfg.max_turns),
             max_check_rounds: req.max_check_rounds.unwrap_or(cfg.max_check_rounds),
             budget_usd: req.budget_usd.unwrap_or(cfg.budget_usd),
+            stream: req.stream,
             memory: Memory::default(),
             cfg,
             tally: watch::Sender::new(Tally::default()),
-            forks: Mutex::default(),
+            forks: Arc::default(),
+            cancel: CancellationToken::new(),
+            run_cancel: CancellationToken::new(),
         }
+    }
+
+    pub fn scoped(&self, cancel: CancellationToken) -> Arc<Self> {
+        let mut scoped = self.clone();
+        scoped.cancel = cancel;
+        Arc::new(scoped)
     }
 
     pub fn run_id(&self) -> String {
@@ -119,7 +139,19 @@ impl Ctx {
             code: ErrorCode::Invalid,
             message: format!("encoding a {target} request: {e}"),
         })?;
-        let reply = self.bus.call(target, payload, budget, &self.trace).await?;
+        // Cleanup and fork bookkeeping must finish even after cancellation.
+        let cleanup = matches!(target, fs::FORK | fs::DROP | fs::DIFF);
+        if !cleanup && self.cancel.is_cancelled() {
+            return Err(RemoteError {
+                code: ErrorCode::Cancelled,
+                message: "attempt stopped before starting a new action".into(),
+            });
+        }
+        let reply = if matches!(target, model::COMPLETE | molt_api::shell::RUN) {
+            self.bus.call_cancellable(target, payload, budget, &self.trace, &self.cancel).await?
+        } else {
+            self.bus.call(target, payload, budget, &self.trace).await?
+        };
         serde_json::from_value(reply)
             .map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("bad {target} reply: {e}") })
     }
@@ -141,7 +173,10 @@ impl Ctx {
     }
 
     pub fn over_budget(&self) -> bool {
-        self.tally().spend.cost_usd >= self.budget_usd
+        {
+            let t = self.tally();
+            t.spend.cost_usd >= self.budget_usd || t.spend.unknown_calls > 0 || t.unsettled > 0
+        }
     }
 
     /// [`Ctx::tally`] once every model call is answered, or after `limit`.
@@ -155,7 +190,7 @@ impl Ctx {
     /// One model call; its usage counts against the run. The call runs in its
     /// own task: the gateway bills it whether or not the caller still waits,
     /// so a caller that stops waiting leaves it pending until the reply lands.
-    pub async fn complete(self: &Arc<Self>, conv: &Conversation) -> Result<CompleteResponse, RemoteError> {
+    pub async fn complete(self: &Arc<Self>, conv: &Conversation, turn: u32) -> Result<CompleteResponse, RemoteError> {
         let req = CompleteRequest {
             model: self.model.clone(),
             system: Some(conv.system.to_owned()),
@@ -164,6 +199,7 @@ impl Ctx {
             max_tokens: Some(self.cfg.max_tokens),
             effort: self.effort,
             output_schema: None,
+            stream: self.stream.then_some(model::StreamContext { attempt: conv.attempt, turn }),
         };
         let ms = u64::try_from(self.cfg.model_timeout.as_millis()).unwrap_or(u64::MAX);
         let budget = Budget::new(self.cfg.max_tokens.into(), ms, 0);
@@ -173,10 +209,14 @@ impl Ctx {
             let resp = ctx.call::<CompleteResponse>(model::COMPLETE, req, budget).await;
             ctx.tally.send_modify(|t| {
                 t.pending -= 1;
-                if let Ok(resp) = &resp {
-                    t.spend.add(resp);
+                match &resp {
+                    Ok(resp) => t.spend.add(resp),
+                    Err(_) => t.unsettled += 1,
                 }
             });
+            if ctx.over_budget() && !ctx.cancel.is_cancelled() {
+                ctx.run_cancel.cancel();
+            }
             resp
         });
         call.await.unwrap_or_else(|e| {

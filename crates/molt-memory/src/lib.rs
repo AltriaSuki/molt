@@ -11,6 +11,7 @@ mod digest;
 mod error;
 mod notes;
 pub mod project;
+mod review;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -21,8 +22,8 @@ use anyhow::{ensure, Context};
 use async_trait::async_trait;
 use molt_api::fs::{self as fs_api, FilesChanged};
 use molt_api::memory::{
-    ConsolidateRequest, ForgetRequest, ForgetResponse, IndexRequest, MapRequest, RecallRequest, RecallResponse,
-    RememberRequest, RememberResponse, RetractRequest, RetractResponse, SymbolsRequest,
+    ConsolidateRequest, CorrectRequest, ForgetRequest, ForgetResponse, IndexRequest, MapRequest, RecallRequest,
+    RecallResponse, RememberRequest, RememberResponse, RetractRequest, RetractResponse, ReviewRequest, SymbolsRequest,
 };
 use molt_api::model::Effort;
 use molt_proto::{Budget, Envelope, ErrorCode, Kind, RemoteError, Target, TraceId};
@@ -163,11 +164,20 @@ fn reply<T: Serialize>(value: T) -> Result<Value, RemoteError> {
     serde_json::to_value(value).map_err(|e| failed(format!("encoding the reply: {e}")))
 }
 
-/// Notes as [`memory.recall`](molt_api::memory::RECALL) finds them, read
-/// straight from the database, for tools such as `molt memory show`.
-/// `req.workspace` must be canonical.
+/// Local recall for trusted host tools. Checks dependencies and records
+/// review state in the database; use the service for kernel-audited calls.
+/// `req.workspace` must be canonical. Capturing requires a service request.
 pub fn recall(db: &Db, req: &RecallRequest) -> Result<Vec<molt_api::memory::Recalled>, RemoteError> {
-    notes::recall(db, req, now_ms())
+    review::recall(db, req, None, now_ms())
+}
+
+/// Read immutable context/tool records for a canonical project and run.
+pub fn recall_snapshots(
+    db: &Db,
+    workspace: &str,
+    run: &str,
+) -> Result<Vec<molt_api::memory::RecallSnapshot>, RemoteError> {
+    review::snapshots(db, workspace, run)
 }
 
 /// The memory service's state.
@@ -264,7 +274,7 @@ impl Memory {
         if req.kind == Kind::Event {
             if let Target::Topic { name } = &req.to {
                 if name == fs_api::CHANGED {
-                    self.files_changed(req.payload).await;
+                    self.files_changed(req.payload, req.trace_id.to_string()).await;
                 }
             }
             return Ok(Value::Null);
@@ -297,8 +307,38 @@ impl Memory {
             "recall" => {
                 let mut r: RecallRequest = parse(&method, req.payload)?;
                 r.workspace = r.workspace.as_deref().map(|w| self.workspace_key(w)).transpose()?;
-                let notes = self.blocking(move |db| notes::recall(db, &r, now)).await?;
+                if r.capture.is_some() && req.from.as_ref().map(|s| s.as_str()) != Some("planner") {
+                    return Err(invalid("only the kernel-identified planner may capture run context"));
+                }
+                let run = req.trace_id.to_string();
+                let call = req.id.to_string();
+                let notes = self.blocking(move |db| review::recall(db, &r, Some((&run, &call)), now)).await?;
                 reply(RecallResponse { notes })
+            }
+            "review" | "correct" => {
+                if req.from.as_ref().map(|s| s.as_str()) != Some("cli") {
+                    return Err(invalid("only the kernel-identified CLI may review or correct notes"));
+                }
+                let (mut r, correction) = if method == "correct" {
+                    let r: CorrectRequest = parse(&method, req.payload)?;
+                    (r.review, Some(r.text))
+                } else {
+                    (parse::<ReviewRequest>(&method, req.payload)?, None)
+                };
+                r.workspace = self.workspace_key(&r.workspace)?;
+                if r.depends_on
+                    .iter()
+                    .any(|p| self.cfg.skip.iter().any(|skip| Path::new(&r.workspace).join(p).starts_with(skip)))
+                {
+                    return Err(invalid("dependencies cannot name Molt's own data directory"));
+                }
+                let provenance = molt_api::memory::Provenance {
+                    trace: req.trace_id.to_string(),
+                    events: vec![req.id.to_string()],
+                    service: "cli".into(),
+                    version: "user".into(),
+                };
+                reply(self.blocking(move |db| review::review(db, &r, correction.as_deref(), provenance, now)).await?)
             }
             "forget" => {
                 let r: ForgetRequest = parse(&method, req.payload)?;
@@ -341,10 +381,14 @@ impl Memory {
 
     /// Re-index the files the `fs` service changed, in a workspace that
     /// already has a model; the others are indexed when first asked for.
-    async fn files_changed(&self, payload: Value) {
+    async fn files_changed(&self, payload: Value, trace: String) {
         let Ok(changed) = serde_json::from_value::<FilesChanged>(payload) else { return };
         let Ok(ws) = self.workspace(&changed.workspace) else { return };
         let Some(key) = ws.to_str().map(str::to_owned) else { return };
+        let review_key = key.clone();
+        if let Err(e) = self.blocking(move |db| review::refresh(db, &review_key, &trace, now_ms())).await {
+            tracing::debug!(error = %e.message, "could not check note dependencies");
+        }
         let modelled = self
             .blocking(move |db| {
                 db.with(|conn| conn.query_row("SELECT 1 FROM projects WHERE root = ?1", [key], |_| Ok(())))

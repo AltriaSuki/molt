@@ -10,6 +10,15 @@ use serde_json::{json, Value};
 
 pub const COMPLETE: &str = "model.complete";
 
+/// Display context for an opt-in streaming call. The run and call ids come
+/// from the authenticated request envelope, not from this payload.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StreamContext {
+    /// `None` for the check designer.
+    pub attempt: Option<u32>,
+    pub turn: u32,
+}
+
 /// How much the model thinks before answering (`output_config.effort`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -60,6 +69,10 @@ pub struct CompleteRequest {
     /// JSON Schema the final text must match (`output_config.format`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<Value>,
+    /// Stream text previews on `topic:progress`, keeping the final reply
+    /// authoritative. Thinking and partial tool inputs are never published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<StreamContext>,
 }
 
 /// Token counts as the Messages API reports them. A count the API sends as

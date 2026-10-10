@@ -79,6 +79,9 @@ pub struct RunRequest {
     /// fork is kept and its path returned.
     #[serde(default = "yes")]
     pub apply: bool,
+    /// Publish model text previews while calls are in flight.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream: bool,
 }
 
 impl RunRequest {
@@ -96,6 +99,7 @@ impl RunRequest {
             max_check_rounds: None,
             budget_usd: None,
             apply: true,
+            stream: false,
         }
     }
 }
@@ -182,6 +186,7 @@ pub struct AttemptReport {
     pub turns: u32,
     pub check_runs: u32,
     pub usage: Usage,
+    /// Known cost subtotal; see uncounted_calls for incomplete settlement.
     pub cost_usd: f64,
     /// Why it ended: the tail of the last failed check, an error, or empty.
     #[serde(default)]
@@ -212,9 +217,10 @@ pub struct RunResponse {
     pub attempts: Vec<AttemptReport>,
     /// Totals over the designer and every attempt.
     pub usage: Usage,
+    /// Known cost subtotal; see uncounted_calls for incomplete settlement.
     pub cost_usd: f64,
-    /// Model calls of cancelled attempts still unanswered when the run
-    /// ended. They are billed but not in `usage` or `cost_usd`.
+    /// Calls still pending, failed without usage, or returned without a known
+    /// price. cost_usd is only a subtotal when this is nonzero.
     #[serde(default)]
     pub uncounted_calls: u32,
 }
