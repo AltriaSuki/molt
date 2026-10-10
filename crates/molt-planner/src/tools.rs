@@ -406,6 +406,7 @@ mod tests {
             exit_code: Some(2),
             signal: None,
             timed_out: false,
+            cancelled: false,
             stdout: "out\n".into(),
             stderr: String::new(),
             truncated: false,

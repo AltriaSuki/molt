@@ -10,7 +10,9 @@ mod error;
 mod files;
 mod fork;
 mod paths;
+pub mod sandbox;
 mod shell;
+pub use sandbox::{ExecutionPolicy, SandboxPolicy};
 mod walk;
 
 use std::future::Future;
@@ -24,6 +26,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{failed, invalid};
 
@@ -137,28 +140,58 @@ pub struct Shell {
     /// `bash`, or `sh` when there is no bash on `PATH`.
     program: PathBuf,
     running: Arc<shell::Groups>,
+    policy: Option<Arc<SandboxPolicy>>,
 }
 
 impl Shell {
     /// Canonicalizes the roots (`scratch` is created if missing, and checked) and finds the shell to run commands with.
     pub fn new(roots: Roots) -> anyhow::Result<Self> {
-        Ok(Self { roots: Arc::new(roots.canonical()?), program: shell::find_shell(), running: Arc::default() })
+        Self::with_policy(roots, ExecutionPolicy::Isolated)
+    }
+
+    pub fn with_policy(roots: Roots, policy: ExecutionPolicy) -> anyhow::Result<Self> {
+        let roots = Arc::new(roots.canonical()?);
+        let policy = match policy {
+            ExecutionPolicy::Unconfined => None,
+            ExecutionPolicy::Isolated => Some(SandboxPolicy::default()),
+            ExecutionPolicy::Configured(policy) => Some(policy),
+        };
+        if let Some(policy) = &policy {
+            policy.probe()?;
+        }
+        Ok(Self { roots, program: shell::find_shell(), running: Arc::default(), policy: policy.map(Arc::new) })
     }
 
     /// Kill every command still running, with everything it started. Call
     /// it before the service exits: each command has a process group of its
     /// own, which neither a signal to the service nor its exit reaches.
+    pub async fn shutdown(&self) {
+        self.running.terminate_all();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        self.kill_all();
+    }
+
     pub fn kill_all(&self) {
         self.running.kill_all();
     }
 
     /// Handle one `shell` method (`run`) with its request payload.
     pub async fn handle(&self, method: &str, payload: Value) -> Result<Value, RemoteError> {
+        self.handle_cancellable(method, payload, CancellationToken::new()).await
+    }
+
+    pub async fn handle_cancellable(
+        &self,
+        method: &str,
+        payload: Value,
+        cancel: CancellationToken,
+    ) -> Result<Value, RemoteError> {
         let method = method.strip_prefix("shell.").unwrap_or(method);
         match method {
             "run" => {
                 let req = parse("shell", method, payload)?;
-                let reply = shell::run(&self.roots, &self.program, &self.running, req).await?;
+                let reply =
+                    shell::run(&self.roots, &self.program, &self.running, self.policy.as_deref(), req, cancel).await?;
                 serde_json::to_value(reply).map_err(|e| failed(e.to_string()))
             }
             _ => Err(invalid(format!("unknown method shell.{method}"))),
@@ -236,9 +269,9 @@ pub async fn serve_fs(svc: Arc<Service>, fs: Arc<Fs>) {
 
 /// Serve `shell.*` on `svc` until its link closes.
 pub async fn serve_shell(svc: Arc<Service>, shell: Arc<Shell>) {
-    svc.serve_concurrent(8, move |req| {
+    svc.serve_cancellable(8, move |req, cancel| {
         let shell = shell.clone();
-        async move { shell.handle(&method_of(&req)?, req.payload).await }
+        async move { shell.handle_cancellable(&method_of(&req)?, req.payload, cancel).await }
     })
     .await
 }

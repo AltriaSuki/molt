@@ -272,8 +272,10 @@ pub async fn run_task(
                 (false, _) | (true, None) => None,
                 (true, Some(Err(e))) => Some(Err(e)),
                 // Learning is a model call too: the run's budget covers it.
-                (true, Some(Ok(()))) if budget_usd.is_some_and(|b| ran.resp.cost_usd >= b) => {
-                    Some(Err("skipped: the run spent its whole budget".to_owned()))
+                (true, Some(Ok(())))
+                    if (ran.resp.uncounted_calls > 0 || budget_usd.is_some_and(|b| ran.resp.cost_usd >= b)) =>
+                {
+                    Some(Err("skipped: the budget is exhausted or model settlement is incomplete".to_owned()))
                 }
                 (true, Some(Ok(()))) => {
                     on_progress(&Progress::Note {
@@ -574,9 +576,9 @@ pub fn report(resp: &RunResponse) -> String {
     } else if let Some(fork) = &resp.fork {
         lines.push(format!("not applied; the result is in {fork}"));
     }
-    let mut cost = format!("cost: ${:.4} ({} tokens)", resp.cost_usd, resp.usage.total());
+    let mut cost = format!("known cost: ${:.4} ({} tokens)", resp.cost_usd, resp.usage.total());
     if resp.uncounted_calls > 0 {
-        cost.push_str(&format!(", not counting {} calls of cancelled attempts left unanswered", resp.uncounted_calls));
+        cost.push_str(&format!(", {} model calls have unknown or unsettled cost", resp.uncounted_calls));
     }
     lines.push(cost);
     let summary = resp.summary.trim();
@@ -854,14 +856,15 @@ mod tests {
         assert_eq!(
             report(&resp),
             "outcome: passed\ncheck: cargo test\nchanges:\n  modified src/lib.rs\napplied to the workspace\n\
-             cost: $0.0120 (1200 tokens)\n\nFixed the parser.\n"
+             known cost: $0.0120 (1200 tokens)\n\nFixed the parser.\n"
         );
         resp.applied = false;
         resp.fork = Some("/cache/work/fork_1".into());
         resp.uncounted_calls = 2;
         assert!(report(&resp).contains("not applied; the result is in /cache/work/fork_1\n"));
-        assert!(report(&resp)
-            .contains("cost: $0.0120 (1200 tokens), not counting 2 calls of cancelled attempts left unanswered\n"));
+        assert!(
+            report(&resp).contains("known cost: $0.0120 (1200 tokens), 2 model calls have unknown or unsettled cost\n")
+        );
         resp.uncounted_calls = 0;
         resp.changes = vec![Change { path: "\x1b[1Aevil".into(), kind: ChangeKind::Added }];
         resp.summary = "Done.\x1b]0;title\x07\n".into();
@@ -871,7 +874,7 @@ mod tests {
         resp.changes.clear();
         resp.summary.clear();
         assert!(report(&resp).ends_with(
-            "changes: none\nnot applied; the result is in /cache/work/fork_1\ncost: $0.0120 (1200 tokens)\n"
+            "changes: none\nnot applied; the result is in /cache/work/fork_1\nknown cost: $0.0120 (1200 tokens)\n"
         ));
     }
 }
