@@ -10,6 +10,7 @@ pub mod proc;
 pub mod record;
 pub mod report;
 pub mod run;
+pub mod sandbox;
 pub mod stats;
 pub mod task;
 

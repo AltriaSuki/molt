@@ -327,6 +327,14 @@ each run. The report gives each arm's success rate with a 95% interval, the
 runs where it said it was done and was not, and compares two arms on the
 same runs with an exact McNemar test.
 
+The agent's commands, its check included, run in Molt's sandbox, as
+`molt do` runs them by default. The tasks' toolchains are found on `PATH`
+and mounted into it read-only (a rustup install with its home, a Node in
+`/opt`); the tasks, the runs and your home directory never are, so the
+agent's commands cannot see the hidden tests. Before it starts, `run`
+checks that the sandbox works here and that each toolchain runs in it.
+`--no-sandbox` runs the commands as you instead; results record which.
+
 The tasks are in `bench/tasks`, in Python, JavaScript, Rust and Go, each a
 small project with a ticket, hidden tests and a reference solution, split
 into `dev` and `heldout` for the evaluator to come. `bench/README.md` has
@@ -334,11 +342,11 @@ the format.
 
 Known limits:
 
-- **Runs are not sandboxed.** `molt do` runs commands as you, so an agent
-  could read a task's hidden tests or solution by their absolute path, or
-  game the grade on purpose, such as with a module that shadows the test
-  framework. Nothing points it there, and each run's diff is kept so such
-  a run can be spotted, but nothing prevents it.
+- **An agent could game the grade on purpose**, such as with a module that
+  shadows the test framework, since the hidden tests run in its workspace.
+  With `--no-sandbox` it could also read a task's hidden tests or solution
+  by their absolute path. Nothing points it there, and each run's diff is
+  kept so such a run can be spotted, but nothing prevents it.
 - **Spending can pass the limits a little.** Molt checks its budget before
   each model call, so a run can pass `--task-usd` by up to one call for
   each of its parallel attempts, and the benchmark can pass `--max-usd` by
@@ -406,7 +414,7 @@ The read-only system runtime includes `/etc/alternatives` so distribution-provid
 
 The default `molt do` shell and done-check use the same Linux x86_64 backend, requiring `/usr/bin/bwrap` (bubblewrap 0.9+) and working unprivileged user namespaces. Startup probes the backend and fails if required capabilities are missing. `molt do --no-sandbox` and `molt-tools shell --no-sandbox` are explicit host choices; the library equivalent is `Shell::with_policy(..., ExecutionPolicy::Unconfined)`. Other architectures and macOS currently need that explicit choice.
 
-Each command starts from an empty mount namespace with read-only system runtime paths, a read-only original project, its writable `fs.fork` directory, private tmp/home, and isolated PID, user, IPC, UTS and network namespaces. Direct isolated shell calls on the original project are refused. Ignored entries linked back to the project remain read-only; shared build directories are not writable. `/proc` shows only sandbox processes. User namespaces cannot be nested, capabilities are dropped, and a seccomp filter blocks AF_UNIX sockets (including access to host service sockets through mounted paths), io_uring (which could bypass syscall socket filtering), and alternate syscall ABIs. Programs must use ordinary file/socket I/O rather than requiring io_uring. The default denies network access. With explicit host networking enabled, IP connections, including localhost, are allowed; AF_UNIX stays denied.
+Each command starts from an empty mount namespace with read-only system runtime paths, a read-only original project, its writable `fs.fork` directory, private tmp/home, and isolated PID, user, IPC, UTS and network namespaces. Direct isolated shell calls on the original project are refused. Ignored entries linked back to the project remain read-only; shared build directories are not writable. `/proc` shows only sandbox processes. User namespaces cannot be nested, capabilities are dropped, and a seccomp filter blocks creating AF_UNIX sockets (so no host service socket is reachable through a mounted path or, with host networking, an abstract name) and AF_UNIX datagram socket pairs (which could send to such sockets by address), io_uring (which could bypass syscall socket filtering), and alternate syscall ABIs. Programs must use ordinary file/socket I/O rather than requiring io_uring. The default denies network access. With explicit host networking enabled, IP connections, including localhost, are allowed; AF_UNIX stays denied. Stream and seqpacket socket pairs, which reach only each other, are allowed: Rust's standard library and Node's libuv start child processes with them, so `cargo test` and `node --test` need them.
 
 `molt do --sandbox-policy /trusted/path/policy.json` supplies a JSON policy. It must be owned by the current user, not writable by others, and outside the canonical project and scratch roots. Each canonical path component is opened without following replacement symlinks; file permissions and content are checked through the same descriptor, and reads are bounded to 64 KiB. The shell reads it at startup; no request payload or repository file selects a policy. The default shell service is protected from service-driven replacement. A custom service configuration is still an explicit trusted user choice, and custom shell implementations are responsible for their own isolation.
 

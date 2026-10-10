@@ -9,6 +9,7 @@ repository.workspace = true
 molt-api.workspace = true
 molt-gateway.workspace = true
 molt-kernel.workspace = true
+molt-tools.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true

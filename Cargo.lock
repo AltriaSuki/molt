@@ -1537,6 +1537,7 @@ dependencies = [
  "molt-api",
  "molt-gateway",
  "molt-kernel",
+ "molt-tools",
  "serde",
  "serde_json",
  "sha2",
