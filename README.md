@@ -185,14 +185,50 @@ of the service that wrote them, so rolling a version back retracts what it
 learned. Recall ranks notes by keyword match (SQLite FTS5 with stemming),
 confidence and recency.
 
+Every context or `recall` tool lookup the planner uses records an immutable
+snapshot: note IDs and revisions, original text, source runs and audit message
+IDs, the query, and keyword relevance, confidence and recency used for ranking.
+Later reinforcement, correction, forgetting or version retraction does not
+rewrite that run's view. A run that recalls notes prints its ID on stderr;
+`memory used` inspects it, scoped to the current project. Older runs have no
+snapshot and are reported as such rather than reconstructed from today's notes.
+
 ```sh
 molt memory show [WORDS...]          # notes about the project, best first
 molt memory forget NOTE_ID --reason "the build moved to make"
 molt memory map [WORDS...]           # the map a run with that task would start with
+molt memory used RUN_ID --json       # the notes actually returned for this run
+molt memory review NOTE_ID --rev 2 --reason "checked the build command" --depends-on Cargo.toml
+molt memory correct NOTE_ID "Tests use pnpm test." --rev 3 --reason "the command changed" --depends-on package.json
 ```
 
 `forget` goes through the kernel, so the audit log records it; the note stays
 as a tombstone with its reason.
+
+`show` includes revisions, sources, recall reasons and notes awaiting review.
+`review` and `correct` go through the kernel too, require a reason and the
+revision printed by `show`, and reject concurrent changes. Corrections keep
+the original note and evidence as a tombstone and link the replacement to it.
+Forgotten, corrected and retracted text cannot be automatically relearned.
+
+Use repeatable `--depends-on` arguments to attach project-relative files,
+including build configuration or a symbol's source file. These are explicit
+file dependencies, not inferred semantic symbol dependencies. Each review
+replaces the dependency list and records SHA-256 content fingerprints. A
+change, deletion or unreadable dependency marks only its linked notes as
+awaiting review; ordinary recall excludes them. Checks run before recall and
+when `fs.changed` arrives, including configuration files outside the source
+index. Restoring a file does not reactivate a note: confirm it with `review`
+using its current revision and dependency list. Unrelated changes leave it
+alone. Files are limited to 1 MiB, at most 16 per note; symlinks, paths outside
+the project and Molt's own data are refused.
+
+`review --temporary` marks a workaround as temporary experience, and the
+model is explicitly told to verify it before reuse. Review metadata does not
+change the original learning evidence. All these commands accept `--workspace`
+and `--data-dir`; `show` and `used` also accept `--json`. The database upgrades
+from schema 1 to schema 2 without rewriting existing notes; older binaries
+refuse the newer schema.
 
 ## Tests
 

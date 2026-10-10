@@ -16,7 +16,7 @@
 
 use std::collections::HashSet;
 
-use molt_api::memory::{Note, NoteKind, Provenance, RecallRequest, Recalled};
+use molt_api::memory::{Note, NoteKind, Provenance, RecallReason, RecallRequest, Recalled};
 use molt_proto::RemoteError;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
@@ -393,13 +393,26 @@ fn settle(tx: &Transaction, id: &str) -> rusqlite::Result<bool> {
 /// same text. Returns the note as stored and whether an existing one was found.
 pub(crate) fn remember(db: &Db, new: NewNote, now: u64) -> Result<(Note, bool), RemoteError> {
     let new = new.checked()?;
-    db.with(|conn| {
-        let tx = conn.transaction()?;
-        let (id, stored) = store(&tx, &new, now)?;
-        tx.commit()?;
-        Ok((get(conn, &id)?.expect("the note was just stored"), stored != Stored::New))
+    db.with(|conn| -> Result<_, RemoteError> {
+        let tx = conn.transaction().map_err(error::db)?;
+        if withdrawn(&tx, &new).map_err(error::db)? {
+            return Err(invalid("this note was withdrawn; its text cannot be automatically restored"));
+        }
+        let (id, stored) = store(&tx, &new, now).map_err(error::db)?;
+        let note = get(&tx, &id).map_err(error::db)?.expect("the note was just stored");
+        tx.commit().map_err(error::db)?;
+        Ok((note, stored != Stored::New))
     })
-    .map_err(error::db)
+}
+
+pub(crate) fn withdrawn(conn: &Connection, new: &NewNote) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM notes WHERE norm = ?1 AND workspace IS ?2 AND forgotten_ms IS NOT NULL LIMIT 1",
+        params![norm(&new.text), new.workspace],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|n| n.is_some())
 }
 
 /// The live note about the same workspace with the same text as `new`.
@@ -505,13 +518,27 @@ fn partners(tx: &Transaction, ids: &[String]) -> rusqlite::Result<Vec<String>> {
     Ok(out)
 }
 
-fn tombstone(tx: &Transaction, id: &str, what: &str, reason: &str, trace: &str, now: u64) -> rusqlite::Result<()> {
+pub(crate) fn tombstone(
+    tx: &Transaction,
+    id: &str,
+    what: &str,
+    reason: &str,
+    trace: &str,
+    now: u64,
+) -> rusqlite::Result<()> {
     tx.execute(
         "UPDATE notes SET forgotten_ms = ?2, forget_reason = ?3, rev = rev + 1 WHERE id = ?1",
         params![id, now as i64, reason],
     )?;
     let by = By { trace, service: "", version: "" };
     record(tx, id, by, what, reason, None, now)
+}
+
+pub(crate) fn settle_partners(tx: &Transaction, id: &str) -> rusqlite::Result<()> {
+    for other in partners(tx, &[id.to_owned()])? {
+        settle(tx, &other)?;
+    }
+    Ok(())
 }
 
 /// Tombstone the live note `id`. False when there is none.
@@ -648,18 +675,39 @@ pub(crate) enum Scope {
 
 /// The notes that best answer `req`, best first. `req.workspace` must be
 /// the canonical workspace already.
+#[cfg(test)]
 pub(crate) fn recall(db: &Db, req: &RecallRequest, now: u64) -> Result<Vec<Recalled>, RemoteError> {
     recall_in(db, req, Scope::WithGlobal, now)
 }
 
 /// [`recall`], over the notes `scope` names.
 pub(crate) fn recall_in(db: &Db, req: &RecallRequest, scope: Scope, now: u64) -> Result<Vec<Recalled>, RemoteError> {
-    let k = req.k.unwrap_or(DEFAULT_K).clamp(1, MAX_K) as usize;
+    validate_recall(req)?;
+    db.with(|conn| select(conn, req, scope, now)).map_err(error::db)
+}
+
+pub(crate) fn validate_recall(req: &RecallRequest) -> Result<(), RemoteError> {
+    if req.capture.as_deref().is_some_and(|p| !matches!(p, "context" | "tool")) {
+        return Err(invalid("capture must be context or tool"));
+    }
+    if req.capture.is_some() && (req.include_review || req.workspace.is_none()) {
+        return Err(invalid("captured recall requires a workspace and excludes notes awaiting review"));
+    }
     if let Some(min) = req.min_confidence {
         if !min.is_finite() || !(0.0..=1.0).contains(&min) {
             return Err(invalid("min_confidence must be between 0 and 1"));
         }
     }
+    Ok(())
+}
+
+pub(crate) fn select(
+    conn: &Connection,
+    req: &RecallRequest,
+    scope: Scope,
+    now: u64,
+) -> rusqlite::Result<Vec<Recalled>> {
+    let k = req.k.unwrap_or(DEFAULT_K).clamp(1, MAX_K) as usize;
     let fts = fts_query(&req.query);
     if fts.is_none() && !req.query.trim().is_empty() {
         return Ok(Vec::new());
@@ -671,6 +719,9 @@ pub(crate) fn recall_in(db: &Db, req: &RecallRequest, scope: Scope, now: u64) ->
         Scope::Own => "n.forgotten_ms IS NULL AND n.workspace IS ?1".to_owned(),
     };
     filter.push_str(" AND n.confidence >= ?3");
+    if !req.include_review {
+        filter.push_str(" AND NOT EXISTS (SELECT 1 FROM note_details d WHERE d.note = n.id AND json_array_length(json_extract(d.details, '$.needs_review')) > 0)");
+    }
     if !req.kinds.is_empty() {
         // The kinds' names are fixed words, safe to write into the query.
         let kinds: Vec<String> = req.kinds.iter().map(|k| format!("'{}'", k.as_str())).collect();
@@ -678,34 +729,36 @@ pub(crate) fn recall_in(db: &Db, req: &RecallRequest, scope: Scope, now: u64) ->
     }
     let columns = COLUMNS.split(", ").map(|c| format!("n.{c}")).collect::<Vec<_>>().join(", ");
     let min = req.min_confidence.unwrap_or(0.0);
-    let candidates: Vec<(Note, f64)> = db
-        .with(|conn| -> rusqlite::Result<_> {
-            let sql = match &fts {
+    let candidates: Vec<(Note, f64, molt_api::memory::NoteDetails)> = {
+        let details = "COALESCE((SELECT details FROM note_details WHERE note = n.id), '{}')";
+        let sql = match &fts {
                 Some(_) => format!(
-                    "SELECT {columns}, -bm25(notes_fts) FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid \
+                    "SELECT {columns}, -bm25(notes_fts), {details} FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid \
                      WHERE notes_fts MATCH ?2 AND {filter} ORDER BY bm25(notes_fts) LIMIT {CANDIDATES}"
                 ),
                 // Without words to match, the ranking is known in full: let SQL do it.
                 None => format!(
-                    "SELECT {columns}, 0.0 FROM notes n WHERE {filter} AND ?2 IS NULL \
+                    "SELECT {columns}, 0.0, {details} FROM notes n WHERE {filter} AND ?2 IS NULL \
                      ORDER BY 0.7 * n.confidence + 0.3 * recency(n.updated_ms, ?4) DESC, n.id LIMIT {k}"
                 ),
             };
-            let mut stmt = conn.prepare_cached(&sql)?;
-            let row = |r: &Row| Ok((note_from(r)?, r.get::<_, f64>(14)?));
-            let rows = match &fts {
-                Some(fts) => stmt.query_map(params![req.workspace, fts, min], row)?,
-                None => stmt.query_map(params![req.workspace, None::<String>, min, now as i64], row)?,
-            };
-            rows.collect()
-        })
-        .map_err(error::db)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let row = |r: &Row| {
+            let details: String = r.get(15)?;
+            Ok((note_from(r)?, r.get::<_, f64>(14)?, crate::review::decode(&details)?))
+        };
+        let rows = match &fts {
+            Some(fts) => stmt.query_map(params![req.workspace, fts, min], row)?,
+            None => stmt.query_map(params![req.workspace, None::<String>, min, now as i64], row)?,
+        };
+        rows.collect::<rusqlite::Result<_>>()?
+    };
 
-    let best = candidates.iter().map(|(_, rel)| *rel).fold(0.0, f64::max);
+    let best = candidates.iter().map(|(_, rel, _)| *rel).fold(0.0, f64::max);
     let matched = fts.is_some();
     let mut ranked: Vec<Recalled> = candidates
         .into_iter()
-        .map(|(note, rel)| {
+        .map(|(note, rel, details)| {
             let recency = recency(note.updated_ms as i64, now);
             let score = if matched {
                 let relevance = if best > 0.0 { rel / best } else { 0.0 };
@@ -713,7 +766,13 @@ pub(crate) fn recall_in(db: &Db, req: &RecallRequest, scope: Scope, now: u64) ->
             } else {
                 0.7 * note.confidence + 0.3 * recency
             };
-            Recalled { note, score }
+            let reason = RecallReason {
+                keywords: fts.clone(),
+                relevance: matched.then_some(if best > 0.0 { rel / best } else { 0.0 }),
+                confidence: note.confidence,
+                recency,
+            };
+            Recalled { note, score, reason, details }
         })
         .collect();
     ranked.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.note.id.cmp(&b.note.id)));
@@ -870,11 +929,9 @@ mod tests {
                 assert!(reason.is_some(), "the tombstone keeps its reason");
             }
         });
-        // A forgotten note's text can be learned afresh.
-        let (again, reinforced) =
-            remember(&db, note(NoteKind::Fact, "Deploy with fly deploy.", Some("/w")), 6).unwrap();
-        assert!(!reinforced);
-        assert_ne!(again.id, a.id);
+        // Automatic learning cannot undo the user's withdrawal.
+        let err = remember(&db, note(NoteKind::Fact, "Deploy with fly deploy.", Some("/w")), 6).unwrap_err();
+        assert!(err.message.contains("withdrawn"));
     }
 
     fn with_tx<R>(db: &Db, f: impl FnOnce(&Transaction) -> rusqlite::Result<R>) -> R {

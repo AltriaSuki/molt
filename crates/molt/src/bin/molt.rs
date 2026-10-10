@@ -5,7 +5,10 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use molt::agent::{self, Interrupted};
 use molt::{Config, Secrets};
-use molt_api::memory::{self, ForgetRequest, ForgetResponse, MapRequest, RecallRequest};
+use molt_api::memory::{
+    self, CorrectRequest, ForgetRequest, ForgetResponse, MapRequest, RecallRequest, RecallResponse, ReviewRequest,
+    ReviewResponse,
+};
 use molt_api::model::Effort;
 use molt_api::planner::{Outcome, RunRequest};
 use molt_proto::ServiceId;
@@ -120,6 +123,22 @@ struct MemoryAt {
 
 #[derive(Subcommand)]
 enum MemoryCmd {
+    /// Inspect the exact notes and recall reasons returned during RUN.
+    Used {
+        #[command(flatten)]
+        at: MemoryAt,
+        run: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Confirm a note, replace its file dependencies, or mark it temporary.
+    Review(ReviewArgs),
+    /// Replace a note while preserving its original evidence and reason.
+    Correct {
+        #[command(flatten)]
+        review: ReviewArgs,
+        text: String,
+    },
     /// List the notes about the project, strongest first, or those matching WORDS.
     Show {
         #[command(flatten)]
@@ -153,6 +172,24 @@ enum MemoryCmd {
         #[arg(long, default_value_t = 3000, value_parser = clap::value_parser!(u32).range(1..=32_000))]
         tokens: u32,
     },
+}
+
+#[derive(Args)]
+struct ReviewArgs {
+    #[command(flatten)]
+    at: MemoryAt,
+    id: String,
+    /// Revision printed by memory show; refuses concurrent changes.
+    #[arg(long)]
+    rev: u64,
+    #[arg(long)]
+    reason: String,
+    /// Replace the dependency list with these project-relative files. Repeatable.
+    #[arg(long)]
+    depends_on: Vec<String>,
+    /// Mark this as temporary experience, to be verified before reuse.
+    #[arg(long)]
+    temporary: bool,
 }
 
 /// A positive amount of US dollars, refused here rather than by the planner
@@ -346,7 +383,11 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
 
 async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()> {
     let at = match &cmd {
-        MemoryCmd::Show { at, .. } | MemoryCmd::Forget { at, .. } | MemoryCmd::Map { at, .. } => at,
+        MemoryCmd::Show { at, .. }
+        | MemoryCmd::Forget { at, .. }
+        | MemoryCmd::Map { at, .. }
+        | MemoryCmd::Used { at, .. } => at,
+        MemoryCmd::Review(r) | MemoryCmd::Correct { review: r, .. } => &r.at,
     };
     let workspace = at.workspace.canonicalize().with_context(|| format!("workspace {}", at.workspace.display()))?;
     let key = workspace.to_str().context("the workspace path is not UTF-8")?.to_owned();
@@ -358,8 +399,19 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
     };
     match cmd {
         MemoryCmd::Show { words, n, json, .. } => {
-            let req = RecallRequest { query: words.join(" "), workspace: Some(key), k: Some(n), ..Default::default() };
-            let notes = molt_memory::recall(&open()?, &req).map_err(|e| anyhow::anyhow!(e.message))?;
+            let req = RecallRequest {
+                query: words.join(" "),
+                workspace: Some(key),
+                k: Some(n),
+                include_review: true,
+                ..Default::default()
+            };
+            // Dependency checks can change note state: keep those checks
+            // on the audited service path too, rather than editing offline.
+            drop(open()?);
+            let response: RecallResponse =
+                serde_json::from_value(agent::call_memory(&cfg, memory::RECALL, serde_json::to_value(req)?).await?)?;
+            let notes = response.notes;
             if json {
                 println!("{}", serde_json::to_string_pretty(&notes)?);
             } else if notes.is_empty() {
@@ -368,6 +420,30 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
                 print!("{}", agent::printable(&show_notes(&notes)));
             }
         }
+        MemoryCmd::Used { run, json, .. } => {
+            let snapshots =
+                molt_memory::recall_snapshots(&open()?, &key, &run).map_err(|e| anyhow::anyhow!(e.message))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snapshots)?);
+            } else if snapshots.is_empty() {
+                eprintln!("no recorded memory context for run {run} in this project");
+            } else {
+                for snapshot in snapshots {
+                    let heading = format!(
+                        "run {}, call {} ({})\nquery: {}\n",
+                        snapshot.run, snapshot.call, snapshot.purpose, snapshot.query
+                    );
+                    print!("{}", agent::printable(&heading));
+                    if snapshot.notes.is_empty() {
+                        println!("no notes were returned");
+                    } else {
+                        print!("{}", agent::printable(&show_notes(&snapshot.notes)));
+                    }
+                }
+            }
+        }
+        MemoryCmd::Review(r) => change_note(&cfg, key, r, None).await?,
+        MemoryCmd::Correct { review, text } => change_note(&cfg, key, review, Some(text)).await?,
         MemoryCmd::Forget { id, reason, .. } => {
             let req = serde_json::to_value(ForgetRequest { id: id.clone(), reason })?;
             let reply: ForgetResponse = serde_json::from_value(agent::call_memory(&cfg, memory::FORGET, req).await?)?;
@@ -388,6 +464,24 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
     Ok(())
 }
 
+async fn change_note(cfg: &Config, workspace: String, r: ReviewArgs, text: Option<String>) -> anyhow::Result<()> {
+    let req = ReviewRequest {
+        workspace,
+        id: r.id,
+        expected_rev: r.rev,
+        reason: r.reason,
+        depends_on: r.depends_on,
+        temporary: r.temporary,
+    };
+    let (target, payload) = match text {
+        Some(text) => (memory::CORRECT, serde_json::to_value(CorrectRequest { review: req, text })?),
+        None => (memory::REVIEW, serde_json::to_value(req)?),
+    };
+    let reply: ReviewResponse = serde_json::from_value(agent::call_memory(cfg, target, payload).await?)?;
+    println!("{}", agent::printable(&format!("{} revision {}: {}", reply.note.id, reply.note.rev, reply.note.text)));
+    Ok(())
+}
+
 /// Notes as `molt memory show` lists them: id, kind, confidence and how
 /// often an episode bore the note out, then the text.
 fn show_notes(notes: &[molt_api::memory::Recalled]) -> String {
@@ -401,8 +495,44 @@ fn show_notes(notes: &[molt_api::memory::Recalled]) -> String {
         if !n.conflicts.is_empty() {
             extra.push(format!("disputed by {}", n.conflicts.join(", ")));
         }
+        if r.details.temporary {
+            extra.push("temporary experience; verify before reuse".into());
+        }
+        if !r.details.needs_review.is_empty() {
+            extra.push(format!("needs review: {}", r.details.needs_review.join(", ")));
+        }
         let extra = if extra.is_empty() { String::new() } else { format!(" ({})", extra.join("; ")) };
-        out.push_str(&format!("{}  {} {:.2}{extra}\n    {}\n", n.id, n.kind.as_str(), n.confidence, n.text));
+        out.push_str(&format!(
+            "{} rev {}  {} {:.2}{extra}\n    {}\n",
+            n.id,
+            n.rev,
+            n.kind.as_str(),
+            n.confidence,
+            n.text
+        ));
+        out.push_str(&format!(
+            "    source: {}/{} run {} events {}\n",
+            n.provenance.service,
+            n.provenance.version,
+            n.provenance.trace,
+            n.provenance.events.join(", ")
+        ));
+        out.push_str(&format!(
+            "    recall: score {:.3}, confidence {:.3}, recency {:.3}, keywords {}\n",
+            r.score,
+            r.reason.confidence,
+            r.reason.recency,
+            r.reason.keywords.as_deref().unwrap_or("none (confidence and recency)")
+        ));
+        if !r.details.dependencies.is_empty() {
+            out.push_str(&format!(
+                "    depends on: {}\n",
+                r.details.dependencies.iter().map(|d| d.path.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !r.details.reason.is_empty() {
+            out.push_str(&format!("    review reason: {}\n", r.details.reason));
+        }
     }
     out
 }

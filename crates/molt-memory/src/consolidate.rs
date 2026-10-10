@@ -451,6 +451,9 @@ fn apply(db: &Db, episode: &str, writer: &Writer, changes: &Changes, now: u64) -
             }
         }
         for (new, corrects) in &changes.new {
+            if notes::withdrawn(&tx, new)? {
+                continue;
+            }
             if let Some(old) = corrects {
                 match notes::contradict(&tx, old, new, now)? {
                     Correction::Added(id) => {
