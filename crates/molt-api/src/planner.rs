@@ -4,7 +4,9 @@
 //!
 //! 1. **Check first.** The done-check is a shell command whose exit status 0
 //!    means the task is done. If the caller gives none, a designer agent
-//!    writes one (possibly with new test files) before any work starts.
+//!    writes one (possibly with new test files) before any work starts. A
+//!    caller can also ask for no check: one attempt then does the task and
+//!    its result is returned unverified.
 //! 2. **Parallel attempts.** Each attempt is an agent loop (model and tools)
 //!    in its own fork of the workspace, with its own approach hint.
 //! 3. **Verify.** When an attempt says it is done, the planner restores the
@@ -42,7 +44,8 @@ pub struct RunRequest {
     pub task: String,
     /// The directory to work on (inside the `fs` and `shell` services' root).
     pub workspace: String,
-    /// Done-check command. `None`: the planner designs one first.
+    /// Done-check command. `None`: the planner designs one first, unless
+    /// `verify` is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<String>,
     /// Files `check` depends on, as `planner.design` returned them: written

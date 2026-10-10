@@ -1,0 +1,15 @@
+{
+  "name": "confmerge",
+  "version": "0.4.1",
+  "description": "Layered configuration loading: defaults, a JSON file, environment overrides and programmatic overrides, deep-merged.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": "./src/index.js",
+  "scripts": {
+    "test": "node --test test/merge.test.js test/env.test.js test/loader.test.js test/util.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

@@ -827,6 +827,40 @@ async fn when_no_check_fits_one_unverified_attempt_runs() {
 }
 
 #[tokio::test]
+async fn without_a_check_one_attempt_works_unverified_and_nothing_is_designed() {
+    let fake = Fake::new(
+        |req| {
+            assert!(!is_designer(req), "no check is designed when the caller asks for none");
+            match turn(req) {
+                1 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            }
+        },
+        |_, _| panic!("no command should run"),
+    );
+    let resp = run(&fake, RunRequest { verify: false, ..request(None, 3) }).await;
+
+    assert_eq!(resp.outcome, Outcome::Unverified);
+    assert_eq!((resp.check, resp.winner, resp.applied), (None, Some(0), true));
+    assert_eq!(resp.attempts.len(), 1, "without a check there is nothing to race on");
+    assert_eq!(resp.attempts[0].turns, 2);
+    assert_eq!(resp.summary, "Wrote hello.txt.");
+    assert_eq!(fake.workspace().get("hello.txt").map(String::as_str), Some("hi\n"));
+    // The attempt is not told about a done-check that will never run.
+    for req in fake.requests() {
+        let system = req.system.as_deref().unwrap();
+        assert!(!system.contains("done-check"), "{system}");
+        assert!(req.messages[0]["content"][0]["text"].as_str().unwrap().contains("no automated done-check"));
+    }
+    assert!(fake.events().contains(&Progress::CheckReady {
+        run: "trace_test".into(),
+        command: None,
+        files: vec![],
+        designed: false
+    }));
+}
+
+#[tokio::test]
 async fn a_designer_that_never_submits_is_nudged_once_then_the_run_fails() {
     let fake = Fake::new(
         |req| match (is_designer(req), turn(req)) {

@@ -47,6 +47,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
+    /// Benchmark Molt against a plain agent loop on coding tasks graded by hidden tests.
+    Bench {
+        #[command(subcommand)]
+        cmd: molt_bench::cli::Cmd,
+    },
     /// Work with the audit log.
     Audit {
         #[command(subcommand)]
@@ -67,6 +72,10 @@ struct DoArgs {
     /// Without one, the planner designs a check first.
     #[arg(long)]
     check: Option<String>,
+    /// Run without a done-check: none is designed, one attempt does the task,
+    /// and its result is applied unverified.
+    #[arg(long, conflicts_with = "check")]
+    no_check: bool,
     /// Parallel attempts.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=8))]
     attempts: u32,
@@ -250,8 +259,12 @@ enum AuditCmd {
 async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let cmd = cli.cmd.unwrap_or_else(|| Cmd::Ui(UiArgs { workspace: ".".into(), ..UiArgs::default() }));
-    // `molt do`, `molt memory` and the interface print their own progress; kernel logs would bury it.
-    molt::init_tracing(if matches!(cmd, Cmd::Do(_) | Cmd::Memory { .. } | Cmd::Ui(_)) { "warn" } else { "info" });
+    // `molt do`, `molt memory`, `molt bench` and the interface print their own progress; kernel logs would bury it.
+    molt::init_tracing(if matches!(cmd, Cmd::Do(_) | Cmd::Memory { .. } | Cmd::Bench { .. } | Cmd::Ui(_)) {
+        "warn"
+    } else {
+        "info"
+    });
     let config = || Config::load(cli.config.as_deref().unwrap_or(Path::new(DEFAULT_CONFIG)));
     let audit_path = |p: Option<PathBuf>| -> anyhow::Result<PathBuf> {
         match p {
@@ -282,6 +295,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
         Cmd::Do(args) => return do_task(cli.config.as_deref(), args).await,
         Cmd::Memory { cmd } => memory_cmd(cli.config.as_deref(), cmd).await?,
+        Cmd::Bench { cmd } => return molt_bench::cli::main(cmd).await,
         Cmd::Audit { cmd: AuditCmd::Verify { path } } => {
             let path = audit_path(path)?;
             let n =
@@ -368,6 +382,7 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     }
     let mut req = RunRequest::new(args.task, workspace.to_str().context("the workspace path is not UTF-8")?);
     req.check = args.check;
+    req.verify = !args.no_check;
     req.attempts = args.attempts;
     req.model = args.model;
     req.effort = args.effort;

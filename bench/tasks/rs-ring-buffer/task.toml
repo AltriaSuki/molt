@@ -1,0 +1,81 @@
+title = "Fix RingBuffer wraparound bugs, drop its Clone bound, and round out its API"
+language = "rust"
+kind = "bugfix"
+difficulty = "medium"
+split = "heldout"
+tests = "cargo test --offline --quiet --lib --test ring --test moving"
+check = "cargo test --offline --quiet --lib --test ring --test moving --test bench_hidden"
+timeout_s = 120
+prompt = """
+`ringbuf::RingBuffer` goes wrong once its contents wrap around the end of its
+storage (after a push into a full buffer, or after pops followed by more
+pushes):
+
+- `iter()` hands back the elements in storage order instead of oldest to
+  newest. With capacity 3, pushing 1, 2, 3, 4 leaves `[2, 3, 4]`, but
+  `iter()` yields 4, 2, 3. `for x in &buf`, the `Debug` output and
+  `MovingAverage::samples()` / `delta()` are wrong the same way.
+- `pop()` can panic with an index out of bounds. With capacity 3, push 1, 2,
+  3, 4 and pop three times: we expect 2, 3, 4, but the third pop panics.
+
+Please fix both. While you're in there: we want to keep things that can't be
+cloned in the buffer (connections, file handles), and we need a few more
+methods.
+
+**No bounds on `T`.** `RingBuffer<T>` and all of its API, old and new, must
+work for any (sized) `T`: no `Clone`, `Copy`, `Default`, `Debug`,
+`PartialEq` or other bound on `with_capacity`, `push`, `pop`, `iter()`,
+`for x in &buf`, the queries (`len`, `capacity`, ...) or the new methods
+below. Only the `Debug` impl may require `T: Debug`.
+
+**Ownership.** Every value pushed is dropped exactly once, never leaked and
+never dropped twice:
+
+- a value returned by `push` (the overwritten oldest element), by `pop` or by
+  `pop_newest` is moved out to the caller; the buffer keeps no copy and does
+  not drop it;
+- `clear()` drops all the elements it removes before it returns;
+- `extend` drops the elements it overwrites (by the time it returns);
+- dropping the buffer drops the elements still in it.
+
+**New API on `RingBuffer<T>`:**
+
+- `iter()` still returns `ringbuf::Iter<'_, T>`, which must now also
+  implement `DoubleEndedIterator` (`next_back()` yields the newest element
+  not yet yielded, so `iter().rev()` goes newest to oldest) and
+  `ExactSizeIterator` (`len()` is the number of elements not yet yielded from
+  either end). `next()` and `next_back()` can be mixed freely: between them
+  they yield each element exactly once, then both return `None`.
+- `pop_newest(&mut self) -> Option<T>`: removes and returns the newest
+  element, or `None` when the buffer is empty.
+- `get(&self, i: usize) -> Option<&T>`: the element at position `i` counted
+  from the oldest (`0` is the oldest, `len() - 1` the newest); `None` for any
+  `i >= len()`, including huge values such as `usize::MAX`.
+- `impl Index<usize> for RingBuffer<T>`: `buf[i]` is the element `get(i)`
+  returns. When `i >= len()` it panics with the message
+  `index {i} out of range for length {len}`, e.g.
+  `index 3 out of range for length 3`.
+- `impl Extend<T> for RingBuffer<T>`: pushes the items in order, exactly as
+  repeated `push` calls would, so once the buffer is full each item overwrites
+  the oldest element: extending an empty capacity-3 buffer with `1..=5`
+  leaves `[3, 4, 5]`.
+- `clear(&mut self)`: removes every element. The capacity stays the same and
+  the buffer behaves like a new one afterwards.
+
+To pin the semantics down: after any sequence of operations the buffer must
+match a `VecDeque` driven alongside it, where `push` into a full buffer is
+`pop_front` (whose result is what `push` returns) followed by `push_back`,
+`push` into a buffer that isn't full is `push_back` (and returns `None`),
+`pop` is `pop_front`, `pop_newest` is `pop_back`, `extend` is a sequence of
+pushes and `clear` is `clear`. `len()`, `is_empty()`, `is_full()`,
+`capacity()`, `iter()` in both directions, `get(i)` and `buf[i]` must all
+agree with it.
+
+Everything already documented stays as it is: `with_capacity(0)` still panics
+with its current message, `Debug` prints the elements oldest first like
+`[2, 3, 4]`, and the `MovingAverage` API is unchanged (its `samples()` are
+oldest first and `delta()` is newest minus oldest, also after the window has
+slid). Run the tests with:
+
+    cargo test --offline --lib --test ring --test moving
+"""

@@ -1,0 +1,42 @@
+title = "Add time-to-live expiry to the LRU cache and memoize"
+language = "python"
+kind = "feature"
+difficulty = "medium"
+split = "dev"
+tests = "python3 -m unittest -q tests.test_lru tests.test_memo tests.test_stats"
+check = "python3 -m unittest -q tests.test_lru tests.test_memo tests.test_stats tests.test_bench_hidden"
+timeout_s = 120
+prompt = """
+We want to use `cachelib` for data that goes stale (feature flags, user lookups), so cache entries need to be able to expire. Please add a time to live (ttl) to `LRUCache` and `memoize`. Here's exactly what we need.
+
+**Constructor.** `LRUCache(capacity, ttl=None, clock=time.monotonic)`.
+- `ttl` is the default time to live of an entry, in seconds (int or float). `None`, the default, means entries never expire. Otherwise it must be greater than 0: `0` or a negative number raises `ValueError`.
+- `clock` is a zero-argument callable that returns the current time in seconds. The cache calls it whenever it needs to know the time, and never uses any other time source. (We'll pass a fake clock in tests.)
+- Like `capacity`, the cache's ttl is readable as a property: `LRUCache(8, ttl=30).ttl == 30`, and `LRUCache(8).ttl is None`.
+
+**put.** `put(key, value, ttl=...)` gets an optional `ttl` argument:
+- left out: the entry gets the cache's ttl. That's always the cache's ttl, even when you overwrite an entry that was stored with a ttl of its own.
+- `ttl=None`: this entry never expires, whatever the cache's ttl.
+- a number: this entry's ttl. Same rule as the constructor: 0 or negative raises `ValueError`, and then the cache is left as it was (nothing is stored, and an existing entry for that key keeps its value).
+
+An entry put at time `t` (the clock's reading during the `put`) with ttl `T` expires at `t + T`: it is live while `clock() < t + T` and expired from `clock() >= t + T` on.
+
+`put` on a key that is already cached replaces the value, restarts its expiry from now (with the ttl worked out as above) and makes it the most recently used entry, as it does today.
+
+**An expired entry is gone.** It behaves exactly like a key that was never put: `get` returns the default and counts a miss, `in` is `False`, `len()` doesn't count it and `keys()` doesn't list it. A `put` on a key whose entry has expired is just like a `put` of a new key. `get` of a live entry still makes it the most recently used one, but it does not extend its expiry.
+
+**Full cache.** When a `put` adds a new key to a full cache, the cache first drops every expired entry, and only if it is still full does it evict the least recently used entry, as today. An expired entry must never cost a live entry its place.
+
+**Stats.** `stats()` returns a dict with exactly four counters: `hits`, `misses`, `evictions` and `expirations`.
+- `hits` and `misses` work as today: only `get` counts, and a `get` of an expired entry is a miss. `in`, `len()` and `keys()` still don't count.
+- `evictions` counts only live entries removed to make room (least recently used). Dropping expired entries is never an eviction.
+- `expirations` counts entries that expired while in the cache. Each such entry counts exactly once, and it counts as soon as its time is up, whether or not anything has touched it since: `stats()` must include expired entries the cache hasn't dropped yet. An entry that is overwritten or evicted before its time is up never expired, so it doesn't count; overwriting an entry that had already expired does count it.
+
+In `cachelib/stats.py`: `CacheStats` gets an `expirations` field (default 0) that `as_dict()` includes; `COUNTERS` lists it last, after `evictions`; `merge_stats` adds it up like the other counters (so `merge_stats()` with no arguments returns all four at 0); and `format_stats` prints it right after evictions, e.g. `"hits=3 misses=1 evictions=2 expirations=4 hit_rate=75.0%"`.
+
+**memoize.** The signature becomes `memoize(func=None, *, maxsize=128, ttl=None, clock=time.monotonic)`. `ttl` and `clock` go to the decorator's `LRUCache`, so `wrapper.cache.ttl` is the ttl, and a cached result is recomputed once its ttl has run out (cache hits don't extend it). `ttl=None` (and bare `@memoize`) means results never expire. An invalid ttl raises `ValueError` by the time the decorator is applied to a function at the latest. `cache_clear()` starts over with a cache that has the same maxsize, ttl and clock. `cache_info()` returns the four counters.
+
+A few existing tests compare a whole stats dict or `format_stats` output; update them for the new counter. Run the tests with:
+
+    python3 -m unittest -q tests.test_lru tests.test_memo tests.test_stats
+"""

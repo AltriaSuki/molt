@@ -60,6 +60,10 @@ sender from that.
 | `molt do` never runs a config the project ships, and the API key never reaches the commands it runs | `crates/molt/tests/agent.rs` (`the_cli_carries_out_a_task`) |
 | Reading the audit log takes a capability, and a read is recorded without a second copy of what it returned | `reading_the_log_takes_a_capability_and_is_recorded_without_a_second_copy` |
 | Every learned note cites the messages behind it, and a run is learned from once | `crates/molt/tests/agent.rs` (`a_second_run_starts_with_what_the_first_learned…`), `crates/molt-memory/src/consolidate.rs` |
+| A benchmark run is graded by tests the agent is not given, which its own edits cannot replace | `crates/molt-bench/src/grade.rs` (`grading_overwrites_the_agents_copy_of_a_hidden_file`), `crates/molt-bench/src/task.rs` (`overlay_replaces_files_links_and_directories_and_stays_inside`) |
+| Every benchmark task fails its check as given and passes it with the reference solution | `crates/molt-bench/tests/tasks.rs` |
+| A benchmark starts a run only while what it spent, plus the whole `--task-usd` of that run and of each run in flight, fits in `--max-usd`; it refuses models it has no price for | `crates/molt-bench/src/run.rs` (`runs_stop_before_they_could_pass_the_budget`, `a_run_of_unknown_cost_stops_the_benchmark`), `crates/molt-bench/src/cli.rs` (`a_model_without_a_price_is_refused`) |
+| A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
 
 ## Quick start
 
@@ -124,7 +128,7 @@ the same project is refused until it closes.
 ## `molt do`
 
 ```
-molt do TASK [--check CMD] [--attempts N] [--model M] [--effort E] [--max-turns N]
+molt do TASK [--check CMD | --no-check] [--attempts N] [--model M] [--effort E] [--max-turns N]
         [--budget-usd X] [--no-apply] [--json] [--stream] [--workspace DIR] [--data-dir DIR]
         [--pass-env NAME]... [--no-memory] [--no-learn] [--config FILE]
 ```
@@ -132,6 +136,7 @@ molt do TASK [--check CMD] [--attempts N] [--model M] [--effort E] [--max-turns 
 | Flag | Meaning |
 | --- | --- |
 | `--check CMD` | Shell command that exits 0 once the task is done, run in each attempt's fork. Default: the planner designs one. |
+| `--no-check` | Design no check: one attempt does the task and its result is applied unverified. This is the plain agent loop `molt bench` compares Molt with. |
 | `--attempts N` | Parallel attempts, 1 to 8 (default 2). The first to pass wins and the others are cancelled. |
 | `--model`, `--effort` | Model for the attempts (`opus`, `sonnet`, `haiku` or an id) and how hard it thinks. |
 | `--max-turns`, `--budget-usd` | Model turns per attempt, and the spending limit for the whole run. |
@@ -289,6 +294,58 @@ and `--data-dir`; `show` and `used` also accept `--json`. The database upgrades
 from schema 1 to schema 2 without rewriting existing notes; older binaries
 refuse the newer schema.
 
+## Benchmark
+
+`molt bench` measures what Molt's design buys. It runs Molt as it ships and
+a plain agent loop on the same coding tasks, grades every run with tests the
+agent is not given, and reports success rate, time to done and cost per task
+for each. Both arms are `molt do`, so they share the model, the tools, the
+prompts and the cost accounting; the plain loop (`--no-check --attempts 1
+--no-memory`) only turns off the done-check, the parallel attempts and
+memory.
+
+```sh
+molt bench list                                        # the tasks
+molt bench run --results runs/base.jsonl --dry-run     # what would run, and the most it could cost
+molt bench run --results runs/base.jsonl --max-usd 40  # run it; again to resume
+molt bench report runs/base.jsonl                      # the comparison, in Markdown (--json for data)
+molt bench validate                                    # check every task grades correctly
+```
+
+`run` needs `ANTHROPIC_API_KEY` and a spending limit. Each run gets its own
+copy of the task's repo, data dir and empty home directory, `--task-usd`
+(default $5) as its budget and `--timeout-s` (default 30 minutes); a run
+starts only if what was spent, plus that budget for it and for each run in
+flight, stays within `--max-usd`. Results are appended one JSON line per run
+as runs finish, with each run's diff, output and grade kept beside them, so
+an interrupted benchmark resumes where it stopped. A run that failed on the
+model API (an outage, a refused key, no credit) is recorded as an error,
+not a failure, and `--retry-errors` runs it again; when several in a row
+fail that way the benchmark stops. `--arm NAME=OPTIONS` adds an arm of your
+own, such as `--arm one-attempt="--attempts 1"`, and `--trials N` repeats
+each run. The report gives each arm's success rate with a 95% interval, the
+runs where it said it was done and was not, and compares two arms on the
+same runs with an exact McNemar test.
+
+The tasks are in `bench/tasks`, in Python, JavaScript, Rust and Go, each a
+small project with a ticket, hidden tests and a reference solution, split
+into `dev` and `heldout` for the evaluator to come. `bench/README.md` has
+the format.
+
+Known limits:
+
+- **Runs are not sandboxed.** `molt do` runs commands as you, so an agent
+  could read a task's hidden tests or solution by their absolute path, or
+  game the grade on purpose, such as with a module that shadows the test
+  framework. Nothing points it there, and each run's diff is kept so such
+  a run can be spotted, but nothing prevents it.
+- **Spending can pass the limits a little.** Molt checks its budget before
+  each model call, so a run can pass `--task-usd` by up to one call for
+  each of its parallel attempts, and the benchmark can pass `--max-usd` by
+  as much. `--dry-run` shows the most it plans to spend.
+- **Times are only comparable at `--jobs 1`**: parallel runs share the
+  machine and slow each other down.
+
 ## Tests
 
 ```sh
@@ -299,6 +356,10 @@ The NATS conformance and end-to-end tests need a `nats-server` binary. Set
 `MOLT_NATS_SERVER=/path/to/nats-server` or put it on `PATH`
 (`go install github.com/nats-io/nats-server/v2@latest`). Without it they print
 a notice and pass; CI always runs them.
+
+`crates/molt-bench/tests/tasks.rs` validates every benchmark task, which takes
+`python3`, `node` (20 or newer), `go` and `cargo`. A missing toolchain skips
+its tasks with a notice, except on CI.
 
 ## Roadmap
 

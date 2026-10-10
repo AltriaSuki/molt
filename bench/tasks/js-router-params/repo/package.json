@@ -1,0 +1,15 @@
+{
+  "name": "minirouter",
+  "version": "0.3.0",
+  "description": "A tiny method + path router with a transport-agnostic request dispatcher.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": "./src/index.js",
+  "scripts": {
+    "test": "node --test test/router.test.js test/dispatcher.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

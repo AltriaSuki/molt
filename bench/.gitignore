@@ -1,0 +1,5 @@
+# Artifacts from running a task's tests in place
+__pycache__/
+target/
+node_modules/
+Cargo.lock

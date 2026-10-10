@@ -1,0 +1,58 @@
+title = "Add tags and due dates to todo with a version 2 file format and v1 migration"
+language = "python"
+kind = "feature"
+difficulty = "hard"
+split = "heldout"
+tests = "python3 -m unittest -q tests.test_models tests.test_store tests.test_render tests.test_cli"
+check = "python3 -m unittest -q tests.test_models tests.test_store tests.test_render tests.test_cli tests.test_bench_hidden"
+timeout_s = 120
+prompt = """
+People want two things from `todo`: tags, so one file can hold home and work items, and due dates, so they can see what is late. Both need new fields in the file, so this also brings in file format version 2, and we must not lose anyone's existing version 1 list on the way. The current behaviour is in the README; everything below is new or changed.
+
+**File format version 2.** Every save now writes exactly this shape (no other keys at either level):
+
+    {"version": 2, "next_id": 4, "items": [
+      {"id": 1, "text": "Buy milk", "done": false, "tags": ["home", "shop"], "due": "2026-01-05"},
+      {"id": 3, "text": "Call the bank", "done": true, "tags": [], "due": null}
+    ]}
+
+- `tags` is a sorted list of unique lowercase strings (`[]` when the item has none).
+- `due` is the due date as a `"YYYY-MM-DD"` string, or `null` when there is none.
+- `next_id` is the id the next added item gets. Ids are never reused: each `add` takes `next_id` and increases it by 1, and removing items never lowers it, so removing item 3 (even the highest one) and then adding gives id 4, not 3. A new list starts at 1.
+- Items stay in the order they were added.
+- When loading a version 2 file, `next_id` must be an integer greater than every item id in the file. If it is missing or isn't, the file is not a valid list: exit status 2 with a message on stderr, as for other broken files today.
+
+**Reading version 1 files.** A version 1 file (`{"version": 1, "items": [{"id", "text", "done"}]}`) still loads. It is converted in memory: every item gets `tags` `[]` and `due` `null`, and `next_id` is the highest id plus 1, or 1 when there are no items. Loading alone never writes anything, so `list`, or a command that fails, leaves a version 1 file exactly as it was and creates no backup. The first command that saves does this:
+1. If no file exists at `PATH + ".v1.bak"` yet (for `--file /x/todo.json` that is `/x/todo.json.v1.bak`), copy the version 1 file there byte for byte, exactly as it was on disk. If something already exists at that path, leave it alone.
+2. Then write the list to `PATH` in version 2.
+
+Saving over a version 2 file, or creating a new file, makes no backup.
+
+**Other versions.** A file whose `version` is an integer other than 1 or 2 makes every command exit with status 3, print a message on stderr that includes that version number, print nothing on stdout, and write nothing (no save, no backup). Other broken files still exit with status 2 as today.
+
+**Tags.** A tag is one or more ASCII letters, digits, `-` or `_`. Tags are case-insensitive: they are lowercased when given (`Home` and `HOME` are the tag `home`), and duplicates collapse. Any tag argument that is not valid (for example `two words`, `#home`, `a,b` or an empty string) is a usage error: exit status 2, nothing on stdout, nothing saved.
+
+**Due dates.** `--due DATE` takes a date written exactly as `YYYY-MM-DD`: a four-digit year, two-digit month and two-digit day, and a day that exists (`2024-02-29` is fine). Anything else is a usage error (exit status 2, nothing on stdout, nothing saved), including `2026-1-5`, `20260105`, `2026-W02-1`, `2026-02-30`, `05/01/2026` and `2026-01-05T09:00`.
+
+**Commands.** `--file PATH` works as before.
+- `add TEXT [--tag T]... [--due DATE]`: `--tag` can be given any number of times. Prints `added ID` as before.
+- `list [--tag T] [--overdue] [--all]`: shows open items by default, and done ones too with `--all`. `--tag T` keeps only items that have tag T (matched case-insensitively). `--overdue` keeps only items whose due date is strictly before today; an item with no due date is never overdue, and one due today is not overdue. The options combine (an item is shown only if it passes all of them), and items are listed in file order. Nothing shown means no output, as today.
+- `done ID` and `remove ID`: unchanged (`done ID`, `removed ID`).
+- `tag ID T...`: adds one or more tags to the item, keeping the ones it already has. Prints the item's list line (format below) after the change.
+- `untag ID T...`: removes one or more tags from the item. Removing a tag the item doesn't have is not an error. Prints the item's list line after the change.
+
+"Today" is the date in the `TODO_TODAY` environment variable (`YYYY-MM-DD`) when it is set, and the real local date otherwise. We need the variable for testing and demos.
+
+An id that names no item (`done`, `remove`, `tag`, `untag`) still exits with status 1 and a message on stderr that includes the id, prints nothing on stdout and saves nothing.
+
+**List line format.** This is exact: `[ ]` for an open item or `[x]` for a done one, a space, the id, a space, the text. Then for each tag in sorted order, a space and `#tag`. Then, if the item has a due date, a space and `(due YYYY-MM-DD)`. For example:
+
+    [ ] 3 Buy milk #home #shop (due 2026-01-05)
+    [x] 4 Call the bank
+    [ ] 5 Pay rent (due 2026-02-01)
+    [ ] 6 Water plants #garden
+
+Keep the existing tests passing, and please update the README (commands, exit status 3, the version 2 format). Run the tests from the project root with:
+
+    python3 -m unittest -q tests.test_models tests.test_store tests.test_render tests.test_cli
+"""

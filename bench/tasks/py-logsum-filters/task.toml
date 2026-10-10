@@ -1,0 +1,31 @@
+title = "Add --since/--until time filters, a skipped-line count and --json output to logsum"
+language = "python"
+kind = "feature"
+difficulty = "easy"
+split = "dev"
+tests = "python3 -m unittest -q tests.test_parser tests.test_summary tests.test_report tests.test_cli"
+check = "python3 -m unittest -q tests.test_parser tests.test_summary tests.test_report tests.test_cli tests.test_bench_hidden"
+timeout_s = 120
+prompt = """
+Ops wants to use `logsum` in incident reviews and to feed a dashboard, and three things are in the way: you can't limit a summary to a time window, the output is text only, and lines that don't parse vanish without a trace. Please add `--since` / `--until`, a skipped-line count, and `--json`. Details below; the log format is in the README.
+
+**Time window: `--since WHEN` and `--until WHEN`.** Both optional, usable alone or together, and they work with `--json` too.
+- `WHEN` is either a date, `YYYY-MM-DD`, or a date and time, `YYYY-MM-DDTHH:MM:SS` (the same form as the log timestamps). A date alone means midnight at the start of that day, so `--until 2024-03-05` stops before anything logged on March 5th, and `--since 2024-03-05` starts at `2024-03-05T00:00:00`.
+- `--since` is inclusive: an entry stamped exactly at that time is counted. `--until` is exclusive: an entry stamped exactly at that time is not.
+- Only entries inside the window count toward anything in the output: requests, bytes, the status classes, the top paths, and the durations in the text report. Entries outside the window are simply left out; they are not "skipped" (see below).
+- A window where `--since` is at or after `--until` is empty: nothing matches, and that is not an error.
+- Any other value is invalid. That includes other ISO 8601 spellings such as `2024-03-05T10:00` (no seconds), `2024-03-05 10:00:00` (space instead of `T`), `20240305`, a time zone (`2024-03-05T10:00:00Z`, `...+01:00`) or fractional seconds (`2024-03-05T10:00:00.250`), as well as things like `05/03/2024`, `yesterday`, and dates or times that don't exist (`2024-02-30`, `2024-03-05T24:00:00`). An invalid value makes `logsum` exit with status 2, print nothing on stdout, and print an error on stderr that contains the bad value exactly as it was given. argparse's usual `error()` output is fine for that.
+
+**Skipped lines.** A non-blank line that the parser rejects (`parse_line` raises `ParseError`) is still left out of the summary, but now it is counted as skipped. Blank and whitespace-only lines are still ignored and are not counted. The count is the total over all files given (and stdin for `-`), and it counts every malformed line whatever the window: a malformed line is skipped even if the timestamp at its start falls outside `--since`/`--until`. The text report gets a new line `skipped: N`, printed every time, also as `skipped: 0`; where it goes in the report is up to you, the other lines stay as they are.
+
+**`--json`.** With `--json`, print a single JSON object instead of the text report, and nothing else on stdout. It has exactly these keys:
+- `requests`: the number of entries counted (an integer)
+- `bytes`: their total bytes (an integer)
+- `statuses`: an object mapping `"2xx"`, `"3xx"`, `"4xx"` and `"5xx"` to the number of entries in that class; all four keys are always present, with 0 for a class that has none
+- `top_paths`: a list of `[path, count]` pairs (two-element lists), the same top paths the text report shows: at most 5, highest count first, equal counts ordered by path ascending, with query strings stripped as the text report does; `[]` when nothing was counted
+- `skipped`: the skipped-line count described above
+
+Exit status stays 0 on success. Please also update the README and the tests. Run the tests with:
+
+    python3 -m unittest -q tests.test_parser tests.test_summary tests.test_report tests.test_cli
+"""

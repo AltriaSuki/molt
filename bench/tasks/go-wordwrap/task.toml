@@ -1,0 +1,67 @@
+title = "Fix textfmt.Wrap: rune widths, long words, paragraph breaks and stray spaces"
+language = "go"
+kind = "bugfix"
+difficulty = "easy"
+split = "heldout"
+tests = "GOTOOLCHAIN=local go test ./ ./cmd/fmtcol/"
+check = "GOTOOLCHAIN=local go test ./ ./cmd/fmtcol/ ./benchhidden/"
+timeout_s = 120
+prompt = '''
+`textfmt.Wrap` (and so `fmtcol`, which is a thin filter around it) is making a
+mess of our release notes. What we've seen:
+
+1. **Non-ASCII text wraps too early.** `Wrap("Zürich ist schön und groß", 10)`
+   breaks after "Zürich" although "Zürich ist" is exactly 10 characters.
+   Greek, Cyrillic and CJK text is even worse.
+2. **Long words stick out past the margin.** A URL longer than the width ends
+   up on a line of its own that is wider than `width`.
+3. **Paragraph breaks disappear.** The blank line between two paragraphs is
+   lost and they run together, and a "blank" line with a stray space or tab in
+   it doesn't even end the paragraph.
+4. **Stray whitespace.** Some lines end with a space (and some have two spaces
+   between words); we see it with text that has two spaces after a full stop.
+   Tabs in the input also come through as part of a word.
+
+Please fix `Wrap` so it follows this contract exactly. The signature stays
+`func Wrap(s string, width int) string`.
+
+- If `width <= 0`, return `s` unchanged.
+- Split `s` into lines at `"\n"`. A line is **blank** if it is empty or holds
+  only spaces and tabs. A **paragraph** is a maximal run of consecutive
+  non-blank lines; blank lines only separate paragraphs.
+- **Words** are separated by runs of ASCII spaces (U+0020) and tabs, and the
+  line break between two lines of a paragraph separates words just like a
+  space does. Every other character is part of a word, including U+00A0
+  NO-BREAK SPACE and the other Unicode space characters (we put a no-break
+  space in things like `"10 km"` on purpose so they never get split
+  across lines).
+- **Width counts runes** (what `utf8.RuneCountInString` returns): every rune is
+  one column, whether it's an accented letter, a CJK character or an emoji. No
+  double-width handling.
+- Each paragraph is **filled greedily**: go through its words in order; a word
+  goes on the current line, after a single space, when the line is not empty
+  and the result is at most `width` runes; otherwise the word starts a new
+  line. Words on a line are separated by exactly one space.
+- A word **longer than `width` runes** never shares a line with the words
+  before it. It is cut into consecutive pieces of exactly `width` runes, the
+  last piece holding what is left (1 to `width` runes), and each piece goes on
+  its own line. Cuts fall between runes, never inside a multi-byte character.
+  The last piece then is the current line, so the words after it join it by
+  the normal rule when they fit. A word of exactly `width` runes is not cut.
+  For example:
+  - `Wrap("abcdefghij", 4)` == `"abcd\nefgh\nij"`
+  - `Wrap("a bcdefgh", 5)` == `"a\nbcdef\ngh"`
+  - `Wrap("go supercalifragilistic now", 6)` == `"go\nsuperc\nalifra\ngilist\nic now"`
+- The result is the paragraphs' lines joined with `"\n"`, with **exactly one
+  empty line between consecutive paragraphs**, however many blank lines
+  separated them in the input. Blank lines before the first paragraph or after
+  the last one produce nothing, and the result has **no trailing newline**. If
+  `s` contains no words at all (`""`, `"  \n\t\n"`, ...), the result is `""`.
+- So no output line starts or ends with a space or a tab, and no output line is
+  longer than `width` runes.
+
+`Indent` and `fmtcol`'s flags and output stay as they are, and their existing
+tests must keep passing.
+
+Run the tests with `go test ./ ./cmd/fmtcol/`.
+'''

@@ -1494,6 +1494,7 @@ dependencies = [
  "hex",
  "libc",
  "molt-api",
+ "molt-bench",
  "molt-gateway",
  "molt-kernel",
  "molt-memory",
@@ -1522,6 +1523,27 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "molt-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "hex",
+ "libc",
+ "molt-api",
+ "molt-gateway",
+ "molt-kernel",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
 ]
 
 [[package]]

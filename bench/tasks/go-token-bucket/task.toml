@@ -1,0 +1,47 @@
+title = "Fix token-bucket refill bugs and add Reserve, Tokens and idle-key sweeping"
+language = "go"
+kind = "bugfix"
+difficulty = "medium"
+split = "dev"
+tests = "GOTOOLCHAIN=local go test ./"
+check = "GOTOOLCHAIN=local go test ./ ./benchhidden/"
+timeout_s = 120
+prompt = """
+Our `ratelimit` package (module `example.com/ratelimit`, everything in the root package) is misbehaving in production, and we need a couple of additions while you're in there. Below is exactly how it should behave afterwards. Keep the existing API working except where this ticket changes it.
+
+## How a Limiter's balance works (this is the contract)
+
+`New(rate, burst, clock)` makes a limiter whose balance starts full, at `burst` tokens, and which remembers the clock reading at creation. Every time the limiter looks at its balance (`Allow`, `AllowN`, `Reserve`, `Tokens`) it reads the clock once and refills first:
+
+- If the reading is later than the latest reading the limiter has seen, it adds `elapsed seconds * rate` tokens (elapsed = reading minus that latest reading), caps the balance at `burst`, and remembers the new reading.
+- If the reading is the same or earlier (the host clock was stepped backwards), nothing is added and the remembered reading stays where it is. Time is only credited again once the clock gets past the latest reading the limiter had already seen.
+
+The balance is a float64 and is never rounded.
+
+## Bugs
+
+1. **Tokens refill past burst after an idle period.** A limiter that sits idle for an hour ends up with thousands of tokens and lets a huge burst through. The balance must never exceed `burst`.
+2. **`AllowN` spends tokens even when it says no.** `AllowN(n)` must succeed only if the refilled balance is at least `n`; then it subtracts `n` and returns true. Otherwise it returns false and the balance is left exactly as it was. `AllowN(n)` with `n < 1` returns false and changes nothing. `Allow()` is `AllowN(1)`.
+3. **A clock that goes backwards adds tokens.** After a backwards step, the time between the step-back point and the latest reading already seen gets credited a second time once the clock catches up. Follow the refill rules above.
+
+## New on Limiter
+
+- `func (l *Limiter) Reserve(n int) (wait time.Duration, ok bool)`. If `n < 1` or `n > Burst()`, it returns `0, false` and changes nothing. Otherwise it refills, subtracts `n` from the balance even if that takes it below zero, and returns `ok = true` with `wait` = how long until the balance is back to zero or more: `0` if the balance is still `>= 0`, otherwise `-balance / rate` seconds, rounded up to a whole nanosecond. A negative balance refills at `rate` like any other (still capped at `burst`), and `Allow`/`AllowN` fail while the balance is below what they ask for.
+- `func (l *Limiter) Tokens() float64` refills and returns the current balance (negative while reservations are outstanding).
+
+## KeyedLimiter: forget idle clients
+
+A `KeyedLimiter` currently keeps a limiter for every key it has ever seen, so on a public endpoint it grows without bound.
+
+- The constructor becomes `NewKeyed(rate float64, burst int, idleTTL time.Duration, clock Clock) *KeyedLimiter` (still panics on a bad rate or burst; a nil clock still means `RealClock`). Add `func (k *KeyedLimiter) IdleTTL() time.Duration` returning it.
+- A key's last use is the clock reading at the most recent `Get`, `Allow` or `AllowN` call for that key on the `KeyedLimiter`, including the call that created its limiter. (`Get` alone counts as a use.)
+- `func (k *KeyedLimiter) Sweep() int` reads the clock and removes every key whose last use was at least `idleTTL` ago (now minus last use `>= idleTTL`), and returns how many keys it removed. `Len()` and `Keys()` no longer include removed keys, and the next use of a removed key starts a new, full limiter. If `idleTTL <= 0`, `Sweep` removes nothing and returns 0.
+
+Update the callers of `NewKeyed` (the existing tests and the README example) for the new parameter.
+
+## Concurrency
+
+Every method on `Limiter` and `KeyedLimiter`, old and new, must be safe for concurrent use (e.g. `Sweep` running while requests call `Allow`).
+
+Run the tests with `go test ./`.
+"""

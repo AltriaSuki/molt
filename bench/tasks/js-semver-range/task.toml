@@ -1,0 +1,129 @@
+title = "Implement npm-style version ranges (satisfies) in pkgver"
+language = "javascript"
+kind = "build"
+difficulty = "hard"
+split = "dev"
+tests = "node --test test/semver.test.js test/select.test.js test/cli.test.js"
+check = "node --test test/semver.test.js test/select.test.js test/cli.test.js test/bench_hidden.test.js"
+timeout_s = 120
+prompt = """
+pkgver's versions side is done (src/semver.js: parsing, precedence including
+prereleases), but `satisfies(version, range)` in src/range.js still throws
+"not implemented", so `maxSatisfying` / `minSatisfying` / `filterSatisfying`
+(src/select.js) and the CLI's `satisfies`, `max` and `min` commands are dead.
+Please implement npm-style ranges there. select.js and the CLI already go
+through `satisfies` and should keep working as they are (skipping list
+entries that are not versions, returning entries as given, and so on); the
+todo test in test/select.test.js should pass once this lands, so drop its
+`todo`. Please add tests and fix the README's "Not implemented yet".
+
+## satisfies(version, range)
+
+Exported from src/range.js (and src/index.js). Returns `true` or `false`.
+
+`version` is a string or a `SemVer`. A string must be a full version that
+`new SemVer` accepts (leading "v", build metadata, surrounding whitespace are
+fine). Anything else, including partial versions such as "1.2" or "1.x", the
+empty string and non-strings, throws the `TypeError` that `new SemVer`
+throws (message starting with "Invalid version"), whatever valid range it
+is checked against, including "" and "*".
+
+## Range syntax
+
+- A range is one or more comparator sets joined by `||` (whitespace around
+  `||` optional). A version satisfies the range if it satisfies at least one
+  set.
+- A comparator set is comparators separated by whitespace (leading and
+  trailing whitespace is ignored); the version must satisfy all of them
+  (plus the prerelease rule below). An empty or all-whitespace set matches
+  every version: the range "" does, and so does either side of "1.0.0 ||"
+  or "|| 1.0.0".
+- A comparator is an optional operator, one of `<` `<=` `>` `>=` `=` `~`
+  `^`, followed by a version. No operator means `=`. Whitespace between an
+  operator and its version is allowed (">= 1.2.3", "^ 1.2.3", "< 2"), but two
+  comparators must be separated by whitespace (">=1.2.3<2.0.0" is invalid),
+  and a comparator has at most one operator ("~^1.2.3", ">>1.2.3", "=>1.2.3"
+  are invalid).
+- A version in a range may start with "v" (after the operator, if any:
+  "v1.2.3", "=v1.2.3", ">=v1.2", "^v1.2.3"). It is either
+  - a full version: major.minor.patch with an optional prerelease and/or
+    build suffix, valid SemVer 2.0.0 (so no leading zeros, no empty or
+    leading-zero-numeric prerelease identifiers, no empty build). Build
+    metadata is ignored, both here and on the version being tested; or
+  - a partial version: one to three dot-separated parts, each a number
+    (no leading zeros) or a wildcard `x`, `X` or `*`. Missing parts count as
+    wildcards ("1" = "1.x" = "1.x.x"). Once a part is a wildcard every later
+    part must be one too ("1.x.3", "*.1", "x.1.x" are invalid). A prerelease
+    or build suffix is only allowed after three numbers ("1.2-beta",
+    "1.2.x-beta" are invalid).
+
+## Meaning
+
+Full versions: `<`, `<=`, `>`, `>=`, `=` compare by SemVer precedence (the
+existing `SemVer#compare`).
+
+Partial versions with a numeric major. Let low(P) be P with its wildcard
+parts set to 0, and high(P) the first version above everything P covers
+(bump the last numeric part, zero the rest: "1" -> 2.0.0, "1.2" -> 1.3.0):
+
+- bare "P" or "=P": >=low(P) <high(P). "1" (= "1.x") is >=1.0.0 <2.0.0,
+  "1.2" (= "1.2.*") is >=1.2.0 <1.3.0.
+- ">P": >=high(P), so ">1.2" is >=1.3.0 and ">1" is >=2.0.0.
+- ">=P": >=low(P).
+- "<P": <low(P).
+- "<=P": <high(P), so "<=1.2" is <1.3.0.
+
+A wildcard major ("*", "x", "X", "x.x", ...): with `<` or `>` it matches no
+version at all; bare, or with any other operator (`=`, `<=`, `>=`, `~`,
+`^`), it matches every version.
+
+Hyphen ranges: "A - B", with whitespace on both sides of the "-", means
+>=A <=B. A and B are bare versions (optional "v", no operator), and the
+hyphen range is the whole comparator set: "1.2.3 - 2.3.4 >1.5.0",
+">=1.0.0 - 2.0.0", "1.2.3 - 2.3.4 - 3.0.0", "1.2.3 -2.3.4" and "1.2.3 - "
+are invalid (it can still be one alternative of a `||`). Without whitespace
+around it, "-" starts a prerelease: "1.2.3-2.3.4" is the single version
+1.2.3 with prerelease tag "2.3.4". A partial A uses low(A) ("1.2 - 2.3.4" is
+>=1.2.0 <=2.3.4); a partial B becomes <high(B) ("1.2.3 - 2.3" is
+>=1.2.3 <2.4.0, "1.2.3 - 2" is >=1.2.3 <3.0.0). A with a wildcard major
+means no lower bound, B with a wildcard major means no upper bound.
+
+Tilde: the lower bound is the version written (low(P) for a partial, the
+full version including any prerelease otherwise); the upper bound bumps the
+minor if the minor is a number, else the major. ~1.2.3 is >=1.2.3 <1.3.0, ~1.2 and
+~1.2.x are >=1.2.0 <1.3.0, ~1 and ~1.x are >=1.0.0 <2.0.0, ~0.2.3 is
+>=0.2.3 <0.3.0, ~1.2.3-beta.2 is >=1.2.3-beta.2 <1.3.0.
+
+Caret: same lower bound as tilde; the upper bound bumps the left-most
+non-zero numeric part, or, if every numeric part given is 0, the last one
+given. ^1.2.3 is >=1.2.3 <2.0.0, ^1.2 is >=1.2.0 <2.0.0, ^0.2.3 is
+>=0.2.3 <0.3.0, ^0.0.3 is >=0.0.3 <0.0.4, ^1.x is >=1.0.0 <2.0.0, ^0.x (and
+^0) is >=0.0.0 <1.0.0, ^0.0 (and ^0.0.x) is >=0.0.0 <0.1.0, ^0.0.0 is
+>=0.0.0 <0.0.1, ^1.2.3-beta.2 is >=1.2.3-beta.2 <2.0.0.
+
+Prerelease rule: a version with a prerelease tag satisfies a comparator set
+only if it satisfies every comparator in the set AND some comparator in
+that same set names (as written in the range, so for ~, ^ and hyphen ranges
+the versions written there) a version with a prerelease tag and the same
+major.minor.patch. So 1.2.3-beta satisfies ">=1.2.3-alpha <1.2.4" and
+"1.x || >=1.2.3-alpha <1.2.4", but not "*", "", "^1.0.0", "<1.2.3" or
+"1.x || 1.2.3-alpha" (the rule is per set, and in that last one the set that
+names 1.2.3-alpha does not match 1.2.3-beta). Versions without a prerelease
+tag are not affected by this rule.
+
+## Errors
+
+An invalid range throws a `TypeError` whose message is exactly
+"Invalid range: " followed by the range string as it was passed (not
+trimmed), e.g. `Invalid range: >=1.2.3 <`. A range is invalid if any part
+of it does not fit the syntax above: an operator with no version (">=",
+"^", "< 1.2.3 >"), something that is not a version ("latest", "1.2.3.4",
+"a.b.c", "-", "v"), and so on, even when another `||` alternative is fine
+("1.2.3 || foo"). A range that is not a string (null, undefined, a number,
+an array) also throws a `TypeError` with a message starting with
+"Invalid range: ". maxSatisfying / minSatisfying must let that error
+through rather than treating it as "no match".
+
+Run the tests with `npm test` (or
+`node --test test/semver.test.js test/select.test.js test/cli.test.js`).
+"""

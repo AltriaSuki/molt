@@ -1,0 +1,12 @@
+[package]
+name = "iniconf"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.80"
+description = "INI configuration files and the typed service settings read from them"
+publish = false
+
+[dependencies]
+
+# Standalone crate: keep cargo from looking for an enclosing workspace.
+[workspace]

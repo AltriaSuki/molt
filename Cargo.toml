@@ -17,6 +17,7 @@ molt-gateway = { path = "crates/molt-gateway" }
 molt-tools = { path = "crates/molt-tools" }
 molt-planner = { path = "crates/molt-planner" }
 molt-memory = { path = "crates/molt-memory" }
+molt-bench = { path = "crates/molt-bench" }
 
 anyhow = "1"
 arc-swap = "1"
