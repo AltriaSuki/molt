@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use molt_api::shell::RunResponse;
 use molt_proto::{ErrorCode, RemoteError};
-use molt_tools::{Roots, Shell};
+use molt_tools::{ExecutionPolicy, Roots, Shell};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -22,7 +22,11 @@ impl Env {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         fs::create_dir_all(root.join("ws")).unwrap();
-        let shell = Shell::new(Roots { root: root.clone(), scratch: tmp.path().join("scratch") }).unwrap();
+        let shell = Shell::with_policy(
+            Roots { root: root.clone(), scratch: tmp.path().join("scratch") },
+            ExecutionPolicy::Unconfined,
+        )
+        .unwrap();
         Env { ws: root.join("ws").canonicalize().unwrap(), shell, _tmp: tmp }
     }
 

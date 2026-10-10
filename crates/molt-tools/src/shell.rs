@@ -6,7 +6,7 @@
 //! the call. A group of its own also means that nothing else stops it, so
 //! the service keeps a list of them and kills them all when it is stopped.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
@@ -23,7 +23,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::failed;
-use crate::Roots;
+use crate::{sandbox, Roots, SandboxPolicy};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 3_600_000;
@@ -34,7 +34,7 @@ const GRACE: Duration = Duration::from_millis(500);
 /// Removed from the command's environment: the service's bus secret and API keys.
 const HIDDEN_PREFIXES: [&[u8]; 2] = [b"MOLT_", b"ANTHROPIC_"];
 /// Keep tools from paging, prompting or printing colour codes.
-const FIXED_ENV: [(&str, &str); 6] = [
+pub(crate) const FIXED_ENV: [(&str, &str); 6] = [
     ("TERM", "dumb"),
     ("NO_COLOR", "1"),
     ("CI", "1"),
@@ -62,22 +62,20 @@ pub(crate) struct Groups(Mutex<GroupState>);
 #[derive(Default)]
 struct GroupState {
     stopping: bool,
-    running: HashSet<libc::pid_t>,
+    running: HashMap<libc::pid_t, Option<Arc<std::fs::File>>>,
 }
 
 impl Groups {
     pub fn terminate_all(&self) {
         let mut state = lock(&self.0);
         state.stopping = true;
-        for &pgid in &state.running {
-            unsafe {
-                libc::killpg(pgid, libc::SIGTERM);
-            }
+        for (&pgid, info) in &state.running {
+            term_group(pgid, info.as_deref());
         }
     }
 
     pub fn kill_all(&self) {
-        for &pgid in &lock(&self.0).running {
+        for &pgid in lock(&self.0).running.keys() {
             killpg(pgid);
         }
     }
@@ -87,6 +85,7 @@ pub(crate) async fn run(
     roots: &Arc<Roots>,
     program: &Path,
     groups: &Arc<Groups>,
+    policy: Option<&SandboxPolicy>,
     req: RunRequest,
     cancel: CancellationToken,
 ) -> Result<RunResponse, RemoteError> {
@@ -101,18 +100,25 @@ pub(crate) async fn run(
     }
     let limit = Duration::from_millis(req.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1, MAX_TIMEOUT_MS));
 
-    let mut cmd = Command::new(program);
+    let (mut cmd, guard) = match policy {
+        Some(policy) => {
+            let (cmd, guard) = policy.prepare(roots, &ws, program).map_err(|e| failed(format!("sandbox: {e:#}")))?;
+            (cmd, Some(guard))
+        }
+        None => (Command::new(program), None),
+    };
     cmd.arg("-c")
         .arg(&req.command)
         .current_dir(&ws)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
-        .env_clear()
-        .envs(child_env());
+        .process_group(0);
+    if policy.is_none() {
+        cmd.env_clear().envs(child_env());
+    }
     let started = Instant::now();
-    let (mut child, group) = Group::spawn(&mut cmd, groups, &cancel)?;
+    let (mut child, group) = Group::spawn(&mut cmd, groups, &cancel, guard.as_ref().map(|guard| guard.info.clone()))?;
 
     let stdout = Arc::new(Mutex::new(Capture::default()));
     let stderr = Arc::new(Mutex::new(Capture::default()));
@@ -150,11 +156,7 @@ pub(crate) async fn run(
 }
 
 async fn terminate(group: &Group, child: &mut tokio::process::Child) -> std::io::Result<std::process::ExitStatus> {
-    if let Some(pgid) = group.pgid {
-        unsafe {
-            libc::killpg(pgid, libc::SIGTERM);
-        }
-    }
+    group.term();
     // Keep the leader unreaped during grace so its process-group id cannot be reused.
     tokio::time::sleep(GRACE).await;
     group.kill();
@@ -176,6 +178,7 @@ struct Group {
     // A pgid of 0 would mean our own group.
     pgid: Option<libc::pid_t>,
     groups: Arc<Groups>,
+    info: Option<Arc<std::fs::File>>,
 }
 
 impl Group {
@@ -183,6 +186,7 @@ impl Group {
         command: &mut Command,
         groups: &Arc<Groups>,
         cancel: &CancellationToken,
+        info: Option<Arc<std::fs::File>>,
     ) -> Result<(tokio::process::Child, Self), RemoteError> {
         // Admission, spawning and registration share the shutdown lock.
         // Shutdown therefore either sees this child or prevents it starting.
@@ -196,14 +200,32 @@ impl Group {
         let child = command.spawn().map_err(|e| failed(format!("could not start command: {e}")))?;
         let pgid = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()).filter(|&p| p > 0);
         if let Some(pgid) = pgid {
-            state.running.insert(pgid);
+            state.running.insert(pgid, info.clone());
         }
-        Ok((child, Self { pgid, groups: groups.clone() }))
+        Ok((child, Self { pgid, groups: groups.clone(), info }))
+    }
+
+    fn term(&self) {
+        if let Some(pgid) = self.pgid {
+            term_group(pgid, self.info.as_deref());
+        }
     }
 
     fn kill(&self) {
         if let Some(pgid) = self.pgid {
             killpg(pgid);
+        }
+    }
+}
+
+fn term_group(pgid: libc::pid_t, info: Option<&std::fs::File>) {
+    let pgid = match info {
+        None => Some(pgid),
+        Some(info) => sandbox::namespace_group(info),
+    };
+    if let Some(pgid) = pgid {
+        unsafe {
+            libc::killpg(pgid, libc::SIGTERM);
         }
     }
 }
