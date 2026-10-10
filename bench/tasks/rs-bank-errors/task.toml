@@ -1,0 +1,113 @@
+title = "Replace ledger's panics with a BankError, make every operation all-or-nothing, add account freezing"
+language = "rust"
+kind = "refactor"
+difficulty = "medium"
+split = "dev"
+tests = "cargo test --offline --quiet --lib --test bank --test cli"
+check = "cargo test --offline --quiet --lib --test bank --test cli --test bench_hidden"
+timeout_s = 120
+prompt = '''
+Every failure in `ledger::Bank` is a panic today: an unknown account id, a
+zero amount, a withdrawal bigger than the balance, a balance that would
+overflow. So the first bad line of a script takes the whole `ledger` CLI
+down. `transfer` is worse: it debits the source before it even looks up the
+destination, so a transfer to an account that doesn't exist panics after the
+money has already left the source.
+
+Please replace the panics with a typed error, make every operation
+all-or-nothing, and add account freezing while you're in there.
+
+**The error type.** Add this enum, exported from the crate root as
+`ledger::BankError`:
+
+```rust
+pub enum BankError {
+    UnknownAccount(AccountId),
+    InsufficientFunds { account: AccountId, needed: u64, available: u64 },
+    ZeroAmount,
+    SameAccount,
+    Frozen(AccountId),
+    Overflow,
+}
+```
+
+It implements `Debug`, `Clone`, `PartialEq`, `Eq` and `std::error::Error`.
+Its `Display` output is exactly as below: account ids print as their number,
+and the two amounts (which are in cents, like everything in `Bank`) print the
+way `money::format_cents` formats them, i.e. how the CLI prints balances.
+
+- `UnknownAccount(AccountId(7))`: `unknown account 7`
+- `InsufficientFunds { account: AccountId(1), needed: 5000, available: 1250 }`:
+  `insufficient funds in account 1: needed 50.00, available 12.50`
+- `ZeroAmount`: `amount must be greater than zero`
+- `SameAccount`: `cannot transfer to the same account`
+- `Frozen(AccountId(3))`: `account 3 is frozen`
+- `Overflow`: `balance would overflow`
+
+**The `Bank` API.** No `Bank` method may panic any more. `open`, `len` and
+`is_empty` can't fail and keep their signatures. Everything else returns a
+`Result`, and there are three new methods:
+
+```rust
+pub fn owner(&self, id: AccountId) -> Result<&str, BankError>
+pub fn balance(&self, id: AccountId) -> Result<u64, BankError>
+pub fn history(&self, id: AccountId) -> Result<&[Txn], BankError>
+pub fn deposit(&mut self, id: AccountId, cents: u64) -> Result<(), BankError>
+pub fn withdraw(&mut self, id: AccountId, cents: u64) -> Result<(), BankError>
+pub fn transfer(&mut self, from: AccountId, to: AccountId, cents: u64) -> Result<(), BankError>
+pub fn freeze(&mut self, id: AccountId) -> Result<(), BankError>    // new
+pub fn unfreeze(&mut self, id: AccountId) -> Result<(), BankError>  // new
+pub fn is_frozen(&self, id: AccountId) -> Result<bool, BankError>   // new
+```
+
+The rules:
+
+- Unknown accounts: any `AccountId` that this bank's `open` has not handed
+  out (e.g. `AccountId(0)`, or any id past the last account opened) gives
+  `UnknownAccount(that id)` from every method that takes an id.
+- `deposit`, `withdraw` and `transfer` of 0 cents give `ZeroAmount`.
+- `withdraw` and `transfer` need the account the money leaves to hold at
+  least `cents` (taking out the whole balance is fine). Otherwise:
+  `InsufficientFunds { account, needed, available }` with that account's
+  id, `needed` = the full amount asked for (not the shortfall), and
+  `available` = its current balance.
+- A deposit or transfer that would take the receiving balance above
+  `u64::MAX` gives `Overflow`. Reaching exactly `u64::MAX` is fine.
+- A `transfer` whose `from` and `to` are the same id gives `SameAccount`.
+- Freezing: new accounts are not frozen. `freeze` marks an account frozen
+  and `unfreeze` clears that; each also succeeds when the account is already
+  in that state, and neither adds a history entry. A frozen account can't
+  take part in a deposit, a withdrawal, or a transfer in either direction:
+  that gives `Frozen(id of the frozen account)`. It can still be read:
+  `owner`, `balance`, `history` and `is_frozen` work as usual.
+- When several things are wrong, the first in this order is returned:
+  - `deposit`: `ZeroAmount`, `UnknownAccount`, `Frozen`, `Overflow`
+  - `withdraw`: `ZeroAmount`, `UnknownAccount`, `Frozen`, `InsufficientFunds`
+  - `transfer`: `ZeroAmount`, `SameAccount`, `UnknownAccount(from)`,
+    `UnknownAccount(to)`, `Frozen(from)`, `Frozen(to)`, `InsufficientFunds`
+    (about `from`), `Overflow`
+  - the others can only fail with `UnknownAccount`.
+- All-or-nothing: an operation that returns `Err` changes nothing at all,
+  on any account: no balance, no history entry, no frozen flag. A
+  successful operation does what it does today; `Txn` is unchanged, and a
+  transfer still adds one `TransferOut` to the source and one `TransferIn`
+  to the destination.
+
+**The CLI.** `ledger` (`src/main.rs` and `ledger::cli::run`, whose
+signature stays the same) must not crash on a command the bank refuses.
+When a command fails, print `error: ` followed by the `BankError`'s
+`Display` on stdout in place of the command's normal output (e.g.
+`error: unknown account 9`), and go on with the next line, just as it
+already does for lines that don't parse. The process exits with status 0
+once the input is exhausted. Also add two commands: `freeze <id>` and
+`unfreeze <id>`, which print `ok` on success. Like the other commands, a
+wrong number of arguments prints `error: usage: freeze <id>` (or
+`error: usage: unfreeze <id>`), and an id that isn't a number prints e.g.
+`error: invalid account id 'x'`. Everything else the CLI prints stays as it
+is.
+
+The existing tests rely on the old panicking API; please update them to
+the new one. Run them with:
+
+    cargo test --offline --lib --test bank --test cli
+'''

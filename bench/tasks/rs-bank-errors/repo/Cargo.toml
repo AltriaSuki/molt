@@ -1,0 +1,12 @@
+[package]
+name = "ledger"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.80"
+description = "A small in-memory bank ledger, and a CLI that runs ledger scripts"
+publish = false
+
+[dependencies]
+
+# Standalone crate: keep cargo from looking for an enclosing workspace.
+[workspace]
