@@ -33,7 +33,7 @@ pub const SERVICES: [&str; 4] = ["model", "fs", "shell", "planner"];
 pub const MEMORY: &str = "memory";
 
 /// How long services get to come up.
-const STARTUP: Duration = Duration::from_secs(15);
+pub(crate) const STARTUP: Duration = Duration::from_secs(15);
 const RETRY: Duration = Duration::from_millis(50);
 /// A method no service has: a live service answers it with `invalid`.
 const PROBE: &str = "ping";
@@ -301,7 +301,8 @@ pub async fn run_task(
     };
     running.shutdown().await;
     if let Some(forks) = forks {
-        forks.remove_new(done.as_ref().ok().and_then(|d| d.run.fork.as_deref()));
+        let keep = done.as_ref().ok().and_then(|d| d.run.fork.as_deref());
+        forks.remove_new(keep.as_slice());
     }
     done
 }
@@ -311,13 +312,13 @@ pub async fn run_task(
 /// each a full copy of the project. Only a scratch dir inside the data dir is
 /// looked after: the data dir is locked to this run, so whatever appears
 /// there during it is the run's own.
-struct RunForks {
+pub(crate) struct RunForks {
     scratch: PathBuf,
     before: HashSet<OsString>,
 }
 
 impl RunForks {
-    fn before(cfg: &Config) -> Option<Self> {
+    pub(crate) fn before(cfg: &Config) -> Option<Self> {
         let args = &cfg.service("fs")?.exec.as_ref()?.args;
         let scratch = std::path::absolute(args.iter().skip_while(|a| *a != "--scratch").nth(1)?).ok()?;
         let data_dir = std::path::absolute(&cfg.kernel.data_dir).ok()?;
@@ -325,12 +326,13 @@ impl RunForks {
         (plain && scratch.starts_with(data_dir)).then(|| Self { before: fork_entries(&scratch), scratch })
     }
 
-    /// Remove the forks made since [`RunForks::before`], except `keep`.
-    fn remove_new(self, keep: Option<&str>) {
-        let keep = keep.and_then(|fork| Path::new(fork).file_name()).and_then(|name| name.to_str());
+    /// Remove the forks made since [`RunForks::before`], except those in `keep`.
+    pub(crate) fn remove_new(self, keep: &[&str]) {
+        let keep: Vec<&str> =
+            keep.iter().filter_map(|fork| Path::new(fork).file_name()).filter_map(|name| name.to_str()).collect();
         for name in fork_entries(&self.scratch).difference(&self.before) {
             let fork = name.to_str().map(|n| n.strip_suffix(".json").unwrap_or(n));
-            if keep.is_some_and(|keep| fork == Some(keep)) {
+            if fork.is_some_and(|fork| keep.contains(&fork)) {
                 continue;
             }
             let path = self.scratch.join(name);
@@ -447,7 +449,7 @@ pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::
 }
 
 /// Register [`CLI`] with the kernel and connect to it like a service would.
-async fn join_bus(running: &Running) -> anyhow::Result<Service> {
+pub(crate) async fn join_bus(running: &Running) -> anyhow::Result<Service> {
     let kernel = running.kernel();
     let id = ServiceId::new(CLI)?;
     let secret = match running.secrets() {
@@ -464,7 +466,7 @@ async fn join_bus(running: &Running) -> anyhow::Result<Service> {
     Ok(Service::new(id, link, HashMap::new()))
 }
 
-async fn grant(kernel: &Kernel, cli: &Service, target: &str, budget: Budget) -> anyhow::Result<CapId> {
+pub(crate) async fn grant(kernel: &Kernel, cli: &Service, target: &str, budget: Budget) -> anyhow::Result<CapId> {
     let cap = kernel.grant(cli.id(), target.parse()?, budget, None).await?;
     cli.add_cap(target, cap.clone());
     Ok(cap)
@@ -476,7 +478,12 @@ async fn grant(kernel: &Kernel, cli: &Service, target: &str, budget: Budget) -> 
 /// or wait out its whole deadline. Once the supervisor gives up on the
 /// service, the wait ends with how its last run ended, which otherwise only
 /// the audit log has.
-async fn wait_until_up(kernel: &Kernel, cli: &Service, service: &str, deadline: Instant) -> anyhow::Result<()> {
+pub(crate) async fn wait_until_up(
+    kernel: &Kernel,
+    cli: &Service,
+    service: &str,
+    deadline: Instant,
+) -> anyhow::Result<()> {
     let id = ServiceId::new(service)?;
     let target = format!("{service}.{PROBE}");
     let cap = grant(kernel, cli, &target, Budget::new(0, 0, 100_000)).await?;
@@ -553,6 +560,18 @@ pub fn describe(event: &Progress) -> String {
         }
         Progress::AttemptFinished { attempt, status, .. } => format!("attempt {attempt}: {}", status_name(*status)),
         Progress::Note { message, .. } => message.clone(),
+        Progress::Recalled { notes, map_tokens, .. } => {
+            let mut parts = Vec::new();
+            if let Some(tokens) = map_tokens {
+                parts.push(format!("a project map of about {tokens} tokens"));
+            }
+            match notes.len() {
+                0 => {}
+                1 => parts.push("1 note from earlier tasks".to_owned()),
+                n => parts.push(format!("{n} notes from earlier tasks")),
+            }
+            format!("memory: {}", parts.join(" and "))
+        }
     })
 }
 
@@ -731,7 +750,7 @@ mod tests {
             std::fs::write(work.join(id).join("src/lib.rs"), "").unwrap();
             std::fs::write(work.join(format!("{id}.json")), "{}").unwrap();
         }
-        forks.remove_new(Some(work.join("fork-000000000003").to_str().unwrap()));
+        forks.remove_new(&[work.join("fork-000000000003").to_str().unwrap()]);
         let mut left: Vec<_> =
             std::fs::read_dir(&work).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         left.sort();

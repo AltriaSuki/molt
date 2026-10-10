@@ -14,18 +14,21 @@ use molt_proto::ServiceId;
 const DEFAULT_CONFIG: &str = "molt.toml";
 
 #[derive(Parser)]
-#[command(name = "molt", version, about = "Molt kernel daemon and tools")]
+#[command(name = "molt", version, about = "Molt: a self-improving agent. Without a subcommand, opens its interface.")]
 struct Cli {
     /// Path to molt.toml [default: molt.toml]. `molt do` and `molt memory`
     /// read one only when this is given.
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Open the interface: tasks one after another in a workspace, the
+    /// check shown before the attempts start, and what memory holds.
+    Ui(UiArgs),
     /// Start the kernel and the configured services; stop on Ctrl-C, SIGTERM or SIGHUP.
     Run,
     /// Carry out a task in a workspace with the agent services, verified by a done-check.
@@ -99,6 +102,20 @@ struct DoArgs {
     /// model call after the run).
     #[arg(long)]
     no_learn: bool,
+}
+
+#[derive(Args, Default)]
+struct UiArgs {
+    /// The project to work on.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// Where kernel state and forks go. Default: ~/.cache/molt/<project>-<hash>.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    /// Pass this variable from your environment to the commands the agent
+    /// runs (repeatable).
+    #[arg(long, value_name = "NAME", value_parser = env_name)]
+    pass_env: Vec<String>,
 }
 
 /// Where a project's memory is.
@@ -186,8 +203,9 @@ enum AuditCmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
-    // `molt do` and `molt memory` print their own progress; kernel logs would bury it.
-    molt::init_tracing(if matches!(cli.cmd, Cmd::Do(_) | Cmd::Memory { .. }) { "warn" } else { "info" });
+    let cmd = cli.cmd.unwrap_or_else(|| Cmd::Ui(UiArgs { workspace: ".".into(), ..UiArgs::default() }));
+    // `molt do`, `molt memory` and the interface print their own progress; kernel logs would bury it.
+    molt::init_tracing(if matches!(cmd, Cmd::Do(_) | Cmd::Memory { .. } | Cmd::Ui(_)) { "warn" } else { "info" });
     let config = || Config::load(cli.config.as_deref().unwrap_or(Path::new(DEFAULT_CONFIG)));
     let audit_path = |p: Option<PathBuf>| -> anyhow::Result<PathBuf> {
         match p {
@@ -195,7 +213,18 @@ async fn main() -> anyhow::Result<ExitCode> {
             None => Ok(config()?.kernel.data_dir.join("audit.jsonl")),
         }
     };
-    match cli.cmd {
+    match cmd {
+        Cmd::Ui(args) => {
+            let opts = molt::tui::Options {
+                config: cli.config,
+                workspace: args.workspace,
+                data_dir: args.data_dir,
+                pass_env: args.pass_env,
+            };
+            for fork in molt::tui::run(opts).await? {
+                eprintln!("kept: {}", agent::printable(&fork));
+            }
+        }
         Cmd::Run => {
             let stop = molt::stop_signal()?;
             let cfg = config()?;

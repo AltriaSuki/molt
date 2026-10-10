@@ -194,17 +194,29 @@ pub(crate) fn build(entries: &[Logged], workspace: &Path, cut_short: bool) -> Di
                     step(Weight::Looked, format!("{target} (too large to show)"))
                 } else {
                     match target.as_str() {
-                        planner::RUN => {
+                        // A caller that shows the user the check first sends planner.design, then
+                        // planner.run with the check the user accepted, both in one episode.
+                        planner::RUN | planner::DESIGN => {
                             if let Some(run) = parse::<RunRequest>(p) {
-                                task = run.task.clone();
-                                if run.workspace != places.workspace {
-                                    places.named = Some(run.workspace.clone());
+                                if task.is_empty() {
+                                    task = run.task.clone();
+                                    if run.workspace != places.workspace {
+                                        places.named = Some(run.workspace.clone());
+                                    }
+                                    head.push(format!("Task: {}", cut(run.task.trim(), MAX_TASK)));
+                                    head.push(format!("Workspace: {}", clip(&places.workspace, 1_000)));
                                 }
-                                head.push(format!("Task: {}", cut(run.task.trim(), MAX_TASK)));
-                                head.push(format!("Workspace: {}", clip(&places.workspace, 1_000)));
-                                match &run.check {
-                                    Some(check) => head.push(format!("Done-check given by the user: `{check}`")),
-                                    None => designed = true,
+                                if target == planner::DESIGN {
+                                    designed = true;
+                                } else {
+                                    match &run.check {
+                                        Some(check) if designed => head.push(format!(
+                                            "Done-check designed by the planner and accepted by the user: `{check}`"
+                                        )),
+                                        Some(check) => head.push(format!("Done-check given by the user: `{check}`")),
+                                        None if run.verify => designed = true,
+                                        None => head.push("No done-check: the user had the run go unverified".into()),
+                                    }
                                 }
                             }
                             None
@@ -291,7 +303,7 @@ pub(crate) fn build(entries: &[Logged], workspace: &Path, cut_short: bool) -> Di
                     if let Some(i) = index {
                         steps[i].text.push_str(&format!(" → failed: {}", clip(&e.message, 300)));
                         steps[i].evidence.push(msg.id.to_string());
-                    } else if asked == planner::RUN {
+                    } else if asked == planner::RUN || asked == planner::DESIGN {
                         foot.push(format!("Outcome: the run failed with an error: {}", clip(&e.message, 300)));
                     }
                     continue;
@@ -694,5 +706,28 @@ mod tests {
         assert!(!t.contains("check designer's"), "{t}");
         assert!(t.contains("Outcome: failed: no attempt passed the done-check"), "{t}");
         assert!(t.contains("Attempt 1: failed after 7 turns (the done-check still failed (exit code 2))"), "{t}");
+    }
+
+    #[test]
+    fn a_check_designed_then_accepted_is_one_episode() {
+        let mut log = Log::new();
+        let req = RunRequest::new("Add a --verbose flag", WS);
+        log.call(planner::DESIGN, serde_json::to_value(&req).unwrap(), json!({}));
+        log.call(fs::FORK, json!({ "workspace": WS }), json!({ "fork": FORK, "files": 3 }));
+        let mut run = req.clone();
+        run.check = Some("cargo test --test flags".into());
+        let (_, _) = log.call(planner::RUN, serde_json::to_value(&run).unwrap(), json!({}));
+        let t = build(&log.entries, Path::new(WS), false).text;
+        assert_eq!(t.matches("Task: Add a --verbose flag").count(), 1, "{t}");
+        assert!(t.contains("designed by the planner and accepted by the user: `cargo test --test flags`"), "{t}");
+        assert!(t.contains("copy 1 was the check designer's"), "{t}");
+        assert!(!t.contains("planner.design"), "{t}");
+
+        let mut log = Log::new();
+        let mut req = RunRequest::new("Explain the parser", WS);
+        req.verify = false;
+        log.call(planner::RUN, serde_json::to_value(&req).unwrap(), json!({}));
+        let t = build(&log.entries, Path::new(WS), false).text;
+        assert!(t.contains("No done-check: the user had the run go unverified"), "{t}");
     }
 }
