@@ -106,12 +106,14 @@ pub fn home_env(home: &Path) -> Vec<(String, String)> {
     env
 }
 
-/// Where rustup keeps its toolchains, when it is installed.
-fn rustup_home() -> Option<std::path::PathBuf> {
-    if let Some(dir) = std::env::var_os("RUSTUP_HOME").filter(|d| !d.is_empty()) {
-        return Some(dir.into());
-    }
-    let dir = Path::new(&std::env::var_os("HOME")?).join(".rustup");
+/// Where rustup keeps its toolchains, when it is installed: the canonical
+/// path, at which the sandbox mounts it.
+pub fn rustup_home() -> Option<std::path::PathBuf> {
+    let dir = match std::env::var_os("RUSTUP_HOME").filter(|d| !d.is_empty()) {
+        Some(dir) => dir.into(),
+        None => Path::new(&std::env::var_os("HOME")?).join(".rustup"),
+    };
+    let dir = dir.canonicalize().unwrap_or(dir);
     dir.is_dir().then_some(dir)
 }
 

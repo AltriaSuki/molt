@@ -34,6 +34,10 @@ pub struct Setup {
     /// Variables set for every run, as `NAME=VALUE`. Variables whose names
     /// look secret are left out, and passwords in URLs are redacted.
     pub env: Vec<String>,
+    /// The agent's commands ran in Molt's sandbox. Runs of builds before
+    /// the sandbox did not.
+    #[serde(default)]
+    pub sandboxed: bool,
 }
 
 /// One run of one arm on one task, graded.
@@ -194,6 +198,7 @@ pub(crate) mod tests {
                 task_usd: 5.0,
                 timeout_s: 1800,
                 env: vec![],
+                sandboxed: true,
             },
             molt_version: "0.1.0".into(),
             git_commit: None,

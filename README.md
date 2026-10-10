@@ -327,6 +327,14 @@ each run. The report gives each arm's success rate with a 95% interval, the
 runs where it said it was done and was not, and compares two arms on the
 same runs with an exact McNemar test.
 
+The agent's commands, its check included, run in Molt's sandbox, as
+`molt do` runs them by default. The tasks' toolchains are found on `PATH`
+and mounted into it read-only (a rustup install with its home, a Node in
+`/opt`); the tasks, the runs and your home directory never are, so the
+agent's commands cannot see the hidden tests. Before it starts, `run`
+checks that the sandbox works here and that each toolchain runs in it.
+`--no-sandbox` runs the commands as you instead; results record which.
+
 The tasks are in `bench/tasks`, in Python, JavaScript, Rust and Go, each a
 small project with a ticket, hidden tests and a reference solution, split
 into `dev` and `heldout` for the evaluator to come. `bench/README.md` has
@@ -334,11 +342,11 @@ the format.
 
 Known limits:
 
-- **Runs are not sandboxed.** `molt do` runs commands as you, so an agent
-  could read a task's hidden tests or solution by their absolute path, or
-  game the grade on purpose, such as with a module that shadows the test
-  framework. Nothing points it there, and each run's diff is kept so such
-  a run can be spotted, but nothing prevents it.
+- **An agent could game the grade on purpose**, such as with a module that
+  shadows the test framework, since the hidden tests run in its workspace.
+  With `--no-sandbox` it could also read a task's hidden tests or solution
+  by their absolute path. Nothing points it there, and each run's diff is
+  kept so such a run can be spotted, but nothing prevents it.
 - **Spending can pass the limits a little.** Molt checks its budget before
   each model call, so a run can pass `--task-usd` by up to one call for
   each of its parallel attempts, and the benchmark can pass `--max-usd` by

@@ -43,9 +43,9 @@ workspace, replacing whatever is at those paths, and `check` runs in the
 workspace root with `bash -c`. The task passed when the check exits 0
 within `timeout_s`. Python bytecode caches are removed from the workspace
 first. The agent is not given `hidden/` or `solution/` and is told nothing
-about the check; runs are not sandboxed, though, so nothing stops an agent
-that goes looking for them (the main README's Benchmark section lists the
-known limits).
+about the check. Its commands run in Molt's sandbox, which shows them only
+the workspace, the system and the toolchains, not the tasks (the main
+README's Benchmark section lists the known limits).
 
 The check runs with a clean environment: `PATH`, the user, shell, locale
 and time zone, `TMPDIR`, the toolchain roots (`GOROOT`, `JAVA_HOME`,
@@ -108,12 +108,12 @@ results recorded before the change are not mixed with results after it.
 
 One JSON line per run in the results file, with the task, its hash, split
 and kind, the arm and its options, the trial, the setup (a hash of the molt
-build, model, effort, turns, budget, time limit, and the variables passed
-with `--env`, except secrets), whether the hidden tests passed, whether the
+build, model, effort, turns, budget, time limit, the variables passed
+with `--env`, except secrets, and whether commands ran in the sandbox), whether the hidden tests passed, whether the
 agent said it was done, wall time, cost and tokens, model calls, Molt's
 verdict, any error and whose it was (the agent's, the model API's or the
 benchmark's), and the end of the check's output. A results file resumes
 only with the same setup, so runs of different builds are never pooled. Beside the results file, a
-`.logs` directory keeps each run's stderr, Molt's JSON result, its changes
+`.logs` directory keeps the sandbox policy the runs used, each run's stderr, Molt's JSON result, its changes
 as a diff, and the check's output (`--keep-audit` adds the audit log, which
 has every model call).
