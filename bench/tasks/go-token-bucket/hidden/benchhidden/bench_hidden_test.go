@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -577,15 +578,16 @@ func TestConcurrentReserve(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < 5; i++ {
+			for i := 0; i < 500; i++ {
 				if _, ok := l.Reserve(1); !ok {
 					t.Error("Reserve(1) = not ok")
+					return
 				}
 			}
 		}()
 	}
 	wg.Wait()
-	wantTokens(t, l, -40)
+	wantTokens(t, l, -4990)
 }
 
 func TestConcurrentKeyedWithSweep(t *testing.T) {
@@ -616,5 +618,55 @@ func TestConcurrentKeyedWithSweep(t *testing.T) {
 	}
 	if k.Len() != len(keys) {
 		t.Fatalf("Len() = %d, want %d", k.Len(), len(keys))
+	}
+}
+
+func TestConcurrentSweepWhileKeysAreAdded(t *testing.T) {
+	clk := newFakeClock()
+	k := ratelimit.NewKeyed(1, 1, time.Hour, clk)
+	const workers, perWorker = 8, 2000
+	var refused int64
+	var wg sync.WaitGroup
+	for g := 0; g < workers; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				if !k.Allow(strconv.Itoa(g*perWorker + i)) {
+					atomic.AddInt64(&refused, 1)
+				}
+			}
+		}(g)
+	}
+	done := make(chan struct{})
+	swept := make(chan int)
+	go func() {
+		total := 0
+		for {
+			select {
+			case <-done:
+				swept <- total
+				return
+			default:
+				total += k.Sweep()
+				k.Len()
+				k.Keys()
+			}
+		}
+	}()
+	wg.Wait()
+	close(done)
+	if n := <-swept; n != 0 {
+		t.Fatalf("Sweep removed %d keys used less than idleTTL ago", n)
+	}
+	if refused != 0 {
+		t.Fatalf("%d first Allow calls on new keys were refused", refused)
+	}
+	if got := k.Len(); got != workers*perWorker {
+		t.Fatalf("Len() = %d, want %d", got, workers*perWorker)
+	}
+	clk.Advance(time.Hour)
+	if n := k.Sweep(); n != workers*perWorker {
+		t.Fatalf("Sweep after an idle hour removed %d keys, want %d", n, workers*perWorker)
 	}
 }

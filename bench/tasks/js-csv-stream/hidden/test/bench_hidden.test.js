@@ -118,6 +118,8 @@ describe('parse: line endings and blank lines', () => {
     assert.deepEqual(parse('a,\r'), [['a', '\r']]);
     assert.deepEqual(parse('1\r2\n"3"'), [['1\r2'], ['3']]);
     assert.deepEqual(parse('a\rb\r"c"d'), [['a\rb\r"c"d']]);
+    assert.deepEqual(parse('a\r,b'), [['a\r', 'b']]);
+    assert.deepEqual(parse('x,\r"y"\n\r,'), [['x', '\r"y"'], ['\r', '']]);
   });
 
   test('completely empty lines are skipped', () => {
@@ -300,6 +302,10 @@ describe('header: true', () => {
     assert.deepEqual(parse('constructor,toString,hasOwnProperty\n1,2,3\n', { header: true }), [
       { constructor: '1', toString: '2', hasOwnProperty: '3' },
     ]);
+    const [record] = parse('__proto__,a\n1,2\n', { header: true });
+    assert.deepEqual(Object.keys(record), ['__proto__', 'a']);
+    assert.equal(Object.getPrototypeOf(record), Object.prototype);
+    assert.equal(Object.getOwnPropertyDescriptor(record, '__proto__')?.value, '1');
   });
 
   test('duplicate header names throw on the header line', () => {

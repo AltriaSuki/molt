@@ -364,6 +364,14 @@ describe('prototype pollution', () => {
     assert.deepEqual(result, { name: 'svc' });
     assert.equal(result.constructor, Object);
   });
+
+  test('keys that only resemble the ignored ones are merged as usual', () => {
+    const result = deepMerge(
+      { db: { protocol: 'tcp' } },
+      { db: { constructorName: 'Pool' }, proto: 1, prototypes: ['a'] },
+    );
+    assert.deepEqual(result, { db: { protocol: 'tcp', constructorName: 'Pool' }, proto: 1, prototypes: ['a'] });
+  });
 });
 
 describe('parseEnv', () => {
@@ -385,6 +393,13 @@ describe('parseEnv', () => {
   test('a skipped variable contributes nothing, not even an empty parent', () => {
     assert.deepEqual(parseEnv({ APP__db__constructor: '5' }), {});
     assert.deepEqual(parseEnv({ APP__db__constructor: '5', APP__db__port: '1' }), { db: { port: 1 } });
+  });
+
+  test('segments that only resemble the ignored keys are kept', () => {
+    assert.deepEqual(parseEnv({ APP__db__protocol: 'tcp', APP__prototypes: '["a"]' }), {
+      db: { protocol: 'tcp' },
+      prototypes: ['a'],
+    });
   });
 
   test('ignored keys inside JSON values are dropped', () => {

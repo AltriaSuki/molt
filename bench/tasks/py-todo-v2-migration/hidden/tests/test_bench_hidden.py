@@ -222,7 +222,7 @@ class TagTests(TodoCliCase):
                 self.assertEqual(self.read_bytes(), before)
 
     def test_invalid_tags_are_usage_errors(self):
-        for bad in ("two words", "#home", "a,b", "", "home!"):
+        for bad in ("two words", "#home", "a,b", "", "home!", "café"):
             with self.subTest(tag=bad):
                 if os.path.exists(self.path):
                     os.remove(self.path)
@@ -232,6 +232,7 @@ class TagTests(TodoCliCase):
         before = self.read_bytes()
         self.assertUsageError("tag", "1", "work", "bad tag")
         self.assertUsageError("untag", "1", "#home")
+        self.assertUsageError("list", "--tag", "bad tag")
         self.assertEqual(self.read_bytes(), before)
 
     def test_list_filters_by_tag_case_insensitively(self):
@@ -443,6 +444,22 @@ class UnsupportedVersionTests(TodoCliCase):
         self.assertEqual(code, 2)
         self.assertEqual(out, "")
         self.assertNotEqual(err.strip(), "")
+
+    def test_a_missing_or_non_integer_version_is_a_broken_file(self):
+        cases = {
+            "missing": {"items": [{"id": 1, "text": "Buy milk", "done": False}]},
+            "not a number": {"version": "two", "items": [item(1, "Buy milk")]},
+        }
+        for name, data in cases.items():
+            with self.subTest(name):
+                original = json.dumps(data).encode("utf-8")
+                self.write_bytes(original)
+                code, out, err = self.run_todo("add", "Pay rent")
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertNotEqual(err.strip(), "")
+                self.assertEqual(self.read_bytes(), original)
+                self.assertEqual(self.files(), ["todo.json"])
 
 
 if __name__ == "__main__":

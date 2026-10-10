@@ -63,9 +63,9 @@ a proper RFC 4180 parser that works incrementally, and build `parse()` on it.
    returned; it supplies the field names. Every later record is returned as a
    plain object (an ordinary `{}`) whose own properties map each name to the
    field at the same position, in header order. Any string is a valid name,
-   including `''` and names such as `constructor`, but two equal names in the
-   header are a `CsvError`, and so is a later record with a different number
-   of fields than the header.
+   including `''` and names such as `constructor` or `__proto__`, but two
+   equal names in the header are a `CsvError`, and so is a later record with a
+   different number of fields than the header.
 
 ## Line numbers
 
