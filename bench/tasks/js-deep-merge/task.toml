@@ -1,0 +1,82 @@
+title = "Make deepMerge non-mutating, type-aware and safe against prototype pollution"
+language = "javascript"
+kind = "bugfix"
+difficulty = "medium"
+split = "heldout"
+tests = "node --test test/merge.test.js test/env.test.js test/loader.test.js test/util.test.js"
+check = "node --test test/merge.test.js test/env.test.js test/loader.test.js test/util.test.js test/bench_hidden.test.js"
+timeout_s = 120
+prompt = """
+**deepMerge corrupts config layers, and a config file can pollute Object.prototype**
+
+`loadConfig` (src/loader.js) layers `defaults`, the JSON config file, the
+`APP__...` environment overrides and the programmatic `overrides` with
+`deepMerge` from src/merge.js. That merge has bitten us several times now:
+
+- It writes into its first argument, so `loadConfig` modifies the caller's
+  `defaults` object, nested objects included. Loading config twice in one
+  process (our tests, the per-tenant workers) leaks the first file's values
+  into the second load.
+- Arrays are merged index by index: defaults `hosts: ["a", "b", "c"]` plus a
+  file with `hosts: ["x"]` gives `["x", "b", "c"]`.
+- `overrides: { startedAt: new Date() }` comes out as `{}`, and passing a
+  `logger` instance in `overrides` copies its fields into the default logger
+  instead of replacing it.
+- A `null` in a later layer (`"password": null` in the file) throws a
+  TypeError, and so does a missing layer (`deepMerge(base, undefined)`).
+- A CLI flag that was not given (`overrides: { port: undefined }`) wipes the
+  default.
+- Security: a config file containing `{"__proto__": {"isAdmin": true}}` sets
+  `isAdmin` on every object in the process. The same works through an env
+  var whose value is JSON (`APP__features='{"__proto__": {"isAdmin": true}}'`),
+  and `APP__constructor__prototype__isAdmin=true` replaces `config.constructor`.
+
+Please fix `deepMerge` so that it follows this contract exactly. Keep the
+signature `deepMerge(target, ...sources)` and the existing exports.
+
+1. It returns a new object and never modifies any of its arguments or
+   anything reachable from them, at any depth; deeply frozen arguments must
+   work. All arguments, `target` included, are layers merged from left to
+   right into that new object, so later layers win.
+2. A *plain object* is an object whose prototype is `Object.prototype` or
+   `null` (object literals, `JSON.parse` output, `Object.create(null)`). An
+   argument that is not a plain object (`null`, `undefined`, a number,
+   string or boolean, an array, a Date, a class instance, ...) is ignored.
+   `deepMerge()` returns `{}`.
+3. Only a layer's own enumerable string keys are considered (what
+   `Object.keys` returns): no inherited keys, no symbol keys, no
+   non-enumerable properties.
+4. The keys `"__proto__"`, `"constructor"` and `"prototype"` are ignored
+   wherever they appear: at the top level and at any depth, in any layer.
+5. For every other key, depending on the layer's value:
+   - `undefined` is skipped: the result keeps what it had for that key, and
+     if it had nothing the key is not created.
+   - A plain object is merged recursively into the result's value for that
+     key when that is a plain object too; otherwise it replaces it with a
+     copy built by these same rules (so ignored keys and `undefined` values
+     inside it are dropped too).
+   - An array replaces whatever was there with a shallow copy: a new array
+     holding the same elements. Arrays are never merged element by element.
+   - Anything else replaces the previous value as is, by reference: `null`
+     (so null overrides), primitives, functions, and every object that is
+     neither a plain object nor an array (Date, Map, Set, RegExp, class
+     instances, objects with some other prototype). Such objects are never
+     merged into or copied.
+6. The result, and every object in it built from plain objects, is a new,
+   ordinary, mutable (not frozen) object with prototype `Object.prototype`
+   (also when it was copied from an `Object.create(null)` object). No plain object or array in
+   the result is shared with the arguments, so changing the result can never
+   change an input.
+
+The env side has to hold the same line. `parseEnv` (src/env.js) must skip a
+variable entirely when any segment of its path is `__proto__`, `constructor`
+or `prototype`: `APP__db__constructor=5` contributes nothing, not even an
+empty `db`. Inside JSON values those keys are dropped the way `deepMerge`
+drops them and the rest of the value is kept, so `parseEnv`'s result never
+contains them at any depth. Nothing in `deepMerge`, `parseEnv` or
+`loadConfig` may ever add a property to `Object.prototype`.
+
+Everything else (the layering order in `loadConfig`, how env values are
+parsed, the errors) stays as it is. Run the tests with `npm test`; please
+add regression tests for the cases above.
+"""

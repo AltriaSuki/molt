@@ -1,0 +1,17 @@
+{
+  "name": "csvlite",
+  "version": "0.3.1",
+  "description": "Small CSV reader/writer with a CSV to JSON lines command line tool",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "csvlite": "bin/csvlite.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/parse.test.js test/stringify.test.js test/cli.test.js"
+  },
+  "license": "MIT"
+}

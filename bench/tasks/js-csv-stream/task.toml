@@ -1,0 +1,108 @@
+title = "RFC 4180 parsing and a streaming CsvParser for csvlite"
+language = "javascript"
+kind = "feature"
+difficulty = "hard"
+split = "dev"
+tests = "node --test test/parse.test.js test/stringify.test.js test/cli.test.js"
+check = "node --test test/parse.test.js test/stringify.test.js test/cli.test.js test/bench_hidden.test.js"
+timeout_s = 120
+prompt = '''
+csvlite's reader (`parse()` in src/parse.js) splits the text into lines first
+and then flips a "quoted" flag on every `"`. Real exports break it: quoted
+fields with line breaks in them, `""` escapes, files that start with a BOM.
+The ingest service also wants to feed it the file chunk by chunk as it comes
+off the network instead of buffering everything. Please replace the reader with
+a proper RFC 4180 parser that works incrementally, and build `parse()` on it.
+`stringify()` is already correct and should not change.
+
+## API (src/parse.js, all three re-exported from src/index.js)
+
+- `class CsvError extends Error`: `name` is `'CsvError'`, and it has a numeric
+  `line` property, the 1-based line on which the offending record starts (see
+  "Line numbers"). The message text is up to you.
+- `class CsvParser`, `constructor({ delimiter = ',', header = false } = {})`.
+  `delimiter` must be a one-character string other than `"`, CR or LF;
+  anything else makes the constructor throw a `TypeError`.
+  - `push(chunk)` takes the next piece of the input (a string) and returns an
+    array of the records that are now complete and have not been returned
+    before, in input order. A record is complete once its line ending has been
+    received in full.
+  - `end()` says the input is over and returns the remaining records: the last
+    record if the input does not end with a line ending, otherwise `[]`.
+- `parse(text, options)` takes the same options as the constructor and returns
+  what one `push(text)` followed by `end()` returns (both arrays concatenated),
+  throwing the same errors. It still throws a `TypeError` when `text` is not a
+  string.
+
+## Parsing rules ("the input" is all chunks concatenated)
+
+1. Records end at LF or CRLF. Outside quotes, a CR that is not immediately
+   followed by LF is ordinary data, including a CR at the very end of the
+   input: `parse('a\rb,c\r\n')` gives `[['a\rb', 'c']]` and `parse('a\r')`
+   gives `[['a\r']]` (JavaScript string notation).
+2. A field is quoted when its first character is `"`. Inside a quoted field a
+   doubled quote `""` is one literal `"`, and the delimiter, CR and LF are
+   data. The field ends at a `"` that is not part of such a pair; the value is
+   what is between the quotes.
+3. Right after the closing quote only the delimiter, a line ending (LF or
+   CRLF) or the end of the input may follow. Anything else is a `CsvError`,
+   including a space and including a CR that is not followed by LF.
+4. In a field that does not start with `"`, a `"` is an ordinary character:
+   `a"b` is `a"b`, and ` "x"` (with a leading space) is ` "x"`.
+5. If the input ends inside a quoted field, `end()` throws a `CsvError`.
+6. Completely empty lines (nothing at all between two line endings, or before
+   the first one, or after the last one) are skipped and give no record. A
+   line that holds anything, even just `""`, a delimiter, a space or a CR that
+   is data, is a record: `a,` gives `['a', '']`, `""` gives `['']`.
+7. A BOM (U+FEFF) as the very first character of the input is dropped, as if
+   it were not there. Anywhere else, including a second BOM right after the
+   first, it is data. Empty chunks do not change what "very first" means.
+8. Without `header`, records are arrays of strings, and records may have
+   different numbers of fields.
+9. With `header: true` the first record (after any skipped empty lines) is not
+   returned; it supplies the field names. Every later record is returned as a
+   plain object (an ordinary `{}`) whose own properties map each name to the
+   field at the same position, in header order. Any string is a valid name,
+   including `''` and names such as `constructor`, but two equal names in the
+   header are a `CsvError`, and so is a later record with a different number
+   of fields than the header.
+
+## Line numbers
+
+Lines are counted by LF characters. A record's line is 1 plus the number of
+LFs in the input before the record's first character, counting every LF:
+those inside quoted fields and those of skipped empty lines too. A BOM or a CR
+does not change the count. `CsvError.line` is always the line where the record
+the error belongs to starts, even when the problem is several lines further
+down inside a multi-line quoted field. For duplicate header names it is the
+header record's line; for a record with the wrong number of fields it is the
+line where that record starts.
+
+## When errors are thrown
+
+- A character that breaks rule 3 makes the `push()` that receives it throw.
+  For a closing quote followed by a CR, that is the `push()` receiving the
+  character after the CR when it is not LF, or `end()` if the input stops
+  right after the CR.
+- Header errors (duplicate names, wrong number of fields) are thrown by the
+  `push()` that receives the line ending which completes the bad record, or by
+  `end()` for a final record without a line ending.
+- An unterminated quoted field is reported by `end()`.
+
+What the parser does after it has thrown is up to you.
+
+## Chunks
+
+Chunks can split the input at any string index: between CR and LF, between
+the two quotes of a `""`, right after a closing quote, and so on. However the
+input is chunked, the records returned (all pushes plus `end()`, in order) and
+any `CsvError` (with its `line`) must be the same as for the whole input in a
+single `push()`. Note that a chunk ending in a CR outside quotes cannot
+complete a record yet: the next character decides whether that CR is a line
+ending or data.
+
+The CLI (src/cli.js) reads its input and calls `parse()`; leave it on
+`parse()`, it should simply pick up the new rules and its tests must keep
+passing. Please update the README for the new API. Run the tests with
+`npm test`.
+'''
