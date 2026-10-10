@@ -60,9 +60,11 @@ async fn main() -> anyhow::Result<()> {
             let shell = Arc::new(Shell::new(args.roots())?);
             let stop = molt_tools::stop_signal()?;
             let svc = Arc::new(Service::connect_from_env().await?);
+            let serving = molt_tools::serve_shell(svc, shell.clone());
+            tokio::pin!(serving);
             tokio::select! {
-                () = molt_tools::serve_shell(svc, shell.clone()) => {}
-                () = stop => {}
+                () = &mut serving => {}
+                () = stop => { shell.shutdown().await; }
             }
             shell.kill_all();
         }

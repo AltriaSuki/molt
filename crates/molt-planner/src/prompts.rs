@@ -416,6 +416,7 @@ mod tests {
             exit_code: Some(1),
             signal: None,
             timed_out: false,
+            cancelled: false,
             stdout: "o".repeat(10_000),
             stderr: "error: boom\n".into(),
             truncated: false,

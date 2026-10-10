@@ -17,9 +17,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use molt_api::shell::{RunRequest, RunResponse};
-use molt_proto::RemoteError;
+use molt_proto::{ErrorCode, RemoteError};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::failed;
 use crate::Roots;
@@ -56,11 +57,27 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 
 /// The process groups of the commands running now.
 #[derive(Default)]
-pub(crate) struct Groups(Mutex<HashSet<libc::pid_t>>);
+pub(crate) struct Groups(Mutex<GroupState>);
+
+#[derive(Default)]
+struct GroupState {
+    stopping: bool,
+    running: HashSet<libc::pid_t>,
+}
 
 impl Groups {
+    pub fn terminate_all(&self) {
+        let mut state = lock(&self.0);
+        state.stopping = true;
+        for &pgid in &state.running {
+            unsafe {
+                libc::killpg(pgid, libc::SIGTERM);
+            }
+        }
+    }
+
     pub fn kill_all(&self) {
-        for &pgid in lock(&self.0).iter() {
+        for &pgid in &lock(&self.0).running {
             killpg(pgid);
         }
     }
@@ -71,6 +88,7 @@ pub(crate) async fn run(
     program: &Path,
     groups: &Arc<Groups>,
     req: RunRequest,
+    cancel: CancellationToken,
 ) -> Result<RunResponse, RemoteError> {
     let ws = {
         let (roots, ws) = (roots.clone(), req.workspace.clone());
@@ -78,6 +96,9 @@ pub(crate) async fn run(
             .await
             .map_err(|e| failed(format!("shell.run failed: {e}")))??
     };
+    if cancel.is_cancelled() {
+        return Err(RemoteError { code: ErrorCode::Cancelled, message: "command cancelled before start".into() });
+    }
     let limit = Duration::from_millis(req.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1, MAX_TIMEOUT_MS));
 
     let mut cmd = Command::new(program);
@@ -91,36 +112,28 @@ pub(crate) async fn run(
         .env_clear()
         .envs(child_env());
     let started = Instant::now();
-    let mut child = cmd.spawn().map_err(|e| failed(format!("could not start {}: {e}", program.display())))?;
-    let group = Group::new(child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()), groups);
+    let (mut child, group) = Group::spawn(&mut cmd, groups, &cancel)?;
 
     let stdout = Arc::new(Mutex::new(Capture::default()));
     let stderr = Arc::new(Mutex::new(Capture::default()));
-    let mut readers = [
-        tokio::spawn(drain(child.stdout.take(), stdout.clone())),
-        tokio::spawn(drain(child.stderr.take(), stderr.clone())),
-    ];
+    // JoinSet aborts its readers when this request future is dropped, too.
+    let mut readers = tokio::task::JoinSet::new();
+    readers.spawn(drain(child.stdout.take(), stdout.clone()));
+    readers.spawn(drain(child.stderr.take(), stderr.clone()));
 
-    let (status, timed_out) = match tokio::time::timeout(limit, child.wait()).await {
-        Ok(status) => (status, false),
-        Err(_) => {
-            group.kill();
-            (child.wait().await, true)
-        }
+    // Prefer an already-finished command in a cancellation/completion tie.
+    let (status, timed_out, cancelled) = tokio::select! {
+        biased;
+        status = child.wait() => (status, false, false),
+        _ = cancel.cancelled() => (terminate(&group, &mut child).await, false, true),
+        _ = tokio::time::sleep(limit) => (terminate(&group, &mut child).await, true, false),
     };
     let duration = started.elapsed();
     group.kill();
     let status = status.map_err(|e| failed(format!("waiting for the command: {e}")))?;
-    let _ = tokio::time::timeout(GRACE, async {
-        for reader in &mut readers {
-            let _ = reader.await;
-        }
-    })
-    .await;
+    let _ = tokio::time::timeout(GRACE, async { while readers.join_next().await.is_some() {} }).await;
     // Whatever escaped the group (a daemon that called setsid) may still hold a pipe.
-    for reader in &readers {
-        reader.abort();
-    }
+    readers.abort_all();
 
     let (stdout, out_cut) = take(&stdout).finish();
     let (stderr, err_cut) = take(&stderr).finish();
@@ -128,11 +141,24 @@ pub(crate) async fn run(
         exit_code: status.code(),
         signal: status.signal(),
         timed_out,
+        cancelled,
         stdout,
         stderr,
         truncated: out_cut || err_cut,
         duration_ms: duration.as_millis() as u64,
     })
+}
+
+async fn terminate(group: &Group, child: &mut tokio::process::Child) -> std::io::Result<std::process::ExitStatus> {
+    if let Some(pgid) = group.pgid {
+        unsafe {
+            libc::killpg(pgid, libc::SIGTERM);
+        }
+    }
+    // Keep the leader unreaped during grace so its process-group id cannot be reused.
+    tokio::time::sleep(GRACE).await;
+    group.kill();
+    child.wait().await
 }
 
 /// The service's environment without its secrets, plus [`FIXED_ENV`].
@@ -153,12 +179,26 @@ struct Group {
 }
 
 impl Group {
-    fn new(pgid: Option<libc::pid_t>, groups: &Arc<Groups>) -> Self {
-        let pgid = pgid.filter(|&p| p > 0);
-        if let Some(pgid) = pgid {
-            lock(&groups.0).insert(pgid);
+    fn spawn(
+        command: &mut Command,
+        groups: &Arc<Groups>,
+        cancel: &CancellationToken,
+    ) -> Result<(tokio::process::Child, Self), RemoteError> {
+        // Admission, spawning and registration share the shutdown lock.
+        // Shutdown therefore either sees this child or prevents it starting.
+        let mut state = lock(&groups.0);
+        if state.stopping {
+            return Err(RemoteError { code: ErrorCode::Unavailable, message: "shell service is shutting down".into() });
         }
-        Self { pgid, groups: groups.clone() }
+        if cancel.is_cancelled() {
+            return Err(RemoteError { code: ErrorCode::Cancelled, message: "command cancelled before start".into() });
+        }
+        let child = command.spawn().map_err(|e| failed(format!("could not start command: {e}")))?;
+        let pgid = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()).filter(|&p| p > 0);
+        if let Some(pgid) = pgid {
+            state.running.insert(pgid);
+        }
+        Ok((child, Self { pgid, groups: groups.clone() }))
     }
 
     fn kill(&self) {
@@ -172,7 +212,7 @@ impl Drop for Group {
     fn drop(&mut self) {
         self.kill();
         if let Some(pgid) = self.pgid {
-            lock(&self.groups.0).remove(&pgid);
+            lock(&self.groups.0).running.remove(&pgid);
         }
     }
 }
