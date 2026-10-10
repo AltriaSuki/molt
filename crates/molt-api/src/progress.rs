@@ -76,6 +76,21 @@ pub enum Progress {
         run: String,
         message: String,
     },
+    /// What memory gave the run to start with: the notes recalled, best
+    /// first, and the size of the project map.
+    Recalled {
+        run: String,
+        notes: Vec<RecalledNote>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        map_tokens: Option<u32>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecalledNote {
+    pub id: String,
+    pub text: String,
+    pub confidence: f64,
 }
 
 impl Progress {
@@ -89,7 +104,8 @@ impl Progress {
             | Self::ToolCall { run, .. }
             | Self::CheckRan { run, .. }
             | Self::AttemptFinished { run, .. }
-            | Self::Note { run, .. } => run,
+            | Self::Note { run, .. }
+            | Self::Recalled { run, .. } => run,
         }
     }
 

@@ -30,6 +30,7 @@ hex = "0.4"
 ignore = "0.4"
 libc = "0.2"
 rand = "0.9"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 rayon = "1"
 regex = "1"
 reqwest = { version = "0.13", features = ["json"] }
@@ -54,4 +55,5 @@ tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-width = "0.2"
 wiremock = "0.6"

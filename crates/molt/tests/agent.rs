@@ -1074,3 +1074,72 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
     }
     assert!(std::fs::read_dir(data.path()).unwrap().next().is_none(), "nothing was started");
 }
+
+/// What the interface does with a task in its default mode, on one session:
+/// design the check and show it, run with the check as accepted, keep the
+/// result for the user to look at, apply it, learn, then list and forget
+/// what was learned.
+#[tokio::test]
+async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
+    use molt::session::Session;
+
+    let server = fake_api(Fake::DesignsThenGreets).await;
+    let setup = Setup::new(&server);
+    let workspace = setup.workspace.path().canonicalize().unwrap();
+    let (events, mut progress) = tokio::sync::mpsc::unbounded_channel();
+    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    assert_eq!(session.memory_problem(), None);
+    assert!(session.versions().iter().any(|(name, v)| name == "planner" && v.len() == 8), "{:?}", session.versions());
+    let trace = molt_proto::TraceId::random();
+    let mut req = setup.request(None, 2);
+    req.apply = false;
+
+    let design = tokio::time::timeout(RUN_LIMIT, session.design(&req, &trace)).await.unwrap().unwrap();
+    assert_eq!(design.command.as_deref(), Some("sh check.sh"));
+    assert_eq!(design.files.len(), 1);
+    assert_eq!(
+        (design.files[0].path.as_str(), design.files[0].content.as_str()),
+        ("check.sh", "grep -q hello greeting.txt\n")
+    );
+    assert_eq!(design.rationale, "Greets.");
+    let baseline = design.baseline.as_ref().expect("the check ran on the workspace as it is");
+    assert!(!baseline.passed, "{baseline:?}");
+    assert!(design.cost_usd > 0.0);
+    // Nothing in the workspace yet: the designer worked in a fork.
+    assert_eq!(setup.files(), ["README.txt"]);
+
+    req.check = design.command.clone();
+    req.check_files = design.files.clone();
+    let resp = tokio::time::timeout(RUN_LIMIT, session.run(&req, &trace)).await.unwrap().unwrap();
+    assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
+    assert_eq!(
+        resp.check,
+        Some(CheckSpec { command: "sh check.sh".into(), files: vec!["check.sh".into()], designed: true })
+    );
+    assert!(!resp.applied);
+    // Only the run's own designer: the accepted check was not designed again.
+    assert_eq!(bodies(&server).await.iter().filter(|b| offers_submit_check(b)).count(), 2);
+    assert_eq!(setup.files(), ["README.txt"], "nothing is applied before the user says so");
+    let fork = resp.fork.clone().expect("the result is kept for the user");
+    session.apply(&fork).await.unwrap();
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    assert_eq!(setup.file("check.sh").as_deref(), Some(format!("{CHECK}\n").as_str()));
+
+    let mut seen = Vec::new();
+    while let Ok(event) = progress.try_recv() {
+        seen.push(event);
+    }
+    assert!(seen.iter().all(|e| e.run() == trace.as_str()), "{seen:#?}");
+    assert!(seen.iter().any(|e| matches!(e, Progress::CheckReady { designed: true, .. })), "{seen:#?}");
+
+    let learned = session.learn(&trace).await.unwrap();
+    assert_eq!(learned.added.len(), 1, "{learned:#?}");
+    let notes = session.notes("").await.unwrap();
+    assert_eq!(notes.iter().map(|r| r.note.text.as_str()).collect::<Vec<_>>(), [LEARNED_TEXT]);
+    assert!(session.forget(&notes[0].note.id, "the check moved").await.unwrap());
+    assert!(session.notes("").await.unwrap().is_empty());
+
+    session.shutdown(&[]).await;
+    assert_requests_valid(&server).await;
+    setup.assert_forks_dropped();
+}

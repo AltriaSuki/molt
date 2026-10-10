@@ -19,6 +19,11 @@ use crate::fs::Change;
 use crate::model::{Effort, Usage};
 
 pub const RUN: &str = "planner.run";
+/// Design the done-check for a task without running it, so a person can
+/// look at it first. Takes a [`RunRequest`] (only the task, workspace,
+/// model, effort and budget matter) and answers a [`DesignResponse`]; a
+/// `planner.run` with its command and files then skips the design.
+pub const DESIGN: &str = "planner.design";
 
 fn two() -> u32 {
     2
@@ -26,6 +31,10 @@ fn two() -> u32 {
 
 fn yes() -> bool {
     true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -36,6 +45,15 @@ pub struct RunRequest {
     /// Done-check command. `None`: the planner designs one first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<String>,
+    /// Files `check` depends on, as `planner.design` returned them: written
+    /// into every attempt's fork and restored before each check run. Only
+    /// with `check`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub check_files: Vec<CheckFile>,
+    /// False: run without a done-check, one attempt, result unverified. Only
+    /// without `check`.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub verify: bool,
     /// Parallel attempts, 1 to 8.
     #[serde(default = "two")]
     pub attempts: u32,
@@ -72,6 +90,8 @@ impl RunRequest {
             task: task.into(),
             workspace: workspace.into(),
             check: None,
+            check_files: Vec::new(),
+            verify: true,
             attempts: two(),
             model: None,
             effort: None,
@@ -105,6 +125,45 @@ pub struct CheckSpec {
     pub files: Vec<String>,
     /// Written by the planner's designer rather than given by the caller.
     pub designed: bool,
+}
+
+/// A file a done-check depends on, with its full contents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckFile {
+    pub path: String,
+    pub content: String,
+}
+
+/// How the designed check did on the workspace as it is, before any work.
+/// A check that already passes cannot tell a finished task from an
+/// unfinished one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Baseline {
+    pub passed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The end of its output.
+    #[serde(default)]
+    pub tail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DesignResponse {
+    /// The check command; `None` when no automated check fits the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The files the designer wrote for the check.
+    #[serde(default)]
+    pub files: Vec<CheckFile>,
+    /// Why the designer settled on this check, or on none.
+    #[serde(default)]
+    pub rationale: String,
+    /// The check run once on the workspace as it is. `None` without a
+    /// check, or when it could not be run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<Baseline>,
+    pub usage: Usage,
+    pub cost_usd: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,5 +329,9 @@ mod tests {
         assert_eq!(req, RunRequest::new("t", "/w"));
         assert_eq!(req.attempts, 2);
         assert!(req.apply);
+        assert!(req.verify);
+        // Requests from callers that know neither field stay as they were.
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(wire.get("verify").is_none() && wire.get("check_files").is_none(), "{wire}");
     }
 }

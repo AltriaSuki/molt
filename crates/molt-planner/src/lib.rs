@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use anyhow::{ensure, Context};
 use async_trait::async_trait;
-use molt_api::planner::{RunRequest, RunResponse};
+use molt_api::planner::{DesignResponse, RunRequest, RunResponse};
 use molt_proto::{Budget, Envelope, ErrorCode, RemoteError, Target, TraceId};
 use molt_sdk::{CallOpts, SdkError, Service};
 use serde_json::Value;
@@ -219,7 +219,17 @@ pub async fn run(
     runner::run(bus, cfg, req, trace).await
 }
 
-/// Serve `planner.run` on `svc` until its link closes.
+/// Design the done-check for a run without starting it (`planner.design`).
+pub async fn design(
+    bus: Arc<dyn Bus>,
+    cfg: Arc<Config>,
+    req: RunRequest,
+    trace: TraceId,
+) -> Result<DesignResponse, RemoteError> {
+    runner::design(bus, cfg, req, trace).await
+}
+
+/// Serve `planner.run` and `planner.design` on `svc` until its link closes.
 pub async fn serve(svc: Arc<Service>, cfg: Config) {
     let max_in_flight = cfg.max_concurrent_runs;
     let cfg = Arc::new(cfg);
@@ -246,15 +256,23 @@ async fn handle_cancellable(
         Target::Method { method, .. } => method.as_str(),
         _ => "",
     };
+    let request = |payload: Value| -> Result<RunRequest, RemoteError> {
+        serde_json::from_value(payload).map_err(|e| RemoteError {
+            code: ErrorCode::Invalid,
+            message: format!("bad planner.{method} request: {e}"),
+        })
+    };
+    let encode = |response: Result<Value, serde_json::Error>| {
+        response.map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("encoding the response: {e}") })
+    };
     match method {
         "run" => {
-            let request: RunRequest = serde_json::from_value(req.payload).map_err(|e| RemoteError {
-                code: ErrorCode::Invalid,
-                message: format!("bad planner.run request: {e}"),
-            })?;
-            let response = runner::run_cancellable(bus, cfg, request, req.trace_id, cancel).await?;
-            serde_json::to_value(response)
-                .map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("encoding the response: {e}") })
+            let response = runner::run_cancellable(bus, cfg, request(req.payload)?, req.trace_id, cancel).await?;
+            encode(serde_json::to_value(response))
+        }
+        "design" => {
+            let response = runner::design_cancellable(bus, cfg, request(req.payload)?, req.trace_id, cancel).await?;
+            encode(serde_json::to_value(response))
         }
         other => Err(RemoteError { code: ErrorCode::Invalid, message: format!("no method {other:?}") }),
     }
@@ -364,6 +382,14 @@ mod tests {
         let bad = json!({ "task": "t", "workspace": "/w", "attempts": 9 });
         let err = handle(bus.clone(), cfg.clone(), envelope("planner.run", bad)).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Invalid);
+
+        // planner.design designs: a check given, or verify off, leaves it nothing to do.
+        for given in [json!({ "check": "true" }), json!({ "verify": false })] {
+            let mut payload = json!({ "task": "t", "workspace": "/w" });
+            payload.as_object_mut().unwrap().extend(given.as_object().unwrap().clone());
+            let err = handle(bus.clone(), cfg.clone(), envelope("planner.design", payload)).await.unwrap_err();
+            assert_eq!(err.code, ErrorCode::Invalid, "{}", err.message);
+        }
 
         // A valid request reaches the bus; the fork fails because nothing serves `fs`.
         let ok = json!({ "task": "t", "workspace": "/w" });

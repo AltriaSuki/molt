@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use molt_api::planner::{AttemptStatus, CheckSpec, Outcome, RunRequest, RunResponse};
+use molt_api::planner::{AttemptStatus, CheckFile, CheckSpec, DesignResponse, Outcome, RunRequest, RunResponse};
 use molt_api::progress::Progress;
 use molt_proto::{ErrorCode, RemoteError, TraceId};
 use tokio::task::JoinSet;
@@ -42,10 +42,19 @@ pub(crate) async fn run_cancellable(
     let ctx = Arc::new(ctx);
     tracing::info!(run = %ctx.trace, workspace = %ctx.workspace, attempts = req.attempts, "run started");
 
+    // A check with files came from planner.design.
+    let designed = req.verify && (req.check.is_none() || !req.check_files.is_empty());
     let check = match &req.check {
-        Some(command) => Some(Check { command: command.clone(), files: Vec::new() }),
-        None => match designer::design(&ctx).await? {
-            Design::Check { command, files } => Some(Check { command, files }),
+        Some(command) => Some(Check {
+            command: command.clone(),
+            files: req.check_files.iter().map(|f| (f.path.clone(), f.content.clone())).collect(),
+        }),
+        None if !req.verify => {
+            ctx.note("running without a done-check, as asked").await;
+            None
+        }
+        None => match designer::design(&ctx, false).await? {
+            Design::Check { command, files, .. } => Some(Check { command, files }),
             Design::Unverified(reason) => {
                 ctx.note(format!("no automated done-check: {reason}")).await;
                 None
@@ -53,16 +62,12 @@ pub(crate) async fn run_cancellable(
             Design::Failed(reason) => return Ok(not_designed(&ctx, &reason)),
         },
     };
-    let spec = check.as_ref().map(|c| CheckSpec {
-        command: c.command.clone(),
-        files: c.paths(),
-        designed: req.check.is_none(),
-    });
+    let spec = check.as_ref().map(|c| CheckSpec { command: c.command.clone(), files: c.paths(), designed });
     ctx.progress(Progress::CheckReady {
         run: ctx.run_id(),
         command: spec.as_ref().map(|s| s.command.clone()),
         files: spec.as_ref().map(|s| s.files.clone()).unwrap_or_default(),
-        designed: req.check.is_none(),
+        designed,
     })
     .await;
 
@@ -86,6 +91,60 @@ pub(crate) async fn run_cancellable(
     Ok(resp)
 }
 
+/// Design the done-check for `req` and run it once on the workspace as it
+/// is, without starting any attempt.
+pub(crate) async fn design(
+    bus: Arc<dyn Bus>,
+    cfg: Arc<Config>,
+    req: RunRequest,
+    trace: TraceId,
+) -> Result<DesignResponse, RemoteError> {
+    design_cancellable(bus, cfg, req, trace, CancellationToken::new()).await
+}
+
+pub(crate) async fn design_cancellable(
+    bus: Arc<dyn Bus>,
+    cfg: Arc<Config>,
+    req: RunRequest,
+    trace: TraceId,
+    cancel: CancellationToken,
+) -> Result<DesignResponse, RemoteError> {
+    validate(&req)?;
+    if req.check.is_some() || !req.verify {
+        let message = "planner.design designs a check: leave out check, and keep verify".to_owned();
+        return Err(RemoteError { code: ErrorCode::Invalid, message });
+    }
+    let mut ctx = Ctx::new(bus, cfg, trace, &req);
+    ctx.cancel = cancel.clone();
+    ctx.run_cancel = cancel;
+    ctx.memory = memory::prepare(&ctx).await;
+    let ctx = Arc::new(ctx);
+    let design = designer::design(&ctx, true).await?;
+    let spend = ctx.settle(ctx.cfg.late_reply_wait).await.spend;
+    let mut resp = DesignResponse {
+        command: None,
+        files: Vec::new(),
+        rationale: String::new(),
+        baseline: None,
+        usage: spend.usage,
+        cost_usd: spend.cost_usd,
+    };
+    match design {
+        Design::Check { command, files, rationale, baseline } => {
+            resp.command = Some(command);
+            resp.files = files.into_iter().map(|(path, content)| CheckFile { path, content }).collect();
+            resp.rationale = rationale;
+            resp.baseline = baseline;
+        }
+        Design::Unverified(reason) => resp.rationale = reason,
+        Design::Failed(reason) => {
+            let message = format!("could not design a done-check: {reason}");
+            return Err(RemoteError { code: ErrorCode::Failed, message });
+        }
+    }
+    Ok(resp)
+}
+
 fn validate(req: &RunRequest) -> Result<(), RemoteError> {
     let problem = if req.task.trim().is_empty() {
         "task is empty".to_owned()
@@ -95,6 +154,12 @@ fn validate(req: &RunRequest) -> Result<(), RemoteError> {
         format!("attempts must be 1 to {MAX_ATTEMPTS}, not {}", req.attempts)
     } else if req.check.as_ref().is_some_and(|c| c.trim().is_empty()) {
         "check is empty: leave it out to have one designed".to_owned()
+    } else if req.check.is_none() && !req.check_files.is_empty() {
+        "check_files without a check".to_owned()
+    } else if req.check.is_some() && !req.verify {
+        "a check with verify off: leave out one or the other".to_owned()
+    } else if req.check_files.iter().any(|f| f.path.trim().is_empty()) {
+        "a check file has no path".to_owned()
     } else if req.max_turns == Some(0) {
         "max_turns must be at least 1".to_owned()
     } else if req.max_check_rounds == Some(0) {
@@ -282,6 +347,13 @@ mod tests {
             RunRequest { attempts: 0, ..ok.clone() },
             RunRequest { attempts: 9, ..ok.clone() },
             RunRequest { check: Some(" ".into()), ..ok.clone() },
+            RunRequest { check_files: vec![CheckFile { path: "t.rs".into(), content: String::new() }], ..ok.clone() },
+            RunRequest { check: Some("true".into()), verify: false, ..ok.clone() },
+            RunRequest {
+                check: Some("true".into()),
+                check_files: vec![CheckFile { path: " ".into(), content: String::new() }],
+                ..ok.clone()
+            },
             RunRequest { max_turns: Some(0), ..ok.clone() },
             RunRequest { max_check_rounds: Some(0), ..ok.clone() },
             RunRequest { budget_usd: Some(0.0), ..ok.clone() },

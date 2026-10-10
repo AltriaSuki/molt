@@ -67,6 +67,7 @@ sender from that.
 cargo install --path crates/molt     # installs molt, molt-echo and the agent services
 export ANTHROPIC_API_KEY=...
 cd your-project
+molt                                 # the interface: one task after another
 molt do "make the parser accept trailing commas" --check "cargo test"
 ```
 
@@ -84,6 +85,41 @@ molt audit tail -n 20
 To run across hosts on NATS, set `transport = "nats"`, run `molt nats-config`
 to generate per-service credentials, put the printed `authorization` block and
 `max_payload` setting in your nats-server config, and start `molt run`.
+
+## The interface
+
+`molt` with no subcommand (or `molt ui [--workspace DIR] [--data-dir DIR]
+[--pass-env NAME]...`) opens a terminal interface on the workspace. It starts
+the services once and keeps them up, so tasks follow one another without a
+restart. Type a task and press Enter.
+
+In the default mode, **confirm**, a task stops twice for you:
+
+1. The planner designs the done-check (`planner.design`) and runs it once on
+   the workspace as it is. You see the command, its files, why it fits and
+   that baseline. A check that already passes cannot tell a finished task
+   from an unfinished one, and is shown in red. Enter starts the attempts
+   with it; `e` edits the command, `v` shows the files, `n` runs without a
+   check.
+2. The attempts run side by side, one box each, with their tool calls and
+   check runs as they happen (Tab shows one large). When one passes, you see
+   its message, the files it changed and, with `d`, the diff. Enter applies
+   it; `k` keeps it in its fork, `n` discards it.
+
+Shift+Tab switches to **auto** (design the check and apply what passes) or
+**plan only** (results stay in their forks). Esc stops a task: the services
+are stopped, with every command the agent started, and started again.
+
+`/memory [words]` lists the notes about the project, strongest first, with
+where each came from: the run, the service version that wrote it and the
+messages in the audit log it rests on. `f` forgets one, with a reason, as
+`molt memory forget` does. `/attempts`, `/model`, `/effort`, `/budget` and
+`/check` set the next tasks' options; `/help` lists the keys. The services'
+log goes to `tui.log` in the data dir, and colors are left out under
+`NO_COLOR`.
+
+The interface holds the data dir's lock while it is open, so a `molt do` in
+the same project is refused until it closes.
 
 ## `molt do`
 
