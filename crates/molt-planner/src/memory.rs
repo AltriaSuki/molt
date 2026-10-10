@@ -10,6 +10,7 @@ use molt_api::memory::{
 };
 use std::time::Duration;
 
+use molt_api::progress::{Progress, RecalledNote};
 use molt_proto::{Budget, ErrorCode};
 
 use crate::ctx::Ctx;
@@ -50,6 +51,7 @@ pub(crate) async fn prepare(ctx: &Ctx) -> Memory {
         workspace: Some(workspace.clone()),
         k: Some(NOTES),
         min_confidence: Some(MIN_CONFIDENCE),
+        capture: Some("context".into()),
         ..Default::default()
     };
     let notes = match ctx.call::<RecallResponse>(memory::RECALL, recall, Budget::new(0, PROBE_MS, 0)).await {
@@ -99,10 +101,15 @@ pub(crate) async fn prepare(ctx: &Ctx) -> Memory {
             None
         }
     };
-    if !notes.is_empty() {
-        ctx.note(format!("recalled {} notes from earlier tasks", notes.len())).await;
-    }
     let map = map.filter(|m| !m.map.trim().is_empty());
+    if !notes.is_empty() || map.is_some() {
+        let recalled = notes
+            .iter()
+            .map(|r| RecalledNote { id: r.note.id.clone(), text: r.note.text.clone(), confidence: r.note.confidence })
+            .collect();
+        let map_tokens = map.as_ref().map(|m| m.tokens);
+        ctx.progress(Progress::Recalled { run: ctx.run_id(), notes: recalled, map_tokens }).await;
+    }
     Memory { up: true, context: prompts::project_context(&notes, map.as_ref().map(|m| m.map.as_str())) }
 }
 
@@ -113,7 +120,8 @@ pub(crate) fn note_lines(notes: &[Recalled]) -> String {
         .map(|r| {
             let n = &r.note;
             let disputed = if n.conflicts.is_empty() { "" } else { ", disputed" };
-            format!("- [{} {:.2}{disputed}] {}", n.kind.as_str(), n.confidence, n.text)
+            let temporary = if r.details.temporary { ", temporary experience; verify before reuse" } else { "" };
+            format!("- [{} {:.2}{disputed}{temporary}] {}", n.kind.as_str(), n.confidence, n.text)
         })
         .collect::<Vec<_>>()
         .join("\n")

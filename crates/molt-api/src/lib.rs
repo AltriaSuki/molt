@@ -8,7 +8,7 @@
 //! | `model`   | `complete`                                 | [`model`]     |
 //! | `fs`      | `read write edit list search fork diff merge drop` | [`fs`] |
 //! | `shell`   | `run`                                      | [`shell`]     |
-//! | `memory`  | `remember recall forget retract consolidate index map symbols` | [`memory`] |
+//! | `memory`  | `remember recall forget retract consolidate index map symbols review correct` | [`memory`] |
 //! | `planner` | `run`                                      | [`planner`]   |
 //!
 //! The planner also publishes [`progress::Progress`] events on

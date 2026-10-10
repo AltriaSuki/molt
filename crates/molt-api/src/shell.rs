@@ -25,6 +25,8 @@ pub struct RunResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<i32>,
     pub timed_out: bool,
+    #[serde(default)]
+    pub cancelled: bool,
     pub stdout: String,
     pub stderr: String,
     /// Output was cut to the service's limit; the start and the end are kept.
@@ -34,6 +36,6 @@ pub struct RunResponse {
 
 impl RunResponse {
     pub fn success(&self) -> bool {
-        self.exit_code == Some(0) && !self.timed_out
+        self.exit_code == Some(0) && !self.timed_out && !self.cancelled
     }
 }

@@ -40,7 +40,7 @@ pub(crate) async fn turn(
     cancel: &CancellationToken,
 ) -> Result<CompleteResponse, Stop> {
     if cancel.is_cancelled() {
-        return Err(Stop::Cancelled);
+        return Err(if ctx.over_budget() { Stop::Budget } else { Stop::Cancelled });
     }
     if meter.turns >= max_turns {
         return Err(Stop::OutOfTurns);
@@ -51,8 +51,8 @@ pub(crate) async fn turn(
     let resp = tokio::select! {
         // A reply that is already in wins a tie, so the loop's meter counts it too.
         biased;
-        resp = ctx.complete(conv) => resp,
-        _ = cancel.cancelled() => return Err(Stop::Cancelled),
+        resp = ctx.complete(conv, meter.turns + 1) => resp,
+        _ = cancel.cancelled() => return Err(if ctx.over_budget() { Stop::Budget } else { Stop::Cancelled }),
     };
     meter.turns += 1;
     let resp = resp.map_err(Stop::Model)?;

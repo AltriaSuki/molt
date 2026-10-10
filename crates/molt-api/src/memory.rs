@@ -32,6 +32,8 @@ pub const CONSOLIDATE: &str = "memory.consolidate";
 pub const INDEX: &str = "memory.index";
 pub const MAP: &str = "memory.map";
 pub const SYMBOLS: &str = "memory.symbols";
+pub const REVIEW: &str = "memory.review";
+pub const CORRECT: &str = "memory.correct";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -160,6 +162,46 @@ pub struct RecallRequest {
     pub k: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_confidence: Option<f64>,
+    /// Include notes awaiting review, for inspection only. Default false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_review: bool,
+    /// Record the exact returned notes for this request's authenticated run.
+    /// The planner uses `context` or `tool` when it injects the returned text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    /// Explicit file or configuration dependencies, relative to the project.
+    #[serde(default)]
+    pub dependencies: Vec<FileDependency>,
+    /// Changed or unreadable dependencies; requires explicit user review.
+    #[serde(default)]
+    pub needs_review: Vec<String>,
+    #[serde(default)]
+    pub temporary: bool,
+    /// The user's explanation for the latest review or correction.
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDependency {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecallReason {
+    /// FTS keyword expression; the index applies Porter stemming.
+    pub keywords: Option<String>,
+    /// Keyword relevance normalized within this response.
+    pub relevance: Option<f64>,
+    pub confidence: f64,
+    pub recency: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -167,6 +209,50 @@ pub struct Recalled {
     pub note: Note,
     /// Higher is better; only comparable within one response.
     pub score: f64,
+    #[serde(default)]
+    pub reason: RecallReason,
+    #[serde(default)]
+    pub details: NoteDetails,
+}
+
+/// Immutable notes returned for one planner context or tool call.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecallSnapshot {
+    pub run: String,
+    pub call: String,
+    pub workspace: String,
+    pub query: String,
+    pub purpose: String,
+    pub created_ms: u64,
+    pub notes: Vec<Recalled>,
+}
+
+/// Attach dependency files, mark temporary experience, or confirm a stale
+/// note after reviewing it. A concurrent edit rejects `expected_rev`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRequest {
+    pub workspace: String,
+    pub id: String,
+    pub expected_rev: u64,
+    pub reason: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub temporary: bool,
+}
+
+/// Replace a note while preserving its original evidence and tombstone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorrectRequest {
+    #[serde(flatten)]
+    pub review: ReviewRequest,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReviewResponse {
+    pub note: Note,
+    pub details: NoteDetails,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

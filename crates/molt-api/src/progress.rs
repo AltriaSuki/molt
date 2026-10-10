@@ -5,13 +5,43 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::Usage;
 use crate::planner::AttemptStatus;
+
+/// Identity and ordering of one model call's preview events. Sequence 0 is
+/// its start; gaps mean best-effort progress was omitted, not missing model
+/// content. The final complete reply always contains the assembled message.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelCall {
+    pub run: String,
+    pub attempt: Option<u32>,
+    pub turn: u32,
+    pub call: String,
+    pub seq: u64,
+}
 
 pub const TOPIC: &str = "progress";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Progress {
+    ModelStarted {
+        #[serde(flatten)]
+        context: ModelCall,
+    },
+    ModelText {
+        #[serde(flatten)]
+        context: ModelCall,
+        text: String,
+    },
+    ModelFinished {
+        #[serde(flatten)]
+        context: ModelCall,
+        /// None on an interrupted or malformed response.
+        usage: Option<Usage>,
+        cost_usd: Option<f64>,
+        error: Option<String>,
+    },
     /// The done-check is settled. `command` is `None` for an unverified run.
     CheckReady {
         run: String,
@@ -46,17 +76,45 @@ pub enum Progress {
         run: String,
         message: String,
     },
+    /// What memory gave the run to start with: the notes recalled, best
+    /// first, and the size of the project map.
+    Recalled {
+        run: String,
+        notes: Vec<RecalledNote>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        map_tokens: Option<u32>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecalledNote {
+    pub id: String,
+    pub text: String,
+    pub confidence: f64,
 }
 
 impl Progress {
     pub fn run(&self) -> &str {
         match self {
+            Self::ModelStarted { context } | Self::ModelText { context, .. } | Self::ModelFinished { context, .. } => {
+                &context.run
+            }
             Self::CheckReady { run, .. }
             | Self::AttemptStarted { run, .. }
             | Self::ToolCall { run, .. }
             | Self::CheckRan { run, .. }
             | Self::AttemptFinished { run, .. }
-            | Self::Note { run, .. } => run,
+            | Self::Note { run, .. }
+            | Self::Recalled { run, .. } => run,
+        }
+    }
+
+    pub fn model_call(&self) -> Option<&ModelCall> {
+        match self {
+            Self::ModelStarted { context } | Self::ModelText { context, .. } | Self::ModelFinished { context, .. } => {
+                Some(context)
+            }
+            _ => None,
         }
     }
 }

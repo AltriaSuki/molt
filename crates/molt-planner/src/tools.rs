@@ -169,6 +169,7 @@ impl Tool {
                     query: r.query,
                     workspace: Some(ctx.workspace.clone()),
                     k: Some(RECALL_K),
+                    capture: Some("tool".into()),
                     ..Default::default()
                 };
                 let resp: RecallResponse = ctx.call(memory::RECALL, req, files).await?;
@@ -405,6 +406,7 @@ mod tests {
             exit_code: Some(2),
             signal: None,
             timed_out: false,
+            cancelled: false,
             stdout: "out\n".into(),
             stderr: String::new(),
             truncated: false,

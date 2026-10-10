@@ -5,6 +5,8 @@
 pub mod agent;
 pub mod config;
 mod lock;
+pub mod session;
+pub mod tui;
 
 use std::future::Future;
 use std::sync::Arc;

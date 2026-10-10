@@ -11,7 +11,7 @@ use anyhow::Context;
 use rusqlite::Connection;
 
 /// Bumped when the schema changes in a way old databases must be migrated for.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// The database. Every write goes through its one connection, so writes
 /// never race; keep the work done under [`Db::with`] short. Long reads (the
@@ -81,6 +81,7 @@ impl Db {
         crate::notes::register(&conn)?;
         conn.execute_batch(crate::notes::SCHEMA)?;
         conn.execute_batch(crate::project::SCHEMA)?;
+        conn.execute_batch(crate::review::SCHEMA)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn: Mutex::new(conn), reader: None })
     }
@@ -162,5 +163,22 @@ mod tests {
         assert!(format!("{err:#}").contains("open to others (mode 644)"), "{err:#}");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         Db::open(&path).unwrap();
+    }
+
+    #[test]
+    fn schema_one_notes_survive_the_review_schema_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.sqlite");
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            c.execute("INSERT INTO notes (id,kind,text,norm,confidence,created_ms,updated_ms,trace,service,version) VALUES ('old_note','fact','Build with cargo.','build with cargo',0.8,1,1,'source_run','memory','v1')", []).unwrap();
+            c.execute_batch("DROP TABLE note_reviews; DROP TABLE note_details; DROP TABLE recall_snapshots; PRAGMA user_version = 1;").unwrap();
+        });
+        drop(db);
+        let upgraded = Db::open(&path).unwrap();
+        let notes = crate::recall(&upgraded, &Default::default()).unwrap();
+        assert_eq!(notes[0].note.id, "old_note");
+        assert_eq!(notes[0].details, Default::default());
+        assert!(crate::recall_snapshots(&upgraded, "/w", "source_run").unwrap().is_empty());
     }
 }

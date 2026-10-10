@@ -98,6 +98,7 @@ struct Pending {
     callee: ServiceId,
     deadline: Instant,
     request: Envelope,
+    cancelled: bool,
 }
 
 /// A service's bounded queue and the task draining it into the transport.
@@ -119,6 +120,7 @@ struct Inner {
     services: Mutex<HashMap<ServiceId, Secret>>,
     mailboxes: Mutex<HashMap<ServiceId, Mailbox>>,
     pending: Mutex<HashMap<MsgId, Pending>>,
+    late: Mutex<HashMap<MsgId, (ServiceId, Instant)>>,
     topics: Mutex<HashMap<String, BTreeSet<ServiceId>>>,
     status: Mutex<HashMap<ServiceId, ServiceStatus>>,
     /// `kernel.audit.read`s scanning the log at once. Each holds a blocking
@@ -164,6 +166,7 @@ impl Kernel {
             services: Mutex::default(),
             mailboxes: Mutex::default(),
             pending: Mutex::default(),
+            late: Mutex::default(),
             topics: Mutex::default(),
             status: Mutex::default(),
             audit_reads: Arc::new(tokio::sync::Semaphore::new(AUDIT_READS)),
@@ -346,6 +349,13 @@ impl Kernel {
     /// kernel logged, the services' exits included, is written and the audit
     /// writer has stopped.
     pub async fn shutdown(mut self) {
+        let owned: Vec<_> =
+            self.inner.pending.lock().unwrap().iter().map(|(id, p)| (id.clone(), p.requester.clone())).collect();
+        for (id, from) in owned {
+            let _ = self.inner.cancel_request(&from, &id).await;
+        }
+        // Give the gateway and shell a chance to audit settlement and reap children.
+        tokio::time::sleep(Duration::from_millis(750)).await;
         self.inner.supervisor.stop_all().await;
         for t in &self.tasks {
             t.abort();
@@ -381,6 +391,7 @@ async fn reaper(inner: Arc<Inner>) {
     loop {
         tick.tick().await;
         let now = Instant::now();
+        inner.late.lock().unwrap().retain(|_, (_, until)| *until > now);
         let expired: Vec<MsgId> =
             inner.pending.lock().unwrap().iter().filter(|(_, p)| p.deadline <= now).map(|(id, _)| id.clone()).collect();
         for id in expired {
@@ -411,6 +422,17 @@ async fn supervisor_events(
         let event = match ev {
             supervisor::Event::Started { service, pid } => AuditEvent::ServiceStarted { service, pid },
             supervisor::Event::Exited { service, status } => {
+                let owned: Vec<MsgId> = inner
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, p)| p.requester == service)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in owned {
+                    let _ = inner.cancel_request(&service, &id).await;
+                }
                 let waiting: Vec<MsgId> = inner
                     .pending
                     .lock()
@@ -513,6 +535,9 @@ impl Inner {
             Kind::Request => self.on_request(from, msg).await,
             Kind::Event => self.on_event(from, msg).await,
             Kind::Reply => self.on_reply(from, msg).await,
+            Kind::Cancel => {
+                self.deny(&from, &msg, ErrorCode::Denied, "only the kernel sends cancellation controls".into()).await
+            }
         }
     }
 
@@ -547,7 +572,7 @@ impl Inner {
         let tx = self.mailboxes.lock().unwrap().get(to).map(|(tx, _)| tx.clone()).ok_or(ErrorCode::Unavailable)?;
         let permit = match tx.try_reserve() {
             Ok(p) => p,
-            Err(mpsc::error::TrySendError::Full(())) if msg.kind == Kind::Reply => {
+            Err(mpsc::error::TrySendError::Full(())) if matches!(msg.kind, Kind::Reply | Kind::Cancel) => {
                 let (audit, to, tx) = (self.audit.clone(), to.clone(), tx.clone());
                 tokio::spawn(async move {
                     match tokio::time::timeout(REPLY_WAIT, tx.reserve_owned()).await {
@@ -575,9 +600,55 @@ impl Inner {
         let Some(p) = self.pending.lock().unwrap().remove(id) else {
             return;
         };
+        self.cancel_delivery(&p).await;
+        if p.request.to.to_string() == "model.complete" {
+            let mut late = self.late.lock().unwrap();
+            late.retain(|_, (_, until)| *until > Instant::now());
+            // At capacity refuse further model work instead of losing accounting.
+            late.insert(id.clone(), (p.callee.clone(), Instant::now() + Duration::from_secs(3600)));
+        }
         let mut reply = p.request.error_reply(code, reason);
+        if p.request.to.to_string() == "model.complete" {
+            reply.payload["settlement"] = json!({"request_id": id, "local_stopped": null,
+                "remote_cancel_confirmed": null, "usage": null, "cost_usd": null});
+        }
         reply.from = Some(self.me.clone());
         let _ = self.route(&p.requester, reply).await;
+    }
+
+    async fn cancel_delivery(&self, p: &Pending) {
+        let mut control = p.request.reply(Value::Null);
+        control.kind = Kind::Cancel;
+        control.from = Some(self.me.clone());
+        let _ = self.route(&p.callee, control).await;
+    }
+
+    async fn cancel_request(&self, from: &ServiceId, id: &MsgId) -> Result<Value, (ErrorCode, String)> {
+        let delivery = {
+            let mut waiting = self.pending.lock().unwrap();
+            let Some(p) = waiting.get_mut(id) else {
+                return Ok(json!({"requested": false}));
+            };
+            if &p.requester != from {
+                return Err((ErrorCode::Denied, "the request belongs to another caller".into()));
+            }
+            if p.cancelled {
+                return Ok(json!({"requested": true}));
+            }
+            p.cancelled = true;
+            // Keep the request until its final reply, to retain correlated late
+            // settlement. Cleanup cannot keep the caller waiting indefinitely.
+            p.deadline = p.deadline.min(Instant::now() + Duration::from_secs(5));
+            Pending {
+                requester: p.requester.clone(),
+                callee: p.callee.clone(),
+                deadline: p.deadline,
+                request: p.request.clone(),
+                cancelled: true,
+            }
+        };
+        self.cancel_delivery(&delivery).await;
+        Ok(json!({"requested": true, "remote_cancel_confirmed": null}))
     }
 
     async fn on_request(&self, from: ServiceId, msg: Envelope) {
@@ -587,6 +658,18 @@ impl Inner {
         if *service == self.me {
             let method = method.clone();
             return self.kernel_call(from, &method, msg).await;
+        }
+        if self.pending.lock().unwrap().contains_key(&msg.id) || self.late.lock().unwrap().contains_key(&msg.id) {
+            return self.deny(&from, &msg, ErrorCode::Invalid, "request id is already pending".into()).await;
+        }
+        if msg.to.to_string() == "model.complete"
+            && self.late.lock().unwrap().len()
+                + self.pending.lock().unwrap().values().filter(|p| p.request.to.to_string() == "model.complete").count()
+                >= 4096
+        {
+            return self
+                .deny(&from, &msg, ErrorCode::Busy, "too many model settlements are still unknown".into())
+                .await;
         }
         let cap = match self.caps.verify(msg.cap.as_ref(), &from, &msg.to) {
             Ok(c) => c,
@@ -615,6 +698,7 @@ impl Inner {
                 callee: callee.clone(),
                 deadline: Instant::now() + Duration::from_millis(ms),
                 request: msg.clone(),
+                cancelled: false,
             },
         );
         if let Err(code) = self.route(&callee, msg.clone()).await {
@@ -664,7 +748,21 @@ impl Inner {
                 let _ = self.route(&p.requester, msg).await;
             }
             None => {
-                self.deny(&from, &msg, ErrorCode::Denied, "no request of yours is waiting for this reply".into()).await
+                let late = {
+                    let mut late = self.late.lock().unwrap();
+                    match late.get(&answers) {
+                        Some((callee, until)) if callee == &from && *until > Instant::now() => late.remove(&answers),
+                        _ => None,
+                    }
+                };
+                if late.is_some() {
+                    // Durable late settlement only: never deliver a second result
+                    // or add the same usage to an already-finished run twice.
+                    let _ = self.audit.submit(AuditEvent::Message { envelope: msg }).await;
+                } else {
+                    self.deny(&from, &msg, ErrorCode::Denied, "no request of yours is waiting for this reply".into())
+                        .await
+                }
             }
         }
     }
@@ -765,6 +863,17 @@ impl Inner {
         let denied = |e: &dyn std::fmt::Display| (ErrorCode::Denied, e.to_string());
         match method {
             "ping" => Ok(json!({ "pong": true })),
+            "cancel" => {
+                #[derive(Deserialize)]
+                struct Cancel {
+                    request: MsgId,
+                }
+                let args: Cancel = serde_json::from_value(msg.payload.clone()).map_err(invalid)?;
+                if args.request.as_str().len() > molt_proto::MAX_ID {
+                    return Err((ErrorCode::Invalid, "request id is too long".into()));
+                }
+                self.cancel_request(from, &args.request).await
+            }
             "cap.delegate" => {
                 // Authority comes from holding the parent capability, checked by delegate().
                 let a: DelegateArgs = serde_json::from_value(msg.payload.clone()).map_err(invalid)?;

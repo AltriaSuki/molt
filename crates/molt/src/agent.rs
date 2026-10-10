@@ -33,7 +33,7 @@ pub const SERVICES: [&str; 4] = ["model", "fs", "shell", "planner"];
 pub const MEMORY: &str = "memory";
 
 /// How long services get to come up.
-const STARTUP: Duration = Duration::from_secs(15);
+pub(crate) const STARTUP: Duration = Duration::from_secs(15);
 const RETRY: Duration = Duration::from_millis(50);
 /// A method no service has: a live service answers it with `invalid`.
 const PROBE: &str = "ping";
@@ -253,6 +253,14 @@ pub async fn run_task(
     stop: impl Future<Output = ()>,
 ) -> anyhow::Result<Done> {
     require_services(cfg)?;
+    if req.stream {
+        let target: Target = format!("topic:{}", progress::TOPIC).parse()?;
+        let allowed =
+            cfg.service("model").is_some_and(|s| s.requests.iter().any(|r| r.target == target && r.budget.calls > 0));
+        if !allowed {
+            bail!("--stream requires the model service to request a topic:progress capability with a nonzero calls budget");
+        }
+    }
     let running = crate::start(cfg).await?;
     // Before planner.run, the only caller that makes forks.
     let forks = RunForks::before(cfg);
@@ -272,8 +280,10 @@ pub async fn run_task(
                 (false, _) | (true, None) => None,
                 (true, Some(Err(e))) => Some(Err(e)),
                 // Learning is a model call too: the run's budget covers it.
-                (true, Some(Ok(()))) if budget_usd.is_some_and(|b| ran.resp.cost_usd >= b) => {
-                    Some(Err("skipped: the run spent its whole budget".to_owned()))
+                (true, Some(Ok(())))
+                    if (ran.resp.uncounted_calls > 0 || budget_usd.is_some_and(|b| ran.resp.cost_usd >= b)) =>
+                {
+                    Some(Err("skipped: the budget is exhausted or model settlement is incomplete".to_owned()))
                 }
                 (true, Some(Ok(()))) => {
                     on_progress(&Progress::Note {
@@ -301,7 +311,8 @@ pub async fn run_task(
     };
     running.shutdown().await;
     if let Some(forks) = forks {
-        forks.remove_new(done.as_ref().ok().and_then(|d| d.run.fork.as_deref()));
+        let keep = done.as_ref().ok().and_then(|d| d.run.fork.as_deref());
+        forks.remove_new(keep.as_slice());
     }
     done
 }
@@ -311,13 +322,13 @@ pub async fn run_task(
 /// each a full copy of the project. Only a scratch dir inside the data dir is
 /// looked after: the data dir is locked to this run, so whatever appears
 /// there during it is the run's own.
-struct RunForks {
+pub(crate) struct RunForks {
     scratch: PathBuf,
     before: HashSet<OsString>,
 }
 
 impl RunForks {
-    fn before(cfg: &Config) -> Option<Self> {
+    pub(crate) fn before(cfg: &Config) -> Option<Self> {
         let args = &cfg.service("fs")?.exec.as_ref()?.args;
         let scratch = std::path::absolute(args.iter().skip_while(|a| *a != "--scratch").nth(1)?).ok()?;
         let data_dir = std::path::absolute(&cfg.kernel.data_dir).ok()?;
@@ -325,12 +336,13 @@ impl RunForks {
         (plain && scratch.starts_with(data_dir)).then(|| Self { before: fork_entries(&scratch), scratch })
     }
 
-    /// Remove the forks made since [`RunForks::before`], except `keep`.
-    fn remove_new(self, keep: Option<&str>) {
-        let keep = keep.and_then(|fork| Path::new(fork).file_name()).and_then(|name| name.to_str());
+    /// Remove the forks made since [`RunForks::before`], except those in `keep`.
+    pub(crate) fn remove_new(self, keep: &[&str]) {
+        let keep: Vec<&str> =
+            keep.iter().filter_map(|fork| Path::new(fork).file_name()).filter_map(|name| name.to_str()).collect();
         for name in fork_entries(&self.scratch).difference(&self.before) {
             let fork = name.to_str().map(|n| n.strip_suffix(".json").unwrap_or(n));
-            if keep.is_some_and(|keep| fork == Some(keep)) {
+            if fork.is_some_and(|fork| keep.contains(&fork)) {
                 continue;
             }
             let path = self.scratch.join(name);
@@ -390,6 +402,7 @@ async fn drive(
     grant(kernel, &cli, &format!("topic:{}", progress::TOPIC), Budget::new(0, 0, 1_000)).await?;
     cli.subscribe(progress::TOPIC).await?;
 
+    let mut preview = PreviewFilter::default();
     let reply = {
         let call = call_planner(&cli, &req, &trace);
         tokio::pin!(call);
@@ -400,7 +413,12 @@ async fn drive(
                 biased;
                 Some(msg) = cli.next() => {
                     if let Some(event) = progress_of(&msg, trace.as_str()) {
-                        on_progress(&event);
+                        if let Some(gap) = preview.accept(&event) {
+                            if gap {
+                                on_progress(&Progress::Note { run: trace.to_string(), message: "some model preview events were omitted; the final reply remains complete".into() });
+                            }
+                            on_progress(&event);
+                        }
                     }
                 }
                 reply = &mut call => break reply?,
@@ -447,7 +465,7 @@ pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::
 }
 
 /// Register [`CLI`] with the kernel and connect to it like a service would.
-async fn join_bus(running: &Running) -> anyhow::Result<Service> {
+pub(crate) async fn join_bus(running: &Running) -> anyhow::Result<Service> {
     let kernel = running.kernel();
     let id = ServiceId::new(CLI)?;
     let secret = match running.secrets() {
@@ -464,7 +482,7 @@ async fn join_bus(running: &Running) -> anyhow::Result<Service> {
     Ok(Service::new(id, link, HashMap::new()))
 }
 
-async fn grant(kernel: &Kernel, cli: &Service, target: &str, budget: Budget) -> anyhow::Result<CapId> {
+pub(crate) async fn grant(kernel: &Kernel, cli: &Service, target: &str, budget: Budget) -> anyhow::Result<CapId> {
     let cap = kernel.grant(cli.id(), target.parse()?, budget, None).await?;
     cli.add_cap(target, cap.clone());
     Ok(cap)
@@ -476,7 +494,12 @@ async fn grant(kernel: &Kernel, cli: &Service, target: &str, budget: Budget) -> 
 /// or wait out its whole deadline. Once the supervisor gives up on the
 /// service, the wait ends with how its last run ended, which otherwise only
 /// the audit log has.
-async fn wait_until_up(kernel: &Kernel, cli: &Service, service: &str, deadline: Instant) -> anyhow::Result<()> {
+pub(crate) async fn wait_until_up(
+    kernel: &Kernel,
+    cli: &Service,
+    service: &str,
+    deadline: Instant,
+) -> anyhow::Result<()> {
     let id = ServiceId::new(service)?;
     let target = format!("{service}.{PROBE}");
     let cap = grant(kernel, cli, &target, Budget::new(0, 0, 100_000)).await?;
@@ -522,12 +545,57 @@ fn progress_of(msg: &Envelope, run: &str) -> Option<Progress> {
         return None;
     }
     let event: Progress = serde_json::from_value(msg.payload.clone()).ok()?;
+    // The kernel stamps the sender. A service with topic access cannot
+    // impersonate the gateway by choosing a model event payload.
+    if event.model_call().is_some()
+        && (msg.from.as_ref().map(ServiceId::as_str) != Some("model") || msg.trace_id.as_str() != run)
+    {
+        return None;
+    }
     (event.run() == run).then_some(event)
+}
+
+#[derive(Default)]
+struct PreviewFilter {
+    calls: HashMap<String, (u64, bool)>,
+    finished: HashSet<u32>,
+}
+
+impl PreviewFilter {
+    /// None drops duplicates or previews of finished attempts. Some(true)
+    /// announces a gap in best-effort progress, without repeating any text.
+    fn accept(&mut self, event: &Progress) -> Option<bool> {
+        if let Progress::AttemptFinished { attempt, .. } = event {
+            self.finished.insert(*attempt);
+        }
+        let Some(context) = event.model_call() else { return Some(false) };
+        if context.attempt.is_some_and(|a| self.finished.contains(&a)) {
+            return None;
+        }
+        let previous = self.calls.get(&context.call).copied();
+        if previous.is_some_and(|(seq, closed)| closed || context.seq <= seq) {
+            return None;
+        }
+        let gap = match previous {
+            Some((seq, _)) => context.seq != seq + 1,
+            None => context.seq != 0,
+        };
+        self.calls.insert(context.call.clone(), (context.seq, matches!(event, Progress::ModelFinished { .. })));
+        Some(gap)
+    }
 }
 
 /// One short line for the terminal, made [`printable`].
 pub fn describe(event: &Progress) -> String {
     printable(&match event {
+        Progress::ModelStarted { context } => format!("{}: model started (cost pending)", model_label(context)),
+        Progress::ModelText { context, text } => format!("{} preview: {text}", model_label(context)),
+        Progress::ModelFinished { context, usage, cost_usd, error } => {
+            let cost = cost_usd.map_or_else(|| "cost unknown".into(), |cost| format!("cost ${cost:.4}"));
+            let tokens = usage.map_or_else(String::new, |u| format!(", {} tokens", u.total()));
+            let result = error.as_ref().map_or_else(|| "model finished".into(), |e| format!("model failed: {e}"));
+            format!("{}: {result} ({cost}{tokens})", model_label(context))
+        }
         Progress::CheckReady { command: Some(command), files, designed, .. } => {
             let mut line = format!("check: {command}");
             if *designed {
@@ -556,7 +624,28 @@ pub fn describe(event: &Progress) -> String {
         }
         Progress::AttemptFinished { attempt, status, .. } => format!("attempt {attempt}: {}", status_name(*status)),
         Progress::Note { message, .. } => message.clone(),
+        Progress::Recalled { run, notes, map_tokens } => {
+            let mut parts = Vec::new();
+            if let Some(tokens) = map_tokens {
+                parts.push(format!("a project map of about {tokens} tokens"));
+            }
+            match notes.len() {
+                0 => {}
+                1 => parts.push("1 note from earlier tasks".to_owned()),
+                n => parts.push(format!("{n} notes from earlier tasks")),
+            }
+            let mut line = format!("memory: {}", parts.join(" and "));
+            if !notes.is_empty() {
+                line.push_str(&format!("; inspect their snapshot with molt memory used {run}"));
+            }
+            line
+        }
     })
+}
+
+fn model_label(context: &molt_api::progress::ModelCall) -> String {
+    let actor = context.attempt.map_or_else(|| "designer".into(), |a| format!("attempt {a}"));
+    format!("{actor}, turn {}, call {}", context.turn, context.call)
 }
 
 /// The result of a run as a few lines for the terminal, made [`printable`].
@@ -577,9 +666,9 @@ pub fn report(resp: &RunResponse) -> String {
     } else if let Some(fork) = &resp.fork {
         lines.push(format!("not applied; the result is in {fork}"));
     }
-    let mut cost = format!("cost: ${:.4} ({} tokens)", resp.cost_usd, resp.usage.total());
+    let mut cost = format!("known cost: ${:.4} ({} tokens)", resp.cost_usd, resp.usage.total());
     if resp.uncounted_calls > 0 {
-        cost.push_str(&format!(", not counting {} calls of cancelled attempts left unanswered", resp.uncounted_calls));
+        cost.push_str(&format!(", {} model calls have unknown or unsettled cost", resp.uncounted_calls));
     }
     lines.push(cost);
     let summary = resp.summary.trim();
@@ -734,7 +823,7 @@ mod tests {
             std::fs::write(work.join(id).join("src/lib.rs"), "").unwrap();
             std::fs::write(work.join(format!("{id}.json")), "{}").unwrap();
         }
-        forks.remove_new(Some(work.join("fork-000000000003").to_str().unwrap()));
+        forks.remove_new(&[work.join("fork-000000000003").to_str().unwrap()]);
         let mut left: Vec<_> =
             std::fs::read_dir(&work).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         left.sort();
@@ -785,6 +874,18 @@ mod tests {
         assert!(err.contains("missing the services shell "), "{err}");
     }
 
+    #[tokio::test]
+    async fn streaming_refuses_a_custom_setup_without_progress_permission_before_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let mut cfg = Config::agent(Path::new("/w"), &data, Path::new("/b")).unwrap();
+        cfg.service_mut("model").unwrap().requests.clear();
+        let request = RunRequest { stream: true, ..RunRequest::new("task", "/w") };
+        let error = run_task(&cfg, request, false, |_| {}, std::future::pending()).await.unwrap_err();
+        assert!(error.to_string().contains("topic:progress"));
+        assert!(!data.exists());
+    }
+
     #[test]
     fn only_this_runs_progress_is_shown() {
         let event = |run: &str| {
@@ -799,6 +900,85 @@ mod tests {
         let mut other = event("trace_a");
         other.to = "topic:builds".parse().unwrap();
         assert_eq!(progress_of(&other, "trace_a"), None);
+    }
+
+    #[test]
+    fn model_previews_require_the_gateway_and_the_matching_trace() {
+        let trace = TraceId::random();
+        let event = Progress::ModelText {
+            context: molt_api::progress::ModelCall {
+                run: trace.to_string(),
+                attempt: Some(1),
+                turn: 2,
+                call: "call-a".into(),
+                seq: 1,
+            },
+            text: "hi".into(),
+        };
+        let mut msg =
+            Envelope::event(trace.clone(), progress::TOPIC, CapId::random(), serde_json::to_value(&event).unwrap())
+                .unwrap();
+        msg.from = Some(ServiceId::new("planner").unwrap());
+        assert_eq!(progress_of(&msg, trace.as_str()), None);
+        msg.from = Some(ServiceId::new("model").unwrap());
+        assert_eq!(progress_of(&msg, trace.as_str()), Some(event));
+        msg.trace_id = TraceId::random();
+        assert_eq!(progress_of(&msg, trace.as_str()), None);
+    }
+
+    #[test]
+    fn previews_keep_calls_separate_detect_gaps_and_ignore_cancelled_attempts() {
+        let mut filter = PreviewFilter::default();
+        let text = |call: &str, seq| Progress::ModelText {
+            context: molt_api::progress::ModelCall {
+                run: "run".into(),
+                attempt: Some(1),
+                turn: 2,
+                call: call.into(),
+                seq,
+            },
+            text: "hi".into(),
+        };
+        assert_eq!(filter.accept(&text("a", 1)), Some(true));
+        assert_eq!(filter.accept(&text("a", 1)), None);
+        assert_eq!(filter.accept(&text("a", 0)), None);
+        assert_eq!(filter.accept(&text("a", 2)), Some(false));
+        assert_eq!(filter.accept(&text("b", 0)), Some(false));
+        assert_eq!(filter.accept(&text("b", 2)), Some(true));
+        let context = text("a", 3).model_call().unwrap().clone();
+        assert_eq!(
+            filter.accept(&Progress::ModelFinished {
+                context,
+                usage: None,
+                cost_usd: None,
+                error: Some("broken stream".into())
+            }),
+            Some(false)
+        );
+        assert_eq!(filter.accept(&text("a", 4)), None);
+        filter.accept(&Progress::AttemptFinished { run: "run".into(), attempt: 1, status: AttemptStatus::Cancelled });
+        assert_eq!(filter.accept(&text("b", 3)), None);
+    }
+
+    #[test]
+    fn preview_display_escapes_control_characters_and_shows_unknown_cost() {
+        let context = molt_api::progress::ModelCall {
+            run: "run".into(),
+            attempt: Some(1),
+            turn: 2,
+            call: "call-a".into(),
+            seq: 1,
+        };
+        let preview = describe(&Progress::ModelText { context: context.clone(), text: "\x1b[2Khi".into() });
+        assert_eq!(preview, "attempt 1, turn 2, call call-a preview: \\u{1b}[2Khi");
+        let finished = describe(&Progress::ModelFinished {
+            context,
+            usage: None,
+            cost_usd: None,
+            error: Some("interrupted".into()),
+        });
+        assert!(finished.contains("cost unknown"));
+        assert!(!finished.contains("$0.0000"));
     }
 
     #[test]
@@ -859,14 +1039,15 @@ mod tests {
         assert_eq!(
             report(&resp),
             "outcome: passed\ncheck: cargo test\nchanges:\n  modified src/lib.rs\napplied to the workspace\n\
-             cost: $0.0120 (1200 tokens)\n\nFixed the parser.\n"
+             known cost: $0.0120 (1200 tokens)\n\nFixed the parser.\n"
         );
         resp.applied = false;
         resp.fork = Some("/cache/work/fork_1".into());
         resp.uncounted_calls = 2;
         assert!(report(&resp).contains("not applied; the result is in /cache/work/fork_1\n"));
-        assert!(report(&resp)
-            .contains("cost: $0.0120 (1200 tokens), not counting 2 calls of cancelled attempts left unanswered\n"));
+        assert!(
+            report(&resp).contains("known cost: $0.0120 (1200 tokens), 2 model calls have unknown or unsettled cost\n")
+        );
         resp.uncounted_calls = 0;
         resp.changes = vec![Change { path: "\x1b[1Aevil".into(), kind: ChangeKind::Added }];
         resp.summary = "Done.\x1b]0;title\x07\n".into();
@@ -876,7 +1057,7 @@ mod tests {
         resp.changes.clear();
         resp.summary.clear();
         assert!(report(&resp).ends_with(
-            "changes: none\nnot applied; the result is in /cache/work/fork_1\ncost: $0.0120 (1200 tokens)\n"
+            "changes: none\nnot applied; the result is in /cache/work/fork_1\nknown cost: $0.0120 (1200 tokens)\n"
         ));
     }
 }

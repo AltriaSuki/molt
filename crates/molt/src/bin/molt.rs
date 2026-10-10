@@ -5,7 +5,10 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use molt::agent::{self, Interrupted};
 use molt::{Config, Secrets};
-use molt_api::memory::{self, ForgetRequest, ForgetResponse, MapRequest, RecallRequest};
+use molt_api::memory::{
+    self, CorrectRequest, ForgetRequest, ForgetResponse, MapRequest, RecallRequest, RecallResponse, ReviewRequest,
+    ReviewResponse,
+};
 use molt_api::model::Effort;
 use molt_api::planner::{Outcome, RunRequest};
 use molt_proto::ServiceId;
@@ -14,18 +17,21 @@ use molt_proto::ServiceId;
 const DEFAULT_CONFIG: &str = "molt.toml";
 
 #[derive(Parser)]
-#[command(name = "molt", version, about = "Molt kernel daemon and tools")]
+#[command(name = "molt", version, about = "Molt: a self-improving agent. Without a subcommand, opens its interface.")]
 struct Cli {
     /// Path to molt.toml [default: molt.toml]. `molt do` and `molt memory`
     /// read one only when this is given.
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Open the interface: tasks one after another in a workspace, the
+    /// check shown before the attempts start, and what memory holds.
+    Ui(UiArgs),
     /// Start the kernel and the configured services; stop on Ctrl-C, SIGTERM or SIGHUP.
     Run,
     /// Carry out a task in a workspace with the agent services, verified by a done-check.
@@ -92,6 +98,9 @@ struct DoArgs {
     /// Print the result as JSON.
     #[arg(long)]
     json: bool,
+    /// Show model text previews on stderr while replies are generated.
+    #[arg(long)]
+    stream: bool,
     /// Where kernel state and forks go. Default: ~/.cache/molt/<project>-<hash>.
     #[arg(long)]
     data_dir: Option<PathBuf>,
@@ -100,6 +109,12 @@ struct DoArgs {
     /// locale and a few more otherwise.
     #[arg(long, value_name = "NAME", value_parser = env_name)]
     pass_env: Vec<String>,
+    /// Explicitly run commands with the host user's files and network.
+    #[arg(long, conflicts_with = "sandbox_policy")]
+    no_sandbox: bool,
+    /// Trusted shell sandbox JSON policy outside the project and scratch.
+    #[arg(long)]
+    sandbox_policy: Option<PathBuf>,
     /// Run without memory: no project map or notes for the model, and
     /// nothing learned from the run.
     #[arg(long)]
@@ -108,6 +123,20 @@ struct DoArgs {
     /// model call after the run).
     #[arg(long)]
     no_learn: bool,
+}
+
+#[derive(Args, Default)]
+struct UiArgs {
+    /// The project to work on.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// Where kernel state and forks go. Default: ~/.cache/molt/<project>-<hash>.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    /// Pass this variable from your environment to the commands the agent
+    /// runs (repeatable).
+    #[arg(long, value_name = "NAME", value_parser = env_name)]
+    pass_env: Vec<String>,
 }
 
 /// Where a project's memory is.
@@ -123,6 +152,22 @@ struct MemoryAt {
 
 #[derive(Subcommand)]
 enum MemoryCmd {
+    /// Inspect the exact notes and recall reasons returned during RUN.
+    Used {
+        #[command(flatten)]
+        at: MemoryAt,
+        run: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Confirm a note, replace its file dependencies, or mark it temporary.
+    Review(ReviewArgs),
+    /// Replace a note while preserving its original evidence and reason.
+    Correct {
+        #[command(flatten)]
+        review: ReviewArgs,
+        text: String,
+    },
     /// List the notes about the project, strongest first, or those matching WORDS.
     Show {
         #[command(flatten)]
@@ -156,6 +201,24 @@ enum MemoryCmd {
         #[arg(long, default_value_t = 3000, value_parser = clap::value_parser!(u32).range(1..=32_000))]
         tokens: u32,
     },
+}
+
+#[derive(Args)]
+struct ReviewArgs {
+    #[command(flatten)]
+    at: MemoryAt,
+    id: String,
+    /// Revision printed by memory show; refuses concurrent changes.
+    #[arg(long)]
+    rev: u64,
+    #[arg(long)]
+    reason: String,
+    /// Replace the dependency list with these project-relative files. Repeatable.
+    #[arg(long)]
+    depends_on: Vec<String>,
+    /// Mark this as temporary experience, to be verified before reuse.
+    #[arg(long)]
+    temporary: bool,
 }
 
 /// A positive amount of US dollars, refused here rather than by the planner
@@ -195,8 +258,9 @@ enum AuditCmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
-    // `molt do` and `molt memory` print their own progress; kernel logs would bury it.
-    molt::init_tracing(if matches!(cli.cmd, Cmd::Do(_) | Cmd::Memory { .. } | Cmd::Bench { .. }) {
+    let cmd = cli.cmd.unwrap_or_else(|| Cmd::Ui(UiArgs { workspace: ".".into(), ..UiArgs::default() }));
+    // `molt do`, `molt memory`, `molt bench` and the interface print their own progress; kernel logs would bury it.
+    molt::init_tracing(if matches!(cmd, Cmd::Do(_) | Cmd::Memory { .. } | Cmd::Bench { .. } | Cmd::Ui(_)) {
         "warn"
     } else {
         "info"
@@ -208,7 +272,18 @@ async fn main() -> anyhow::Result<ExitCode> {
             None => Ok(config()?.kernel.data_dir.join("audit.jsonl")),
         }
     };
-    match cli.cmd {
+    match cmd {
+        Cmd::Ui(args) => {
+            let opts = molt::tui::Options {
+                config: cli.config,
+                workspace: args.workspace,
+                data_dir: args.data_dir,
+                pass_env: args.pass_env,
+            };
+            for fork in molt::tui::run(opts).await? {
+                eprintln!("kept: {}", agent::printable(&fork));
+            }
+        }
         Cmd::Run => {
             let stop = molt::stop_signal()?;
             let cfg = config()?;
@@ -256,6 +331,13 @@ async fn main() -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn cfg_scratch(args: &[String]) -> anyhow::Result<PathBuf> {
+    let path =
+        args.windows(2).find(|pair| pair[0] == "--scratch").context("molt-tools shell must declare --scratch")?;
+    let path = PathBuf::from(&path[1]);
+    Ok(path.canonicalize().unwrap_or(path))
+}
+
 async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode> {
     // From the start, so that no signal leaves services running.
     let stop = molt::stop_signal()?;
@@ -266,6 +348,28 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
         eprintln!("config: {}", agent::printable(&path.display().to_string()));
     }
     if let Some(shell) = cfg.service_mut("shell") {
+        let standard = shell
+            .exec
+            .as_ref()
+            .is_some_and(|exec| Path::new(&exec.command).file_name().is_some_and(|name| name == "molt-tools"));
+        anyhow::ensure!(
+            standard || (!args.no_sandbox && args.sandbox_policy.is_none() && args.pass_env.is_empty()),
+            "shell policy flags require the molt-tools shell service"
+        );
+        if let Some(exec) = shell.exec.as_mut().filter(|_| standard) {
+            if args.no_sandbox {
+                exec.args.push("--no-sandbox".into());
+            }
+            if let Some(path) = &args.sandbox_policy {
+                let roots = molt_tools::Roots { root: workspace.clone(), scratch: cfg_scratch(&exec.args)? };
+                let policy = molt_tools::SandboxPolicy::load(path, &roots)?;
+                shell.pass_env.extend(policy.environment);
+                exec.args.extend(["--sandbox-policy".into(), path.canonicalize()?.to_string_lossy().into_owned()]);
+            }
+            for name in &args.pass_env {
+                exec.args.extend(["--sandbox-env".into(), name.clone()]);
+            }
+        }
         shell.pass_env.extend(args.pass_env);
     }
     if args.no_memory {
@@ -278,13 +382,14 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     }
     let mut req = RunRequest::new(args.task, workspace.to_str().context("the workspace path is not UTF-8")?);
     req.check = args.check;
-    req.no_check = args.no_check;
+    req.verify = !args.no_check;
     req.attempts = args.attempts;
     req.model = args.model;
     req.effort = args.effort;
     req.max_turns = args.max_turns;
     req.budget_usd = args.budget_usd;
     req.apply = !args.no_apply;
+    req.stream = args.stream;
     let apply = req.apply;
 
     let mut signal = None;
@@ -326,7 +431,11 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
 
 async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()> {
     let at = match &cmd {
-        MemoryCmd::Show { at, .. } | MemoryCmd::Forget { at, .. } | MemoryCmd::Map { at, .. } => at,
+        MemoryCmd::Show { at, .. }
+        | MemoryCmd::Forget { at, .. }
+        | MemoryCmd::Map { at, .. }
+        | MemoryCmd::Used { at, .. } => at,
+        MemoryCmd::Review(r) | MemoryCmd::Correct { review: r, .. } => &r.at,
     };
     let workspace = at.workspace.canonicalize().with_context(|| format!("workspace {}", at.workspace.display()))?;
     let key = workspace.to_str().context("the workspace path is not UTF-8")?.to_owned();
@@ -338,8 +447,19 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
     };
     match cmd {
         MemoryCmd::Show { words, n, json, .. } => {
-            let req = RecallRequest { query: words.join(" "), workspace: Some(key), k: Some(n), ..Default::default() };
-            let notes = molt_memory::recall(&open()?, &req).map_err(|e| anyhow::anyhow!(e.message))?;
+            let req = RecallRequest {
+                query: words.join(" "),
+                workspace: Some(key),
+                k: Some(n),
+                include_review: true,
+                ..Default::default()
+            };
+            // Dependency checks can change note state: keep those checks
+            // on the audited service path too, rather than editing offline.
+            drop(open()?);
+            let response: RecallResponse =
+                serde_json::from_value(agent::call_memory(&cfg, memory::RECALL, serde_json::to_value(req)?).await?)?;
+            let notes = response.notes;
             if json {
                 println!("{}", serde_json::to_string_pretty(&notes)?);
             } else if notes.is_empty() {
@@ -348,6 +468,30 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
                 print!("{}", agent::printable(&show_notes(&notes)));
             }
         }
+        MemoryCmd::Used { run, json, .. } => {
+            let snapshots =
+                molt_memory::recall_snapshots(&open()?, &key, &run).map_err(|e| anyhow::anyhow!(e.message))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snapshots)?);
+            } else if snapshots.is_empty() {
+                eprintln!("no recorded memory context for run {run} in this project");
+            } else {
+                for snapshot in snapshots {
+                    let heading = format!(
+                        "run {}, call {} ({})\nquery: {}\n",
+                        snapshot.run, snapshot.call, snapshot.purpose, snapshot.query
+                    );
+                    print!("{}", agent::printable(&heading));
+                    if snapshot.notes.is_empty() {
+                        println!("no notes were returned");
+                    } else {
+                        print!("{}", agent::printable(&show_notes(&snapshot.notes)));
+                    }
+                }
+            }
+        }
+        MemoryCmd::Review(r) => change_note(&cfg, key, r, None).await?,
+        MemoryCmd::Correct { review, text } => change_note(&cfg, key, review, Some(text)).await?,
         MemoryCmd::Forget { id, reason, .. } => {
             let req = serde_json::to_value(ForgetRequest { id: id.clone(), reason })?;
             let reply: ForgetResponse = serde_json::from_value(agent::call_memory(&cfg, memory::FORGET, req).await?)?;
@@ -368,6 +512,24 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
     Ok(())
 }
 
+async fn change_note(cfg: &Config, workspace: String, r: ReviewArgs, text: Option<String>) -> anyhow::Result<()> {
+    let req = ReviewRequest {
+        workspace,
+        id: r.id,
+        expected_rev: r.rev,
+        reason: r.reason,
+        depends_on: r.depends_on,
+        temporary: r.temporary,
+    };
+    let (target, payload) = match text {
+        Some(text) => (memory::CORRECT, serde_json::to_value(CorrectRequest { review: req, text })?),
+        None => (memory::REVIEW, serde_json::to_value(req)?),
+    };
+    let reply: ReviewResponse = serde_json::from_value(agent::call_memory(cfg, target, payload).await?)?;
+    println!("{}", agent::printable(&format!("{} revision {}: {}", reply.note.id, reply.note.rev, reply.note.text)));
+    Ok(())
+}
+
 /// Notes as `molt memory show` lists them: id, kind, confidence and how
 /// often an episode bore the note out, then the text.
 fn show_notes(notes: &[molt_api::memory::Recalled]) -> String {
@@ -381,8 +543,44 @@ fn show_notes(notes: &[molt_api::memory::Recalled]) -> String {
         if !n.conflicts.is_empty() {
             extra.push(format!("disputed by {}", n.conflicts.join(", ")));
         }
+        if r.details.temporary {
+            extra.push("temporary experience; verify before reuse".into());
+        }
+        if !r.details.needs_review.is_empty() {
+            extra.push(format!("needs review: {}", r.details.needs_review.join(", ")));
+        }
         let extra = if extra.is_empty() { String::new() } else { format!(" ({})", extra.join("; ")) };
-        out.push_str(&format!("{}  {} {:.2}{extra}\n    {}\n", n.id, n.kind.as_str(), n.confidence, n.text));
+        out.push_str(&format!(
+            "{} rev {}  {} {:.2}{extra}\n    {}\n",
+            n.id,
+            n.rev,
+            n.kind.as_str(),
+            n.confidence,
+            n.text
+        ));
+        out.push_str(&format!(
+            "    source: {}/{} run {} events {}\n",
+            n.provenance.service,
+            n.provenance.version,
+            n.provenance.trace,
+            n.provenance.events.join(", ")
+        ));
+        out.push_str(&format!(
+            "    recall: score {:.3}, confidence {:.3}, recency {:.3}, keywords {}\n",
+            r.score,
+            r.reason.confidence,
+            r.reason.recency,
+            r.reason.keywords.as_deref().unwrap_or("none (confidence and recency)")
+        ));
+        if !r.details.dependencies.is_empty() {
+            out.push_str(&format!(
+                "    depends on: {}\n",
+                r.details.dependencies.iter().map(|d| d.path.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !r.details.reason.is_empty() {
+            out.push_str(&format!("    review reason: {}\n", r.details.reason));
+        }
     }
     out
 }

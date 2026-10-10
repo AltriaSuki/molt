@@ -8,6 +8,7 @@
 //! failed check's feedback. It answers `400` to anything the real API would
 //! refuse (see [`check_request`]), and every test checks that it never had to.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -44,6 +45,7 @@ const LEARNED_TEXT: &str = "The done-check greps greeting.txt for hello.";
 enum Fake {
     /// Attempts write greeting.txt and say they are done.
     Greets,
+    ConcurrentEdit(PathBuf),
     /// The designer writes check.sh and submits it; attempts then greet.
     DesignsThenGreets,
     /// Attempts write the wrong greeting, then fix it after the check fails.
@@ -75,6 +77,7 @@ impl Respond for FakeApi {
         let messages = body["messages"].as_array().cloned().unwrap_or_default();
         let n = messages.len();
         let model = body["model"].as_str().unwrap_or("unknown");
+        let stream = body["stream"] == true;
         // Memory learning from a finished run asks for JSON in a fixed shape.
         if body["output_config"]["format"]["type"] == "json_schema" {
             let note =
@@ -84,7 +87,7 @@ impl Respond for FakeApi {
                 json!({ "type": "thinking", "thinking": "", "signature": signature(n) }),
                 json!({ "type": "text", "text": text }),
             ];
-            return message(n, model, content, "end_turn");
+            return message(n, model, content, "end_turn", stream);
         }
         let designer = body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_CHECK));
         let last = messages.last().cloned().unwrap_or(Value::Null);
@@ -96,7 +99,7 @@ impl Respond for FakeApi {
         };
         let write = |path: &str, content: &str| tool_use(n, WRITE_FILE, json!({ "path": path, "content": content }));
         let (mut content, stop) = match (&self.0, designer, turn) {
-            (Fake::Refuses, ..) => return refusal(n, model),
+            (Fake::Refuses, ..) => return message(n, model, vec![], "refusal", stream),
             (_, true, Turn::First) => (vec![write("check.sh", &format!("{CHECK}\n"))], "tool_use"),
             (_, true, _) => {
                 let input = json!({ "command": "sh check.sh", "files": ["check.sh"], "rationale": "Greets." });
@@ -113,6 +116,11 @@ impl Respond for FakeApi {
             }
             (_, false, Turn::First | Turn::Feedback) => (vec![write("greeting.txt", "hello\n")], "tool_use"),
             (_, false, Turn::AfterTools) => {
+                if let Fake::ConcurrentEdit(original) = &self.0 {
+                    // A user edits the original outside the sandbox while the
+                    // attempt is working; its done-check cannot do this.
+                    std::fs::write(original, "theirs\n").unwrap();
+                }
                 (vec![json!({ "type": "text", "text": "Wrote greeting.txt." })], "end_turn")
             }
         };
@@ -120,12 +128,12 @@ impl Respond for FakeApi {
         // turn's place in the conversation, so check_request can tell that
         // it came back unmodified.
         content.insert(0, json!({ "type": "thinking", "thinking": "", "signature": signature(n) }));
-        message(n, model, content, stop)
+        message(n, model, content, stop, stream)
     }
 }
 
-fn message(n: usize, model: &str, content: Vec<Value>, stop: &str) -> ResponseTemplate {
-    ResponseTemplate::new(200).set_body_json(json!({
+fn message(n: usize, model: &str, content: Vec<Value>, stop: &str, stream: bool) -> ResponseTemplate {
+    let body = json!({
         "id": format!("msg_{n:03}"),
         "type": "message",
         "role": "assistant",
@@ -139,11 +147,45 @@ fn message(n: usize, model: &str, content: Vec<Value>, stop: &str) -> ResponseTe
             "cache_creation_input_tokens": 0,
             "cache_read_input_tokens": 0
         }
-    }))
-}
-
-fn refusal(n: usize, model: &str) -> ResponseTemplate {
-    message(n, model, vec![], "refusal")
+    });
+    if !stream {
+        return ResponseTemplate::new(200).set_body_json(body);
+    }
+    let event = |value: Value| format!("event: {}\ndata: {value}\n\n", value["type"].as_str().unwrap());
+    let mut start = body.clone();
+    start["content"] = json!([]);
+    start["stop_reason"] = Value::Null;
+    let mut wire = event(json!({"type":"message_start","message":start}));
+    for (index, block) in body["content"].as_array().unwrap().iter().enumerate() {
+        let mut initial = block.clone();
+        let deltas = match block["type"].as_str().unwrap() {
+            "text" => {
+                initial["text"] = json!("");
+                vec![json!({"type":"text_delta","text":block["text"]})]
+            }
+            "thinking" => {
+                initial["thinking"] = json!("");
+                initial["signature"] = json!("");
+                vec![
+                    json!({"type":"thinking_delta","thinking":block["thinking"]}),
+                    json!({"type":"signature_delta","signature":block["signature"]}),
+                ]
+            }
+            "tool_use" => {
+                initial["input"] = json!({});
+                vec![json!({"type":"input_json_delta","partial_json":block["input"].to_string()})]
+            }
+            _ => unreachable!(),
+        };
+        wire.push_str(&event(json!({"type":"content_block_start","index":index,"content_block":initial})));
+        for delta in deltas {
+            wire.push_str(&event(json!({"type":"content_block_delta","index":index,"delta":delta})));
+        }
+        wire.push_str(&event(json!({"type":"content_block_stop","index":index})));
+    }
+    wire.push_str(&event(json!({"type":"message_delta","delta":{"stop_reason":stop},"usage":body["usage"]})));
+    wire.push_str(&event(json!({"type":"message_stop"})));
+    ResponseTemplate::new(200).set_body_raw(wire, "text/event-stream")
 }
 
 /// Ids follow from the conversation's length, so replies are reproducible.
@@ -506,6 +548,31 @@ async fn a_second_run_starts_with_what_the_first_learned_and_a_map_of_the_code()
     // Learning the same thing again confirms the note rather than adding a copy.
     let again = second.learned.unwrap().unwrap();
     assert!(again.added.is_empty() && again.reinforced == vec![note.id.clone()], "{again:#?}");
+    let audit = molt_kernel::audit::read_all(&setup.data.path().join("audit.jsonl")).await.unwrap();
+    let run = audit
+        .iter()
+        .rev()
+        .find_map(|e| match &e.event {
+            AuditEvent::Message { envelope }
+                if envelope.kind == Kind::Request && envelope.to.to_string() == PLANNER_RUN =>
+            {
+                Some(envelope.trace_id.to_string())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+        .args(["memory", "used", &run, "--json", "--data-dir"])
+        .arg(setup.data.path())
+        .current_dir(setup.workspace.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let captured: Vec<molt_api::memory::RecallSnapshot> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].notes[0].note, *note, "later reinforcement must not rewrite this run's context");
+    assert_eq!(captured[0].purpose, "context");
+    assert!(context.contains(&captured[0].notes[0].note.text));
     assert_requests_valid(&server).await;
     setup.assert_forks_dropped();
 }
@@ -584,7 +651,11 @@ async fn stopping_a_run_kills_the_commands_it_started() {
     let pids = tempfile::tempdir().unwrap();
     let pidfile = pids.path().join("sleep.pid");
     let server = fake_api(Fake::Hangs(pidfile.clone())).await;
-    let setup = Setup::new(&server);
+    let mut setup = Setup::new(&server);
+    // This legacy fixture writes a host PID marker outside the fork. Its
+    // process-group checks explicitly use the unconfined path; namespace
+    // lifecycle coverage lives in molt-tools/tests/sandbox.rs.
+    setup.cfg.service_mut("shell").unwrap().exec.as_mut().unwrap().args.push("--no-sandbox".into());
     let started = wait_for_pid(&pidfile);
     let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), false, |_| {}, async {
         started.await;
@@ -618,7 +689,11 @@ async fn a_planner_that_dies_mid_run_ends_the_run_rather_than_starting_it_again(
     let pids = tempfile::tempdir().unwrap();
     let pidfile = pids.path().join("sleep.pid");
     let server = fake_api(Fake::Hangs(pidfile.clone())).await;
-    let setup = Setup::new(&server);
+    let mut setup = Setup::new(&server);
+    // This legacy fixture writes a host PID marker outside the fork. Its
+    // process-group checks explicitly use the unconfined path; namespace
+    // lifecycle coverage lives in molt-tools/tests/sandbox.rs.
+    setup.cfg.service_mut("shell").unwrap().exec.as_mut().unwrap().args.push("--no-sandbox".into());
     let kill_planner = async {
         let sleep = wait_for_pid(&pidfile).await;
         let planner = started_pid(&setup.data.path().join("audit.jsonl"), "planner").await;
@@ -662,6 +737,7 @@ async fn the_cli_carries_out_a_task() {
     let server = fake_api(Fake::Greets).await;
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     // A project's own molt.toml is never read unless asked for: it could run anything with the user's key.
     std::fs::write(workspace.path().join("molt.toml"), "[[service]]\nname = \"model\"\nexec = 'not toml\n").unwrap();
     // The check fails if the API key reached the commands the agent runs, or the passed variable did not.
@@ -698,9 +774,40 @@ async fn the_cli_carries_out_a_task() {
     assert!(shown.contains(&format!("lesson 0.90\n    {LEARNED_TEXT}\n")), "{shown}");
     let id = shown.split_whitespace().next().unwrap().to_owned();
     assert!(id.starts_with("note_"), "{shown}");
-    assert_eq!(memory(&["show", "greps", "hello"]).0, shown, "matched by its words");
-    let (forgot, _) = memory(&["forget", &id, "--reason", "the check changed"]);
-    assert_eq!(forgot, format!("forgot {id}\n"));
+    let matched = memory(&["show", "greps", "hello"]).0;
+    assert!(matched.starts_with(&id) && matched.contains(LEARNED_TEXT), "{matched}");
+    assert!(matched.contains("keywords \"greps\" OR \"hello\""), "{matched}");
+    let reviewed = memory(&[
+        "review",
+        &id,
+        "--rev",
+        "1",
+        "--reason",
+        "temporary check",
+        "--depends-on",
+        "greeting.txt",
+        "--temporary",
+    ])
+    .0;
+    assert!(reviewed.contains("revision 2"), "{reviewed}");
+    let shown = memory(&["show"]).0;
+    assert!(shown.contains("temporary experience") && shown.contains("depends on: greeting.txt"), "{shown}");
+    let corrected = memory(&[
+        "correct",
+        &id,
+        "The greeting check requires a newline.",
+        "--rev",
+        "2",
+        "--reason",
+        "clarified the requirement",
+        "--depends-on",
+        "greeting.txt",
+    ])
+    .0;
+    let corrected_id = corrected.split_whitespace().next().unwrap();
+    assert_ne!(corrected_id, id);
+    let (forgot, _) = memory(&["forget", corrected_id, "--reason", "the check changed"]);
+    assert_eq!(forgot, format!("forgot {corrected_id}\n"));
     assert_eq!(memory(&["show"]), (String::new(), "no notes\n".to_owned()));
     // The forget went through the bus, so the audit log has it.
     let audit = molt_kernel::audit::read_all(&data.path().join("audit.jsonl")).await.unwrap();
@@ -710,6 +817,67 @@ async fn the_cli_carries_out_a_task() {
     assert!(data.path().join("audit.jsonl").exists());
     assert_requests_valid(&server).await;
     assert_forks_dropped(data.path());
+}
+
+#[tokio::test]
+async fn streamed_calls_keep_tools_signatures_and_parallel_call_identity() {
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let mut req = setup.request(Some(CHECK), 2);
+    req.stream = true;
+    let (response, events) = setup.run(req).await;
+    assert_eq!(response.outcome, Outcome::Passed);
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    let mut calls = std::collections::HashMap::new();
+    let mut saw_preview = false;
+    for event in &events {
+        if let Some(context) = event.model_call() {
+            let key = (context.run.clone(), context.attempt, context.turn);
+            let previous = calls.entry(context.call.clone()).or_insert((key.clone(), None));
+            assert_eq!(previous.0, key);
+            assert!(previous.1.is_none_or(|seq| context.seq > seq));
+            previous.1 = Some(context.seq);
+        }
+        if let Progress::ModelText { text, .. } = event {
+            assert_eq!(text, "Wrote greeting.txt.");
+            saw_preview = true;
+        }
+    }
+    assert!(saw_preview, "{events:?}");
+    assert!(calls.len() >= 2);
+    assert_requests_valid(&server).await;
+    let audit = molt_kernel::audit::read_all(&setup.data.path().join("audit.jsonl")).await.unwrap();
+    assert!(audit.iter().any(|e| matches!(&e.event, AuditEvent::Message { envelope }
+        if envelope.kind == Kind::Event && envelope.payload["event"] == "model_text"
+        && envelope.payload["run"] == envelope.trace_id.as_str())));
+}
+
+#[tokio::test]
+async fn streaming_keeps_json_stdout_complete_and_previews_on_stderr() {
+    let server = fake_api(Fake::Greets).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let out = tokio::time::timeout(
+        RUN_LIMIT,
+        molt_do(
+            &server,
+            workspace.path(),
+            data.path(),
+            &["--check", CHECK, "--attempts", "1", "--stream", "--json", "--no-learn"],
+        )
+        .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["outcome"], "passed");
+    assert_eq!(result["summary"], "Wrote greeting.txt.");
+    assert!(stderr.contains("preview: Wrote greeting.txt."), "{stderr}");
+    assert!(stderr.contains("model finished (cost $"), "{stderr}");
+    assert_requests_valid(&server).await;
 }
 
 #[tokio::test]
@@ -743,13 +911,11 @@ async fn the_cli_runs_the_example_config_when_given_one() {
 
 #[tokio::test]
 async fn a_result_that_cannot_be_applied_exits_3_and_is_kept() {
-    let server = fake_api(Fake::Greets).await;
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
-    // The check changes the original's greeting.txt during the run, as a user editing it would.
     let original = workspace.path().canonicalize().unwrap().join("greeting.txt");
-    let check = format!("echo theirs > '{}' && {CHECK}", original.display());
-    let args = ["--check", &check, "--attempts", "1", "--json"];
+    let server = fake_api(Fake::ConcurrentEdit(original.clone())).await;
+    let args = ["--check", CHECK, "--attempts", "1", "--json"];
     let out = tokio::time::timeout(RUN_LIMIT, molt_do(&server, workspace.path(), data.path(), &args).output())
         .await
         .expect("molt do hung")
@@ -773,7 +939,8 @@ async fn ctrl_c_stops_molt_do_and_the_commands_it_started() {
     let server = fake_api(Fake::Hangs(pidfile.clone())).await;
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
-    let mut cmd = molt_do(&server, workspace.path(), data.path(), &["--check", CHECK, "--attempts", "1"]);
+    let mut cmd =
+        molt_do(&server, workspace.path(), data.path(), &["--check", CHECK, "--attempts", "1", "--no-sandbox"]);
     // A process group of its own, as a terminal gives a command, so the
     // signal below reaches molt and its services but not this test.
     cmd.process_group(0);
@@ -801,7 +968,9 @@ async fn sigterm_and_sighup_stop_molt_do_like_ctrl_c() {
         let workspace = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let child =
-            molt_do(&server, workspace.path(), data.path(), &["--check", CHECK, "--attempts", "1"]).spawn().unwrap();
+            molt_do(&server, workspace.path(), data.path(), &["--check", CHECK, "--attempts", "1", "--no-sandbox"])
+                .spawn()
+                .unwrap();
         let molt = child.id().unwrap() as i32;
         let pid = tokio::time::timeout(RUN_LIMIT, wait_for_pid(&pidfile)).await.expect("the command never started");
 
@@ -904,4 +1073,73 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
         assert!(err.contains(args[0]), "{err}");
     }
     assert!(std::fs::read_dir(data.path()).unwrap().next().is_none(), "nothing was started");
+}
+
+/// What the interface does with a task in its default mode, on one session:
+/// design the check and show it, run with the check as accepted, keep the
+/// result for the user to look at, apply it, learn, then list and forget
+/// what was learned.
+#[tokio::test]
+async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
+    use molt::session::Session;
+
+    let server = fake_api(Fake::DesignsThenGreets).await;
+    let setup = Setup::new(&server);
+    let workspace = setup.workspace.path().canonicalize().unwrap();
+    let (events, mut progress) = tokio::sync::mpsc::unbounded_channel();
+    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    assert_eq!(session.memory_problem(), None);
+    assert!(session.versions().iter().any(|(name, v)| name == "planner" && v.len() == 8), "{:?}", session.versions());
+    let trace = molt_proto::TraceId::random();
+    let mut req = setup.request(None, 2);
+    req.apply = false;
+
+    let design = tokio::time::timeout(RUN_LIMIT, session.design(&req, &trace)).await.unwrap().unwrap();
+    assert_eq!(design.command.as_deref(), Some("sh check.sh"));
+    assert_eq!(design.files.len(), 1);
+    assert_eq!(
+        (design.files[0].path.as_str(), design.files[0].content.as_str()),
+        ("check.sh", "grep -q hello greeting.txt\n")
+    );
+    assert_eq!(design.rationale, "Greets.");
+    let baseline = design.baseline.as_ref().expect("the check ran on the workspace as it is");
+    assert!(!baseline.passed, "{baseline:?}");
+    assert!(design.cost_usd > 0.0);
+    // Nothing in the workspace yet: the designer worked in a fork.
+    assert_eq!(setup.files(), ["README.txt"]);
+
+    req.check = design.command.clone();
+    req.check_files = design.files.clone();
+    let resp = tokio::time::timeout(RUN_LIMIT, session.run(&req, &trace)).await.unwrap().unwrap();
+    assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
+    assert_eq!(
+        resp.check,
+        Some(CheckSpec { command: "sh check.sh".into(), files: vec!["check.sh".into()], designed: true })
+    );
+    assert!(!resp.applied);
+    // Only the run's own designer: the accepted check was not designed again.
+    assert_eq!(bodies(&server).await.iter().filter(|b| offers_submit_check(b)).count(), 2);
+    assert_eq!(setup.files(), ["README.txt"], "nothing is applied before the user says so");
+    let fork = resp.fork.clone().expect("the result is kept for the user");
+    session.apply(&fork).await.unwrap();
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    assert_eq!(setup.file("check.sh").as_deref(), Some(format!("{CHECK}\n").as_str()));
+
+    let mut seen = Vec::new();
+    while let Ok(event) = progress.try_recv() {
+        seen.push(event);
+    }
+    assert!(seen.iter().all(|e| e.run() == trace.as_str()), "{seen:#?}");
+    assert!(seen.iter().any(|e| matches!(e, Progress::CheckReady { designed: true, .. })), "{seen:#?}");
+
+    let learned = session.learn(&trace).await.unwrap();
+    assert_eq!(learned.added.len(), 1, "{learned:#?}");
+    let notes = session.notes("").await.unwrap();
+    assert_eq!(notes.iter().map(|r| r.note.text.as_str()).collect::<Vec<_>>(), [LEARNED_TEXT]);
+    assert!(session.forget(&notes[0].note.id, "the check moved").await.unwrap());
+    assert!(session.notes("").await.unwrap().is_empty());
+
+    session.shutdown(&[]).await;
+    assert_requests_valid(&server).await;
+    setup.assert_forks_dropped();
 }

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use molt_api::fs::ChangeKind;
 use molt_api::model::{tool_result, user_blocks, user_text, ToolUse, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{SubmitCheck, SUBMIT_CHECK};
+use molt_api::planner::Baseline;
 use molt_proto::RemoteError;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -20,12 +21,18 @@ use crate::tools::{self, Actor};
 /// The designer's turn limit. The run's `max_turns` counts an attempt's
 /// turns; a small one must not starve the designer.
 const MAX_TURNS: u32 = 25;
+/// Bytes of the baseline check's output kept.
+const BASELINE_TAIL: usize = 2000;
 
 pub(crate) enum Design {
     Check {
         command: String,
         /// Path and full contents of each file the check depends on.
         files: Vec<(String, String)>,
+        rationale: String,
+        /// The check run once in the designer's fork, before any work:
+        /// only when asked for, and `None` when it could not be run.
+        baseline: Option<Baseline>,
     },
     /// No automated check fits the task: the designer submitted none.
     Unverified(String),
@@ -34,18 +41,46 @@ pub(crate) enum Design {
     Failed(String),
 }
 
-/// Design the done-check. Errors only when the workspace cannot be forked.
-pub(crate) async fn design(ctx: &Arc<Ctx>) -> Result<Design, RemoteError> {
+/// Design the done-check, and with `baseline` run it once on the workspace
+/// as it is. Errors only when the workspace cannot be forked.
+pub(crate) async fn design(ctx: &Arc<Ctx>, baseline: bool) -> Result<Design, RemoteError> {
     let fork = ctx.fork().await?;
-    let design = work(ctx, &fork).await;
+    let mut design = work(ctx, &fork).await;
+    if let (true, Design::Check { command, files, baseline, .. }) = (baseline, &mut design) {
+        *baseline = run_baseline(ctx, &fork, command, files).await;
+    }
     ctx.drop_fork(&fork).await;
     Ok(design)
+}
+
+/// The check run in the designer's fork with its files as submitted (the
+/// designer may have edited them after writing them) and the rest of the
+/// project untouched by any attempt.
+async fn run_baseline(ctx: &Arc<Ctx>, fork: &str, command: &str, files: &[(String, String)]) -> Option<Baseline> {
+    for (path, content) in files {
+        if let Err(e) = ctx.write(fork, path, content).await {
+            tracing::warn!(run = %ctx.trace, path, error = %e, "could not restore a check file for the baseline");
+            return None;
+        }
+    }
+    let timeout_ms = u64::try_from(ctx.cfg.check_timeout.as_millis()).unwrap_or(u64::MAX);
+    match tools::run_command(ctx, fork, command, timeout_ms).await {
+        Ok(ran) => Some(Baseline {
+            passed: ran.success(),
+            exit_code: ran.exit_code,
+            tail: prompts::output_tail(&ran, BASELINE_TAIL),
+        }),
+        Err(e) => {
+            tracing::warn!(run = %ctx.trace, error = %e, "could not run the baseline check");
+            None
+        }
+    }
 }
 
 async fn work(ctx: &Arc<Ctx>, fork: &str) -> Design {
     let tools = Arc::new(prompts::designer_tools(ctx.memory.up));
     let first = prompts::designer_first_message(&ctx.task, ctx.memory.context.as_deref());
-    let mut conv = Conversation::new(prompts::DESIGNER_SYSTEM, tools, first);
+    let mut conv = Conversation::new(prompts::DESIGNER_SYSTEM, tools, first, None);
     let mut meter = Meter::default();
     let never = CancellationToken::new();
     let mut nudged = false;
@@ -146,5 +181,5 @@ async fn submitted(ctx: &Ctx, fork: &str, call: &ToolUse) -> Result<Design, Stri
         })?;
         files.push((path.to_owned(), content));
     }
-    Ok(Design::Check { command, files })
+    Ok(Design::Check { command, files, rationale: submit.rationale, baseline: None })
 }

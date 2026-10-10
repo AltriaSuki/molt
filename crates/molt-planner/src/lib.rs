@@ -18,10 +18,11 @@ use std::time::Duration;
 
 use anyhow::{ensure, Context};
 use async_trait::async_trait;
-use molt_api::planner::{RunRequest, RunResponse};
+use molt_api::planner::{DesignResponse, RunRequest, RunResponse};
 use molt_proto::{Budget, Envelope, ErrorCode, RemoteError, Target, TraceId};
 use molt_sdk::{CallOpts, SdkError, Service};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 /// Planner settings. [`Config::from_env`] documents the variables.
 #[derive(Clone, Debug)]
@@ -127,6 +128,18 @@ impl Config {
 pub trait Bus: Send + Sync + 'static {
     /// Call `target` (e.g. `fs.read`) and wait for the reply payload.
     async fn call(&self, target: &str, payload: Value, budget: Budget, trace: &TraceId) -> Result<Value, RemoteError>;
+    /// Implementations may propagate cancellation; providers without support
+    /// can return a late result, whose usage is still counted exactly once.
+    async fn call_cancellable(
+        &self,
+        target: &str,
+        payload: Value,
+        budget: Budget,
+        trace: &TraceId,
+        _cancel: &CancellationToken,
+    ) -> Result<Value, RemoteError> {
+        self.call(target, payload, budget, trace).await
+    }
     /// Publish an event; failures are ignored.
     async fn publish(&self, topic: &str, payload: Value);
 }
@@ -144,10 +157,54 @@ impl Bus for ServiceBus {
         })
     }
 
+    async fn call_cancellable(
+        &self,
+        target: &str,
+        payload: Value,
+        budget: Budget,
+        trace: &TraceId,
+        cancel: &CancellationToken,
+    ) -> Result<Value, RemoteError> {
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        let opts = CallOpts { cap: None, budget, trace: Some(trace.clone()) };
+        let pending = self.0.request(target, payload, opts).await.map_err(sdk_error)?;
+        let id = pending.id().clone();
+        let wait = pending.wait();
+        tokio::pin!(wait);
+        tokio::select! {
+            biased;
+            result = &mut wait => result.map_err(sdk_error),
+            _ = cancel.cancelled() => {
+                // Dropping the wait sends kernel.cancel, but keep it alive here
+                // to accept a completion that raced cancellation and its usage.
+                let _ = tokio::time::timeout(Duration::from_secs(1), self.0.kernel("cancel", None, serde_json::json!({"request": id}))).await;
+                match tokio::time::timeout(Duration::from_secs(2), &mut wait).await {
+                    Ok(result) => result.map_err(sdk_error),
+                    Err(_) => Err(cancelled()),
+                }
+            }
+        }
+    }
+
     async fn publish(&self, topic: &str, payload: Value) {
         if let Err(e) = self.0.publish(topic, payload).await {
             tracing::debug!(topic, error = %e, "could not publish an event");
         }
+    }
+}
+
+fn cancelled() -> RemoteError {
+    RemoteError {
+        code: ErrorCode::Cancelled,
+        message: "local call stopped; remote cancellation and settlement are unknown".into(),
+    }
+}
+fn sdk_error(error: SdkError) -> RemoteError {
+    match error {
+        SdkError::Remote(e) => e,
+        e => RemoteError { code: ErrorCode::Unavailable, message: e.to_string() },
     }
 }
 
@@ -162,32 +219,60 @@ pub async fn run(
     runner::run(bus, cfg, req, trace).await
 }
 
-/// Serve `planner.run` on `svc` until its link closes.
+/// Design the done-check for a run without starting it (`planner.design`).
+pub async fn design(
+    bus: Arc<dyn Bus>,
+    cfg: Arc<Config>,
+    req: RunRequest,
+    trace: TraceId,
+) -> Result<DesignResponse, RemoteError> {
+    runner::design(bus, cfg, req, trace).await
+}
+
+/// Serve `planner.run` and `planner.design` on `svc` until its link closes.
 pub async fn serve(svc: Arc<Service>, cfg: Config) {
     let max_in_flight = cfg.max_concurrent_runs;
     let cfg = Arc::new(cfg);
     let bus: Arc<dyn Bus> = Arc::new(ServiceBus(svc.clone()));
-    svc.serve_concurrent(max_in_flight, move |req| {
+    svc.serve_cancellable(max_in_flight, move |req, cancel| {
         let (bus, cfg) = (bus.clone(), cfg.clone());
-        async move { handle(bus, cfg, req).await }
+        async move { handle_cancellable(bus, cfg, req, cancel).await }
     })
     .await;
 }
 
+#[cfg(test)]
 async fn handle(bus: Arc<dyn Bus>, cfg: Arc<Config>, req: Envelope) -> Result<Value, RemoteError> {
+    handle_cancellable(bus, cfg, req, CancellationToken::new()).await
+}
+
+async fn handle_cancellable(
+    bus: Arc<dyn Bus>,
+    cfg: Arc<Config>,
+    req: Envelope,
+    cancel: CancellationToken,
+) -> Result<Value, RemoteError> {
     let method = match &req.to {
         Target::Method { method, .. } => method.as_str(),
         _ => "",
     };
+    let request = |payload: Value| -> Result<RunRequest, RemoteError> {
+        serde_json::from_value(payload).map_err(|e| RemoteError {
+            code: ErrorCode::Invalid,
+            message: format!("bad planner.{method} request: {e}"),
+        })
+    };
+    let encode = |response: Result<Value, serde_json::Error>| {
+        response.map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("encoding the response: {e}") })
+    };
     match method {
         "run" => {
-            let request: RunRequest = serde_json::from_value(req.payload).map_err(|e| RemoteError {
-                code: ErrorCode::Invalid,
-                message: format!("bad planner.run request: {e}"),
-            })?;
-            let response = run(bus, cfg, request, req.trace_id).await?;
-            serde_json::to_value(response)
-                .map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("encoding the response: {e}") })
+            let response = runner::run_cancellable(bus, cfg, request(req.payload)?, req.trace_id, cancel).await?;
+            encode(serde_json::to_value(response))
+        }
+        "design" => {
+            let response = runner::design_cancellable(bus, cfg, request(req.payload)?, req.trace_id, cancel).await?;
+            encode(serde_json::to_value(response))
         }
         other => Err(RemoteError { code: ErrorCode::Invalid, message: format!("no method {other:?}") }),
     }
@@ -297,6 +382,14 @@ mod tests {
         let bad = json!({ "task": "t", "workspace": "/w", "attempts": 9 });
         let err = handle(bus.clone(), cfg.clone(), envelope("planner.run", bad)).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Invalid);
+
+        // planner.design designs: a check given, or verify off, leaves it nothing to do.
+        for given in [json!({ "check": "true" }), json!({ "verify": false })] {
+            let mut payload = json!({ "task": "t", "workspace": "/w" });
+            payload.as_object_mut().unwrap().extend(given.as_object().unwrap().clone());
+            let err = handle(bus.clone(), cfg.clone(), envelope("planner.design", payload)).await.unwrap_err();
+            assert_eq!(err.code, ErrorCode::Invalid, "{}", err.message);
+        }
 
         // A valid request reaches the bus; the fork fails because nothing serves `fs`.
         let ok = json!({ "task": "t", "workspace": "/w" });

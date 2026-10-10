@@ -21,6 +21,11 @@ use crate::fs::Change;
 use crate::model::{Effort, Usage};
 
 pub const RUN: &str = "planner.run";
+/// Design the done-check for a task without running it, so a person can
+/// look at it first. Takes a [`RunRequest`] (only the task, workspace,
+/// model, effort and budget matter) and answers a [`DesignResponse`]; a
+/// `planner.run` with its command and files then skips the design.
+pub const DESIGN: &str = "planner.design";
 
 fn two() -> u32 {
     2
@@ -30,20 +35,28 @@ fn yes() -> bool {
     true
 }
 
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunRequest {
     pub task: String,
     /// The directory to work on (inside the `fs` and `shell` services' root).
     pub workspace: String,
     /// Done-check command. `None`: the planner designs one first, unless
-    /// `no_check` is set.
+    /// `verify` is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<String>,
-    /// Run without a done-check: no check is designed, one attempt does the
-    /// task and its result is returned unverified. Cannot be combined with
-    /// `check`.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub no_check: bool,
+    /// Files `check` depends on, as `planner.design` returned them: written
+    /// into every attempt's fork and restored before each check run. Only
+    /// with `check`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub check_files: Vec<CheckFile>,
+    /// False: run without a done-check, one attempt, result unverified. Only
+    /// without `check`.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub verify: bool,
     /// Parallel attempts, 1 to 8.
     #[serde(default = "two")]
     pub attempts: u32,
@@ -69,6 +82,9 @@ pub struct RunRequest {
     /// fork is kept and its path returned.
     #[serde(default = "yes")]
     pub apply: bool,
+    /// Publish model text previews while calls are in flight.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream: bool,
 }
 
 impl RunRequest {
@@ -77,7 +93,8 @@ impl RunRequest {
             task: task.into(),
             workspace: workspace.into(),
             check: None,
-            no_check: false,
+            check_files: Vec::new(),
+            verify: true,
             attempts: two(),
             model: None,
             effort: None,
@@ -85,6 +102,7 @@ impl RunRequest {
             max_check_rounds: None,
             budget_usd: None,
             apply: true,
+            stream: false,
         }
     }
 }
@@ -112,6 +130,45 @@ pub struct CheckSpec {
     pub designed: bool,
 }
 
+/// A file a done-check depends on, with its full contents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckFile {
+    pub path: String,
+    pub content: String,
+}
+
+/// How the designed check did on the workspace as it is, before any work.
+/// A check that already passes cannot tell a finished task from an
+/// unfinished one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Baseline {
+    pub passed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The end of its output.
+    #[serde(default)]
+    pub tail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DesignResponse {
+    /// The check command; `None` when no automated check fits the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The files the designer wrote for the check.
+    #[serde(default)]
+    pub files: Vec<CheckFile>,
+    /// Why the designer settled on this check, or on none.
+    #[serde(default)]
+    pub rationale: String,
+    /// The check run once on the workspace as it is. `None` without a
+    /// check, or when it could not be run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<Baseline>,
+    pub usage: Usage,
+    pub cost_usd: f64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptStatus {
@@ -132,6 +189,7 @@ pub struct AttemptReport {
     pub turns: u32,
     pub check_runs: u32,
     pub usage: Usage,
+    /// Known cost subtotal; see uncounted_calls for incomplete settlement.
     pub cost_usd: f64,
     /// Why it ended: the tail of the last failed check, an error, or empty.
     #[serde(default)]
@@ -162,9 +220,10 @@ pub struct RunResponse {
     pub attempts: Vec<AttemptReport>,
     /// Totals over the designer and every attempt.
     pub usage: Usage,
+    /// Known cost subtotal; see uncounted_calls for incomplete settlement.
     pub cost_usd: f64,
-    /// Model calls of cancelled attempts still unanswered when the run
-    /// ended. They are billed but not in `usage` or `cost_usd`.
+    /// Calls still pending, failed without usage, or returned without a known
+    /// price. cost_usd is only a subtotal when this is nonzero.
     #[serde(default)]
     pub uncounted_calls: u32,
 }
@@ -273,7 +332,9 @@ mod tests {
         assert_eq!(req, RunRequest::new("t", "/w"));
         assert_eq!(req.attempts, 2);
         assert!(req.apply);
-        assert!(!req.no_check);
-        assert!(!serde_json::to_string(&req).unwrap().contains("no_check"));
+        assert!(req.verify);
+        // Requests from callers that know neither field stay as they were.
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(wire.get("verify").is_none() && wire.get("check_files").is_none(), "{wire}");
     }
 }
