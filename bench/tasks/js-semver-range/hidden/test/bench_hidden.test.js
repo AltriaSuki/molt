@@ -1,7 +1,15 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { SemVer, parse, satisfies, maxSatisfying, minSatisfying } from '../src/index.js';
+import {
+  SemVer,
+  parse,
+  satisfies,
+  maxSatisfying,
+  minSatisfying,
+  filterSatisfying,
+} from '../src/index.js';
+import { run } from '../src/cli.js';
 
 // [version, range, expected]
 const TABLE = {
@@ -239,6 +247,9 @@ const TABLE = {
     ['1.2.3-alpha', '>=1.2.3-beta <1.2.3', false],
     ['1.2.3-beta', '>=1.2.3-alpha >=1.0.0', true],
     ['1.2.3-beta', '1.x || 1.2.3-alpha', false],
+    ['2.0.0-rc.1', '>=1.0.0 || 2.0.0-rc.5', false],
+    ['1.2.3-beta', '<1.2.3 || >1.2.3-rc.1', false],
+    ['1.2.3-rc.2', '<1.2.3 || >1.2.3-rc.1', true],
     ['1.2.3-beta', '1.x || >=1.2.3-alpha <1.2.4', true],
     ['1.2.3-beta', '>=1.2.3-alpha <1.2.4 || 2.x', true],
     ['1.2.3-beta.4', '~1.2.3-beta.2', true],
@@ -406,5 +417,48 @@ describe('maxSatisfying / minSatisfying', () => {
   it('throw TypeError for an invalid range', () => {
     assert.throws(() => maxSatisfying(['1.0.0'], '>=1.0.0 <'), TypeError);
     assert.throws(() => minSatisfying(['1.0.0'], 'banana'), TypeError);
+  });
+});
+
+describe('filterSatisfying', () => {
+  it('keeps the matching entries in their original order', () => {
+    const list = ['2.0.0', '1.2.3-rc.1', 'v1.2.3', 'nightly', '1.2.10', '1.3.0', '1.2.3-rc.2'];
+    assert.deepEqual(filterSatisfying(list, '~1.2'), ['v1.2.3', '1.2.10']);
+    assert.deepEqual(filterSatisfying(list, '~1.2.3-rc.2'), ['v1.2.3', '1.2.10', '1.2.3-rc.2']);
+    assert.deepEqual(filterSatisfying(list, '>=1.2.3-rc.0 <1.2.3 || >=2'), ['2.0.0', '1.2.3-rc.1', '1.2.3-rc.2']);
+  });
+});
+
+function exec(...argv) {
+  let out = '';
+  let err = '';
+  const code = run(argv, { out: (s) => (out += s), err: (s) => (err += s) });
+  return { code, out, err };
+}
+
+describe('pkgver cli with ranges', () => {
+  it('satisfies prints the answer and exits 0 or 1', () => {
+    assert.deepEqual(exec('satisfies', '1.4.0', '^1.2'), { code: 0, out: 'true\n', err: '' });
+    assert.deepEqual(exec('satisfies', '1.4.0-rc.1', '^1.2'), { code: 1, out: 'false\n', err: '' });
+  });
+
+  it('satisfies reports an invalid range or version and exits 2', () => {
+    assert.deepEqual(exec('satisfies', '1.2.3', '>=1.2.3 <'), {
+      code: 2,
+      out: '',
+      err: 'pkgver: Invalid range: >=1.2.3 <\n',
+    });
+    const r = exec('satisfies', '1.2', '*');
+    assert.equal(r.code, 2);
+    assert.equal(r.out, '');
+    assert.match(r.err, /^pkgver: Invalid version/);
+  });
+
+  it('max and min pick from the listed versions', () => {
+    const list = ['1.2.3', '1.2.4', '1.3.0-beta.1', '1.3.0', '2.0.0'];
+    assert.deepEqual(exec('max', '1.2.3 - 1.3', ...list), { code: 0, out: '1.3.0\n', err: '' });
+    assert.deepEqual(exec('min', '>1.2', ...list), { code: 0, out: '1.3.0\n', err: '' });
+    assert.deepEqual(exec('max', '~1.2.3', ...list), { code: 0, out: '1.2.4\n', err: '' });
+    assert.deepEqual(exec('max', '^3', ...list), { code: 1, out: '', err: '' });
   });
 });

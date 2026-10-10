@@ -13,7 +13,7 @@ use anyhow::{bail, ensure, Context};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, AgentRun, Arm, Job};
+use crate::agent::{Agent, AgentRun, Arm, ErrorKind, Job};
 use crate::grade::{self, Grade};
 use crate::record::{Record, Results, Setup, FORMAT};
 use crate::task::{self, Task};
@@ -123,8 +123,11 @@ pub enum Stop {
         left: usize,
     },
     Interrupted,
-    /// Several runs in a row failed before reaching the model.
+    /// Several runs in a row failed before reaching the model, or on its API.
     Failing(String),
+    /// A run made model calls the gateway has no price for, so no budget
+    /// can hold the benchmark back.
+    CostUnknown(String),
 }
 
 /// How a benchmark went.
@@ -204,17 +207,22 @@ pub async fn run(
             Finished::Recorded(record) => {
                 file.append(&record)?;
                 recorded += 1;
-                failing = if record.error.is_some() && record.model_calls == 0 { failing + 1 } else { 0 };
-                if failing >= FAILING_IN_A_ROW && stop.is_none() {
-                    let why = record.error.clone().unwrap_or_default();
-                    stop = Some(Stop::Failing(why));
+                let broken =
+                    record.error.is_some() && (record.model_calls == 0 || record.error_kind == Some(ErrorKind::Api));
+                failing = if broken { failing + 1 } else { 0 };
+                let why = || record.error.clone().unwrap_or_default();
+                if record.unpriced_calls > 0 && stop.is_none() {
+                    stop = Some(Stop::CostUnknown(why()));
+                    cancel.cancel();
+                } else if failing >= FAILING_IN_A_ROW && stop.is_none() {
+                    stop = Some(Stop::Failing(why()));
                 }
                 on(Event::Finished { record, n: recorded, of, spent_usd: spent });
             }
             Finished::Dropped { task, arm, trial, cost_usd } => on(Event::Dropped { task, arm, trial, cost_usd }),
         }
     }
-    if cancel.is_cancelled() {
+    if cancel.is_cancelled() && stop.is_none() {
         stop = Some(Stop::Interrupted);
     }
     Ok(Summary { total, done_before, recorded, spent_usd: spent, stop })
@@ -261,7 +269,7 @@ pub fn already_done(plan: &Plan, settings: &Settings, records: &[Record]) -> any
             }
         }
         let key = (r.task.clone(), r.arm.clone(), r.trial);
-        if settings.retry_errors && r.error.is_some() {
+        if settings.retry_errors && r.retryable() {
             // A later record of the same run replaces this one.
             done.remove(&key);
         } else {
@@ -333,16 +341,18 @@ impl One {
             fs::create_dir_all(&logs).with_context(|| format!("creating {}", logs.display()))?;
             let tmp = tempfile::Builder::new().prefix("mb-").tempdir_in(&self.scratch)?;
             task::copy_tree(&self.task.repo(), &tmp.path().join("w"))?;
+            fs::create_dir(tmp.path().join("h"))?;
             Ok(tmp)
         })();
         let tmp = match prepared {
             Ok(tmp) => tmp,
             Err(e) => {
-                let run = AgentRun { error: Some(format!("preparing the run: {e:#}")), ..AgentRun::default() };
+                let mut run = AgentRun::default();
+                run.set_error(ErrorKind::Harness, format!("preparing the run: {e:#}"));
                 return Finished::Recorded(Box::new(self.record(started_ms, 0, run, Grade::ungraded(String::new()))));
             }
         };
-        let (workspace, data_dir) = (tmp.path().join("w"), tmp.path().join("d"));
+        let (workspace, data_dir, home) = (tmp.path().join("w"), tmp.path().join("d"), tmp.path().join("h"));
 
         let clock = Instant::now();
         let job = Job {
@@ -350,6 +360,7 @@ impl One {
             arm: &self.arm,
             workspace: &workspace,
             data_dir: &data_dir,
+            home: &home,
             logs: &logs,
             budget_usd: self.settings.setup.task_usd,
             timeout: std::time::Duration::from_secs(self.settings.setup.timeout_s),
@@ -371,7 +382,7 @@ impl One {
         let grade = match grade::grade(&self.task, &workspace).await {
             Ok(grade) => grade,
             Err(e) => {
-                run.error.get_or_insert_with(|| format!("grading: {e:#}"));
+                run.set_error(ErrorKind::Harness, format!("grading: {e:#}"));
                 Grade::ungraded(format!("{e:#}"))
             }
         };
@@ -408,29 +419,45 @@ impl One {
             turns: run.turns,
             attempts: run.attempts,
             uncounted_calls: run.uncounted_calls,
+            unpriced_calls: run.unpriced_calls,
             exit_code: run.exit_code,
             signal: run.signal,
             timed_out: run.timed_out,
             outcome: run.outcome,
             applied: run.applied,
             error: run.error,
+            error_kind: run.error_kind,
             grade,
         }
     }
 }
 
 /// Keep what the run changed, as a unified diff of the starting repo and
-/// the workspace, before the grade lays the hidden files over it. Best
-/// effort: no diff is kept when `diff` is missing.
+/// the workspace, before the grade lays the hidden files over it. Links are
+/// compared as links, not followed. Best effort: no diff is kept when
+/// `diff` is missing.
 async fn save_diff(repo: &Path, workspace: &Path, to: &Path) {
+    use tokio::io::AsyncReadExt;
     let mut cmd = tokio::process::Command::new("diff");
-    cmd.arg("-ruN");
+    cmd.args(["-ruN", "--no-dereference"]);
     for skipped in task::SKIPPED {
         cmd.arg(format!("--exclude={skipped}"));
     }
-    cmd.arg(repo).arg(workspace).stdin(std::process::Stdio::null()).kill_on_drop(true);
-    let Ok(Ok(out)) = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await else { return };
-    let mut diff = out.stdout;
+    cmd.arg(repo)
+        .arg(workspace)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let Ok(mut child) = cmd.spawn() else { return };
+    let Some(stdout) = child.stdout.take() else { return };
+    // Read no more than is kept; the rest is not even buffered.
+    let mut diff = Vec::new();
+    let mut stdout = stdout.take(DIFF_KEPT as u64 + 1);
+    let read = stdout.read_to_end(&mut diff);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(60), read).await;
+    let _ = child.start_kill();
+    let _ = child.wait().await;
     if diff.len() > DIFF_KEPT {
         diff.truncate(DIFF_KEPT);
         diff.extend_from_slice(b"\n[... the rest of the diff is not kept ...]\n");
@@ -455,8 +482,9 @@ mod tests {
     use crate::testing::task_dir;
 
     /// Does each run as its arm says: `solve` writes the answer, `skip`
-    /// does nothing, `boom` fails before reaching the model, `wait` waits
-    /// to be interrupted. Every run costs `cost`.
+    /// does nothing, `boom` fails before reaching the model, `crash` fails
+    /// after reaching it, `unpriced` makes calls without a price, `wait`
+    /// waits to be interrupted. Every run costs `cost`.
     struct Fake {
         cost: f64,
         started: Mutex<Vec<(String, String)>>,
@@ -486,7 +514,14 @@ mod tests {
                 "solve" => fs::write(job.workspace.join("hello.txt"), "hi\n").unwrap(),
                 "skip" => {}
                 "boom" => {
-                    return AgentRun { error: Some("no API key".into()), exit_code: Some(1), ..AgentRun::default() }
+                    let mut run = AgentRun { exit_code: Some(1), ..AgentRun::default() };
+                    run.set_error(ErrorKind::Api, "no API key".into());
+                    return run;
+                }
+                "crash" => run.set_error(ErrorKind::Agent, "molt panicked".into()),
+                "unpriced" => {
+                    run.unpriced_calls = 2;
+                    run.set_error(ErrorKind::Harness, "2 model calls had no price".into());
                 }
                 "wait" => {
                     job.cancel.cancelled().await;
@@ -620,6 +655,30 @@ mod tests {
         bench.settings.retry_errors = true;
         let (summary, _) = bench.run(Fake::new(0.0)).await.unwrap();
         assert_eq!((summary.done_before, summary.recorded), (0, 3));
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_crashes_is_charged_with_it() {
+        let mut bench = Bench::new(&["py-a", "py-b", "py-c", "py-d"], &["crash"], 1);
+        let (summary, _) = bench.run(Fake::new(0.1)).await.unwrap();
+        // It reached the model, so the benchmark goes on.
+        assert_eq!((summary.recorded, summary.stop), (4, None));
+        let records = record::load(&bench.results()).unwrap();
+        assert!(records.iter().all(|r| r.error_kind == Some(ErrorKind::Agent) && !r.passed && !r.retryable()));
+
+        // A crash is the agent's failure, not one to run again.
+        bench.settings.retry_errors = true;
+        let (summary, _) = bench.run(Fake::new(0.1)).await.unwrap();
+        assert_eq!((summary.done_before, summary.recorded), (4, 0));
+    }
+
+    #[tokio::test]
+    async fn a_run_of_unknown_cost_stops_the_benchmark() {
+        let mut bench = Bench::new(&["py-a", "py-b", "py-c"], &["unpriced"], 1);
+        bench.settings.jobs = 2;
+        let (summary, _) = bench.run(Fake::new(0.0)).await.unwrap();
+        assert!(matches!(summary.stop, Some(Stop::CostUnknown(_))), "{summary:?}");
+        assert!(summary.recorded < 3, "{summary:?}");
     }
 
     #[tokio::test]

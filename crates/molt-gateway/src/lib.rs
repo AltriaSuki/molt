@@ -143,6 +143,13 @@ pub fn resolve_model(name: &str) -> String {
     .to_owned()
 }
 
+/// Whether the gateway knows what `model` (an alias or a model id) costs.
+/// Calls to a model it has no price for report no cost, so no spending
+/// limit holds them back.
+pub fn has_price(model: &str) -> bool {
+    profile::profile(&resolve_model(model)).prices.is_some()
+}
+
 pub struct Gateway {
     cfg: Config,
     api: api::Api,

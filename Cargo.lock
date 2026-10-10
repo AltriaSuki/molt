@@ -1299,6 +1299,7 @@ dependencies = [
  "hex",
  "libc",
  "molt-api",
+ "molt-gateway",
  "molt-kernel",
  "serde",
  "serde_json",

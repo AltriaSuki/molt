@@ -16,7 +16,9 @@ pub struct Report {
     /// Records counted: the last one of each run, as a retried run has several.
     pub runs: usize,
     pub tasks: usize,
-    pub setup: Option<Setup>,
+    /// The setups of the runs counted. More than one means the runs were
+    /// not all made the same way, such as by different builds of molt.
+    pub setups: Vec<Setup>,
     pub molt_versions: Vec<String>,
     pub git_commits: Vec<String>,
     pub arms: Vec<ArmStats>,
@@ -52,6 +54,11 @@ pub struct ArmStats {
     /// Everything the arm spent over the runs it solved.
     pub cost_per_solve_usd: Option<f64>,
     pub mean_model_calls: Option<f64>,
+    /// Records of earlier tries of runs that were run again, such as after
+    /// an API outage; they are not counted above.
+    pub superseded: u32,
+    /// What those earlier tries spent, which is not in `total_cost_usd`.
+    pub superseded_cost_usd: f64,
 }
 
 /// Two arms on the same (task, trial) runs.
@@ -114,6 +121,7 @@ pub fn latest(records: &[Record]) -> Vec<&Record> {
 }
 
 pub fn report(records: &[Record]) -> Report {
+    let all = records;
     let records = latest(records);
     let mut arm_names: Vec<&str> =
         records.iter().map(|r| r.arm.as_str()).collect::<BTreeSet<_>>().into_iter().collect();
@@ -121,7 +129,16 @@ pub fn report(records: &[Record]) -> Report {
     arm_names.sort_by_key(|a| (*a != "molt", *a != "plain", *a));
     let of = |arm: &str| -> Vec<&Record> { records.iter().copied().filter(|r| r.arm == arm).collect() };
 
-    let arms = arm_names.iter().map(|&a| arm_stats(a, &of(a))).collect();
+    let arms = arm_names
+        .iter()
+        .map(|&a| {
+            let mut stats = arm_stats(a, &of(a));
+            let tries: Vec<&Record> = all.iter().filter(|r| r.arm == a).collect();
+            stats.superseded = tries.len() as u32 - stats.runs;
+            stats.superseded_cost_usd = (tries.iter().map(|r| r.cost_usd).sum::<f64>() - stats.total_cost_usd).max(0.0);
+            stats
+        })
+        .collect();
 
     let mut pairs = Vec::new();
     for (i, &a) in arm_names.iter().enumerate() {
@@ -179,10 +196,16 @@ pub fn report(records: &[Record]) -> Report {
     let set = |f: fn(&Record) -> Option<String>| -> Vec<String> {
         records.iter().filter_map(|r| f(r)).collect::<BTreeSet<_>>().into_iter().collect()
     };
+    let mut setups: Vec<Setup> = Vec::new();
+    for r in &records {
+        if !setups.contains(&r.setup) {
+            setups.push(r.setup.clone());
+        }
+    }
     Report {
         runs: records.len(),
         tasks: by_task.len(),
-        setup: records.first().map(|r| r.setup.clone()),
+        setups,
         molt_versions: set(|r| Some(r.molt_version.clone())),
         git_commits: set(|r| r.git_commit.clone()),
         arms,
@@ -224,6 +247,8 @@ fn arm_stats(arm: &str, rs: &[&Record]) -> ArmStats {
         median_cost_usd: median(&costs),
         cost_per_solve_usd: (passed > 0).then(|| total_cost / f64::from(passed)),
         mean_model_calls: mean(&rs.iter().map(|r| f64::from(r.model_calls)).collect::<Vec<_>>()),
+        superseded: 0,
+        superseded_cost_usd: 0.0,
     }
 }
 
@@ -273,7 +298,7 @@ pub fn markdown(r: &Report) -> String {
         return out;
     }
     let _ = write!(out, "{} runs of {} tasks", r.runs, r.tasks);
-    if let Some(s) = &r.setup {
+    if let [s] = &r.setups[..] {
         let _ = write!(
             out,
             "; model {}, effort {}, max turns {}, ${} and {} per run",
@@ -285,6 +310,14 @@ pub fn markdown(r: &Report) -> String {
         );
     }
     let _ = writeln!(out, ".");
+    if r.setups.len() > 1 {
+        let _ = writeln!(
+            out,
+            "**These runs were made {} different ways** (build of molt, model, limits or variables), so they \
+             do not compare as one experiment. Give each setup its own results file.",
+            r.setups.len()
+        );
+    }
     let _ = writeln!(
         out,
         "Molt {}{}.\n",
@@ -324,6 +357,16 @@ pub fn markdown(r: &Report) -> String {
     for a in &r.arms {
         let args = if a.args.is_empty() { "the defaults".to_owned() } else { format!("`{}`", a.args.join(" ")) };
         let _ = writeln!(out, "- {}: `molt do` with {args}", a.arm);
+    }
+    let (superseded, cost) = r.arms.iter().fold((0, 0.0), |(n, c), a| (n + a.superseded, c + a.superseded_cost_usd));
+    if superseded > 0 {
+        let _ = writeln!(
+            out,
+            "\n{} run again, as after an API error; only the last try counts above. The earlier tries \
+             spent {} more.",
+            if superseded == 1 { "1 run was".to_owned() } else { format!("{superseded} runs were") },
+            usd(cost)
+        );
     }
 
     if !r.pairs.is_empty() {
@@ -399,7 +442,7 @@ fn usd(x: f64) -> String {
     format!("${x:.2}")
 }
 
-fn duration(s: f64) -> String {
+pub(crate) fn duration(s: f64) -> String {
     let s = s.round() as u64;
     match s {
         0..60 => format!("{s}s"),
@@ -445,7 +488,7 @@ mod tests {
         records.insert(0, retried);
 
         let r = report(&records);
-        assert_eq!((r.runs, r.tasks), (7, 4));
+        assert_eq!((r.runs, r.tasks, r.setups.len()), (7, 4, 1));
         assert_eq!(r.arms.iter().map(|a| a.arm.as_str()).collect::<Vec<_>>(), ["molt", "plain"]);
         let molt = &r.arms[0];
         assert_eq!((molt.runs, molt.passed, molt.errors), (4, 3, 0));
@@ -453,6 +496,8 @@ mod tests {
         assert_eq!(molt.median_time_s, Some(210.0));
         assert!((molt.total_cost_usd - 4.3).abs() < 1e-9);
         assert!((molt.cost_per_solve_usd.unwrap() - 4.3 / 3.0).abs() < 1e-9);
+        assert_eq!(molt.superseded, 1);
+        assert!((molt.superseded_cost_usd - 9.0).abs() < 1e-9);
         let plain = &r.arms[1];
         assert_eq!((plain.passed, plain.claimed_done, plain.false_done), (1, 2, 1));
 
@@ -472,7 +517,18 @@ mod tests {
         assert!(md.contains("molt against plain on 3 paired runs: both solved 1, only molt 1, only plain 0"), "{md}");
         assert!(md.contains("| py-d (dev) | 1/1 · 30s · $0.50 | – |"), "{md}");
         assert!(md.contains("2m 00s against 1m 00s"), "{md}");
+        assert!(md.contains("1 run was run again"), "{md}");
         assert!(serde_json::to_value(&r).unwrap()["arms"][0]["passed"] == 3);
+    }
+
+    #[test]
+    fn runs_of_different_setups_are_flagged() {
+        let a = run("py-a", "molt", 0, true, 60, 0.2);
+        let mut b = run("py-b", "molt", 0, true, 60, 0.2);
+        b.setup.molt_build = "b2".into();
+        let r = report(&[a, b]);
+        assert_eq!(r.setups.len(), 2);
+        assert!(markdown(&r).contains("made 2 different ways"));
     }
 
     #[test]

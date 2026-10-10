@@ -1,0 +1,12 @@
+[package]
+name = "ringbuf"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.80"
+description = "A fixed-capacity ring buffer and a moving average built on it"
+publish = false
+
+[dependencies]
+
+# Standalone crate: keep cargo from looking for an enclosing workspace.
+[workspace]

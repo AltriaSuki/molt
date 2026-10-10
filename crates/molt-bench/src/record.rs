@@ -10,6 +10,7 @@ use molt_api::model::Usage;
 use molt_api::planner::Outcome;
 use serde::{Deserialize, Serialize};
 
+use crate::agent::ErrorKind;
 use crate::grade::Grade;
 use crate::task::{Difficulty, Kind, Language, Split};
 
@@ -20,6 +21,9 @@ pub const FORMAT: u32 = 1;
 /// file has the same.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Setup {
+    /// Identifies the molt executable and the services beside it
+    /// ([`crate::agent::build_id`]), so results of different builds are never pooled.
+    pub molt_build: String,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub max_turns: Option<u32>,
@@ -27,8 +31,8 @@ pub struct Setup {
     pub task_usd: f64,
     /// Each run's time limit.
     pub timeout_s: u64,
-    /// Variables set for every run, as `NAME=VALUE`, with values that look
-    /// secret left out.
+    /// Variables set for every run, as `NAME=VALUE`. Variables whose names
+    /// look secret are left out, and passwords in URLs are redacted.
     pub env: Vec<String>,
 }
 
@@ -66,39 +70,46 @@ pub struct Record {
     pub turns: u32,
     pub attempts: u32,
     pub uncounted_calls: u32,
+    /// Model calls with no price, whose cost is not in `cost_usd`.
+    #[serde(default)]
+    pub unpriced_calls: u32,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
     pub timed_out: bool,
     pub outcome: Option<Outcome>,
     pub applied: Option<bool>,
+    /// Why the run has no result of the agent's own, when it has none.
     pub error: Option<String>,
+    #[serde(default)]
+    pub error_kind: Option<ErrorKind>,
     pub grade: Grade,
 }
 
 impl Record {
-    /// Whether the run ended without the agent's own result: it failed to
-    /// start, crashed, was stopped at the time limit, or printed nothing.
-    pub fn errored(&self) -> bool {
-        self.error.is_some() || self.timed_out
+    /// Whether the run's error says nothing about the agent, so it may be
+    /// run again ([`ErrorKind::retryable`]).
+    pub fn retryable(&self) -> bool {
+        self.error.is_some() && self.error_kind.is_some_and(ErrorKind::retryable)
     }
 }
 
 /// Read every record in `path`. A last line cut off mid-write is ignored;
 /// any other line that does not parse is an error.
 pub fn load(path: &Path) -> anyhow::Result<Vec<Record>> {
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(parse(path, &text)?.0)
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(parse(path, &bytes)?.0)
 }
 
-/// The records; the length of the text to keep, which leaves out a last
-/// line cut off mid-write; and whether that text lacks its final newline.
-fn parse(path: &Path, text: &str) -> anyhow::Result<(Vec<Record>, usize, bool)> {
+/// The records; the length of the bytes to keep, which leaves out a last
+/// line cut off mid-write (even inside a character); and whether those
+/// bytes lack their final newline.
+fn parse(path: &Path, bytes: &[u8]) -> anyhow::Result<(Vec<Record>, usize, bool)> {
     let mut records = Vec::new();
     let mut offset = 0;
-    for (i, line) in text.split_inclusive('\n').enumerate() {
-        let whole = line.ends_with('\n');
-        if !line.trim().is_empty() {
-            match serde_json::from_str::<Record>(line) {
+    for (i, line) in bytes.split_inclusive(|&b| b == b'\n').enumerate() {
+        let whole = line.ends_with(b"\n");
+        if !line.trim_ascii().is_empty() {
+            match serde_json::from_slice::<Record>(line) {
                 Ok(r) if r.format == FORMAT => records.push(r),
                 Ok(r) => {
                     bail!("{}:{}: a record in format {}; this molt reads {FORMAT}", path.display(), i + 1, r.format)
@@ -110,7 +121,7 @@ fn parse(path: &Path, text: &str) -> anyhow::Result<(Vec<Record>, usize, bool)> 
         }
         offset += line.len();
     }
-    Ok((records, offset, !text.is_empty() && !text.ends_with('\n')))
+    Ok((records, offset, !bytes.is_empty() && !bytes.ends_with(b"\n")))
 }
 
 /// A results file open for appending.
@@ -127,18 +138,18 @@ impl Results {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
-        let text = match fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        let (records, keep, unterminated) = parse(path, &text)?;
+        let (records, keep, unterminated) = parse(path, &bytes)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .with_context(|| format!("opening {}", path.display()))?;
-        if keep < text.len() {
+        if keep < bytes.len() {
             file.set_len(keep as u64)?;
         }
         if unterminated {
@@ -175,7 +186,15 @@ pub(crate) mod tests {
             arm: arm.into(),
             arm_args: vec![],
             trial,
-            setup: Setup { model: None, effort: None, max_turns: None, task_usd: 5.0, timeout_s: 1800, env: vec![] },
+            setup: Setup {
+                molt_build: "b1".into(),
+                model: None,
+                effort: None,
+                max_turns: None,
+                task_usd: 5.0,
+                timeout_s: 1800,
+                env: vec![],
+            },
             molt_version: "0.1.0".into(),
             git_commit: None,
             passed,
@@ -188,12 +207,14 @@ pub(crate) mod tests {
             turns: 9,
             attempts: 1,
             uncounted_calls: 0,
+            unpriced_calls: 0,
             exit_code: Some(0),
             signal: None,
             timed_out: false,
             outcome: Some(Outcome::Passed),
             applied: Some(true),
             error: None,
+            error_kind: None,
             grade: Grade {
                 passed,
                 exit_code: Some(if passed { 0 } else { 1 }),
@@ -228,6 +249,24 @@ pub(crate) mod tests {
             all.iter().map(|r| (r.task.as_str(), r.arm.as_str())).collect::<Vec<_>>(),
             [("py-a", "molt"), ("py-a", "plain"), ("py-b", "molt")]
         );
+    }
+
+    #[test]
+    fn a_line_torn_inside_a_character_is_dropped_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.jsonl");
+        let mut r = record("py-a", "molt", 0, true);
+        r.grade.output = "café ✓".repeat(10);
+        let line = serde_json::to_string(&r).unwrap();
+        let cut = line.find('é').unwrap() + 1;
+        let mut bytes = format!("{line}\n").into_bytes();
+        bytes.extend_from_slice(&line.as_bytes()[..cut]);
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(load(&path).unwrap().len(), 1);
+        let (mut results, old) = Results::open(&path).unwrap();
+        assert_eq!(old.len(), 1);
+        results.append(&r).unwrap();
+        assert_eq!(load(&path).unwrap().len(), 2);
     }
 
     #[test]

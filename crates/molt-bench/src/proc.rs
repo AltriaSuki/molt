@@ -1,5 +1,6 @@
-//! Running a task's test commands: with bash, in a clean environment, in a
-//! process group of their own that is killed when they finish or time out.
+//! Running a task's test commands: with bash, in a clean environment and an
+//! empty home directory of their own, in a process group of their own that
+//! is killed when they finish or time out.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -18,8 +19,32 @@ const KEEP: usize = 16 * 1024;
 /// process that left its group, before they are abandoned.
 const GRACE: Duration = Duration::from_secs(2);
 
-/// Set for every command, over whatever the environment says.
+/// Variables a command gets from the benchmark's own environment, when they
+/// are set there: where programs are, whose they are, the locale and
+/// toolchain roots. Proxies, `PYTHONPATH`, virtualenvs and the like are not
+/// passed, so a check runs the same on any machine and reaches no network.
+const PASSED_ENV: &[&str] = &[
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "TZ",
+    "TMPDIR",
+    "GOROOT",
+    "JAVA_HOME",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+];
+
+/// Set for every command, over whatever the environment says. Python does
+/// not read the user's site-packages or write bytecode next to the code.
 const FIXED_ENV: &[(&str, &str)] = &[
+    ("PYTHONNOUSERSITE", "1"),
+    ("PYTHONDONTWRITEBYTECODE", "1"),
     ("CI", "1"),
     ("TERM", "dumb"),
     ("NO_COLOR", "1"),
@@ -55,22 +80,57 @@ impl Ran {
     }
 }
 
-/// The variables a test command gets: the ones Molt's services may see
-/// (`PATH`, `HOME`, the locale, toolchain locations and the like) when they
-/// are set here, and [`FIXED_ENV`]. API keys and anything else are left out.
-pub fn clean_env() -> BTreeMap<String, String> {
-    let mut env: BTreeMap<String, String> = molt_kernel::supervisor::BASELINE_ENV
-        .iter()
-        .filter_map(|name| std::env::var(name).ok().map(|value| (name.to_string(), value)))
-        .collect();
+/// Variables that make `home` a process's home directory, with the caches
+/// and settings toolchains keep there (Cargo's, Go's, the XDG ones), so
+/// nothing it writes there reaches another run. Rustup's toolchains are
+/// still found where they are installed.
+pub fn home_env(home: &Path) -> Vec<(String, String)> {
+    let at = |rel: &str| home.join(rel).display().to_string();
+    let mut env: Vec<(String, String)> = [
+        ("HOME", home.display().to_string()),
+        ("XDG_CACHE_HOME", at(".cache")),
+        ("XDG_CONFIG_HOME", at(".config")),
+        ("XDG_DATA_HOME", at(".local/share")),
+        ("XDG_STATE_HOME", at(".local/state")),
+        ("CARGO_HOME", at(".cargo")),
+        ("GOPATH", at("go")),
+        ("GOCACHE", at(".cache/go-build")),
+        ("GOMODCACHE", at("go/pkg/mod")),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect();
+    if let Some(rustup) = rustup_home() {
+        env.push(("RUSTUP_HOME".into(), rustup.display().to_string()));
+    }
+    env
+}
+
+/// Where rustup keeps its toolchains, when it is installed.
+fn rustup_home() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("RUSTUP_HOME").filter(|d| !d.is_empty()) {
+        return Some(dir.into());
+    }
+    let dir = Path::new(&std::env::var_os("HOME")?).join(".rustup");
+    dir.is_dir().then_some(dir)
+}
+
+/// The variables a test command gets: [`PASSED_ENV`] as set here, an empty
+/// home directory `home` ([`home_env`]), and [`FIXED_ENV`]. API keys and
+/// anything else are left out.
+pub fn clean_env(home: &Path) -> BTreeMap<String, String> {
+    let mut env: BTreeMap<String, String> =
+        PASSED_ENV.iter().filter_map(|name| std::env::var(name).ok().map(|value| (name.to_string(), value))).collect();
+    env.extend(home_env(home));
     env.extend(FIXED_ENV.iter().map(|(k, v)| (k.to_string(), v.to_string())));
     env
 }
 
-/// Run `command` with `bash -c` in `dir` with [`clean_env`] and no stdin.
-/// The command and everything it starts are killed at `timeout`, and when
-/// the command itself exits.
+/// Run `command` with `bash -c` in `dir` with [`clean_env`], a new empty
+/// home directory, and no stdin. The command and everything it starts are
+/// killed at `timeout`, and when the command itself exits.
 pub async fn shell(dir: &Path, command: &str, timeout: Duration) -> io::Result<Ran> {
+    let home = tempfile::Builder::new().prefix("molt-bench-home-").tempdir()?;
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
         .arg(command)
@@ -80,7 +140,7 @@ pub async fn shell(dir: &Path, command: &str, timeout: Duration) -> io::Result<R
         .stderr(Stdio::piped())
         .process_group(0)
         .env_clear()
-        .envs(clean_env())
+        .envs(clean_env(home.path()))
         .kill_on_drop(true);
     let started = Instant::now();
     let mut child = cmd.spawn()?;
@@ -205,9 +265,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // The test process has variables that must not reach a check.
         std::env::set_var("MOLT_BENCH_SECRET_PROBE", "leaked");
+        std::env::set_var("PYTHONPATH", "/somewhere");
         let ran = shell(
             dir.path(),
-            "echo \"[$MOLT_BENCH_SECRET_PROBE]\" \"$CI\" \"$PWD\"; echo oops >&2; exit 3",
+            "echo \"[$MOLT_BENCH_SECRET_PROBE$PYTHONPATH]\" \"$CI\" \"$PWD\"; echo oops >&2; exit 3",
             Duration::from_secs(10),
         )
         .await
@@ -216,6 +277,17 @@ mod tests {
         let pwd = dir.path().canonicalize().unwrap();
         assert_eq!(ran.output, format!("[] 1 {}\noops\n", pwd.display()));
         assert_eq!(ran.ending(), "exit code 3");
+
+        // Each command has an empty home of its own, which is gone after it.
+        let home = "test -z \"$(ls -A \"$HOME\")\" && touch \"$HOME/mark\" && echo \"$HOME|$CARGO_HOME|$GOCACHE|$PYTHONNOUSERSITE\"";
+        let first = shell(dir.path(), home, Duration::from_secs(10)).await.unwrap();
+        let second = shell(dir.path(), home, Duration::from_secs(10)).await.unwrap();
+        assert!(first.success() && second.success(), "{first:?} {second:?}");
+        let parts: Vec<&str> = first.output.trim().split('|').collect();
+        assert_eq!(parts[1], format!("{}/.cargo", parts[0]));
+        assert_eq!(parts[3], "1");
+        assert_ne!(first.output, second.output);
+        assert!(!Path::new(parts[0]).exists());
     }
 
     #[tokio::test]

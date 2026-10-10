@@ -1,0 +1,64 @@
+title = "Fix operator precedence and error positions in the calc parser, and add %"
+language = "rust"
+kind = "bugfix"
+difficulty = "medium"
+split = "dev"
+tests = "cargo test --offline --quiet --lib --test lexer --test parser --test eval --test cli"
+check = "cargo test --offline --quiet --lib --test lexer --test parser --test eval --test cli --test bench_hidden"
+timeout_s = 120
+prompt = """
+The `calc` crate gets several expressions wrong, and the README already
+documents the behaviour we actually want. What people have reported:
+
+- `-2^2` evaluates to `4`. It should be `-4`.
+- `2^3^2` evaluates to `64`. It should be `512` (`^` is right-associative).
+- `10 - 2 - 3` evaluates to `11` and `100 / 10 / 5` to `50`: these operators
+  are grouping to the right. They should give `5` and `2`.
+- Syntax errors point at the wrong place. `1 + * 2` reports
+  `UnexpectedToken { pos: 5, found: "*" }`, so the CLI's caret lands one
+  column to the right of the `*`. It should be `pos: 4`.
+
+While you're in there, please also add a `%` (remainder) operator. Details for
+all of it:
+
+**Precedence**, loosest to tightest:
+
+1. binary `+` `-`, left-associative
+2. binary `*` `/` `%`, left-associative
+3. prefix (unary) `-` and `+` (they can repeat: `--x`)
+4. `^`, right-associative
+
+So `a - b - c` is `(a - b) - c`, `a / b * c` is `(a / b) * c`, and
+`a ^ b ^ c` is `a ^ (b ^ c)`. Unary signs bind tighter than `*` `/` `%` (`-a * b`
+is `(-a) * b`) but looser than `^`: a leading sign applies to the whole power,
+so `-a^b` is `-(a^b)` and `-2^2` is `-4`; parentheses still win (`(-2)^2` is
+`4`). The right operand of `^` may itself start with signs, and is read at the
+unary level: `a^-b` is `a^(-b)` (`2^-1` is `0.5`), `a^-b^c` is `a^(-(b^c))`, and
+`a^-b * c` is `(a^(-b)) * c`. The `Display` of `calc::parse`'s result is fully
+parenthesised and should show these groupings, e.g. `-x ^ 2` displays as
+`(-(x ^ 2))`, `a - b - c` as `((a - b) - c)` and `x ^ -y` as `(x ^ (-y))`.
+
+**`%`**: the lexer produces a new `TokenKind::Percent` for `%`, and the AST
+gets a new `BinOp::Rem` whose `symbol()` is `"%"` (so `parse("a % b")`
+displays as `(a % b)` and `parse("7 % 2")` equals
+`Expr::binary(BinOp::Rem, Expr::Number(7.0), Expr::Number(2.0))`). The value
+is Rust's `%` on `f64`: the result has the sign of the left operand, so
+`7 % 3` is `1`, `-7 % 3` is `-1`, `7 % -3` is `1` and `7.5 % 2` is `1.5`.
+Like `/`, a right operand equal to zero is an error,
+`CalcError::DivisionByZero`, not NaN.
+
+**Error positions**: keep `CalcError` as it is. In
+`CalcError::UnexpectedToken { pos, found }`, `pos` must be the 0-based byte
+offset where the offending token starts and `found` its source text, e.g.
+`foo bar` gives `{ pos: 4, found: "bar" }` and `π π` gives
+`{ pos: 3, found: "π" }` (`π` is two bytes). That holds for `parse`,
+`parse_statement`, `eval` and `run` alike. Input that ends too early is still
+`CalcError::UnexpectedEnd`, unknown names are still
+`CalcError::UnknownVariable(name)`, and the lexer's `UnexpectedChar` /
+`InvalidNumber` positions are already right. The CLI prints its caret from
+`err.pos()`, so it should be right once the library is.
+
+The rest of the public API stays as it is. Run the tests with:
+
+    cargo test --offline --lib --test lexer --test parser --test eval --test cli
+"""

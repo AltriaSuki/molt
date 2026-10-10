@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{bail, ensure};
+use anyhow::{bail, ensure, Context};
 use async_trait::async_trait;
 use molt_api::model::Usage;
 use molt_api::planner::{Outcome, RunResponse};
@@ -17,6 +17,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
+use crate::proc;
 use crate::task::Task;
 
 /// How long `molt do` gets to stop cleanly after SIGTERM before it is killed.
@@ -81,12 +82,37 @@ pub struct Job<'a> {
     pub workspace: &'a Path,
     /// A fresh directory for the agent's own state, outside the workspace.
     pub data_dir: &'a Path,
+    /// An empty directory to be the agent's home, so that what one run
+    /// installs or configures there never reaches another.
+    pub home: &'a Path,
     /// Where to keep what the run printed.
     pub logs: &'a Path,
     pub budget_usd: f64,
     pub timeout: Duration,
     /// Fired when the whole benchmark is interrupted: stop and return.
     pub cancel: CancellationToken,
+}
+
+/// Whose failure an error was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    /// Molt's: it crashed, printed no result, or sent the model a request the
+    /// API refused as invalid.
+    Agent,
+    /// The model API's: unreachable, overloaded past the retries, refusing
+    /// the key, or out of credit. The run says nothing about the agent.
+    Api,
+    /// The benchmark's: it could not prepare or grade the run.
+    Harness,
+}
+
+impl ErrorKind {
+    /// Whether the run says nothing about the agent, so that running it
+    /// again (`--retry-errors`) is fair to every arm.
+    pub fn retryable(self) -> bool {
+        matches!(self, ErrorKind::Api | ErrorKind::Harness)
+    }
 }
 
 /// What an agent reported about a run, before grading.
@@ -113,8 +139,12 @@ pub struct AgentRun {
     pub attempts: u32,
     /// Model calls billed whose cost never arrived.
     pub uncounted_calls: u32,
-    /// Why the run gave no result, when it did not.
+    /// Model calls answered for a model the gateway has no price for, so
+    /// their cost is not in `cost_usd` and no budget held them back.
+    pub unpriced_calls: u32,
+    /// Why the run gave no result of the agent's own, when it did not.
     pub error: Option<String>,
+    pub error_kind: Option<ErrorKind>,
 }
 
 impl AgentRun {
@@ -166,6 +196,35 @@ impl Molt {
     }
 }
 
+/// A short hash of the `molt` executable and the agent services beside it
+/// (`molt-*`), which `molt do` starts: the build that was benchmarked.
+pub fn build_id(exe: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    let mut files = vec![exe.to_owned()];
+    if let Some(dir) = exe.parent() {
+        let mut services: Vec<PathBuf> = fs::read_dir(dir)?
+            .filter_map(Result::ok)
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.starts_with("molt-") && !name.contains('.')
+            })
+            .filter(|e| e.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+            .map(|e| e.path())
+            .collect();
+        services.sort();
+        files.extend(services);
+    }
+    let mut hash = Sha256::new();
+    for file in &files {
+        let mut f = fs::File::open(file).with_context(|| format!("reading {}", file.display()))?;
+        hash.update(file.file_name().unwrap_or_default().as_encoded_bytes());
+        hash.update([0]);
+        std::io::copy(&mut f, &mut hash)?;
+    }
+    Ok(hex::encode(&hash.finalize()[..8]))
+}
+
 #[async_trait]
 impl Agent for Molt {
     async fn run(&self, job: Job<'_>) -> AgentRun {
@@ -176,13 +235,41 @@ impl Agent for Molt {
             Err(e) => return failed(format!("could not create {}: {e}", stderr_path.display())),
         };
         let mut cmd = Command::new(&self.exe);
-        cmd.args(self.args(&job)).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(stderr).kill_on_drop(true);
+        cmd.args(self.args(&job))
+            .current_dir(job.home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            // Ctrl-C at the terminal reaches the benchmark, which stops its runs itself.
+            .process_group(0)
+            .kill_on_drop(true);
         for (name, _) in std::env::vars_os() {
             if name.to_string_lossy().starts_with("MOLT_") {
                 cmd.env_remove(name);
             }
         }
         cmd.envs(self.env.iter().map(|(k, v)| (k, v)));
+        cmd.envs(proc::home_env(job.home));
+        #[cfg(target_os = "linux")]
+        {
+            let bench = std::process::id() as libc::pid_t;
+            // SAFETY: only async-signal-safe calls (prctl, getppid, _exit) run between fork and exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    // A benchmark killed outright must not leave molt spending: it gets SIGTERM, which
+                    // stops its services. Linux sends it when the spawning thread exits; spawns run on
+                    // the runtime's long-lived threads.
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // The benchmark died before the signal was armed.
+                    if libc::getppid() != bench {
+                        libc::_exit(1);
+                    }
+                    Ok(())
+                });
+            }
+        }
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => return failed(format!("could not start {}: {e}", self.exe.display())),
@@ -205,13 +292,15 @@ impl Agent for Molt {
                 stop(&mut child).await
             }
         };
+        // A run that ended as the benchmark was interrupted may have ended because of it.
+        run.interrupted |= job.cancel.is_cancelled();
         match status {
             Ok(status) => {
                 use std::os::unix::process::ExitStatusExt;
                 run.exit_code = status.code();
                 run.signal = status.signal();
             }
-            Err(e) => run.error = Some(format!("waiting for molt: {e}")),
+            Err(e) => run.set_error(ErrorKind::Harness, format!("waiting for molt: {e}")),
         }
         let out = reader.await.unwrap_or_default();
         if !out.is_empty() {
@@ -227,10 +316,14 @@ impl Agent for Molt {
                 run.uncounted_calls = resp.uncounted_calls;
                 run.attempts = resp.attempts.len() as u32;
                 run.turns = resp.attempts.iter().map(|a| a.turns).sum();
+                if let Some((kind, why)) = model_failure(&resp) {
+                    run.set_error(kind, why);
+                }
             }
             // A run stopped by the benchmark says so in its own fields.
             Err(_) if run.error.is_none() && !run.timed_out && !run.interrupted => {
-                run.error = Some(last_line(&stderr_path).unwrap_or_else(|| "molt printed no result".to_owned()));
+                let why = last_line(&stderr_path).unwrap_or_else(|| "molt printed no result".to_owned());
+                run.set_error(ErrorKind::Agent, why);
             }
             Err(_) => {}
         }
@@ -240,10 +333,17 @@ impl Agent for Molt {
         let audit = job.data_dir.join("audit.jsonl");
         if let Some(spent) = spent(&audit) {
             run.model_calls = spent.calls;
+            run.unpriced_calls = spent.unpriced;
             if run.reported_cost_usd.is_none_or(|r| spent.cost_usd > r) {
                 run.cost_usd = spent.cost_usd;
                 run.usage = spent.usage;
             }
+        }
+        if run.unpriced_calls > 0 {
+            let why = format!("{} model calls had no price, so the run's cost is unknown", run.unpriced_calls);
+            run.set_error(ErrorKind::Harness, why);
+        } else if run.model_calls == 0 && run.outcome == Some(Outcome::Failed) {
+            run.set_error(ErrorKind::Api, "no model call was answered".to_owned());
         }
         if self.keep_audit && audit.exists() {
             let _ = fs::copy(&audit, job.logs.join("audit.jsonl"));
@@ -252,8 +352,34 @@ impl Agent for Molt {
     }
 }
 
+impl AgentRun {
+    /// Record why the run has no result of the agent's own, unless an
+    /// earlier reason was recorded.
+    pub fn set_error(&mut self, kind: ErrorKind, why: String) {
+        if self.error.is_none() {
+            self.error = Some(why);
+            self.error_kind = Some(kind);
+        }
+    }
+}
+
 fn failed(error: String) -> AgentRun {
-    AgentRun { error: Some(error), ..AgentRun::default() }
+    AgentRun { error: Some(error), error_kind: Some(ErrorKind::Harness), ..AgentRun::default() }
+}
+
+/// A failed run's failed model call: an API failure, or, when the API
+/// refused the request as invalid, the agent's. `None` when the run failed
+/// for reasons of its own, or did not fail.
+fn model_failure(resp: &RunResponse) -> Option<(ErrorKind, String)> {
+    if resp.outcome != Outcome::Failed {
+        return None;
+    }
+    let notes = std::iter::once(resp.summary.as_str()).chain(resp.attempts.iter().map(|a| a.note.as_str()));
+    let failed = notes.filter_map(|n| n.find("model call failed").map(|i| &n[i..])).next()?;
+    let invalid = ["returned 400", "returned 404", "returned 413", "returned 422"].iter().any(|c| failed.contains(c));
+    // An account out of credit gets a 400 too.
+    let kind = if invalid && !failed.contains("credit") { ErrorKind::Agent } else { ErrorKind::Api };
+    Some((kind, failed.chars().take(300).collect()))
 }
 
 /// Ask `molt do` to stop, which stops its services and drops its forks,
@@ -288,6 +414,8 @@ pub struct Spent {
     pub usage: Usage,
     /// Replies of the model service that carried usage.
     pub calls: u32,
+    /// Of those, the ones without a price.
+    pub unpriced: u32,
 }
 
 /// Sum every reply the model service sent, as the audit log recorded it.
@@ -309,7 +437,10 @@ pub fn spent(audit: &Path) -> Option<Spent> {
         };
         spent.calls += 1;
         spent.usage.add(&usage);
-        spent.cost_usd += payload["cost_usd"].as_f64().unwrap_or(0.0);
+        match payload["cost_usd"].as_f64() {
+            Some(cost) => spent.cost_usd += cost,
+            None => spent.unpriced += 1,
+        }
     }
     Some(spent)
 }
@@ -371,8 +502,37 @@ mod tests {
         fs::write(&path, lines.join("\n")).unwrap();
         let spent = spent(&path).unwrap();
         assert_eq!(spent.calls, 2);
+        assert_eq!(spent.unpriced, 1, "the reply without a price is counted as such");
         assert_eq!(spent.cost_usd, 0.25);
         assert_eq!((spent.usage.input_tokens, spent.usage.output_tokens), (2000, 200));
         assert!(super::spent(&dir.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn a_run_that_failed_on_the_model_api_is_an_error_but_not_one_that_failed_on_its_own() {
+        let resp = |outcome, summary: &str, notes: &[&str]| -> RunResponse {
+            serde_json::from_value(json!({
+                "outcome": outcome, "summary": summary, "changes": [], "patch": "", "applied": false,
+                "usage": {}, "cost_usd": 0.0,
+                "attempts": notes.iter().enumerate().map(|(i, n)| json!({
+                    "index": i, "status": "error", "turns": 1, "check_runs": 0, "usage": {}, "cost_usd": 0.0, "note": n
+                })).collect::<Vec<_>>(),
+            }))
+            .unwrap()
+        };
+        let outage = "model call failed: the Messages API returned 529 overloaded (5 attempts)";
+        let (kind, why) = model_failure(&resp("failed", "No attempt passed.", &["ran out of turns", outage])).unwrap();
+        assert_eq!(kind, ErrorKind::Api);
+        assert!(why.starts_with("model call failed: the Messages API returned 529"), "{why}");
+        let designer = "Could not design a done-check: model call failed: could not reach the Messages API: refused.";
+        assert_eq!(model_failure(&resp("failed", designer, &[])).unwrap().0, ErrorKind::Api);
+        let invalid = "model call failed: the Messages API returned 400: prompt is too long";
+        assert_eq!(model_failure(&resp("failed", "", &[invalid])).unwrap().0, ErrorKind::Agent);
+        let broke = "model call failed: the Messages API returned 400: your credit balance is too low";
+        assert_eq!(model_failure(&resp("failed", "", &[broke])).unwrap().0, ErrorKind::Api);
+        // Failing on its own, or passing despite one attempt's outage, is no error.
+        assert!(model_failure(&resp("failed", "No attempt passed.", &["ran out of turns"])).is_none());
+        assert!(model_failure(&resp("passed", "Done.", &[outage])).is_none());
+        assert!(ErrorKind::Api.retryable() && ErrorKind::Harness.retryable() && !ErrorKind::Agent.retryable());
     }
 }

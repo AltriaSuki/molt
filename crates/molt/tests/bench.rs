@@ -142,7 +142,9 @@ async fn both_arms_run_every_task_and_the_report_compares_them() {
         assert!(!r.passed && r.claimed_done, "{r:#?}");
         assert!(r.grade.output.is_empty() && r.grade.exit_code == Some(1), "{r:#?}");
     }
-    assert!(records.iter().all(|r| r.setup.env.contains(&"ANTHROPIC_API_KEY=<redacted>".to_owned())));
+    // The key is left out of the results; the rest of the setup is kept.
+    assert!(records.iter().all(|r| r.setup.env == [format!("ANTHROPIC_BASE_URL={}", server.uri())]));
+    assert!(records.iter().all(|r| r.setup.molt_build.len() == 16));
     let logs = root.path().join("out/results.logs/py-hi/molt-0");
     assert!(std::fs::read_to_string(logs.join("changes.diff")).unwrap().contains("+hi"));
     assert!(logs.join("molt.json").exists() && logs.join("stderr.log").exists());

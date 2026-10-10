@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 molt-api.workspace = true
+molt-gateway.workspace = true
 molt-kernel.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true

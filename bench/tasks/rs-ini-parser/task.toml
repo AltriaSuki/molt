@@ -1,0 +1,117 @@
+title = "Turn iniconf's line splitter into a real INI parser"
+language = "rust"
+kind = "feature"
+difficulty = "hard"
+split = "dev"
+tests = "cargo test --offline --quiet --lib --test parse --test config"
+check = "cargo test --offline --quiet --lib --test parse --test config --test bench_hidden"
+timeout_s = 120
+prompt = '''
+`iniconf::parse` is barely a parser right now: it understands `[section]` and
+`key=value` lines and silently drops everything else, so a typo in a config
+file just makes a setting vanish, and a commented-out `# port = 80` turns into
+a key called `# port`. Please make it a real INI parser that reports bad
+input, and give `Ini` a few more accessors. The rules:
+
+**Lines.** The input is split into lines, numbered from 1, and each line is
+trimmed of surrounding whitespace (so `\r\n` line endings work). Empty lines
+and lines whose first character is `;` or `#` are comments and are skipped.
+
+**Section headers.** A line starting with `[` is a section header. The
+section name is the text between the `[` and the *first* `]`, trimmed. It is
+an `ErrorKind::BadSection` error if there is no `]`, if the name is empty
+(`[]`, `[   ]`), or if anything other than whitespace and an optional comment
+(text starting with `;` or `#`) follows that `]`: `[db] ; primary`, `[db]#x`
+and `[db] ; [old]` (section `db`) are fine; `[db] x`, `[db]]` and `[db] = 1`
+are not. Entries that come before the first header belong to the section
+`""`. A header naming a section that already appeared continues that section.
+
+**Entries.** Every other line is an entry `key = value`. The key is
+everything before the first `=`, trimmed (`url = http://h/?a=b` has the value
+`http://h/?a=b`). A line with no `=` is `ErrorKind::MissingEquals`, and an
+empty key (`= 1`) is `ErrorKind::EmptyKey`. If a key appears more than once in
+a section, the last value wins.
+
+**Unquoted values.** The value is the text after the first `=`, trimmed. The
+first `;` or `#` that has whitespace immediately before it in the line starts
+an inline comment running to the end of the line, which is dropped along
+with the whitespace before it: `port = 80 ; http` and `port = 80 # http`
+give `80` (a tab before the `;` or `#` counts as whitespace too), and
+`a = ; nothing` gives the empty string. A `;` or `#` without whitespace right
+before it is part of the value: `color=#fff` is `#fff`, `a = x;y` is `x;y`,
+`a =;x` is `;x`. Apart from that, unquoted values are literal: backslashes
+and double quotes are kept exactly as written (`path = C:\new` is `C:\new`,
+`say = he said "hi"` is `he said "hi"`).
+
+**Quoted values.** If the value, after the whitespace following the `=`,
+starts with `"`, it is quoted. It runs to the next unescaped `"`, and
+everything in between is kept as is, including leading and trailing spaces,
+`;` and `#` (`q = "a ; b "` is `a ; b `). Inside the quotes, `\"`, `\\`, `\n`
+and `\t` stand for a double quote, a backslash, a newline and a tab; a
+backslash followed by any other character `c` is `ErrorKind::BadEscape(c)`.
+If the line ends before the closing quote (including when it ends right after
+a backslash), that is `ErrorKind::UnterminatedQuote`; a quoted value never
+continues onto the next line. After the closing quote only whitespace and an
+optional comment (starting with `;` or `#`) may follow, so `q = "a" ; note`
+and `q = "a";note` are fine, while `q = "a" b`, `q = "a"b` and `q = "a" "b"`
+are `ErrorKind::TrailingAfterQuote`.
+
+**Case.** Section names and keys are case-insensitive: they are stored
+lowercased (`[Server]` is section `server`, `Port = 1` is key `port`), and
+every `Ini` method that takes a section or key name matches it
+case-insensitively. Values keep their case.
+
+**Errors.** `parse` stops at the first bad line and returns its error.
+Replace the current `ParseError` with these two types, and export `ErrorKind`
+from the crate root next to `ParseError`:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    pub line: usize, // 1-based number of the bad line; blank and comment lines count
+    pub kind: ErrorKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorKind {
+    BadSection,
+    MissingEquals,
+    EmptyKey,
+    BadEscape(char),
+    UnterminatedQuote,
+    TrailingAfterQuote,
+}
+```
+
+`ParseError` implements `std::error::Error`, and its `Display` is
+`line {line}: {description}`, where the description is:
+
+- `BadSection`: `malformed section header`
+- `MissingEquals`: `missing '=' in entry`
+- `EmptyKey`: `empty key`
+- `BadEscape(c)`: `unknown escape '\c'`, e.g. `line 4: unknown escape '\q'`
+- `UnterminatedQuote`: `unterminated quoted value`
+- `TrailingAfterQuote`: `unexpected text after closing quote`
+
+**`Ini`.** Keep `get` and `has_section`, and add `get_as`, `sections` and
+`keys`:
+
+- `get(&self, section: &str, key: &str) -> Option<&str>`: as today.
+- `get_as<T: FromStr>(&self, section: &str, key: &str) -> Option<Result<T, T::Err>>`:
+  `None` when the key is absent, otherwise `Some` of the stored value parsed
+  with `str::parse::<T>`.
+- `sections(&self) -> Vec<&str>`: the (lowercased) section names in the order
+  they first appeared. A header with no entries still counts; the section
+  `""` is listed (it is then always first) only when it has at least one key.
+- `keys(&self, section: &str) -> Vec<&str>`: that section's (lowercased) keys
+  in the order they first appeared; a key that is set again keeps its
+  original place. Empty for a section that doesn't exist.
+- `has_section(&self, section: &str) -> bool`: true exactly when `sections()`
+  lists that name.
+
+The `config` module and its public API must keep working as they do now
+(services load their settings through `Config`; a parse failure there is
+`ConfigError::Parse`). Run the tests with:
+
+    cargo test --offline --lib --test parse --test config
+'''

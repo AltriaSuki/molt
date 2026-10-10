@@ -42,11 +42,30 @@ impl From<Ran> for Grade {
 }
 
 /// Lay the task's hidden files over `workspace`, replacing what the agent
-/// left at those paths, and run the task's check there.
+/// left at those paths, remove the compiled Python it left (which Python
+/// could run in place of the hidden tests' source), and run the task's
+/// check there.
 pub async fn grade(task: &Task, workspace: &Path) -> anyhow::Result<Grade> {
     task::overlay(&task.hidden(), workspace).context("laying the hidden files over the workspace")?;
+    remove_bytecode(workspace).context("removing compiled Python from the workspace")?;
     let ran = proc::shell(workspace, &task.spec.check, task.timeout()).await.context("running the check")?;
     Ok(ran.into())
+}
+
+/// Remove every `__pycache__` directory under `dir`, without following links.
+fn remove_bytecode(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if entry.file_name() == "__pycache__" {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            remove_bytecode(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// One finding of [`validate`].
@@ -208,5 +227,18 @@ mod tests {
         assert_eq!(fs::read_to_string(ws.join("test_bench_hidden.sh")).unwrap(), "grep -q hi hello.txt\n");
         fs::write(ws.join("hello.txt"), "hi\n").unwrap();
         assert!(grade(&task, &ws).await.unwrap().passed);
+    }
+
+    #[tokio::test]
+    async fn compiled_python_the_agent_left_is_removed_before_grading() {
+        let root = tempfile::tempdir().unwrap();
+        let task = Task::load(&task_dir(root.path(), "py-hello")).unwrap();
+        let ws = root.path().join("ws");
+        task::copy_tree(&task.repo(), &ws).unwrap();
+        crate::testing::write(&ws.join("tests/__pycache__/test_bench_hidden.cpython-311.pyc"), "planted");
+        crate::testing::write(&ws.join("__pycache__/x.pyc"), "planted");
+        grade(&task, &ws).await.unwrap();
+        assert!(!ws.join("tests/__pycache__").exists() && !ws.join("__pycache__").exists());
+        assert!(ws.join("README.md").exists());
     }
 }

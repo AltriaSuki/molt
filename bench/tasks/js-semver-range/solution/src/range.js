@@ -58,7 +58,7 @@ class Comparator {
 // Matches every version (still subject to the prerelease rule).
 const ANY = { semver: null, test: () => true, toString: () => '*' };
 // Matches no version at all (">*", "<x").
-const NONE = { semver: null, test: () => false, toString: () => '<0.0.0' };
+const NONE = { semver: null, test: () => false, toString: () => '<0.0.0-0' };
 
 /**
  * Parse a partial version: an optional "v", then one to three parts, each a

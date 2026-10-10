@@ -10,7 +10,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Arm, Job, Molt};
+use crate::agent::{self, Arm, Job, Molt};
 use crate::grade;
 use crate::record::{self, Setup};
 use crate::report;
@@ -19,7 +19,7 @@ use crate::task::{Language, Select, Split, Task};
 
 /// Exit status when a benchmark stopped at its spending limit.
 const STOPPED_AT_BUDGET: u8 = 3;
-/// Names of variables whose values are left out of results.
+/// Variables whose names contain one of these are left out of results.
 const SECRET_NAMES: &[&str] = &["KEY", "TOKEN", "SECRET", "PASSWORD", "AUTH", "CREDENTIAL"];
 
 #[derive(Subcommand)]
@@ -82,11 +82,13 @@ pub struct RunArgs {
     pub logs: Option<PathBuf>,
     /// Spending limit for this invocation, in US dollars. A run starts only
     /// if what was spent, plus --task-usd for it and for each run in flight,
-    /// stays within it.
+    /// stays within it. As each run can pass --task-usd a little, so can the
+    /// invocation pass this.
     #[arg(long, value_parser = usd, required_unless_present = "dry_run")]
     pub max_usd: Option<f64>,
     /// Spending limit of each run, passed to `molt do --budget-usd`. Molt
-    /// checks it before each model call, so a run can pass it by one call.
+    /// checks it before each model call, so a run can pass it by up to one
+    /// call for each of its parallel attempts.
     #[arg(long, default_value_t = 5.0, value_parser = usd)]
     pub task_usd: f64,
     /// Seconds each run may take before it is stopped and counted as failed.
@@ -106,7 +108,7 @@ pub struct RunArgs {
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub max_turns: Option<u32>,
     /// Set this variable for every run, such as ANTHROPIC_BASE_URL=... (repeatable).
-    /// Values of names that look secret are left out of the results.
+    /// Variables whose names look secret are left out of the results.
     #[arg(long = "env", value_name = "NAME=VALUE", value_parser = env_pair)]
     pub env: Vec<(String, String)>,
     /// Where each run's workspace and data dir are made, and removed after.
@@ -208,6 +210,7 @@ async fn run_cmd(args: RunArgs) -> anyhow::Result<ExitCode> {
         Some(p) => p.canonicalize().with_context(|| format!("the molt executable {}", p.display()))?,
         None => std::env::current_exe().context("finding this executable")?,
     };
+    priced(args.model.as_deref(), &plan.arms)?;
     let mut options = Vec::new();
     if let Some(model) = &args.model {
         options.extend(["--model".to_owned(), model.clone()]);
@@ -219,12 +222,13 @@ async fn run_cmd(args: RunArgs) -> anyhow::Result<ExitCode> {
         options.extend(["--max-turns".to_owned(), turns.to_string()]);
     }
     let setup = Setup {
+        molt_build: agent::build_id(&exe).with_context(|| format!("hashing {}", exe.display()))?,
         model: args.model.clone(),
         effort: args.effort.clone(),
         max_turns: args.max_turns,
         task_usd: args.task_usd,
         timeout_s: args.timeout_s,
-        env: args.env.iter().map(|(k, v)| redacted(k, v)).collect(),
+        env: args.env.iter().filter_map(|(k, v)| recorded(k, v)).collect(),
     };
     let logs = args.logs.clone().unwrap_or_else(|| args.results.with_extension("logs"));
     let settings = Settings {
@@ -292,6 +296,10 @@ async fn run_cmd(args: RunArgs) -> anyhow::Result<ExitCode> {
             eprintln!("Stopped: runs keep failing before they reach the model. The last one: {why}");
             ExitCode::FAILURE
         }
+        Some(Stop::CostUnknown(why)) => {
+            eprintln!("Stopped: {why}. Without a price no spending limit holds runs back.");
+            ExitCode::FAILURE
+        }
     })
 }
 
@@ -310,11 +318,11 @@ fn progress(event: Event) {
                 (None, false, false, false) => "failed".to_owned(),
             };
             eprintln!(
-                "[{n}/{of}] {} · {} · trial {}: {verdict} in {}s for ${:.2} (spent ${spent_usd:.2})",
+                "[{n}/{of}] {} · {} · trial {}: {verdict} in {} for ${:.2} (spent ${spent_usd:.2})",
                 r.task,
                 r.arm,
                 r.trial + 1,
-                r.wall_ms / 1000,
+                report::duration(r.wall_ms as f64 / 1000.0),
                 r.cost_usd
             );
         }
@@ -339,7 +347,8 @@ fn dry_run(plan: &Plan, settings: &Settings, results: &Path, molt: &Molt) -> any
         results.display()
     );
     println!(
-        "The {todo} to run could spend up to ${:.2} at ${:.2} each (plus at most one model call each past that).",
+        "The {todo} to run could spend up to ${:.2} at ${:.2} each, plus up to one model call per parallel \
+         attempt past that.",
         todo as f64 * settings.setup.task_usd,
         settings.setup.task_usd
     );
@@ -349,6 +358,7 @@ fn dry_run(plan: &Plan, settings: &Settings, results: &Path, molt: &Molt) -> any
             arm,
             workspace: Path::new("WORKSPACE"),
             data_dir: Path::new("DATA_DIR"),
+            home: Path::new("HOME"),
             logs: Path::new("LOGS"),
             budget_usd: settings.setup.task_usd,
             timeout: std::time::Duration::from_secs(settings.setup.timeout_s),
@@ -394,14 +404,55 @@ fn count(n: usize, what: &str) -> String {
     format!("{n} {what}{}", if n == 1 { "" } else { "s" })
 }
 
-/// `NAME=VALUE`, or `NAME=<redacted>` when the name looks like a secret's.
-fn redacted(name: &str, value: &str) -> String {
+/// How a variable set for every run goes into the results: `NAME=VALUE`
+/// with any password in a URL redacted, or nothing when the name looks like
+/// a secret's. Leaving secrets out also keeps the setup the same however
+/// the key was passed, so a run resumed with the key in the environment
+/// matches one that had it from `--env`.
+fn recorded(name: &str, value: &str) -> Option<String> {
     let upper = name.to_ascii_uppercase();
     if SECRET_NAMES.iter().any(|s| upper.contains(s)) {
-        format!("{name}=<redacted>")
-    } else {
-        format!("{name}={value}")
+        return None;
     }
+    // scheme://user:password@host/... keeps only the scheme and what follows the @.
+    let value = match value.split_once("://") {
+        Some((scheme, rest)) => {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+            match authority.rfind('@') {
+                Some(at) => format!("{scheme}://<redacted>@{}", &rest[at + 1..]),
+                None => value.to_owned(),
+            }
+        }
+        None => value.to_owned(),
+    };
+    Some(format!("{name}={value}"))
+}
+
+/// Refuse a model the gateway has no price for, given for every arm or in
+/// an arm's options: its runs would report no cost, and no spending limit
+/// would hold them back.
+fn priced(model: Option<&str>, arms: &[Arm]) -> anyhow::Result<()> {
+    let mut models: Vec<(String, &str)> = model.map(|m| (m.to_owned(), "--model")).into_iter().collect();
+    for arm in arms {
+        let mut args = arm.args.iter();
+        while let Some(arg) = args.next() {
+            if arg == "--model" {
+                if let Some(m) = args.next() {
+                    models.push((m.clone(), &arm.name));
+                }
+            } else if let Some(m) = arg.strip_prefix("--model=") {
+                models.push((m.to_owned(), &arm.name));
+            }
+        }
+    }
+    for (m, from) in models {
+        ensure!(
+            molt_gateway::has_price(&m),
+            "{from}: molt has no price for the model {m:?}, so its runs' cost would be unknown and no spending \
+             limit would hold them back; use opus, sonnet or haiku"
+        );
+    }
+    Ok(())
 }
 
 /// Seconds since the epoch and the process id: unique enough to tell
@@ -434,9 +485,29 @@ mod tests {
 
     #[test]
     fn secrets_stay_out_of_results() {
-        assert_eq!(redacted("ANTHROPIC_API_KEY", "sk-1"), "ANTHROPIC_API_KEY=<redacted>");
-        assert_eq!(redacted("my_token", "t"), "my_token=<redacted>");
-        assert_eq!(redacted("ANTHROPIC_BASE_URL", "http://x"), "ANTHROPIC_BASE_URL=http://x");
+        assert_eq!(recorded("ANTHROPIC_API_KEY", "sk-1"), None);
+        assert_eq!(recorded("my_token", "t"), None);
+        assert_eq!(
+            recorded("ANTHROPIC_BASE_URL", "http://x:1/v1").as_deref(),
+            Some("ANTHROPIC_BASE_URL=http://x:1/v1")
+        );
+        assert_eq!(
+            recorded("HTTPS_PROXY", "http://me:pw@proxy:8080/").as_deref(),
+            Some("HTTPS_PROXY=http://<redacted>@proxy:8080/")
+        );
+        // An @ past the host is not a password.
+        assert_eq!(recorded("U", "https://h/a@b").as_deref(), Some("U=https://h/a@b"));
+    }
+
+    #[test]
+    fn a_model_without_a_price_is_refused() {
+        let arm = |spec: &str| Arm::parse(spec).unwrap();
+        assert!(priced(Some("opus"), &[arm("molt"), arm("plain")]).is_ok());
+        assert!(priced(Some("claude-sonnet-5-5-20260901"), &[]).is_ok());
+        assert!(priced(Some("gpt-9"), &[]).unwrap_err().to_string().contains("--model"));
+        assert!(priced(None, &[arm("cheap=--model haiku")]).is_ok());
+        let err = priced(None, &[arm("odd=--attempts 1 --model=claude-unknown-1")]).unwrap_err();
+        assert!(err.to_string().starts_with("odd:"), "{err}");
     }
 
     #[test]

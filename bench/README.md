@@ -41,12 +41,19 @@ What the agent is asked to do, written like a ticket from a teammate.
 After an agent finishes, the files under `hidden/` are copied into its
 workspace, replacing whatever is at those paths, and `check` runs in the
 workspace root with `bash -c`. The task passed when the check exits 0
-within `timeout_s`. The agent never sees `hidden/` or `solution/`, and is
-told nothing about the check.
+within `timeout_s`. Python bytecode caches are removed from the workspace
+first. The agent is not given `hidden/` or `solution/` and is told nothing
+about the check; runs are not sandboxed, though, so nothing stops an agent
+that goes looking for them (the main README's Benchmark section lists the
+known limits).
 
-The check runs with a clean environment: `PATH`, `HOME`, the locale, the
-toolchain locations (`CARGO_HOME`, `GOPATH`, `GOCACHE` and the like) and
-`CI=1`, nothing else. It has no network access it can count on.
+The check runs with a clean environment: `PATH`, the user, shell, locale
+and time zone, `TMPDIR`, the toolchain roots (`GOROOT`, `JAVA_HOME`,
+`RUSTUP_HOME`), the certificate locations, `CI=1`, and settings that keep
+Python off the user's site packages and from writing bytecode. Its `HOME`
+is a new empty directory, with `CARGO_HOME`, `GOPATH`, `GOCACHE` and the
+XDG directories inside it. API keys and everything else are left out. It
+has no network access it can count on.
 
 ### Rules for a task
 
@@ -100,10 +107,13 @@ results recorded before the change are not mixed with results after it.
 ## What a run records
 
 One JSON line per run in the results file, with the task, its hash, split
-and kind, the arm and its options, the trial, the setup (model, effort,
-turns, budget, time limit), whether the hidden tests passed, whether the
+and kind, the arm and its options, the trial, the setup (a hash of the molt
+build, model, effort, turns, budget, time limit, and the variables passed
+with `--env`, except secrets), whether the hidden tests passed, whether the
 agent said it was done, wall time, cost and tokens, model calls, Molt's
-verdict, and the end of the check's output. Beside the results file, a
+verdict, any error and whose it was (the agent's, the model API's or the
+benchmark's), and the end of the check's output. A results file resumes
+only with the same setup, so runs of different builds are never pooled. Beside the results file, a
 `.logs` directory keeps each run's stderr, Molt's JSON result, its changes
 as a diff, and the check's output (`--keep-audit` adds the audit log, which
 has every model call).
