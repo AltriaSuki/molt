@@ -117,13 +117,4 @@ impl Progress {
             _ => None,
         }
     }
-
-    pub fn model_call(&self) -> Option<&ModelCall> {
-        match self {
-            Self::ModelStarted { context } | Self::ModelText { context, .. } | Self::ModelFinished { context, .. } => {
-                Some(context)
-            }
-            _ => None,
-        }
-    }
 }
