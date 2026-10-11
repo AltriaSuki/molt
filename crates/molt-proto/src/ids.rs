@@ -106,13 +106,16 @@ random_id!(
 /// What a message is addressed to.
 ///
 /// Text forms: `memory.recall` (one method), `tools.*` (every method of a
-/// service) and `topic:audit` (a publish/subscribe topic).
+/// service), `topic:publish:audit`, `topic:subscribe:audit`, and the legacy
+/// `topic:audit` (both rights). Events themselves still target `topic:audit`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum Target {
     Method { service: ServiceId, method: String },
     AnyMethod { service: ServiceId },
     Topic { name: String },
+    TopicPublish { name: String },
+    TopicSubscribe { name: String },
 }
 
 impl Target {
@@ -124,7 +127,7 @@ impl Target {
     pub fn service(&self) -> Option<&ServiceId> {
         match self {
             Target::Method { service, .. } | Target::AnyMethod { service } => Some(service),
-            Target::Topic { .. } => None,
+            Target::Topic { .. } | Target::TopicPublish { .. } | Target::TopicSubscribe { .. } => None,
         }
     }
 
@@ -133,6 +136,9 @@ impl Target {
         match (self, other) {
             (Target::AnyMethod { service: a }, Target::AnyMethod { service: b })
             | (Target::AnyMethod { service: a }, Target::Method { service: b, .. }) => a == b,
+            (Target::Topic { name: a }, Target::TopicPublish { name: b } | Target::TopicSubscribe { name: b }) => {
+                a == b
+            }
             (a, b) => a == b,
         }
     }
@@ -142,11 +148,26 @@ impl FromStr for Target {
     type Err = IdError;
     fn from_str(s: &str) -> Result<Self, IdError> {
         let bad = || IdError::Target(s.to_owned());
-        if let Some(name) = s.strip_prefix("topic:") {
+        if let Some(topic) = s.strip_prefix("topic:") {
+            let (name, right) = if let Some(name) = topic.strip_prefix("publish:") {
+                (name, 1)
+            } else if let Some(name) = topic.strip_prefix("subscribe:") {
+                (name, 2)
+            } else {
+                (topic, 0)
+            };
             let ok = !name.is_empty()
                 && name.len() <= 128
                 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
-            return if ok { Ok(Target::Topic { name: name.to_owned() }) } else { Err(bad()) };
+            return if ok {
+                Ok(match right {
+                    1 => Target::TopicPublish { name: name.to_owned() },
+                    2 => Target::TopicSubscribe { name: name.to_owned() },
+                    _ => Target::Topic { name: name.to_owned() },
+                })
+            } else {
+                Err(bad())
+            };
         }
         let (service, method) = s.split_once('.').ok_or_else(bad)?;
         let service = ServiceId::new(service).map_err(|_| bad())?;
@@ -183,6 +204,8 @@ impl fmt::Display for Target {
             Target::Method { service, method } => write!(f, "{service}.{method}"),
             Target::AnyMethod { service } => write!(f, "{service}.*"),
             Target::Topic { name } => write!(f, "topic:{name}"),
+            Target::TopicPublish { name } => write!(f, "topic:publish:{name}"),
+            Target::TopicSubscribe { name } => write!(f, "topic:subscribe:{name}"),
         }
     }
 }
@@ -210,5 +233,23 @@ mod tests {
         assert!(!any.covers(&"memory.recall".parse().unwrap()));
         let one: Target = "tools.shell".parse().unwrap();
         assert!(!one.covers(&any));
+    }
+
+    #[test]
+    fn topic_rights_round_trip_and_can_only_be_narrowed() {
+        let targets = ["topic:progress", "topic:publish:progress", "topic:subscribe:progress"];
+        for (i, a) in targets.iter().enumerate() {
+            let a: Target = a.parse().unwrap();
+            assert_eq!(serde_json::from_value::<Target>(serde_json::to_value(&a).unwrap()).unwrap(), a);
+            for (j, b) in targets.iter().enumerate() {
+                assert_eq!(a.covers(&b.parse().unwrap()), i == 0 || i == j);
+            }
+            assert!(!a.covers(&"topic:publish:other".parse().unwrap()));
+            assert!(!a.covers(&"planner.run".parse().unwrap()));
+            assert!(a.service().is_none());
+        }
+        for text in ["topic:publish:", "topic:subscribe:", "topic:publish:*", "topic:subscribe:a:b", "topic:other:a"] {
+            assert!(text.parse::<Target>().is_err(), "{text}");
+        }
     }
 }

@@ -53,6 +53,7 @@ sender from that.
 | Guarantee | Test |
 | --- | --- |
 | No service can grant itself a capability or raise its own budget | `crates/molt-kernel/tests/invariants.rs` (`a_service_cannot_use…`, `delegation_can_split…`, `budgets_are_enforced…`) |
+| Topic subscriptions cannot publish or delegate broader rights; denied events are audited, and revoked subscription leases stop future events on both transports | `crates/molt-kernel/tests/topic_rights.rs` (`unix_topic_subscribers_cannot_publish_or_widen_their_rights`, `nats_topic_subscribers_cannot_publish_or_widen_their_rights`), `crates/molt-kernel/src/caps.rs` (`topic_delegation_cannot_upgrade_subscription_to_publication`) |
 | No service can promote a kernel or protected component, change a tier, or add capabilities without a human | `only_humans_promote_protected_and_kernel_components` |
 | No service can delete or rewrite audit entries; every message is on the record before delivery | `every_message_is_logged_before_it_is_delivered`, `the_audit_log_has_no_write_path_and_detects_tampering` |
 | Audit verification and startup retain one bounded record; tail retains only the requested entries, independent of total log size | `audit_readers_keep_memory_bounded_as_the_log_grows`, `malformed_oversized_and_unterminated_records_are_never_discarded` |
@@ -246,7 +247,7 @@ their remote calls can still run and incur charges (see the limits below).
 This line-oriented mode uses no alternate screen or cursor controls, so it
 also works in a narrow terminal or when stderr is redirected.
 
-For `--config`, give the model service a `topic:progress` request capability,
+For `--config`, give the model service a `topic:publish:progress` request capability,
 as in `molt.example.toml`; `--stream` refuses a setup without it. The new
 gateway events use the request's audit trace and are accepted by the CLI only
 from the kernel-authenticated model service. A TUI can consume the same
@@ -281,6 +282,23 @@ A fork directory set with `--scratch` in a config must be private: the
 another user's directory or one that group or others may write to (`chmod
 700` it). A service that cannot start ends `molt do` with the reason, such as
 a missing binary, as soon as the supervisor gives up on it.
+
+Topic permissions use `topic:publish:<name>` or `topic:subscribe:<name>` in a
+service's `requests`. The kernel checks publication separately from subscription;
+the SDK chooses the corresponding capability. Event destinations remain
+`topic:<name>`, so event payloads and subscriptions' topic names do not change.
+A subscription's recorded capability and its ancestors must still be live at
+delivery; revocation and expiry end access to subsequent events. A denied
+publication is recorded in the audit log before the denial is delivered.
+
+Existing `topic:<name>` grants remain compatible and authorize both operations.
+They can be delegated as a narrower publish or subscribe grant, but a narrow
+grant cannot become the combined grant or the other right. To migrate, upgrade
+the kernel and SDK-backed services together, then replace each combined grant
+with the operations that service actually uses. The default and example setups
+give model/planner publication on progress, fs publication on fs.changed, memory
+subscription on fs.changed, and CLI/TUI subscription on progress. Older kernels
+and SDKs do not recognize the new permission spellings.
 
 Defaults come from the environment:
 
@@ -589,7 +607,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - Recall matches keywords (with stemming), not meaning: there is no vector index, since the Anthropic API has no embeddings endpoint. A note worded differently from the task can be missed; the strongest notes about the project are always shown.
 - Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. With the default setup, memory lives in the project's data dir, so nothing is shared between projects yet.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
-- A topic capability currently allows both publishing and subscribing.
+- Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.
 - Model prices are as current as the last `molt prices update` (or the release's snapshot) and as right as the community list they came from; a price that changes mid-run is not picked up until the next run. Models that LiteLLM lists only with tiered or regional prices, such as some Qwen models, have no price until declared in `MOLT_MODEL_PRICES`.
 - No license has been chosen yet.
 
