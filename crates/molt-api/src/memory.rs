@@ -39,6 +39,7 @@ pub const CONSOLIDATE: &str = "memory.consolidate";
 pub const INDEX: &str = "memory.index";
 pub const MAP: &str = "memory.map";
 pub const SYMBOLS: &str = "memory.symbols";
+pub const FORK_SYMBOLS: &str = "memory.fork_symbols";
 pub const REVIEW: &str = "memory.review";
 pub const CORRECT: &str = "memory.correct";
 pub const PROMOTE: &str = "memory.promote";
@@ -478,6 +479,26 @@ pub struct SymbolsResponse {
     pub references: Vec<Reference>,
     /// More definitions or references exist than were returned.
     pub truncated: bool,
+}
+
+/// Find symbols in one verified attempt fork, keeping the original workspace
+/// as the authority boundary. This never changes the persistent project model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkSymbolsRequest {
+    #[serde(flatten)]
+    pub query: SymbolsRequest,
+    pub fork: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkSymbolsResponse {
+    #[serde(flatten)]
+    pub symbols: SymbolsResponse,
+    pub view: crate::fs::ViewResponse,
+    /// Files parsed during this refresh; unchanged contents reuse their symbols.
+    pub parsed: u64,
+    /// Unsupported, oversized or unreadable files are not indexed.
+    pub skipped: u64,
 }
 
 #[cfg(test)]

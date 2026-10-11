@@ -13,6 +13,7 @@ use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::provider::Provider;
 use crate::stream::{Accumulator, Decoder};
 use crate::Config;
 
@@ -142,6 +143,7 @@ impl Failure {
 
 /// A client for `POST {base_url}/v1/messages`.
 pub(crate) struct Api {
+    provider: Provider,
     http: reqwest::Client,
     url: Url,
     headers: HeaderMap,
@@ -175,7 +177,51 @@ impl Api {
         headers.insert("x-api-key", key);
         headers.insert("anthropic-version", HeaderValue::from_static(API_VERSION));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        Ok(Self { http, url, headers, timeout: cfg.timeout, max_retries: cfg.max_retries, retry_base: cfg.retry_base })
+        Ok(Self {
+            provider: Provider::Anthropic,
+            http,
+            url,
+            headers,
+            timeout: cfg.timeout,
+            max_retries: cfg.max_retries,
+            retry_base: cfg.retry_base,
+        })
+    }
+
+    pub fn openai(cfg: &Config, key: &str) -> anyhow::Result<Self> {
+        let url: Url = format!("{}/v1/chat/completions", cfg.providers.openai_base_url.trim_end_matches('/'))
+            .parse()
+            .context("bad OPENAI_BASE_URL")?;
+        anyhow::ensure!(
+            url.username().is_empty() && url.password().is_none() && url.query().is_none() && url.fragment().is_none(),
+            "OPENAI_BASE_URL cannot contain credentials, query or fragment"
+        );
+        anyhow::ensure!(
+            url.scheme() == "https" || (url.scheme() == "http" && is_loopback(&url)),
+            "OpenAI credentials require HTTPS except on loopback"
+        );
+        let mut builder = reqwest::Client::builder()
+            .timeout(cfg.timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(concat!("molt-gateway/", env!("CARGO_PKG_VERSION")));
+        if is_loopback(&url) {
+            builder = builder.no_proxy();
+        }
+        let http = builder.build()?;
+        let mut key = HeaderValue::from_str(&format!("Bearer {key}")).context("invalid OpenAI authorization header")?;
+        key.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, key);
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        Ok(Self {
+            provider: Provider::Openai,
+            http,
+            url,
+            headers,
+            timeout: cfg.timeout,
+            max_retries: cfg.max_retries,
+            retry_base: cfg.retry_base,
+        })
     }
 
     /// Send `body`, retrying transient failures. Before `deadline`, when there
@@ -215,7 +261,7 @@ impl Api {
             };
             let cut = timeout < self.timeout;
             if !failure.retryable() || retries >= self.max_retries {
-                return Err(failure.into_error(retries + 1, timeout, cut));
+                return Err(self.error(failure.into_error(retries + 1, timeout, cut)));
             }
             let delay = match &failure {
                 Failure::Status { retry_after: Some(d), .. } => *d,
@@ -227,12 +273,19 @@ impl Api {
                     ?delay,
                     "Messages API call failed; no time to retry before the caller's deadline"
                 );
-                return Err(failure.into_error(retries + 1, timeout, cut));
+                return Err(self.error(failure.into_error(retries + 1, timeout, cut)));
             }
             tracing::warn!(?failure, retry = retries + 1, ?delay, "Messages API call failed; retrying");
             tokio::time::sleep(delay).await;
             retries += 1;
         }
+    }
+
+    fn error(&self, mut error: RemoteError) -> RemoteError {
+        if self.provider == Provider::Openai {
+            error.message = error.message.replace("Messages API", "OpenAI Chat Completions API");
+        }
+        error
     }
 
     async fn attempt(
@@ -254,11 +307,16 @@ impl Api {
         let request_id = header("request-id");
         let location = header("location").filter(|_| status.is_redirection());
         if status.is_success() && streaming {
-            return read_stream(resp, on_text).await;
+            return read_stream(resp, on_text, self.provider).await;
         }
         let bytes = resp.bytes().await.map_err(transport)?;
         if status.is_success() {
-            return serde_json::from_slice(&bytes).map_err(|e| Failure::BadBody(e.to_string()));
+            return match self.provider {
+                Provider::Anthropic => serde_json::from_slice(&bytes).map_err(|e| Failure::BadBody(e.to_string())),
+                Provider::Openai => serde_json::from_slice(&bytes)
+                    .map_err(|e| Failure::BadBody(e.to_string()))
+                    .and_then(|v| crate::openai::decode(v).map_err(Failure::BadBody)),
+            };
         }
         let mut detail = match serde_json::from_slice::<ErrorBody>(&bytes) {
             Ok(b) => format!(": {}: {}", b.error.kind, b.error.message),
@@ -275,17 +333,43 @@ impl Api {
     }
 }
 
+enum ResponseStream {
+    Anthropic(Accumulator),
+    Openai(crate::openai::Accumulator),
+}
+impl ResponseStream {
+    fn new(provider: Provider) -> Self {
+        match provider {
+            Provider::Anthropic => Self::Anthropic(Accumulator::default()),
+            Provider::Openai => Self::Openai(crate::openai::Accumulator::default()),
+        }
+    }
+    fn event(&mut self, event: Value) -> Result<Option<String>, String> {
+        match self {
+            Self::Anthropic(s) => s.event(event),
+            Self::Openai(s) => s.event(event),
+        }
+    }
+    fn finish(self) -> Result<Message, String> {
+        match self {
+            Self::Anthropic(s) => s.finish(),
+            Self::Openai(s) => s.finish(),
+        }
+    }
+}
+
 async fn read_stream(
     mut response: reqwest::Response,
     on_text: &mut Option<&mut (dyn FnMut(String) + Send)>,
+    provider: Provider,
 ) -> Result<Message, Failure> {
     let bad = |e: String| Failure::BadBody(format!("invalid Messages API stream: {e}"));
     let content_type = response.headers().get(CONTENT_TYPE).and_then(|h| h.to_str().ok()).unwrap_or("");
     if content_type.split(';').next().unwrap_or("").trim() != "text/event-stream" {
         return Err(bad("expected text/event-stream".into()));
     }
-    let mut decoder = Decoder::default();
-    let mut accumulator = Accumulator::default();
+    let mut decoder = Decoder::for_provider(provider);
+    let mut accumulator = ResponseStream::new(provider);
     let mut preview = String::new();
     let mut last_flush = Instant::now() - Duration::from_secs(1);
     loop {

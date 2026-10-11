@@ -23,6 +23,9 @@ struct Cli {
     /// directory with the forks in it. May be given more than once.
     #[arg(long)]
     skip: Vec<PathBuf>,
+    /// The fs service's trusted scratch directory, for disposable fork symbols.
+    #[arg(long)]
+    forks: Option<PathBuf>,
     /// The id of the project in the user's registry: notes about its
     /// directories are kept under it.
     #[arg(long, requires = "project_path")]
@@ -41,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
     molt::init_tracing("info");
     let cli = Cli::parse();
     let project = cli.project.map(|id| molt_memory::Project { id, paths: cli.project_path });
-    let cfg = Config { skip: cli.skip, project, ..Config::from_env()? };
+    let cfg = Config { skip: cli.skip, fork_root: cli.forks, project, ..Config::from_env()? };
     let db = Arc::new(Db::open(&cli.db)?);
     let svc = Arc::new(Service::connect_from_env().await?);
     let bus = Arc::new(ServiceBus(svc.clone()));

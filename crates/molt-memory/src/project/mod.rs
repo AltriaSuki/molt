@@ -102,6 +102,12 @@ pub fn index_skipping(
     update::index(db, root, paths, skip, update::MAX_FILES)
 }
 
+/// Re-hash every source file before answering an attempt-local query. Shell
+/// scripts can preserve both size and mtime, so metadata is not sufficient.
+pub(crate) fn index_verified(db: &Db, root: &Path) -> Result<IndexResponse, RemoteError> {
+    update::index_verified(db, root)
+}
+
 /// The map of `root` for `req.query` (`req.workspace` is ignored: `root` is it, resolved).
 ///
 /// `max_tokens` is clamped to 1..=32000 (default 4000); a budget too small

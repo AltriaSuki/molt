@@ -32,7 +32,7 @@ const TAIL_BYTES: usize = 24 * 1024;
 /// How long output may keep arriving after the command exited and its group was killed.
 const GRACE: Duration = Duration::from_millis(500);
 /// Removed from the command's environment: the service's bus secret and API keys.
-const HIDDEN_PREFIXES: [&[u8]; 2] = [b"MOLT_", b"ANTHROPIC_"];
+const HIDDEN_PREFIXES: [&[u8]; 3] = [b"MOLT_", b"ANTHROPIC_", b"OPENAI_"];
 /// Keep tools from paging, prompting or printing colour codes.
 pub(crate) const FIXED_ENV: [(&str, &str); 6] = [
     ("TERM", "dumb"),

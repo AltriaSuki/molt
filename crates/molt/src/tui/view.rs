@@ -1,13 +1,14 @@
 //! Drawing [`App`] into a frame.
 
-use molt_api::memory::Layer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::app::{App, Input, MemoryEdit, MemoryView, Mode, Phase, Prompt, Screen, SessionState, Task};
+use super::app::{
+    memory_lines, App, ChangeStep, Input, MemoryEdit, MemoryView, Mode, Phase, Prompt, Screen, SessionState, Task,
+};
 use super::text::{self, clean_line, span, style, wrap_all, Tone};
 
 const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
@@ -143,6 +144,17 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 span("◆ check", Tone::Shell),
                 span(format!("  designed · ${:.2}", d.cost_usd), Tone::Dim),
             ])];
+            if d.uncounted_calls > 0 {
+                lines.push(Line::from(span(
+                    format!("  cost incomplete · {} calls uncounted · remaining budget unknown", d.uncounted_calls),
+                    Tone::Warn,
+                )));
+            } else if let Some(remaining) = d.remaining_budget_usd {
+                lines.push(Line::from(span(
+                    format!("  ${remaining:.2} remaining for attempts"),
+                    if remaining <= 0.0 { Tone::Bad } else { Tone::Dim },
+                )));
+            }
             match &d.command {
                 Some(c) => lines.push(Line::from(vec![span("  $ ", Tone::Dim), span(clean_line(c), Tone::Plain)])),
                 None => lines.push(Line::from(span("  no automated check fits this task", Tone::Warn))),
@@ -220,9 +232,16 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             },
         ],
         None => match &app.task {
-            Some(Task { phase: Phase::Designing, .. }) => busy("designing the check"),
+            Some(task @ Task { phase: Phase::Designing, .. }) => {
+                let mut lines = busy("designing the check");
+                lines.extend(task.designer_preview.lines(width, 4));
+                lines
+            }
             Some(task @ Task { phase: Phase::Running, .. }) if task.lanes.is_empty() => {
-                busy(if task.req.check.is_some() || !task.req.verify { "starting" } else { "designing the check" })
+                let mut lines =
+                    busy(if task.req.check.is_some() || !task.req.verify { "starting" } else { "designing the check" });
+                lines.extend(task.designer_preview.lines(width, 4));
+                lines
             }
             Some(Task { phase: Phase::Applying, .. }) => busy("applying"),
             _ => Vec::new(),
@@ -283,9 +302,13 @@ fn draw_lanes(frame: &mut Frame, area: Rect, app: &App) {
                 .title(Line::from(span(format!(" {status} "), tone)).right_aligned());
             let inner = block.inner(cols[c]);
             frame.render_widget(block, cols[c]);
+            let preview = lane.preview.lines(inner.width, usize::from(inner.height).min(4));
+            let history_height = usize::from(inner.height).saturating_sub(preview.len());
             let lines = wrap_all(&lane.lines, inner.width);
-            let skip = lines.len().saturating_sub(usize::from(inner.height));
-            frame.render_widget(Paragraph::new(lines[skip..].to_vec()), inner);
+            let skip = lines.len().saturating_sub(history_height);
+            let mut shown = lines[skip..].to_vec();
+            shown.extend(preview);
+            frame.render_widget(Paragraph::new(shown), inner);
         }
     }
 }
@@ -385,7 +408,13 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(check) = &s.check {
         parts.push(format!("check: {}", text::fit(&clean_line(check), 24)));
     }
+    if !s.stream {
+        parts.push("previews off".into());
+    }
     let mut cost = format!("${:.2}", app.spent_usd);
+    if app.uncounted_calls > 0 {
+        cost.push_str(&format!(" known · {} calls uncounted", app.uncounted_calls));
+    }
     if let Some(b) = s.budget_usd {
         cost.push_str(&format!(" · ${b:.2}/task"));
     }
@@ -451,7 +480,18 @@ fn draw_memory(frame: &mut Frame, area: Rect, view: &MemoryView, tick: u64) {
                 span(format!(" {} ", text::bar(n.confidence)), tone),
                 span(format!("{:.2}  ", n.confidence), tone),
                 span(format!("{:<11}", n.kind.as_str()), Tone::Dim),
-                span(text::fit(&clean_line(&n.text), text_room), Tone::Plain),
+                span(
+                    text::fit(
+                        &format!(
+                            "{}{}{}",
+                            if r.details.needs_review.is_empty() { "" } else { "[review] " },
+                            if r.details.temporary { "[temporary] " } else { "" },
+                            clean_line(&n.text)
+                        ),
+                        text_room,
+                    ),
+                    Tone::Plain,
+                ),
             ]);
             if i == view.selected {
                 line = line.style(Style::new().add_modifier(Modifier::REVERSED));
@@ -465,52 +505,17 @@ fn draw_memory(frame: &mut Frame, area: Rect, view: &MemoryView, tick: u64) {
     let inner = block.inner(detail);
     frame.render_widget(block, detail);
     let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
-    if let Some(r) = view.notes.get(view.selected).filter(|_| !view.loading) {
-        let n = &r.note;
-        let field = |name: &str, value: String| {
-            Line::from(vec![span(format!("{name:<11}"), Tone::Dim), span(value, Tone::Plain)])
-        };
-        let mut lines = vec![
-            Line::from(Span::styled(clean_line(&n.text), Style::new().add_modifier(Modifier::BOLD))),
-            Line::default(),
-            field("kind", n.kind.as_str().to_owned()),
-        ];
-        let mut confidence = format!("{:.2}", n.confidence);
-        if n.reinforced > 0 {
-            confidence.push_str(&format!("  confirmed {}×", n.reinforced));
-        }
-        lines.push(field("confidence", confidence));
-        if r.layer == Layer::User {
-            lines.push(field("layer", "yours, for every project".into()));
-        } else if r.details.everywhere {
-            lines.push(field("layer", "this project; proposed for every project (p to promote)".into()));
-        } else if let Some(to) = &r.details.promoted_to {
-            lines.push(field("layer", format!("this project; promoted as {}", clean_line(to))));
-        }
-        if !n.conflicts.is_empty() {
-            lines.push(Line::from(vec![
-                span(format!("{:<11}", "disputes"), Tone::Dim),
-                span(clean_line(&n.conflicts.join(", ")), Tone::Bad),
-            ]));
-        }
-        let p = &n.provenance;
-        let run: String = clean_line(p.trace.trim_start_matches("trace_")).chars().take(8).collect();
-        lines.push(field("learned", format!("{} · run {run}", text::when(n.created_ms))));
-        let version: String = p.version.rsplit(':').next().unwrap_or(&p.version).chars().take(8).collect();
-        lines.push(Line::from(vec![
-            span(format!("{:<11}", "by"), Tone::Dim),
-            span(clean_line(&p.service), Tone::Plain),
-            span(format!("@{}", clean_line(&version)), Tone::Shell),
-        ]));
-        lines.push(field("id", clean_line(&n.id)));
-        if !p.events.is_empty() {
-            lines.push(Line::default());
-            lines.push(Line::from(span("evidence in the audit log", Tone::Dim)));
-            for e in &p.events {
-                lines.push(Line::from(span(format!("  {}", clean_line(e)), Tone::Sea)));
-            }
-        }
+    if let Some(MemoryEdit::Change(change)) = &view.edit {
+        let fields = format!(
+            "{} revision {}\n{}\n\nreason: {}\ndependencies (; separated): {}\ntemporary: {}\n\nEnter advances; Shift+Tab goes back.\nAt confirmation: t toggles temporary; Enter saves. Esc cancels.",
+            change.review.id, change.review.expected_rev,
+            change.text.as_ref().map_or("Confirm this note after reviewing its evidence.", |i| i.text.as_str()),
+            change.reason.text, change.dependencies.text, change.review.temporary,
+        );
+        let lines = text::block(&fields, "", Tone::Plain);
         frame.render_widget(Paragraph::new(wrap_all(&lines, inner.width)), inner);
+    } else if let Some(r) = view.notes.get(view.selected).filter(|_| !view.loading) {
+        frame.render_widget(Paragraph::new(wrap_all(&memory_lines(r), inner.width)), inner);
     }
 
     let block =
@@ -524,6 +529,15 @@ fn draw_memory(frame: &mut Frame, area: Rect, view: &MemoryView, tick: u64) {
         Some(MemoryEdit::Promote(_)) => {
             block.title(Line::from(span(" why does it hold in every project? ", Tone::Shell)))
         }
+        Some(MemoryEdit::Change(change)) => block.title(Line::from(span(
+            match change.step {
+                ChangeStep::Text => " corrected note ",
+                ChangeStep::Reason => " review reason ",
+                ChangeStep::Dependencies => " dependencies (; separated; empty clears) ",
+                ChangeStep::Confirm => " confirm · Enter save · t temporary · Shift+Tab back ",
+            },
+            Tone::Shell,
+        ))),
         None => block,
     };
     let inner = block.inner(bottom);
@@ -532,13 +546,27 @@ fn draw_memory(frame: &mut Frame, area: Rect, view: &MemoryView, tick: u64) {
         Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input) | MemoryEdit::Promote(input)) => {
             draw_field(frame, inner, input, true)
         }
+        Some(MemoryEdit::Change(change)) => {
+            if let Some(input) = change.input() {
+                draw_field(frame, inner, input, true);
+            } else {
+                frame.render_widget(
+                    Paragraph::new(span("Save the displayed revision and dependency list?", Tone::Warn)),
+                    inner,
+                );
+            }
+        }
         None => {
             let hints = keys(&[
                 ("↑↓", "select"),
+                ("v", "details"),
                 ("/", "filter"),
+                ("a", "review"),
+                ("c", "correct"),
                 ("f", "forget"),
                 ("p", "promote"),
                 ("r", "reload"),
+                ("u", "used"),
                 ("esc", "back"),
             ]);
             frame.render_widget(Paragraph::new(hints), inner);

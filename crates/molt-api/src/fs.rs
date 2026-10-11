@@ -21,6 +21,7 @@ pub const LIST: &str = "fs.list";
 pub const SEARCH: &str = "fs.search";
 pub const FORK: &str = "fs.fork";
 pub const DIFF: &str = "fs.diff";
+pub const VIEW: &str = "fs.view";
 pub const MERGE: &str = "fs.merge";
 pub const DROP: &str = "fs.drop";
 pub const APPLIES: &str = "fs.applies";
@@ -209,6 +210,22 @@ pub struct DiffResponse {
     pub patch: String,
     /// The patch was cut to the service's size limit.
     pub truncated: bool,
+}
+
+/// Validate a service-created fork and identify its complete current contents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewRequest {
+    pub fork: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewResponse {
+    pub workspace: String,
+    pub fork: String,
+    /// Hash of the fork-time file inventory.
+    pub baseline: String,
+    /// Hash of the current file inventory, including shell edits.
+    pub version: String,
 }
 
 /// Copy a fork's changes back into its original workspace. Fails with a

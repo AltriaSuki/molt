@@ -65,7 +65,7 @@ impl Db {
         Ok(db)
     }
 
-    /// A database that lives in memory, for tests.
+    /// A database that lives in memory, for tests and bounded attempt views.
     pub fn in_memory() -> anyhow::Result<Self> {
         Self::init(Connection::open_in_memory()?)
     }

@@ -1187,6 +1187,7 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_molt"));
         cmd.args(["do", "anything", "--data-dir"]).arg(data_dir).args(args).current_dir(workspace.path());
         cmd.env("XDG_DATA_HOME", user_data.path());
+        cmd.env_remove("OPENAI_API_KEY").env_remove("MOLT_PROVIDER");
         match key {
             Some(key) => cmd.env("ANTHROPIC_API_KEY", key),
             None => cmd.env_remove("ANTHROPIC_API_KEY"),
@@ -1196,7 +1197,7 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
         String::from_utf8_lossy(&out.stderr).into_owned()
     };
     let err = molt_do(data.path(), None, &[]);
-    assert!(err.contains("ANTHROPIC_API_KEY is not set"), "{err}");
+    assert!(err.contains("ANTHROPIC_API_KEY or OPENAI_API_KEY is not set"), "{err}");
     let ws = workspace.path().canonicalize().unwrap();
     let inside = ws.join("state");
     let err = molt_do(&inside, Some("test"), &[]);
@@ -1275,13 +1276,41 @@ async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
     assert!(seen.iter().any(|e| matches!(e, Progress::CheckReady { designed: true, .. })), "{seen:#?}");
     assert!(seen.iter().any(|e| matches!(e, Progress::AttemptStarted { fork: Some(_), .. })), "{seen:#?}");
 
+    let captured = session.used_notes(trace.as_str()).await.unwrap();
+    assert!(!captured.is_empty());
+    assert!(captured.iter().all(|s| s.run == trace.as_str() && s.workspace == workspace.to_str().unwrap()));
+
     let learned = session.learn(&trace, Some("haiku".into())).await.unwrap();
     assert_eq!(learned.added.len(), 1, "{learned:#?}");
     // Memory learned with the model it was given, not its default.
     let learning = bodies(&server).await.into_iter().filter(|b| b["output_config"]["format"]["type"] == "json_schema");
     assert_eq!(learning.map(|b| b["model"].clone()).collect::<Vec<_>>(), [json!("claude-haiku-4-5")]);
-    let notes = session.notes("").await.unwrap();
+    let mut notes = session.notes("").await.unwrap();
     assert_eq!(notes.iter().map(|r| r.note.text.as_str()).collect::<Vec<_>>(), [LEARNED_TEXT]);
+    let review = molt_api::memory::ReviewRequest {
+        workspace: workspace.to_str().unwrap().into(),
+        id: notes[0].note.id.clone(),
+        expected_rev: notes[0].note.rev,
+        reason: "checked the greeting".into(),
+        depends_on: vec!["greeting.txt".into()],
+        temporary: true,
+    };
+    let saved = session.change_note(review.clone(), None).await.unwrap();
+    assert!(saved.details.temporary && saved.note.rev > review.expected_rev);
+    let refused = session.change_note(review.clone(), None).await.unwrap_err();
+    assert!(format!("{refused:#}").contains("revision"));
+    std::fs::write(workspace.join("greeting.txt"), "a later change\n").unwrap();
+    assert!(session.notes("").await.unwrap().is_empty(), "ordinary recall excludes quarantined notes");
+    let inspected = session.inspect_notes("").await.unwrap();
+    assert_eq!(inspected.len(), 1);
+    assert_eq!(inspected[0].details.needs_review, ["greeting.txt"]);
+    let review = molt_api::memory::ReviewRequest { expected_rev: inspected[0].note.rev, ..review };
+    let corrected =
+        session.change_note(review, Some("The greeting changed; inspect it before editing.".into())).await.unwrap();
+    assert_ne!(corrected.note.id, saved.note.id);
+    notes = session.notes("").await.unwrap();
+    assert_eq!(notes[0].note.id, corrected.note.id);
+    assert_eq!(session.used_notes(trace.as_str()).await.unwrap(), captured, "review does not rewrite earlier context");
     assert!(session.forget(&notes[0].note.id, "the check moved").await.unwrap());
     assert!(session.notes("").await.unwrap().is_empty());
 

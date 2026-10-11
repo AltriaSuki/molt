@@ -28,6 +28,7 @@ exec = { command = "molt-gateway" }
 provides = ["model.*"]
 requests = [{ target = "topic:publish:progress", budget = { calls = 10000000 } }]
 pass_env = [
+  "OPENAI_API_KEY", "OPENAI_BASE_URL", "MOLT_PROVIDER", "MOLT_MODEL_ALIASES", "MOLT_OPENAI_MODELS",
   "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "MOLT_MODEL", "MOLT_EFFORT", "MOLT_MAX_TOKENS",
   "MOLT_MODEL_TIMEOUT_S", "MOLT_MODEL_RETRIES", "MOLT_MODEL_CONCURRENCY", "MOLT_FALLBACKS",
   "MOLT_MODEL_PRICES", "MOLT_PRICES_FILE", "XDG_DATA_HOME",
@@ -53,7 +54,7 @@ requests = [{ target = "topic:publish:fs.changed", budget = { calls = 100000000 
 
 # Commands run as you, unsandboxed, with a scrubbed environment; add what
 # your builds and tests need with pass_env (`molt do --pass-env NAME` does the
-# same for the default setup). MOLT_* and ANTHROPIC_* never reach them.
+# same for the default setup). MOLT_*, ANTHROPIC_* and OPENAI_* never reach them.
 [[service]]
 name = "shell"
 tier = "protected"
@@ -67,13 +68,14 @@ provides = ["shell.*"]
 [[service]]
 name = "memory"
 tier = "mutable"
-exec = { command = "molt-memory", args = ["--root", ".", "--db", ".molt/memory.db"] }
+exec = { command = "molt-memory", args = ["--root", ".", "--db", ".molt/memory.db", "--forks", "/home/you/.cache/molt/work"] }
 provides = ["memory.*"]
 pass_env = ["MOLT_MEMORY_MODEL", "MOLT_MEMORY_EFFORT", "MOLT_MEMORY_MAX_TOKENS", "MOLT_MEMORY_MODEL_TIMEOUT_S"]
 requests = [
   { target = "model.complete", budget = { tokens = 1000000000, calls = 1000000 } },
   { target = "kernel.audit.read", budget = { calls = 10000000 } },
   { target = "topic:subscribe:fs.changed", budget = { calls = 10 } },
+  { target = "fs.view", budget = { calls = 100000000 } },
 ]
 
 # Calls 0 would refuse every call; ms 0 leaves deadlines to each request.
@@ -97,6 +99,7 @@ requests = [
   { target = "memory.map", budget = { calls = 10000000 } },
   { target = "memory.recall", budget = { calls = 10000000 } },
   { target = "memory.symbols", budget = { calls = 10000000 } },
+  { target = "memory.fork_symbols", budget = { calls = 10000000 } },
 ]
 
 # When the interface's confirm mode stops for you; these are the defaults.
