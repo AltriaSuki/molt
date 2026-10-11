@@ -823,13 +823,19 @@ mod tests {
             std::fs::write(work.join(id).join("src/lib.rs"), "").unwrap();
             std::fs::write(work.join(format!("{id}.json")), "{}").unwrap();
         }
+        std::fs::create_dir_all(work.join(".molt/applies/apply-0000000000000001")).unwrap();
+        std::fs::write(work.join(".molt/applies/apply-0000000000000001/journal.json"), "recovery material").unwrap();
         forks.remove_new(&[work.join("fork-000000000003").to_str().unwrap()]);
+        assert_eq!(
+            std::fs::read_to_string(work.join(".molt/applies/apply-0000000000000001/journal.json")).unwrap(),
+            "recovery material"
+        );
         let mut left: Vec<_> =
             std::fs::read_dir(&work).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         left.sort();
         assert_eq!(
             left,
-            ["fork-000000000001", "fork-000000000001.json", "fork-000000000003", "fork-000000000003.json"]
+            [".molt", "fork-000000000001", "fork-000000000001.json", "fork-000000000003", "fork-000000000003.json"]
         );
 
         // A scratch dir outside the data dir may be shared with other runs.

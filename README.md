@@ -63,6 +63,7 @@ sender from that.
 | Every learned note cites the messages behind it, and a run is learned from once | `crates/molt/tests/agent.rs` (`a_second_run_starts_with_what_the_first_learned…`), `crates/molt-memory/src/consolidate.rs` |
 | A benchmark run is graded by tests the agent is not given, which its own edits cannot replace | `crates/molt-bench/src/grade.rs` (`grading_overwrites_the_agents_copy_of_a_hidden_file`), `crates/molt-bench/src/task.rs` (`overlay_replaces_files_links_and_directories_and_stays_inside`) |
 | Every benchmark task fails its check as given and passes it with the reference solution | `crates/molt-bench/tests/tasks.rs` |
+| A workspace apply persists preimages before writing, identifies actual post-crash file states, and refuses recovery over later edits | `crates/molt-tools/src/apply.rs` (`first_middle_and_last_write_failures_can_resume_or_undo_idempotently`, `restarting_after_each_durable_stage_observes_disk_truth_and_recovers`, `later_edits_and_candidate_changes_are_preserved_and_reported_by_path`), `crates/molt-tools/tests/fs.rs` (`a_durable_merge_retains_preimages_for_files_links_modes_and_dropped_forks`), `crates/molt/tests/apply.rs` |
 | A benchmark starts a run only while what it spent, plus the whole `--task-usd` of that run and of each run in flight, fits in `--max-usd`; it refuses models it has no price for | `crates/molt-bench/src/run.rs` (`runs_stop_before_they_could_pass_the_budget`, `a_run_of_unknown_cost_stops_the_benchmark`), `crates/molt-bench/src/cli.rs` (`a_model_without_a_price_is_refused`) |
 | A model with no price stays of unknown cost and stops the run; prices come only from the user's environment or data directory, never from a project, and a download that does not validate replaces nothing | `crates/molt-gateway/src/prices.rs` (`the_data_directory_holds_the_snapshot_and_nothing_else_is_read`, `a_download_that_does_not_validate_is_refused`, `malformed_declared_prices_stop_startup_and_name_the_item`), `crates/molt-gateway/tests/gateway.rs` (`a_snapshot_prices_a_third_party_model…`) |
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
@@ -419,6 +420,53 @@ its tasks with a notice, except on CI.
 4. **Evaluation**: deterministic replay from the audit log, regression and held-out suites, the promotion gate.
 5. **Self-improvement, low risk**: prompts and skills only, auto-approved when the gate passes.
 6. **Self-improvement, code**: Wasm services under wasmtime, sandbox builds, canary runs, hot swap.
+
+## Recovering a workspace apply
+
+Every merge that writes files stages private, fsynced preimages and candidate
+contents under `.molt/applies/apply-<id>` in the trusted scratch area before
+its first workspace write. Its journal records preparing, staged, applying,
+applied, undoing, undone or needs-recovery phases. `fs.merge` adds an optional
+`operation` ID to its reply; failures name the same ID, and the planner keeps
+the candidate and its existing exit status 3. `fs.applies` reports both the
+last durable phase and each path's observed pending/applied/conflict state,
+so a crash between a file rename and a journal update cannot hide a write.
+
+With the default setup, use the project's data directory followed by `/work`
+as `SCRATCH`. These host commands need neither a model key nor a running
+kernel. Ordinary fs reads/writes cannot access this recovery data; service calls to `fs.applies` / `fs.recover` still go through the
+kernel's normal capability checks and audit. Offline commands update the
+same durable journal, without creating a bus audit record.
+
+```sh
+molt-tools apply --root /path/to/project --scratch /path/to/data/work list
+molt-tools apply --root /path/to/project --scratch /path/to/data/work inspect apply-ID
+molt-tools apply --root /path/to/project --scratch /path/to/data/work resume apply-ID
+molt-tools apply --root /path/to/project --scratch /path/to/data/work undo apply-ID
+```
+
+Resume finishes the originally staged candidate. A source fork that still
+exists must have the same fingerprint; changes are refused. If run cleanup
+removed it, recovery uses the immutable, checksum-verified postimages instead.
+Undo restores the exact old file contents,
+symlink targets and permissions, including files deleted by the apply, and
+removes added files. Undo remains available after a successful merge drops
+its fork. Both actions are idempotent and refuse a path whose current bytes,
+link target or permissions differ from both recorded states, preserving later
+user edits. Incomplete staging has made no workspace writes: undo abandons
+it; resume asks for a new merge. Corrupt staging blobs never replace a file.
+
+A process lock serializes apply/recovery commands sharing a scratch directory.
+Exclude other editors and commands that write the workspace or candidate
+while applying or recovering: path checks detect edits between operations,
+but cannot make check-and-rename atomic against arbitrary external writers.
+The operation is a sequence of durable single-file renames/deletions, not an
+atomic directory swap. Files/symlinks and their existing merge permission
+semantics are supported; empty directory metadata and file-to-directory
+replacements, ownership, hardlink identity and extended attributes are not tracked. Recovery materials are retained after success
+for explicit undo; they consume disk space until the user removes a completed
+operation directory after inspecting it and deciding that undo is no longer
+needed. Deleting an unfinished record loses its recovery material.
 
 ## Known limits
 

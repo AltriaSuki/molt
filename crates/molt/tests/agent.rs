@@ -340,8 +340,16 @@ impl Setup {
 /// No fork outlived the run that made it.
 fn assert_forks_dropped(data_dir: &Path) {
     let work = data_dir.join("work");
-    let left: Vec<_> = std::fs::read_dir(&work).unwrap().map(|e| e.unwrap().file_name()).collect();
+    let left: Vec<_> =
+        std::fs::read_dir(&work).unwrap().map(|e| e.unwrap().file_name()).filter(|n| n != ".molt").collect();
     assert!(left.is_empty(), "left in {}: {left:?}", work.display());
+    let recovery = work.join(".molt");
+    if recovery.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::symlink_metadata(recovery).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700, "retained recovery material stays private");
+    }
 }
 
 /// Every request the fake got was one the real API would have accepted.

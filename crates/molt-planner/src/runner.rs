@@ -258,7 +258,7 @@ async fn conclude(
                             Ok(_) => resp.applied = true,
                             Err(e) => {
                                 let what = if e.message.starts_with("partial:") {
-                                    "The merge stopped partway, so the workspace has only some of the changes"
+                                    "The apply needs recovery; the workspace may contain changes"
                                 } else {
                                     "The changes were not applied"
                                 };
