@@ -243,7 +243,7 @@ impl Runtime {
                 let result = s.forget(&id, &reason).await.map_err(|e| format!("{e:#}"));
                 Msg::Forgot { id, result }
             }),
-            Action::Interrupt { keep } => {
+            Action::Interrupt { keep, attempts, check_files } => {
                 for work in self.work.drain(..) {
                     work.abort();
                 }
@@ -251,13 +251,23 @@ impl Runtime {
                 match self.session.take() {
                     Some(session) => {
                         tokio::spawn(async move {
-                            session.shutdown(&keep).await;
-                            let _ = tx.send(Msg::Stopped);
+                            let mut kept = Vec::new();
+                            for fork in attempts {
+                                // A fork with nothing but the check's own files holds no work.
+                                match session.changes(&fork).await {
+                                    Ok(paths) if paths.iter().any(|p| !check_files.contains(p)) => kept.push(fork),
+                                    Ok(_) => {}
+                                    Err(e) => tracing::warn!("could not list the changes in {fork}: {e:#}"),
+                                }
+                            }
+                            let all: Vec<String> = keep.into_iter().chain(kept.iter().cloned()).collect();
+                            session.shutdown(&all).await;
+                            let _ = tx.send(Msg::Stopped { kept });
                         });
                     }
                     None if self.starting => {}
                     None => {
-                        let _ = tx.send(Msg::Stopped);
+                        let _ = tx.send(Msg::Stopped { kept: Vec::new() });
                     }
                 }
             }

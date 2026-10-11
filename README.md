@@ -119,7 +119,11 @@ In the default mode, **confirm**, a task stops twice for you:
 
 Shift+Tab switches to **auto** (design the check and apply what passes) or
 **plan only** (results stay in their forks). Esc stops a task: the services
-are stopped, with every command the agent started, and started again.
+are stopped, with every command the agent started, and started again. The
+forks of attempts that had changed files are kept (`kept 2 · interrupted`),
+and with a check known in full `r` starts the task again with it. Ctrl+C
+on an empty input, or Ctrl+D, quits only when pressed twice within about a
+second; the first press says what quitting keeps.
 The log keeps everything a task reports, in full; PgUp and PgDn scroll it,
 and Ctrl+Home and Ctrl+End (or Home and End with an empty input) jump to its
 start and end.

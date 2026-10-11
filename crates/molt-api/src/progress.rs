@@ -52,6 +52,10 @@ pub enum Progress {
     AttemptStarted {
         run: String,
         attempt: u32,
+        /// The attempt's fork; absent when it could not be made, or from an
+        /// older planner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fork: Option<String>,
     },
     /// The model asked for a tool. `detail` is a short one-line description.
     ToolCall {
@@ -136,6 +140,11 @@ mod tests {
             Progress::CheckRan { run: "r".into(), attempt: 1, passed: false, exit_code: Some(2), tail: String::new() }
         );
         // An empty tail is left out, so older subscribers see what they always saw.
+        assert_eq!(serde_json::to_string(&event).unwrap(), old);
+
+        let old = r#"{"event":"attempt_started","run":"r","attempt":0}"#;
+        let event: Progress = serde_json::from_str(old).unwrap();
+        assert_eq!(event, Progress::AttemptStarted { run: "r".into(), attempt: 0, fork: None });
         assert_eq!(serde_json::to_string(&event).unwrap(), old);
     }
 }
