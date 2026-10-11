@@ -12,6 +12,7 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 fn config(server: &MockServer) -> Config {
     Config {
+        providers: Default::default(),
         api_key: "test-key".into(),
         base_url: server.uri(),
         default_model: "opus".into(),
@@ -124,13 +125,10 @@ async fn opus_requests_carry_thinking_effort_fallbacks_and_cache_breakpoints() {
 async fn haiku_requests_get_no_thinking_effort_or_fallbacks_and_a_clamped_max_tokens() {
     let server = MockServer::start().await;
     answer_with(&server, ok(message("claude-haiku-4-5"))).await;
-    let gw = Gateway::new(Config { effort: Some(Effort::High), ..config(&server) }).unwrap();
-    let req = CompleteRequest {
-        model: Some("haiku".into()),
-        max_tokens: Some(100_000),
-        effort: Some(Effort::Low),
-        ..request()
-    };
+    let gw = Gateway::new(config(&server)).unwrap();
+    let req = CompleteRequest { model: Some("haiku".into()), max_tokens: Some(100_000), ..request() };
+    let unsupported = CompleteRequest { effort: Some(Effort::Low), ..req.clone() };
+    assert_eq!(gw.complete(unsupported).await.unwrap_err().code, ErrorCode::Invalid);
     gw.complete(req).await.unwrap();
 
     let sent = sent(&server).await;
@@ -421,6 +419,7 @@ async fn an_unreachable_api_is_unavailable() {
     let addr = listener.local_addr().unwrap();
     drop(listener);
     let cfg = Config {
+        providers: Default::default(),
         api_key: "test-key".into(),
         base_url: format!("http://{addr}"),
         default_model: "opus".into(),

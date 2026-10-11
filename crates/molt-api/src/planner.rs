@@ -85,6 +85,33 @@ pub struct RunRequest {
     /// Publish model text previews while calls are in flight.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stream: bool,
+    /// Have a reviewer look at a winner that passed its check, for changes
+    /// that game the check, before it is applied. With `apply`, only an
+    /// approved result is merged.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub review: bool,
+    /// Save a checkpoint as the run goes, so that a run stopped before it
+    /// finished (interrupted, out of budget, killed) can go on with
+    /// `resume`. Needs a planner that keeps checkpoints.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkpoint: bool,
+    /// Go on with the checkpointed run named here rather than start one. The
+    /// task, check, attempts, model and limits are the checkpoint's; `apply`,
+    /// `stream` and a `budget_usd` given here replace its own, and the
+    /// workspace must be its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<Resume>,
+}
+
+/// Which checkpointed run to go on with, and how.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resume {
+    /// The run's id: the trace it ran under.
+    pub run: String,
+    /// Leave the stopped attempts where they are and start new ones, with the
+    /// same check and the cost so far.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retry: bool,
 }
 
 impl RunRequest {
@@ -103,6 +130,9 @@ impl RunRequest {
             budget_usd: None,
             apply: true,
             stream: false,
+            checkpoint: false,
+            resume: None,
+            review: true,
         }
     }
 }
@@ -166,7 +196,48 @@ pub struct DesignResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<Baseline>,
     pub usage: Usage,
+    /// Known subtotal, not a complete price when `uncounted_calls` is nonzero.
     pub cost_usd: f64,
+    /// Pending replies, calls without usage, and replies without a known price.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub uncounted_calls: u32,
+    /// Remaining effective task limit, including the planner's default.
+    /// `None` on incomplete settlement or in a reply from an older planner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_budget_usd: Option<f64>,
+    /// Design failure, with settlement preserved. Callers must not run a
+    /// failed design as an unverified task. Invalid requests still use errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Local design work stopped; this does not confirm remote cancellation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// What the reviewer made of a winner's changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// The changes do the task.
+    Approve,
+    /// Something needs a person's look before the changes are used.
+    Concern,
+    /// The changes game the check rather than do the task.
+    Reject,
+}
+
+/// The review of a winner that passed its check.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Review {
+    pub verdict: Verdict,
+    /// What it rests on, each citing the diff where it can: the fixed rules'
+    /// findings first, then the reviewer model's.
+    #[serde(default)]
+    pub findings: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +288,10 @@ pub struct RunResponse {
     /// Where the winner's files are when they were not merged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork: Option<String>,
+    /// The winner's review; absent when there was none (no winner, no
+    /// check, no changes, or review turned off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<Review>,
     pub attempts: Vec<AttemptReport>,
     /// Totals over the designer and every attempt.
     pub usage: Usage,
@@ -226,6 +301,10 @@ pub struct RunResponse {
     /// price. cost_usd is only a subtotal when this is nonzero.
     #[serde(default)]
     pub uncounted_calls: u32,
+    /// The run stopped before it finished and its checkpoint is kept: the
+    /// run id to resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
 }
 
 /// Names and inputs of the tools the planner offers the model. Each maps to
@@ -245,6 +324,8 @@ pub mod tools {
     pub const RECALL: &str = "recall";
     /// Offered only to the check designer: the check it settled on.
     pub const SUBMIT_CHECK: &str = "submit_check";
+    /// Offered only to the reviewer: its verdict.
+    pub const SUBMIT_REVIEW: &str = "submit_review";
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ReadFile {
@@ -320,11 +401,30 @@ pub mod tools {
         pub files: Vec<String>,
         pub rationale: String,
     }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SubmitReview {
+        pub verdict: super::Verdict,
+        #[serde(default)]
+        pub findings: Vec<String>,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_design_replies_remain_readable_without_inventing_a_budget() {
+        let wire = serde_json::json!({"usage":{}, "cost_usd":0.25});
+        let response: DesignResponse = serde_json::from_value(wire).unwrap();
+        assert_eq!(response.uncounted_calls, 0);
+        assert!(response.error.is_none() && response.remaining_budget_usd.is_none() && !response.cancelled);
+        let wire = serde_json::to_value(response).unwrap();
+        for key in ["uncounted_calls", "error", "remaining_budget_usd", "cancelled"] {
+            assert!(wire.get(key).is_none());
+        }
+    }
 
     #[test]
     fn minimal_request_gets_defaults() {
@@ -334,7 +434,9 @@ mod tests {
         assert!(req.apply);
         assert!(req.verify);
         // Requests from callers that know neither field stay as they were.
+        assert!(req.review);
         let wire = serde_json::to_value(&req).unwrap();
         assert!(wire.get("verify").is_none() && wire.get("check_files").is_none(), "{wire}");
+        assert!(wire.get("review").is_none(), "{wire}");
     }
 }

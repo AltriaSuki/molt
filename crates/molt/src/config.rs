@@ -14,6 +14,12 @@
 //! memory_mb = 512
 //! env = { GREETING = "hi" }           # set for the process
 //! pass_env = ["ECHO_PREFIX"]          # copied from molt's environment when set
+//!
+//! [confirm]                           # when the interface's confirm mode stops
+//! max_lines = 300
+//! max_files = 10
+//! ask_paths = [".github/", "Cargo.toml"]
+//! always_ask = false
 //! ```
 
 use std::collections::BTreeMap;
@@ -150,10 +156,60 @@ pub struct Config {
     pub kernel: KernelSection,
     #[serde(default, rename = "service")]
     pub services: Vec<ServiceSection>,
+    #[serde(default)]
+    pub confirm: ConfirmSection,
+}
+
+/// When the interface's confirm mode stops for the user. It goes on by
+/// itself when nothing here calls for a look.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmSection {
+    /// Stop before applying a result that adds and removes more lines than this.
+    #[serde(default = "default_max_lines")]
+    pub max_lines: usize,
+    /// Stop before applying a result that changes more files than this.
+    #[serde(default = "default_max_files")]
+    pub max_files: usize,
+    /// Stop before applying a result that changes one of these: a path, a
+    /// directory ending in `/`, or a file name matched in any directory.
+    #[serde(default = "default_ask_paths")]
+    pub ask_paths: Vec<String>,
+    /// Stop for every check and every result, as before these rules.
+    #[serde(default)]
+    pub always_ask: bool,
+}
+
+fn default_max_lines() -> usize {
+    300
+}
+
+fn default_max_files() -> usize {
+    10
+}
+
+fn default_ask_paths() -> Vec<String> {
+    [".github/", "Cargo.toml", "Cargo.lock", "package.json", "go.mod", "migrations/"].map(str::to_owned).to_vec()
+}
+
+impl Default for ConfirmSection {
+    fn default() -> Self {
+        Self {
+            max_lines: default_max_lines(),
+            max_files: default_max_files(),
+            ask_paths: default_ask_paths(),
+            always_ask: false,
+        }
+    }
 }
 
 /// What the gateway reads from its environment (see `molt_gateway::Config::from_env`).
 const GATEWAY_ENV: &[&str] = &[
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "MOLT_PROVIDER",
+    "MOLT_MODEL_ALIASES",
+    "MOLT_OPENAI_MODELS",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "MOLT_MODEL",
@@ -178,6 +234,8 @@ const PLANNER_ENV: &[&str] = &[
     "MOLT_MODEL_TIMEOUT_S",
     "MOLT_CHECK_TIMEOUT_S",
     "MOLT_MAP_TOKENS",
+    "MOLT_CONTEXT_TOKENS",
+    "MOLT_INSTRUCTION_FILES",
 ];
 
 /// What the memory service reads from its environment (see `molt_memory::Config::from_env`).
@@ -186,6 +244,8 @@ const MEMORY_ENV: &[&str] =
 
 /// The memory database in a data dir.
 pub const MEMORY_DB: &str = "memory.db";
+/// The directory in the data dir where the planner keeps run checkpoints.
+pub const RUNS: &str = "runs";
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -225,8 +285,9 @@ impl Config {
         // The gateway is the only holder of the API key, so only a human may change it.
         let mut model = service("model", Tier::Protected, bin("molt-gateway")?)?;
         model.pass_env = names(GATEWAY_ENV);
-        model.requests = vec![request(&format!("topic:{}", molt_api::progress::TOPIC), Budget::new(0, 0, 10_000_000))?];
-        let changed = format!("topic:{}", molt_api::fs::CHANGED);
+        model.requests =
+            vec![request(&format!("topic:publish:{}", molt_api::progress::TOPIC), Budget::new(0, 0, 10_000_000))?];
+        let changed = format!("topic:publish:{}", molt_api::fs::CHANGED);
         let mut fs = service("fs", Tier::Mutable, tools("fs")?)?;
         fs.requests = vec![request(&changed, Budget::new(0, 0, 100_000_000))?];
         let shell = service("shell", Tier::Protected, tools("shell")?)?;
@@ -239,6 +300,8 @@ impl Config {
             text(&data_dir.join(MEMORY_DB))?,
             "--skip".into(),
             text(data_dir)?,
+            "--forks".into(),
+            text(&data_dir.join("work"))?,
         ];
         let mut memory = service("memory", Tier::Mutable, memory_exec)?;
         memory.pass_env = names(MEMORY_ENV);
@@ -247,9 +310,13 @@ impl Config {
         memory.requests = vec![
             request(molt_api::model::COMPLETE, Budget::new(1_000_000_000, 0, 1_000_000))?,
             request(molt_proto::audit::READ, Budget::new(0, 0, 10_000_000))?,
-            request(&changed, Budget::new(0, 0, 10))?,
+            request(&format!("topic:subscribe:{}", molt_api::fs::CHANGED), Budget::new(0, 0, 10))?,
+            request(molt_api::fs::VIEW, Budget::new(0, 0, 100_000_000))?,
         ];
-        let mut planner = service("planner", Tier::Mutable, bin("molt-planner")?)?;
+        let mut planner_exec = bin("molt-planner")?;
+        // Checkpoints of runs, to resume one that stopped.
+        planner_exec.args = vec!["--state".into(), text(&data_dir.join(RUNS))?];
+        let mut planner = service("planner", Tier::Mutable, planner_exec)?;
         planner.pass_env = names(PLANNER_ENV);
         // A budget of zero calls refuses every call, and `ms` 0 leaves deadlines
         // to each request; the planner enforces the run's own limits.
@@ -257,17 +324,22 @@ impl Config {
             request(molt_api::model::COMPLETE, Budget::new(4_000_000_000, 0, 1_000_000))?,
             request("fs.*", Budget::new(0, 0, 10_000_000))?,
             request(molt_api::shell::RUN, Budget::new(0, 0, 1_000_000))?,
-            request(&format!("topic:{}", molt_api::progress::TOPIC), Budget::new(0, 0, 10_000_000))?,
+            request(&format!("topic:publish:{}", molt_api::progress::TOPIC), Budget::new(0, 0, 10_000_000))?,
         ];
         // What memory knows about the workspace; not remember, forget or consolidate.
-        for method in
-            [molt_api::memory::INDEX, molt_api::memory::MAP, molt_api::memory::RECALL, molt_api::memory::SYMBOLS]
-        {
+        for method in [
+            molt_api::memory::INDEX,
+            molt_api::memory::MAP,
+            molt_api::memory::RECALL,
+            molt_api::memory::SYMBOLS,
+            molt_api::memory::FORK_SYMBOLS,
+        ] {
             planner.requests.push(request(method, Budget::new(0, 0, 10_000_000))?);
         }
         Ok(Self {
             kernel: KernelSection { data_dir: data_dir.to_path_buf(), ..KernelSection::default() },
             services: vec![model, fs, shell, memory, planner],
+            confirm: ConfirmSection::default(),
         })
     }
 
@@ -362,6 +434,15 @@ mod tests {
     }
 
     #[test]
+    fn the_confirm_rules_have_defaults_and_take_what_is_set() {
+        assert_eq!(Config::parse("").unwrap().confirm, ConfirmSection::default());
+        let cfg = Config::parse("[confirm]\nmax_lines = 50\nask_paths = [\"db/\"]\n").unwrap();
+        assert_eq!((cfg.confirm.max_lines, cfg.confirm.max_files), (50, 10));
+        assert_eq!(cfg.confirm.ask_paths, ["db/"]);
+        assert!(Config::parse("[confirm]\nmax_line = 50\n").is_err());
+    }
+
+    #[test]
     fn rejects_unknown_keys() {
         assert!(Config::parse("[kernel]\ntransprot = \"unix\"\n").is_err());
     }
@@ -428,8 +509,12 @@ mod tests {
         let model = cfg.service("model").unwrap();
         assert_eq!(model.exec.as_ref().unwrap().command, "/opt/molt/bin/molt-gateway");
         assert_eq!(model.tier, Tier::Protected);
-        assert_eq!(model.requests.iter().map(|r| r.target.to_string()).collect::<Vec<_>>(), ["topic:progress"]);
+        assert_eq!(model.requests.iter().map(|r| r.target.to_string()).collect::<Vec<_>>(), ["topic:publish:progress"]);
         assert!(model.pass_env.iter().any(|v| v == "ANTHROPIC_API_KEY"));
+        assert!(model.pass_env.iter().any(|v| v == "OPENAI_API_KEY"));
+        for service in cfg.services.iter().filter(|s| s.name.as_str() != "model") {
+            assert!(!service.pass_env.iter().any(|v| v.starts_with("OPENAI_")));
+        }
         assert!(model.pass_env.iter().any(|v| v == "ANTHROPIC_BASE_URL"));
 
         for kind in ["fs", "shell"] {
@@ -440,7 +525,7 @@ mod tests {
         let targets = |name: &str| -> Vec<String> {
             cfg.service(name).unwrap().requests.iter().map(|r| r.target.to_string()).collect()
         };
-        assert_eq!(targets("fs"), ["topic:fs.changed"], "fs reports the files it changes");
+        assert_eq!(targets("fs"), ["topic:publish:fs.changed"], "fs reports the files it changes");
         assert!(targets("shell").is_empty());
 
         let memory = cfg.service("memory").unwrap();
@@ -448,14 +533,24 @@ mod tests {
         assert_eq!(exec.command, "/opt/molt/bin/molt-memory");
         assert_eq!(
             exec.args,
-            ["--root", "/home/u/proj", "--db", "/cache/molt/proj/memory.db", "--skip", "/cache/molt/proj"]
+            [
+                "--root",
+                "/home/u/proj",
+                "--db",
+                "/cache/molt/proj/memory.db",
+                "--skip",
+                "/cache/molt/proj",
+                "--forks",
+                "/cache/molt/proj/work"
+            ]
         );
         assert_eq!(memory.tier, Tier::Mutable);
-        assert_eq!(targets("memory"), ["model.complete", "kernel.audit.read", "topic:fs.changed"]);
+        assert_eq!(targets("memory"), ["model.complete", "kernel.audit.read", "topic:subscribe:fs.changed", "fs.view"]);
         assert!(memory.pass_env.iter().all(|v| v.starts_with("MOLT_MEMORY_")));
 
         let planner = cfg.service("planner").unwrap();
         assert_eq!(planner.exec.as_ref().unwrap().command, "/opt/molt/bin/molt-planner");
+        assert_eq!(planner.exec.as_ref().unwrap().args, ["--state", "/cache/molt/proj/runs"]);
         assert!(planner.pass_env.iter().any(|v| v == "MOLT_MAX_TURNS"));
         assert!(!planner.pass_env.iter().any(|v| v.starts_with("ANTHROPIC")), "the planner never sees the key");
         let targets: Vec<String> = planner.requests.iter().map(|r| r.target.to_string()).collect();
@@ -465,11 +560,12 @@ mod tests {
                 "model.complete",
                 "fs.*",
                 "shell.run",
-                "topic:progress",
+                "topic:publish:progress",
                 "memory.index",
                 "memory.map",
                 "memory.recall",
-                "memory.symbols"
+                "memory.symbols",
+                "memory.fork_symbols"
             ]
         );
         for req in &planner.requests {

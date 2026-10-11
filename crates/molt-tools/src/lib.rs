@@ -6,6 +6,7 @@
 //! since Molt's data directory may live in `root`; only forks may sit below
 //! one, when `scratch` does. Forks are created in `scratch`.
 
+mod apply;
 mod error;
 mod files;
 mod fork;
@@ -73,6 +74,9 @@ impl Fs {
         if method == "merge" {
             return self.merge(payload).await;
         }
+        if method == "recover" {
+            return self.recover(payload).await;
+        }
         match self.handle_other(method, payload).await {
             Ok((reply, changed)) => (Ok(reply), changed),
             Err(e) => (Err(e), None),
@@ -103,6 +107,29 @@ impl Fs {
         }
     }
 
+    async fn recover(&self, payload: Value) -> (Result<Value, RemoteError>, Option<FilesChanged>) {
+        let req: api::RecoverRequest = match parse("fs", "recover", payload) {
+            Ok(r) => r,
+            Err(e) => return (Err(e), None),
+        };
+        let (roots, forks) = (self.roots.clone(), self.forks.clone());
+        let joined = tokio::task::spawn_blocking(move || {
+            let _turn = forks.lock().unwrap_or_else(|e| e.into_inner());
+            let base = roots.workspace(&req.workspace).ok();
+            let mut written = Vec::new();
+            let result = apply::recover(&roots, req, &mut written);
+            let changed = base
+                .filter(|_| !written.is_empty())
+                .map(|base| FilesChanged { workspace: base.to_string_lossy().into(), paths: written });
+            (result, changed)
+        })
+        .await;
+        match joined {
+            Ok((r, changed)) => (r.and_then(|r| serde_json::to_value(r).map_err(|e| failed(e.to_string()))), changed),
+            Err(e) => (Err(failed(format!("fs.recover failed: {e}"))), None),
+        }
+    }
+
     async fn handle_other(&self, method: &str, payload: Value) -> Result<(Value, Option<FilesChanged>), RemoteError> {
         let roots = self.roots.clone();
         let forks = self.forks.clone();
@@ -128,6 +155,8 @@ impl Fs {
             "search" => blocking(method, payload, move |req| files::search(&roots, req).map(quiet)).await,
             "fork" => blocking(method, payload, move |req| fork::fork(&roots, req).map(quiet)).await,
             "diff" => blocking(method, payload, move |req| fork::diff(&roots, req).map(quiet)).await,
+            "applies" => blocking(method, payload, move |req| apply::list(&roots, req).map(quiet)).await,
+            "view" => blocking(method, payload, move |req| fork::view(&roots, &forks, req).map(quiet)).await,
             "drop" => blocking(method, payload, move |req| fork::drop_fork(&roots, &forks, req).map(quiet)).await,
             _ => Err(invalid(format!("unknown method fs.{method}"))),
         }

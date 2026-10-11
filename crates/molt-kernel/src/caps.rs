@@ -273,4 +273,28 @@ mod tests {
         table.revoke(&parent.id);
         assert_eq!(table.verify(Some(&child.id), &sid("c"), &t("m.x")).unwrap_err(), CapError::Revoked);
     }
+
+    #[test]
+    fn topic_delegation_cannot_upgrade_subscription_to_publication() {
+        let table = CapTable::new();
+        let both = table.grant(sid("p"), t("topic:progress"), Budget::new(0, 0, 10), None);
+        let child = table
+            .delegate(&both.id, &sid("p"), sid("c"), t("topic:subscribe:progress"), Budget::new(0, 0, 3), None)
+            .unwrap();
+        assert_eq!(both.remaining().calls, 7);
+        for widened in ["topic:progress", "topic:publish:progress", "topic:subscribe:other"] {
+            assert!(table.delegate(&child.id, &sid("c"), sid("d"), t(widened), Budget::new(0, 0, 1), None).is_err());
+        }
+        assert_eq!(child.remaining().calls, 3, "refused delegations cannot consume budget");
+        assert!(table.verify(Some(&child.id), &sid("c"), &t("topic:subscribe:progress")).is_ok());
+        assert!(matches!(
+            table.verify(Some(&child.id), &sid("c"), &t("topic:publish:progress")),
+            Err(CapError::WrongTarget(_))
+        ));
+        table.revoke(&both.id);
+        assert_eq!(
+            table.verify(Some(&child.id), &sid("c"), &t("topic:subscribe:progress")).unwrap_err(),
+            CapError::Revoked
+        );
+    }
 }

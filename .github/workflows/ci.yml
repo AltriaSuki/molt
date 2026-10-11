@@ -8,24 +8,66 @@ on:
 env:
   CARGO_TERM_COLOR: always
   MOLT_REQUIRE_SANDBOX_TESTS: "1"
+  GOTOOLCHAIN: local
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-          cache: false
-      - name: Install nats-server for the NATS conformance and end-to-end tests
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Read pinned toolchain versions
+        id: versions
         run: |
-          go install github.com/nats-io/nats-server/v2@latest
-          echo "MOLT_NATS_SERVER=$(go env GOPATH)/bin/nats-server" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import os, re, tomllib
+          with open("rust-toolchain.toml", "rb") as f:
+              rust = tomllib.load(f)["toolchain"]
+          with open(".github/ci-versions.toml", "rb") as f:
+              versions = tomllib.load(f)
+          pins = {"rust": rust["channel"], "go": versions["go"], "nats": versions["nats"]}
+          for name, version in pins.items():
+              pattern = r"v\d+\.\d+\.\d+" if name == "nats" else r"\d+\.\d+\.\d+"
+              if not re.fullmatch(pattern, version):
+                  raise ValueError(f"{name} must be an exact release version: {version}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              for name, version in pins.items():
+                  print(f"{name}={version}", file=output)
+              print("components=" + ",".join(rust["components"]), file=output)
+          PY
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: ${{ steps.versions.outputs.rust }}
+          components: ${{ steps.versions.outputs.components }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          check-latest: false
+          cache: false
+      - name: Cache the pinned NATS binary
+        id: nats-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/molt-nats
+          key: molt-nats-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.versions.outputs.nats }}-go${{ steps.versions.outputs.go }}
+      - name: Install nats-server for the NATS conformance and end-to-end tests
+        if: steps.nats-cache.outputs.cache-hit != 'true'
+        env:
+          NATS_VERSION: ${{ steps.versions.outputs.nats }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/molt-nats"
+          GOBIN="$RUNNER_TEMP/molt-nats" go install "github.com/nats-io/nats-server/v2@$NATS_VERSION"
+      - name: Verify tool versions, including cache hits
+        env:
+          RUST_VERSION: ${{ steps.versions.outputs.rust }}
+          GO_VERSION: ${{ steps.versions.outputs.go }}
+          NATS_VERSION: ${{ steps.versions.outputs.nats }}
+        run: |
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_VERSION"
+          test "$(go env GOVERSION)" = "go$GO_VERSION"
+          nats_binary="$RUNNER_TEMP/molt-nats/nats-server"
+          test "$("$nats_binary" -v)" = "nats-server: $NATS_VERSION"
+          echo "MOLT_NATS_SERVER=$nats_binary" >> "$GITHUB_ENV"
       - name: Install Linux isolation backend
         run: |
           sudo apt-get update
