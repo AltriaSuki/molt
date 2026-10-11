@@ -265,6 +265,9 @@ impl Service {
     pub fn cap_for(&self, target: &Target) -> Option<CapId> {
         let caps = self.caps.lock().unwrap();
         caps.get(&target.to_string()).cloned().or_else(|| {
+            if let Target::TopicPublish { name } | Target::TopicSubscribe { name } = target {
+                return caps.get(&format!("topic:{name}")).cloned();
+            }
             let service = target.service()?;
             caps.get(&format!("{service}.*")).cloned()
         })
@@ -343,7 +346,8 @@ impl Service {
     }
 
     pub async fn subscribe(&self, topic: &str) -> Result<(), SdkError> {
-        let target: Target = format!("topic:{topic}").parse().map_err(|_| SdkError::Target(topic.to_owned()))?;
+        let target: Target =
+            format!("topic:subscribe:{topic}").parse().map_err(|_| SdkError::Target(topic.to_owned()))?;
         let cap = self.cap_for(&target).ok_or_else(|| SdkError::NoCapability(target.to_string()))?;
         self.kernel("subscribe", Some(cap), json!({ "topic": topic })).await.map(|_| ())
     }
@@ -355,7 +359,8 @@ impl Service {
     /// Publish an event as part of an existing trace, so progress is grouped
     /// with the request that produced it in the audit log.
     pub async fn publish_traced(&self, topic: &str, payload: Value, trace: TraceId) -> Result<(), SdkError> {
-        let target: Target = format!("topic:{topic}").parse().map_err(|_| SdkError::Target(topic.to_owned()))?;
+        let target: Target =
+            format!("topic:publish:{topic}").parse().map_err(|_| SdkError::Target(topic.to_owned()))?;
         let cap = self.cap_for(&target).ok_or_else(|| SdkError::NoCapability(target.to_string()))?;
         let msg = Envelope::event(trace, topic, cap, payload).map_err(|e| SdkError::Target(e.to_string()))?;
         Ok(self.link.send(&msg).await?)
@@ -623,6 +628,34 @@ mod tests {
         async fn recv(&self) -> Option<Envelope> {
             self.inbox.lock().await.recv().await
         }
+    }
+
+    #[tokio::test]
+    async fn topic_operations_select_only_their_right_and_keep_legacy_grants_working() {
+        let (to_service, inbox) = mpsc::channel(4);
+        let (sent, mut from_service) = mpsc::channel(4);
+        let link = SmallLink { max: usize::MAX, inbox: tokio::sync::Mutex::new(inbox), sent };
+        let svc = Service::new(ServiceId::new("listener").unwrap(), Box::new(link), HashMap::new());
+        let sub = CapId::random();
+        svc.add_cap("topic:subscribe:builds", sub.clone());
+        assert!(matches!(svc.publish("builds", json!("forged")).await, Err(SdkError::NoCapability(_))));
+        let subscribe = svc.subscribe("builds");
+        tokio::pin!(subscribe);
+        let request = tokio::select! { req=from_service.recv()=>req.unwrap(), result=&mut subscribe=>panic!("no subscription request: {result:?}") };
+        assert_eq!(request.to.to_string(), "kernel.subscribe");
+        assert_eq!(request.cap, Some(sub.clone()));
+        to_service.send(request.reply(json!({"subscribed":true}))).await.unwrap();
+        subscribe.await.unwrap();
+        let legacy = CapId::random();
+        svc.add_cap("topic:builds", legacy.clone());
+        assert_eq!(svc.cap_for(&"topic:publish:builds".parse().unwrap()), Some(legacy));
+        assert_eq!(svc.cap_for(&"topic:subscribe:builds".parse().unwrap()), Some(sub));
+        let publish = CapId::random();
+        svc.add_cap("topic:publish:builds", publish.clone());
+        svc.publish("builds", json!("real")).await.unwrap();
+        let event = from_service.recv().await.unwrap();
+        assert_eq!(event.to.to_string(), "topic:builds", "event wire destinations are unchanged");
+        assert_eq!(event.cap, Some(publish));
     }
 
     #[tokio::test]

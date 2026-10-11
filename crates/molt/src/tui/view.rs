@@ -85,14 +85,19 @@ fn spin(tick: u64) -> usize {
 fn draw_main(frame: &mut Frame, area: Rect, app: &mut App) {
     let live = live_lines(app, area.width.saturating_sub(2));
     let lanes = app.task.as_ref().is_some_and(|t| t.phase == Phase::Running && !t.lanes.is_empty());
+    // The input grows with its lines, up to half the screen.
+    let (rows, _) = field_rows(&app.input, field_width(area.width));
+    let input_height = u16::try_from(rows.len()).unwrap_or(u16::MAX).clamp(1, (area.height / 2).max(1)) + 2;
+    let taken = area.height.saturating_sub(input_height + 2);
     let live_height = if lanes {
-        let room = area.height.saturating_sub(6);
+        let room = taken.saturating_sub(1);
         if app.zoom.is_some() { room * 2 / 3 } else { (room / 2).min(14) }.max(4)
     } else {
-        u16::try_from(live.len()).unwrap_or(u16::MAX).min(area.height.saturating_sub(5))
+        u16::try_from(live.len()).unwrap_or(u16::MAX).min(taken)
     };
     let [log, live_area, input] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(live_height), Constraint::Length(3)]).areas(area);
+        Layout::vertical([Constraint::Min(1), Constraint::Length(live_height), Constraint::Length(input_height)])
+            .areas(area);
 
     // The log, from its end unless scrolled.
     let width = log.width.saturating_sub(2).max(1);
@@ -137,6 +142,17 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 span("◆ check", Tone::Shell),
                 span(format!("  designed · ${:.2}", d.cost_usd), Tone::Dim),
             ])];
+            if d.uncounted_calls > 0 {
+                lines.push(Line::from(span(
+                    format!("  cost incomplete · {} calls uncounted · remaining budget unknown", d.uncounted_calls),
+                    Tone::Warn,
+                )));
+            } else if let Some(remaining) = d.remaining_budget_usd {
+                lines.push(Line::from(span(
+                    format!("  ${remaining:.2} remaining for attempts"),
+                    if remaining <= 0.0 { Tone::Bad } else { Tone::Dim },
+                )));
+            }
             match &d.command {
                 Some(c) => lines.push(Line::from(vec![span("  $ ", Tone::Dim), span(clean_line(c), Tone::Plain)])),
                 None => lines.push(Line::from(span("  no automated check fits this task", Tone::Warn))),
@@ -170,6 +186,7 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     None => Line::from(vec![span("  baseline  ", Tone::Dim), span("not run", Tone::Dim)]),
                 });
             }
+            lines.extend(stops_line(app));
             lines.push(Line::default());
             if editing {
                 lines.push(keys(&[("enter", "save the command"), ("esc", "back")]));
@@ -190,17 +207,28 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             let (added, removed) = text::diff_counts(&resp.patch);
             let files =
                 if resp.changes.len() == 1 { "1 file".to_owned() } else { format!("{} files", resp.changes.len()) };
-            vec![
-                Line::from(vec![
-                    span("◆ apply to the workspace?", Tone::Shell),
-                    span(format!("  {files}  "), Tone::Dim),
-                    span(format!("+{added}"), Tone::Ok),
-                    span(" ", Tone::Plain),
-                    span(format!("−{removed}"), Tone::Bad),
-                ]),
-                keys(&[("enter", "apply"), ("d", "diff"), ("k", "keep in its fork"), ("n", "discard")]),
-            ]
+            let mut lines = vec![Line::from(vec![
+                span("◆ apply to the workspace?", Tone::Shell),
+                span(format!("  {files}  "), Tone::Dim),
+                span(format!("+{added}"), Tone::Ok),
+                span(" ", Tone::Plain),
+                span(format!("−{removed}"), Tone::Bad),
+            ])];
+            lines.extend(stops_line(app));
+            lines.push(keys(&[("enter", "apply"), ("d", "diff"), ("k", "keep in its fork"), ("n", "discard")]));
+            lines
         }
+        Some(Prompt::Retry { req, stopped, .. }) => vec![
+            Line::from(vec![
+                if *stopped { span("■ stopped", Tone::Warn) } else { span("◆ no attempt passed", Tone::Bad) },
+                span(format!("  $ {}", clean_line(req.check.as_deref().unwrap_or_default())), Tone::Dim),
+            ]),
+            if *stopped {
+                keys(&[("r", "start again with the same check"), ("v", "what the attempts did"), ("esc", "dismiss")])
+            } else {
+                keys(&[("r", "retry with the same check"), ("v", "why"), ("esc", "dismiss")])
+            },
+        ],
         None => match &app.task {
             Some(Task { phase: Phase::Designing, .. }) => busy("designing the check"),
             Some(task @ Task { phase: Phase::Running, .. }) if task.lanes.is_empty() => {
@@ -210,6 +238,12 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             _ => Vec::new(),
         },
     }
+}
+
+/// Why confirm mode stopped, when a rule did it.
+fn stops_line(app: &App) -> Option<Line<'static>> {
+    let stops = &app.task.as_ref()?.stops;
+    (!stops.is_empty()).then(|| Line::from(vec![span("  stopped: ", Tone::Dim), span(stops.join(" · "), Tone::Warn)]))
 }
 
 fn keys(pairs: &[(&str, &str)]) -> Line<'static> {
@@ -292,19 +326,55 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     draw_field(frame, field, &app.input, !waiting);
 }
 
+/// The width of the task input's text: inside the border, after the prompt mark.
+fn field_width(width: u16) -> u16 {
+    width.saturating_sub(4)
+}
+
+/// `input` as rows that fit `width`, its lines broken where they do not,
+/// and the row and column of its cursor.
+fn field_rows(input: &Input, width: u16) -> (Vec<String>, (usize, usize)) {
+    // One cell is kept for the cursor at the end of a full row.
+    let room = usize::from(width.saturating_sub(1)).max(1);
+    let mut rows = vec![String::new()];
+    let mut widths = vec![0];
+    let mut at = (0, 0);
+    for (i, c) in input.text.chars().enumerate() {
+        if i == input.cursor {
+            at = (rows.len() - 1, widths[rows.len() - 1]);
+        }
+        if c == '\n' {
+            rows.push(String::new());
+            widths.push(0);
+            continue;
+        }
+        let shown = clean_line(&c.to_string());
+        let w = text::width(&shown);
+        if widths[rows.len() - 1] + w > room {
+            rows.push(String::new());
+            widths.push(0);
+        }
+        let last = rows.len() - 1;
+        rows[last].push_str(&shown);
+        widths[last] += w;
+    }
+    if input.cursor >= input.text.chars().count() {
+        at = (rows.len() - 1, widths[rows.len() - 1]);
+    }
+    (rows, at)
+}
+
 /// A text field scrolled so its cursor shows.
 fn draw_field(frame: &mut Frame, area: Rect, input: &Input, cursor: bool) {
-    let chars: Vec<char> = input.text.chars().collect();
-    let room = usize::from(area.width.saturating_sub(1)).max(1);
-    let mut start = 0;
-    while text::width(&chars[start..input.cursor].iter().collect::<String>()) > room {
-        start += 1;
-    }
-    let shown: String = chars[start..].iter().collect();
-    frame.render_widget(Paragraph::new(clean_line(&shown)), area);
+    let (rows, (row, column)) = field_rows(input, area.width);
+    let height = usize::from(area.height).max(1);
+    let top = (row + 1).saturating_sub(height);
+    let shown: Vec<Line> = rows.into_iter().skip(top).take(height).map(Line::from).collect();
+    frame.render_widget(Paragraph::new(shown), area);
     if cursor {
-        let x = text::width(&chars[start..input.cursor].iter().collect::<String>());
-        frame.set_cursor_position((area.x + u16::try_from(x).unwrap_or(0), area.y));
+        let x = area.x + u16::try_from(column).unwrap_or(0);
+        let y = area.y + u16::try_from(row - top).unwrap_or(0);
+        frame.set_cursor_position((x, y));
     }
 }
 
@@ -326,6 +396,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         parts.push(format!("check: {}", text::fit(&clean_line(check), 24)));
     }
     let mut cost = format!("${:.2}", app.spent_usd);
+    if app.uncounted_calls > 0 {
+        cost.push_str(&format!(" known · {} calls uncounted", app.uncounted_calls));
+    }
     if let Some(b) = s.budget_usd {
         cost.push_str(&format!(" · ${b:.2}/task"));
     }
@@ -464,5 +537,22 @@ fn draw_memory(frame: &mut Frame, area: Rect, view: &MemoryView, tick: u64) {
             let hints = keys(&[("↑↓", "select"), ("/", "filter"), ("f", "forget"), ("r", "reload"), ("esc", "back")]);
             frame.render_widget(Paragraph::new(hints), inner);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_input_breaks_into_rows_that_fit_and_finds_its_cursor() {
+        let mut input = Input::with("ab\n\tc\ndefghij");
+        input.cursor = 4; // after the tab
+        let (rows, at) = field_rows(&input, 6);
+        assert_eq!(rows, ["ab", "    c", "defgh", "ij"]);
+        assert_eq!(at, (1, 4));
+        input.cursor = input.text.chars().count();
+        assert_eq!(field_rows(&input, 6).1, (3, 2));
+        assert_eq!(field_rows(&Input::default(), 6), (vec![String::new()], (0, 0)));
     }
 }
