@@ -10,8 +10,9 @@ use molt_api::memory::{
     ReviewResponse,
 };
 use molt_api::model::Effort;
-use molt_api::planner::{Outcome, RunRequest};
-use molt_proto::ServiceId;
+use molt_api::planner::{Outcome, Resume, RunRequest};
+use molt_planner::checkpoint;
+use molt_proto::{ServiceId, TraceId};
 
 /// The config `molt run`, `molt audit` and `molt nats-config` read when none is given.
 const DEFAULT_CONFIG: &str = "molt.toml";
@@ -42,6 +43,10 @@ enum Cmd {
                             report names; 128+N when stopped by signal N (130 for Ctrl-C, 129 for SIGHUP, 143 for SIGTERM)."
     )]
     Do(DoArgs),
+    /// Go on with a run of `molt do --checkpoint` that stopped before it
+    /// finished, from its last checkpoint. Its attempts keep their forks and
+    /// conversations, and the cost so far counts against its budget.
+    Resume(ResumeArgs),
     /// See and correct what memory holds about a project.
     Memory {
         #[command(subcommand)]
@@ -70,9 +75,6 @@ enum Cmd {
 struct DoArgs {
     /// What to do, in plain words.
     task: String,
-    /// The project to work on.
-    #[arg(long, default_value = ".")]
-    workspace: PathBuf,
     /// Shell command, run in the workspace, that exits 0 once the task is done.
     /// Without one, the planner designs a check first.
     #[arg(long)]
@@ -93,8 +95,24 @@ struct DoArgs {
     /// Model turns per attempt.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     max_turns: Option<u32>,
+    /// Save a checkpoint as the run goes, so that a run stopped before it
+    /// finishes (interrupted, out of budget, killed) can go on with `molt resume`.
+    #[arg(long)]
+    checkpoint: bool,
+    #[command(flatten)]
+    common: RunArgs,
+}
+
+/// How a run of `molt do` or `molt resume` goes.
+#[derive(Args)]
+struct RunArgs {
+    /// The project to work on.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
     /// Spending limit for the whole run, learning included, in US dollars.
     /// It is checked before each model call, so the last one can go past it.
+    /// For `molt resume`, it replaces the stopped run's, which counts what
+    /// was spent before.
     #[arg(long, value_parser = usd)]
     budget_usd: Option<f64>,
     /// Keep the result in its fork instead of applying it to the workspace.
@@ -128,6 +146,31 @@ struct DoArgs {
     /// model call after the run).
     #[arg(long)]
     no_learn: bool,
+    /// Do not have a reviewer look at a passing result before it is applied
+    /// (the review is more model calls, and holds back what it questions).
+    #[arg(long)]
+    no_review: bool,
+    /// Model memory learns from the run with: opus, sonnet, haiku, a model
+    /// id, or `same` for the attempts' model. Default: MOLT_MEMORY_MODEL,
+    /// else sonnet.
+    #[arg(long, value_name = "MODEL", conflicts_with_all = ["no_learn", "no_memory"])]
+    memory_model: Option<String>,
+}
+
+#[derive(Args)]
+struct ResumeArgs {
+    /// The stopped run to go on with, as `--list` shows it. Default: the one
+    /// in the workspace that stopped last.
+    run: Option<String>,
+    /// Leave the stopped attempts as they are and start new ones, with the
+    /// same check and the cost so far.
+    #[arg(long)]
+    retry: bool,
+    /// List the stopped runs of the workspace that can be resumed.
+    #[arg(long)]
+    list: bool,
+    #[command(flatten)]
+    common: RunArgs,
 }
 
 #[derive(Args, Default)]
@@ -242,8 +285,8 @@ fn env_name(name: &str) -> Result<String, String> {
     if name.is_empty() || name.contains(['=', '\0']) {
         return Err(format!("{name:?} is not a variable name"));
     }
-    if name.starts_with("MOLT_") || name.starts_with("ANTHROPIC_") {
-        return Err("commands never see MOLT_* or ANTHROPIC_* variables".into());
+    if name.starts_with("MOLT_") || name.starts_with("ANTHROPIC_") || name.starts_with("OPENAI_") {
+        return Err("commands never see MOLT_*, ANTHROPIC_* or OPENAI_* variables".into());
     }
     Ok(name.to_owned())
 }
@@ -289,7 +332,10 @@ async fn main() -> anyhow::Result<ExitCode> {
     let cmd = cli.cmd.unwrap_or_else(|| Cmd::Ui(UiArgs { workspace: ".".into(), ..UiArgs::default() }));
     // `molt do`, `molt memory`, `molt bench` and the interface print their own progress; kernel logs would bury it.
     molt::init_tracing(
-        if matches!(cmd, Cmd::Do(_) | Cmd::Memory { .. } | Cmd::Bench { .. } | Cmd::Prices { .. } | Cmd::Ui(_)) {
+        if matches!(
+            cmd,
+            Cmd::Do(_) | Cmd::Resume(_) | Cmd::Memory { .. } | Cmd::Bench { .. } | Cmd::Prices { .. } | Cmd::Ui(_)
+        ) {
             "warn"
         } else {
             "info"
@@ -324,6 +370,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             running.shutdown().await;
         }
         Cmd::Do(args) => return do_task(cli.config.as_deref(), args).await,
+        Cmd::Resume(args) => return resume_task(cli.config.as_deref(), args).await,
         Cmd::Memory { cmd } => memory_cmd(cli.config.as_deref(), cmd).await?,
         Cmd::Bench { cmd } => return molt_bench::cli::main(cmd).await,
         Cmd::Prices { cmd } => return prices_cmd(cmd).await,
@@ -457,9 +504,8 @@ fn cfg_scratch(args: &[String]) -> anyhow::Result<PathBuf> {
     Ok(path.canonicalize().unwrap_or(path))
 }
 
-async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode> {
-    // From the start, so that no signal leaves services running.
-    let stop = molt::stop_signal()?;
+/// The config and canonical workspace a run of `molt do` or `molt resume` uses.
+fn prepare(config: Option<&Path>, args: &RunArgs) -> anyhow::Result<(Config, String)> {
     let workspace = args.workspace.canonicalize().with_context(|| format!("workspace {}", args.workspace.display()))?;
     anyhow::ensure!(workspace.is_dir(), "the workspace {} is not a directory", workspace.display());
     let mut cfg = agent::resolve_config(config, &workspace, args.data_dir.as_deref())?;
@@ -489,7 +535,7 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
                 exec.args.extend(["--sandbox-env".into(), name.clone()]);
             }
         }
-        shell.pass_env.extend(args.pass_env);
+        shell.pass_env.extend(args.pass_env.iter().cloned());
     }
     if args.no_memory {
         cfg.services.retain(|s| s.name.as_str() != agent::MEMORY);
@@ -499,26 +545,119 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
             svc.env.entry("RUST_LOG".into()).or_insert_with(|| "warn".into());
         }
     }
-    let mut req = RunRequest::new(args.task, workspace.to_str().context("the workspace path is not UTF-8")?);
+    let workspace = workspace.to_str().context("the workspace path is not UTF-8")?.to_owned();
+    Ok((cfg, workspace))
+}
+
+async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode> {
+    // From the start, so that no signal leaves services running.
+    let stop = molt::stop_signal()?;
+    let (cfg, workspace) = prepare(config, &args.common)?;
+    let mut req = RunRequest::new(args.task, workspace);
     req.check = args.check;
     req.verify = !args.no_check;
     req.attempts = args.attempts;
     req.model = args.model;
     req.effort = args.effort;
     req.max_turns = args.max_turns;
-    req.budget_usd = args.budget_usd;
-    req.apply = !args.no_apply;
-    req.stream = args.stream;
-    let apply = req.apply;
+    req.budget_usd = args.common.budget_usd;
+    req.apply = !args.common.no_apply;
+    req.stream = args.common.stream;
+    req.checkpoint = args.checkpoint;
+    req.review = !args.common.no_review;
+    execute(&cfg, req, TraceId::random(), &args.common, stop).await
+}
 
+async fn resume_task(config: Option<&Path>, args: ResumeArgs) -> anyhow::Result<ExitCode> {
+    let stop = molt::stop_signal()?;
+    let (cfg, workspace) = prepare(config, &args.common)?;
+    let dir = agent::checkpoint_dir(&cfg).context("this config's planner keeps no checkpoints (it has no --state)")?;
+    let here: Vec<checkpoint::Saved> = checkpoint::list(&dir)
+        .into_iter()
+        .filter_map(|(run, saved)| match saved {
+            Ok(saved) => Some(saved),
+            Err(e) => {
+                eprintln!("{run}: {e}");
+                None
+            }
+        })
+        .filter(|saved| saved.request.workspace == workspace)
+        .collect();
+    if args.list {
+        if here.is_empty() {
+            eprintln!("no stopped run to resume in {}", agent::printable(&workspace));
+        }
+        for saved in &here {
+            println!("{}", agent::printable(&stopped_run(saved)));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let run = match args.run {
+        Some(run) => run,
+        None => here
+            .first()
+            .map(|saved| saved.run.clone())
+            .with_context(|| format!("no stopped run to resume in {}", agent::printable(&workspace)))?,
+    };
+    let saved = checkpoint::load(&dir, &run).map_err(|e| anyhow::anyhow!(e))?;
+    let mut req = saved.request;
+    req.workspace = workspace;
+    req.resume = Some(Resume { run: run.clone(), retry: args.retry });
+    req.checkpoint = true;
+    req.apply = !args.common.no_apply;
+    req.stream = args.common.stream;
+    req.budget_usd = args.common.budget_usd.or(req.budget_usd);
+    eprintln!("resuming run {run}: {}", agent::printable(req.task.lines().next().unwrap_or_default()));
+    execute(&cfg, req, TraceId::from_raw(&run), &args.common, stop).await
+}
+
+/// One line about a stopped run: its id, when it stopped, what it spent,
+/// its attempts and its task.
+fn stopped_run(saved: &checkpoint::Saved) -> String {
+    let ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |now| (now.as_millis() as u64).saturating_sub(saved.saved_ms) / 60_000);
+    let attempts: Vec<String> = saved
+        .attempts
+        .iter()
+        .map(|a| match &a.end {
+            Some(end) => format!("{}: {:?} after {} turns", a.index, end.status, a.turns).to_lowercase(),
+            None => format!("{}: stopped after {} turns", a.index, a.turns),
+        })
+        .collect();
+    let task: String = saved.request.task.lines().next().unwrap_or_default().chars().take(60).collect();
+    format!(
+        "{}  {ago} min ago  ${:.2}  [{}]  {task}",
+        saved.run,
+        saved.spend.cost_usd,
+        if attempts.is_empty() { "no attempt yet".to_owned() } else { attempts.join(", ") }
+    )
+}
+
+/// Carry out `req` under the run id `trace` and report it.
+async fn execute(
+    cfg: &Config,
+    req: RunRequest,
+    trace: TraceId,
+    args: &RunArgs,
+    stop: impl std::future::Future<Output = i32>,
+) -> anyhow::Result<ExitCode> {
+    let apply = req.apply;
+    let checkpointed = req.checkpoint;
+    let run = trace.to_string();
     let mut signal = None;
     let stopped = async { signal = Some(stop.await) };
     let progress = |event: &_| eprintln!("{}", agent::describe(event));
-    let result = agent::run_task(&cfg, req, !args.no_learn, progress, stopped).await;
+    let learn = (!args.no_learn)
+        .then(|| agent::Learn { model: agent::memory_model(args.memory_model.as_deref(), req.model.as_deref()) });
+    let result = agent::run_task_as(cfg, req, trace, learn, progress, stopped).await;
     let done = match result {
         Ok(done) => done,
         Err(e) if e.is::<Interrupted>() => {
             eprintln!("interrupted; the services are stopped");
+            if checkpointed {
+                eprintln!("the run's checkpoint and forks are kept: go on with `molt resume {run}`");
+            }
             let status = signal.map_or(130, |n| 128 + n);
             return Ok(ExitCode::from(u8::try_from(status).unwrap_or(130)));
         }

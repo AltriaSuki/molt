@@ -1,11 +1,11 @@
 //! `fs.fork`, `fs.diff`, `fs.merge` and `fs.drop`.
 //!
 //! A fork is `scratch/fork-<id>`, with its metadata in
-//! `scratch/fork-<id>.json`: the workspace it was copied from and a hash of
-//! every copied file. Diff and merge compare three states of each path: the
-//! hash at fork time, the fork now and the original now. Forks and their
-//! metadata are private to the service's user: they copy private source, and
-//! merge trusts them.
+//! `scratch/fork-<id>.json`: the workspace it was copied from and the state
+//! of every copied file, its content hash and whether it is executable. Diff
+//! and merge compare three states of each path: the state at fork time, the
+//! fork now and the original now. Forks and their metadata are private to
+//! the service's user: they copy private source, and merge trusts them.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, DirBuilder, File, Permissions};
@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use molt_api::fs::{
     Change, ChangeKind, DiffRequest, DiffResponse, DropRequest, DropResponse, ForkRequest, ForkResponse, MergeRequest,
-    MergeResponse,
+    MergeResponse, ViewRequest, ViewResponse,
 };
 use molt_proto::RemoteError;
 use serde::{Deserialize, Serialize};
@@ -25,8 +25,8 @@ use sha2::{Digest, Sha256};
 use similar::TextDiff;
 
 use crate::error::{failed, invalid};
-use crate::files::{atomic_write, is_binary, temp_path};
-use crate::{paths, walk, Roots};
+use crate::files::{atomic_write, is_binary};
+use crate::{apply, paths, walk, Roots};
 
 const MAX_PATCH_BYTES: usize = 1024 * 1024;
 const MAX_DIFF_FILE: u64 = 4 * 1024 * 1024;
@@ -34,12 +34,19 @@ const DIFF_TIMEOUT: Duration = Duration::from_secs(2);
 /// The state of a path that is a directory, or sits below something that is
 /// not a directory. Never equal to a hash.
 const NOT_A_FILE: &str = "not-a-file";
+/// Appended to the hash of a regular file its owner can execute.
+const EXECUTABLE: &str = "+x";
+/// The metadata format. Version 0 recorded content hashes only.
+const META_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
 struct ForkMeta {
+    /// Absent, and so 0, in metadata older than [`META_VERSION`] 1.
+    #[serde(default)]
+    version: u32,
     /// The canonical workspace the fork was copied from.
     base: PathBuf,
-    /// The hash of every copied file and symlink, by workspace-relative path.
+    /// The state of every copied file and symlink, by workspace-relative path.
     files: BTreeMap<String, String>,
     /// Entries the ignore rules excluded, linked to the original instead of copied.
     #[serde(default)]
@@ -125,10 +132,10 @@ fn copy_tree(base: &Path, dest: &Path, scratch: &Path) -> Result<ForkMeta, Remot
         let to = dest.join(dir);
         fs::set_permissions(&to, mode.clone()).map_err(|e| err(&to, e))?;
     }
-    Ok(ForkMeta { base: base.to_path_buf(), files, links })
+    Ok(ForkMeta { version: META_VERSION, base: base.to_path_buf(), files, links })
 }
 
-/// Copy a regular file with its permission bits; returns its hash.
+/// Copy a regular file with its permission bits; returns its state.
 fn copy_file(from: &Path, to: &Path) -> io::Result<String> {
     let mut src = File::open(from)?;
     let mut dst = fs::OpenOptions::new().write(true).create_new(true).open(to)?;
@@ -142,8 +149,23 @@ fn copy_file(from: &Path, to: &Path) -> io::Result<String> {
         hasher.update(&buf[..n]);
         dst.write_all(&buf[..n])?;
     }
-    dst.set_permissions(src.metadata()?.permissions())?;
-    Ok(hex::encode(hasher.finalize()))
+    let mode = src.metadata()?.permissions().mode();
+    dst.set_permissions(Permissions::from_mode(mode))?;
+    Ok(file_state(hex::encode(hasher.finalize()), mode))
+}
+
+/// A regular file's state: its content hash, marked when its owner can
+/// execute it. That is the one mode bit a merge carries, as in git.
+fn file_state(hash: String, mode: u32) -> String {
+    if mode & 0o100 != 0 {
+        hash + EXECUTABLE
+    } else {
+        hash
+    }
+}
+
+fn is_executable(state: &str) -> bool {
+    state.ends_with(EXECUTABLE)
 }
 
 fn rel_string(rel: &Path) -> String {
@@ -161,9 +183,10 @@ fn link_hash(target: &Path) -> String {
     format!("link:{}", hex::encode(Sha256::digest(target.as_os_str().as_encoded_bytes())))
 }
 
-/// The state of `rel` under `root`: `None` when missing, else its hash (or
-/// [`NOT_A_FILE`]). Symlinks are never followed, including in parent
-/// directories, so a link swapped in cannot lead the caller outside `root`.
+/// The state of `rel` under `root`: `None` when missing, else its
+/// [`file_state`], its symlink hash or [`NOT_A_FILE`]. Symlinks are never
+/// followed, including in parent directories, so a link swapped in cannot
+/// lead the caller outside `root`.
 fn state(root: &Path, rel: &str) -> io::Result<Option<String>> {
     let parts: Vec<&str> = rel.split('/').collect();
     let mut path = root.to_path_buf();
@@ -181,7 +204,7 @@ fn state(root: &Path, rel: &str) -> io::Result<Option<String>> {
         if last {
             let kind = meta.file_type();
             return Ok(Some(if kind.is_file() {
-                hash_file(&path)?
+                file_state(hash_file(&path)?, meta.permissions().mode())
             } else if kind.is_symlink() {
                 link_hash(&fs::read_link(&path)?)
             } else {
@@ -198,7 +221,7 @@ fn meta_path(dir: &Path) -> PathBuf {
     dir.with_file_name(name)
 }
 
-fn is_fork_name(name: &str) -> bool {
+pub(crate) fn is_fork_name(name: &str) -> bool {
     name.strip_prefix("fork-")
         .is_some_and(|id| id.len() == 12 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }
@@ -233,6 +256,9 @@ fn open(roots: &Roots, fork: &str) -> Result<Fork, RemoteError> {
     };
     let meta: ForkMeta =
         serde_json::from_slice(&json).map_err(|e| failed(format!("the metadata of {fork} is corrupt: {e}")))?;
+    if meta.version > META_VERSION {
+        return Err(failed(format!("{fork} was made by a newer Molt; merge or drop it with that version")));
+    }
     // The metadata sits in scratch, where commands run; check it before trusting it.
     let base_ok = meta.base.canonicalize().is_ok_and(|b| b == meta.base && b.is_dir() && roots.contains(&b));
     if !base_ok {
@@ -244,7 +270,20 @@ fn open(roots: &Roots, fork: &str) -> Result<Fork, RemoteError> {
     Ok(Fork { dir, meta })
 }
 
-/// The hash of every file and symlink in the fork now, by path.
+impl Fork {
+    /// The state of `rel` under `root`, comparable with the fork-time state.
+    /// A version 0 fork recorded no modes, so its states leave them out and
+    /// its merges keep the original's modes, as they did when it was made.
+    fn state(&self, root: &Path, rel: &str) -> io::Result<Option<String>> {
+        let state = state(root, rel)?;
+        if self.meta.version == 0 {
+            return Ok(state.map(|s| s.strip_suffix(EXECUTABLE).map(str::to_owned).unwrap_or(s)));
+        }
+        Ok(state)
+    }
+}
+
+/// The state of every file and symlink in the fork now, by path.
 fn current(fork: &Fork, scratch: &Path) -> Result<BTreeMap<String, String>, RemoteError> {
     let err = |e: io::Error| failed(format!("reading the fork: {e}"));
     let mut now = BTreeMap::new();
@@ -259,7 +298,7 @@ fn current(fork: &Fork, scratch: &Path) -> Result<BTreeMap<String, String>, Remo
             }
         }
         if kind.is_file() || kind.is_symlink() {
-            if let Some(hash) = state(&fork.dir, &rel).map_err(err)?.filter(|h| h != NOT_A_FILE) {
+            if let Some(hash) = fork.state(&fork.dir, &rel).map_err(err)?.filter(|h| h != NOT_A_FILE) {
                 now.insert(rel, hash);
             }
         }
@@ -268,12 +307,31 @@ fn current(fork: &Fork, scratch: &Path) -> Result<BTreeMap<String, String>, Remo
     // .gitignore) still exists; it is not deleted.
     for rel in fork.meta.files.keys() {
         if !now.contains_key(rel) {
-            if let Some(hash) = state(&fork.dir, rel).map_err(err)?.filter(|h| h != NOT_A_FILE) {
+            if let Some(hash) = fork.state(&fork.dir, rel).map_err(err)?.filter(|h| h != NOT_A_FILE) {
                 now.insert(rel.clone(), hash);
             }
         }
     }
     Ok(now)
+}
+
+pub(crate) fn fingerprint(roots: &Roots, name: &str) -> Result<String, RemoteError> {
+    let fork = open(roots, name)?;
+    let files = current(&fork, &roots.scratch)?;
+    fingerprint_of(&fork.dir, &files)
+}
+
+fn fingerprint_of(dir: &Path, files: &BTreeMap<String, String>) -> Result<String, RemoteError> {
+    // Recovery freezes all file permission bits, including a new file's
+    // read/write permissions. Diff's execute-only identity is insufficient.
+    let mut inventory = BTreeMap::new();
+    for (path, state) in files {
+        let meta = fs::symlink_metadata(dir.join(path)).map_err(|e| failed(format!("candidate {path}: {e}")))?;
+        let mode = meta.is_file().then(|| meta.permissions().mode() & 0o7777);
+        inventory.insert(path, (state, mode));
+    }
+    let bytes = serde_json::to_vec(&inventory).map_err(|e| failed(e.to_string()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn changes(before: &BTreeMap<String, String>, now: &BTreeMap<String, String>) -> Vec<Change> {
@@ -313,12 +371,29 @@ pub(crate) fn diff(roots: &Roots, req: DiffRequest) -> Result<DiffResponse, Remo
     Ok(DiffResponse { changes, patch, truncated })
 }
 
+pub(crate) fn view(roots: &Roots, lock: &Mutex<()>, req: ViewRequest) -> Result<ViewResponse, RemoteError> {
+    // A drop or merge must not replace the fork while its identity is checked.
+    let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let fork = open(roots, &req.fork)?;
+    let now = current(&fork, &roots.scratch)?;
+    let fingerprint = |files: &BTreeMap<String, String>| -> Result<String, RemoteError> {
+        let bytes = serde_json::to_vec(files).map_err(|e| failed(e.to_string()))?;
+        Ok(hex::encode(Sha256::digest(bytes)))
+    };
+    Ok(ViewResponse {
+        workspace: fork.meta.base.to_string_lossy().into_owned(),
+        fork: fork.dir.to_string_lossy().into_owned(),
+        baseline: fingerprint(&fork.meta.files)?,
+        version: fingerprint(&now)?,
+    })
+}
+
 /// The patch for one changed path. The old side is the original as it is
 /// now, which is only the fork-time content while its hash still matches.
 fn file_patch(fork: &Fork, change: &Change, in_fork: Option<&String>) -> String {
     let path = &change.path;
     let base = &fork.meta.base;
-    let in_base = match state(base, path) {
+    let in_base = match fork.state(base, path) {
         Ok(s) => s,
         Err(e) => return format!("# {path}: cannot read the original: {e}\n"),
     };
@@ -336,8 +411,28 @@ fn file_patch(fork: &Fork, change: &Change, in_fork: Option<&String>) -> String 
         ChangeKind::Deleted => Side::Missing,
         _ => Side::read(&fork.dir.join(path)),
     };
+    // Only a regular file's state is marked; a symlink's never ends in the mark.
+    let mode = match (fork.meta.files.get(path), in_fork) {
+        (Some(was), Some(now)) if change.kind == ChangeKind::Modified && is_executable(was) != is_executable(now) => {
+            if is_executable(now) {
+                format!("# {path}: made executable\n")
+            } else {
+                format!("# {path}: no longer executable\n")
+            }
+        }
+        _ => String::new(),
+    };
+    let same_content = match (fork.meta.files.get(path), in_fork) {
+        (Some(was), Some(now)) => {
+            was.strip_suffix(EXECUTABLE).unwrap_or(was) == now.strip_suffix(EXECUTABLE).unwrap_or(now)
+        }
+        _ => false,
+    };
+    if same_content {
+        return mode;
+    }
     let (a, b) = (format!("a/{path}"), format!("b/{path}"));
-    match (old, new) {
+    let patch = match (old, new) {
         (Side::Unreadable(e), _) | (_, Side::Unreadable(e)) => format!("# {path}: cannot read: {e}\n"),
         (_, Side::Link(t)) => format!("# {path}: {} symlink to {}\n", kind_word(change.kind), t.display()),
         (Side::Link(_), Side::Missing) => format!("# {path}: deleted symlink\n"),
@@ -358,7 +453,8 @@ fn file_patch(fork: &Fork, change: &Change, in_fork: Option<&String>) -> String 
             let diff = TextDiff::configure().timeout(DIFF_TIMEOUT).diff_lines(&old, &new);
             format!("--- {old_name}\n+++ {new_name}\n{}", diff.unified_diff())
         }
-    }
+    };
+    mode + &patch
 }
 
 fn kind_word(kind: ChangeKind) -> &'static str {
@@ -418,6 +514,7 @@ pub(crate) fn merge(
     written: &mut Vec<String>,
 ) -> Result<MergeResponse, RemoteError> {
     let _merging = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let _process_lock = apply::lock(roots)?;
     let fork = open(roots, &req.fork)?;
     let now = current(&fork, &roots.scratch)?;
     let changes = changes(&fork.meta.files, &now);
@@ -427,7 +524,7 @@ pub(crate) fn merge(
     let mut conflicts = Vec::new();
     let mut work = Vec::new();
     for change in &changes {
-        let in_base = state(base, &change.path).map_err(|e| failed(format!("{}: {e}", change.path)))?;
+        let in_base = fork.state(base, &change.path).map_err(|e| failed(format!("{}: {e}", change.path)))?;
         let wanted = now.get(&change.path);
         if in_base.as_ref() == wanted {
             // The original already has what the fork has.
@@ -445,80 +542,45 @@ pub(crate) fn merge(
             conflicts.join(", ")
         )));
     }
-    apply_all(&work, written, |change| apply(&fork, change))?;
-    if req.drop {
-        remove(&fork.dir).map_err(|e| failed(format!("the merge succeeded, but dropping the fork failed: {e}")))?;
-    }
-    Ok(MergeResponse { changes })
-}
-
-/// Run `apply` on each change in turn. A failure after the first write is
-/// reported as `partial:` with the paths already written, since the
-/// original then holds some of the fork's changes.
-fn apply_all(
-    work: &[&Change],
-    written: &mut Vec<String>,
-    mut apply: impl FnMut(&Change) -> io::Result<()>,
-) -> Result<(), RemoteError> {
-    for change in work {
-        if let Err(e) = apply(change) {
-            let path = &change.path;
-            let message = if written.is_empty() {
-                format!("merging {path}: {e}")
-            } else {
-                format!("partial: merging {path} failed ({e}) after these files were written: {}", written.join(", "))
-            };
-            // It may be half written.
-            written.push(change.path.clone());
-            return Err(failed(message));
-        }
-        written.push(change.path.clone());
-    }
-    Ok(())
-}
-
-/// Make the original's `change.path` what it is in the fork.
-fn apply(fork: &Fork, change: &Change) -> io::Result<()> {
-    let base = &fork.meta.base;
-    let dest = base.join(&change.path);
-    let parent = dest.parent().ok_or_else(|| io::Error::other("no parent directory"))?;
-    if change.kind == ChangeKind::Deleted {
-        match fs::remove_file(&dest) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
-        // Remove directories the deletion emptied, as git would.
-        let mut dir = parent;
-        while dir != base && fs::remove_dir(dir).is_ok() {
-            dir = match dir.parent() {
-                Some(d) => d,
-                None => break,
-            };
-        }
-        return Ok(());
-    }
-    fs::create_dir_all(parent)?;
-    if !parent.canonicalize()?.starts_with(base) {
-        return Err(io::Error::other("the path leads outside the workspace"));
-    }
-    let src = fork.dir.join(&change.path);
-    let meta = fs::symlink_metadata(&src)?;
-    if !meta.is_file() && !meta.file_type().is_symlink() {
-        return Err(io::Error::other("not a regular file or symlink in the fork"));
-    }
-    if meta.file_type().is_symlink() {
-        let tmp = temp_path(&dest)?;
-        symlink(fs::read_link(&src)?, &tmp)?;
-        return fs::rename(&tmp, &dest).inspect_err(|_| {
-            let _ = fs::remove_file(&tmp);
-        });
-    }
-    // A replaced file keeps the original's mode, as fs.write does.
-    let mode = match fs::symlink_metadata(&dest) {
-        Ok(m) if m.is_file() => m.permissions(),
-        _ => meta.permissions(),
+    let operation = if work.is_empty() {
+        None
+    } else {
+        Some(apply::begin(
+            roots,
+            apply::Candidate {
+                workspace: base,
+                fork: &fork.dir,
+                fingerprint: fingerprint_of(&fork.dir, &now)?,
+                changes: &work,
+                version: fork.meta.version,
+                before: &fork.meta.files,
+                after: &now,
+            },
+            written,
+        )?)
     };
-    atomic_write(&dest, &fs::read(&src)?, Some(mode))
+    if req.drop {
+        remove(&fork.dir).map_err(|e| match &operation {
+            Some(id) => {
+                failed(format!("partial: operation {id}: all files applied, but dropping the fork failed: {e}"))
+            }
+            None => failed(format!("the merge succeeded, but dropping the fork failed: {e}")),
+        })?;
+    }
+    Ok(MergeResponse { changes, operation })
+}
+
+/// `mode` made executable or not by its owner. Making it executable also
+/// lets whoever can read it execute it, as `chmod +x` does under the usual
+/// umask; making it not executable clears every execute bit.
+pub(crate) fn with_executable(mode: u32, executable: bool) -> u32 {
+    if (mode & 0o100 != 0) == executable {
+        mode
+    } else if executable {
+        mode | 0o100 | ((mode & 0o044) >> 2)
+    } else {
+        mode & !0o111
+    }
 }
 
 pub(crate) fn drop_fork(roots: &Roots, lock: &Mutex<()>, req: DropRequest) -> Result<DropResponse, RemoteError> {
@@ -557,26 +619,6 @@ mod tests {
         assert!(!is_fork_name("fork-0123456789a"));
         assert!(!is_fork_name("fork-0123456789abc"));
         assert!(!is_fork_name("spoon-0123456789ab"));
-    }
-
-    #[test]
-    fn a_merge_that_stops_after_a_write_names_what_was_written() {
-        let change = |path: &str| Change { path: path.into(), kind: ChangeKind::Modified };
-        let work = [change("a.txt"), change("b.txt"), change("c.txt")];
-        let work: Vec<&Change> = work.iter().collect();
-        let failing =
-            |at: &'static str| move |c: &Change| if c.path == at { Err(io::Error::other("disk full")) } else { Ok(()) };
-
-        let mut written = Vec::new();
-        let e = apply_all(&work, &mut written, failing("c.txt")).unwrap_err();
-        assert_eq!(e.code, molt_proto::ErrorCode::Failed);
-        assert_eq!(e.message, "partial: merging c.txt failed (disk full) after these files were written: a.txt, b.txt");
-        assert_eq!(written, ["a.txt", "b.txt", "c.txt"], "the file it stopped in may be half written");
-        let mut written = Vec::new();
-        let e = apply_all(&work, &mut written, failing("a.txt")).unwrap_err();
-        assert_eq!(e.message, "merging a.txt: disk full", "nothing was written yet");
-        assert_eq!(written, ["a.txt"]);
-        assert!(apply_all(&work, &mut Vec::new(), failing("z.txt")).is_ok());
     }
 
     #[test]

@@ -15,6 +15,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn config(base_url: String) -> Config {
     Config {
+        providers: Default::default(),
         api_key: "test-key".into(),
         base_url,
         default_model: "opus".into(),

@@ -1,9 +1,10 @@
-//! `model.complete`: one Messages API call through the gateway.
+//! `model.complete`: one provider call through the gateway.
 //!
 //! The gateway is the only process that holds the API key. Callers send
 //! messages and tool definitions in the Messages API's own JSON shape, and
-//! get the response content back verbatim, so thinking blocks can be passed
-//! back unmodified on the next turn.
+//! get Anthropic response content back verbatim, so thinking blocks can be passed
+//! back unmodified on the next turn. The OpenAI adapter translates unsigned
+//! text and function tools to this shared shape and rejects native blocks.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
