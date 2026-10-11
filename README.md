@@ -99,7 +99,17 @@ to generate per-service credentials, put the printed `authorization` block and
 the services once and keeps them up, so tasks follow one another without a
 restart. Type a task and press Enter.
 
-In the default mode, **confirm**, a task stops twice for you:
+In the default mode, **confirm**, a task can stop twice for you, and does
+only when something calls for a look; otherwise it runs through and the log
+shows the check and the result as usual. The check stops when no automated
+check fits, its baseline already passes or did not run, or its files would
+replace files in the workspace. The result stops when it is not `passed`,
+changes more than 300 lines or 10 files, deletes a file, touches a protected
+path (`.github/`, `Cargo.toml`, `Cargo.lock`, `package.json`, `go.mod`,
+`migrations/`), or its diff was cut short. Each stop names its reasons in one
+line, such as `stopped: baseline passes · deletes 2 files`. A config given
+with `--config` can change these in a `[confirm]` section (`max_lines`,
+`max_files`, `ask_paths`), or set `always_ask = true` to stop every time:
 
 1. The planner designs the done-check (`planner.design`) and runs it once on
    the workspace as it is. You see the command, its files, why it fits and

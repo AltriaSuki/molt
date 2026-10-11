@@ -170,6 +170,7 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     None => Line::from(vec![span("  baseline  ", Tone::Dim), span("not run", Tone::Dim)]),
                 });
             }
+            lines.extend(stops_line(app));
             lines.push(Line::default());
             if editing {
                 lines.push(keys(&[("enter", "save the command"), ("esc", "back")]));
@@ -190,16 +191,16 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             let (added, removed) = text::diff_counts(&resp.patch);
             let files =
                 if resp.changes.len() == 1 { "1 file".to_owned() } else { format!("{} files", resp.changes.len()) };
-            vec![
-                Line::from(vec![
-                    span("◆ apply to the workspace?", Tone::Shell),
-                    span(format!("  {files}  "), Tone::Dim),
-                    span(format!("+{added}"), Tone::Ok),
-                    span(" ", Tone::Plain),
-                    span(format!("−{removed}"), Tone::Bad),
-                ]),
-                keys(&[("enter", "apply"), ("d", "diff"), ("k", "keep in its fork"), ("n", "discard")]),
-            ]
+            let mut lines = vec![Line::from(vec![
+                span("◆ apply to the workspace?", Tone::Shell),
+                span(format!("  {files}  "), Tone::Dim),
+                span(format!("+{added}"), Tone::Ok),
+                span(" ", Tone::Plain),
+                span(format!("−{removed}"), Tone::Bad),
+            ])];
+            lines.extend(stops_line(app));
+            lines.push(keys(&[("enter", "apply"), ("d", "diff"), ("k", "keep in its fork"), ("n", "discard")]));
+            lines
         }
         Some(Prompt::Retry { req, stopped, .. }) => vec![
             Line::from(vec![
@@ -221,6 +222,12 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             _ => Vec::new(),
         },
     }
+}
+
+/// Why confirm mode stopped, when a rule did it.
+fn stops_line(app: &App) -> Option<Line<'static>> {
+    let stops = &app.task.as_ref()?.stops;
+    (!stops.is_empty()).then(|| Line::from(vec![span("  stopped: ", Tone::Dim), span(stops.join(" · "), Tone::Warn)]))
 }
 
 fn keys(pairs: &[(&str, &str)]) -> Line<'static> {

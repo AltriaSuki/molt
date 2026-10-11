@@ -105,6 +105,7 @@ async fn event_loop(
 
     let mut app = App::new(&workspace, home);
     app.secrets = secrets_in_env();
+    app.rules = cfg.confirm.clone();
     let mut rt =
         Runtime { cfg: Arc::new(cfg), workspace, tx, sessions, session: None, starting: false, work: Vec::new() };
     rt.exec(Action::StartSession);
@@ -220,7 +221,19 @@ impl Runtime {
             }
             Action::Design { req, trace } => self.call(move |s| async move {
                 let result = s.design(&req, &trace).await.map_err(|e| format!("{e:#}"));
-                Msg::Designed { trace, result }
+                // Which check files would replace the workspace's own, for confirm mode to stop on.
+                let existing = match &result {
+                    Ok(d) => {
+                        let root = Path::new(s.workspace());
+                        d.files
+                            .iter()
+                            .filter(|f| root.join(&f.path).symlink_metadata().is_ok())
+                            .map(|f| f.path.clone())
+                            .collect()
+                    }
+                    Err(_) => Vec::new(),
+                };
+                Msg::Designed { trace, result, existing }
             }),
             Action::Run { req, trace } => self.call(move |s| async move {
                 let result = s.run(&req, &trace).await.map_err(|e| format!("{e:#}"));

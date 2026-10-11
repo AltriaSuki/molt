@@ -16,6 +16,7 @@ use ratatui::text::Line;
 
 use super::text::{self, block, clean_line, span, Tone};
 use crate::agent::outcome_name;
+use crate::config::ConfirmSection;
 
 /// Bytes of one summary written to the log. Only a runaway message reaches
 /// this; the log keeps everything a normal task says.
@@ -131,6 +132,8 @@ pub enum Msg {
     Designed {
         trace: TraceId,
         result: Result<DesignResponse, String>,
+        /// The check's files that already exist in the workspace.
+        existing: Vec<String>,
     },
     Ran {
         trace: TraceId,
@@ -186,6 +189,8 @@ pub struct Task {
     check_shown: bool,
     recalled_shown: bool,
     notes_seen: HashSet<String>,
+    /// Why confirm mode stopped for the user, in short labels.
+    pub stops: Vec<String>,
 }
 
 pub enum Prompt {
@@ -345,6 +350,8 @@ pub struct App {
     /// Values never to show, such as API keys: replaced wherever text from
     /// commands is shown.
     pub secrets: Vec<String>,
+    /// When confirm mode stops.
+    pub rules: ConfirmSection,
     /// The attempt drawn alone, large.
     pub zoom: Option<u32>,
     /// A short message in the status bar, until the next key.
@@ -390,6 +397,7 @@ impl App {
             last: None,
             last_lanes: Vec::new(),
             secrets: Vec::new(),
+            rules: ConfirmSection::default(),
             zoom: None,
             flash: None,
             tick: 0,
@@ -482,7 +490,7 @@ impl App {
                 self.progress(event);
                 Vec::new()
             }
-            Msg::Designed { trace, result } => self.designed(trace, result),
+            Msg::Designed { trace, result, existing } => self.designed(trace, result, &existing),
             Msg::Ran { trace, result } => self.ran(trace, result),
             Msg::Learned { trace, result } => {
                 self.learning.remove(trace.as_str());
@@ -749,6 +757,7 @@ impl App {
             check_shown: false,
             recalled_shown: false,
             notes_seen: HashSet::new(),
+            stops: Vec::new(),
         };
         let action = if let Some(check) = &self.settings.check {
             task.req.check = Some(check.clone());
@@ -948,7 +957,7 @@ impl App {
         }
     }
 
-    fn designed(&mut self, trace: TraceId, result: Result<DesignResponse, String>) -> Vec<Action> {
+    fn designed(&mut self, trace: TraceId, result: Result<DesignResponse, String>, existing: &[String]) -> Vec<Action> {
         let Some(task) = &mut self.task else { return Vec::new() };
         if task.trace != trace {
             return Vec::new();
@@ -956,6 +965,10 @@ impl App {
         match result {
             Ok(d) => {
                 self.spent_usd += d.cost_usd;
+                task.stops = check_stops(&d, existing);
+                if task.stops.is_empty() && !self.rules.always_ask {
+                    return self.start_after_check(d, true);
+                }
                 task.phase = Phase::Confirming;
                 self.prompt = Some(Prompt::Check(d));
             }
@@ -1136,14 +1149,22 @@ impl App {
             self.last = Some(LastDiff { patch: resp.patch.clone(), truncated: resp.patch_truncated });
         }
         let mut deciding = false;
+        let mut applying = false;
         if resp.applied {
             self.push(Line::from(span("  applied", Tone::Ok)));
         } else if let Some(fork) = resp.fork.clone() {
             if resp.changes.is_empty() {
                 actions.push(Action::Discard { fork });
             } else if self.mode == Mode::Confirm && !task.req.apply && !matches!(resp.outcome, Outcome::Failed) {
-                deciding = true;
-                self.prompt = Some(Prompt::Apply { resp: Box::new(resp.clone()), fork });
+                let stops = apply_stops(&resp, &self.rules);
+                if stops.is_empty() && !self.rules.always_ask {
+                    applying = true;
+                    actions.push(Action::Apply { fork });
+                } else {
+                    deciding = true;
+                    task.stops = stops;
+                    self.prompt = Some(Prompt::Apply { resp: Box::new(resp.clone()), fork });
+                }
             } else {
                 self.push(Line::from(span(format!("  kept in {}", clean_line(&fork)), Tone::Dim)));
                 self.kept.push(fork);
@@ -1151,6 +1172,8 @@ impl App {
         }
         if deciding {
             self.task = Some(Task { phase: Phase::Deciding, lanes: Vec::new(), ..task });
+        } else if applying {
+            self.task = Some(Task { phase: Phase::Applying, lanes: Vec::new(), stops: Vec::new(), ..task });
         } else if resp.outcome == Outcome::Failed && !resp.attempts.is_empty() {
             // Only a check known in full can be run again without designing it anew.
             let mut req = task.req;
@@ -1274,6 +1297,7 @@ impl App {
             check_shown: true,
             recalled_shown: false,
             notes_seen: HashSet::new(),
+            stops: Vec::new(),
         });
         vec![Action::Run { req, trace }]
     }
@@ -1391,6 +1415,67 @@ fn diff_viewer(patch: &str, truncated: bool) -> Viewer {
     Viewer { title: "diff".into(), lines, scroll: 0 }
 }
 
+/// Why a designed check needs the user's look before the attempts start.
+fn check_stops(d: &DesignResponse, existing: &[String]) -> Vec<String> {
+    if d.command.is_none() {
+        return vec!["no automated check".into()];
+    }
+    let mut stops = Vec::new();
+    match &d.baseline {
+        Some(b) if b.passed => stops.push("baseline passes".into()),
+        Some(_) => {}
+        None => stops.push("baseline not run".into()),
+    }
+    match existing.len() {
+        0 => {}
+        1 => stops.push(format!("replaces {}", clean_line(&existing[0]))),
+        n => stops.push(format!("replaces {n} files")),
+    }
+    stops
+}
+
+/// Why a result needs the user's look before it is applied.
+fn apply_stops(resp: &RunResponse, rules: &ConfirmSection) -> Vec<String> {
+    let mut stops = Vec::new();
+    if resp.outcome != Outcome::Passed {
+        stops.push(outcome_name(resp.outcome).to_owned());
+    }
+    let (added, removed) = text::diff_counts(&resp.patch);
+    if added + removed > rules.max_lines {
+        stops.push(format!("{} lines changed", added + removed));
+    }
+    if resp.changes.len() > rules.max_files {
+        stops.push(format!("{} files", resp.changes.len()));
+    }
+    let deleted = resp.changes.iter().filter(|c| c.kind == ChangeKind::Deleted).count();
+    match deleted {
+        0 => {}
+        1 => stops.push("deletes 1 file".into()),
+        n => stops.push(format!("deletes {n} files")),
+    }
+    let touched: Vec<&str> =
+        resp.changes.iter().map(|c| c.path.as_str()).filter(|p| rules.ask_paths.iter().any(|a| covers(a, p))).collect();
+    match touched.as_slice() {
+        [] => {}
+        [one] => stops.push(format!("touches {}", clean_line(one))),
+        many => stops.push(format!("touches {} protected paths", many.len())),
+    }
+    if resp.patch_truncated {
+        stops.push("diff cut short".into());
+    }
+    stops
+}
+
+/// `rule` names `path`: the same path, a directory above it (`dir/`), or its file name.
+fn covers(rule: &str, path: &str) -> bool {
+    match rule.strip_suffix('/') {
+        // A directory named alone (`migrations/`) is matched at any depth.
+        Some(dir) if !dir.contains('/') => path.starts_with(rule) || path.contains(&format!("/{rule}")),
+        Some(_) => path.starts_with(rule),
+        None => path == rule || (!rule.contains('/') && path.rsplit('/').next() == Some(rule)),
+    }
+}
+
 /// Each lane's lines under its attempt's name, for the viewer.
 fn lane_lines(lanes: &[Lane]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -1471,7 +1556,7 @@ fn help() -> Vec<Line<'static>> {
         Line::default(),
         head("modes"),
         row("plan only", "results stay in their forks; the workspace is not changed"),
-        row("confirm", "stop to accept the check, and again before applying"),
+        row("confirm", "stop for the check or the result when one needs a look"),
         row("auto", "design the check and apply what passes"),
     ]
 }
@@ -1577,12 +1662,13 @@ mod tests {
         assert_eq!(app.workspace, "~/parser");
         assert_eq!(app.mode, Mode::Confirm);
         up(&mut app);
+        app.rules.always_ask = true;
         let actions = type_in(&mut app, "accept trailing commas");
         let [Action::Design { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
         assert!(!req.apply && req.check.is_none());
         let trace = trace.clone();
 
-        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()) });
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
         assert!(matches!(app.prompt, Some(Prompt::Check(_))));
         // Typing goes nowhere while the check waits on the user.
         assert!(app.update(key(KeyCode::Char('x'))).is_empty());
@@ -1674,10 +1760,12 @@ mod tests {
     fn the_check_can_be_edited_dropped_or_refused() {
         let mut app = App::new("/w", None);
         up(&mut app);
+        // These are about the prompts themselves.
+        app.rules.always_ask = true;
         let actions = type_in(&mut app, "task");
         let [Action::Design { trace, .. }] = actions.as_slice() else { panic!() };
         let trace = trace.clone();
-        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()) });
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
         app.update(key(KeyCode::Char('e')));
         assert_eq!(app.input.text, "cargo test --test commas");
         app.update(ctrl_key('u'));
@@ -1700,7 +1788,11 @@ mod tests {
         up(&mut app);
         let actions = type_in(&mut app, "task");
         let [Action::Design { trace, .. }] = actions.as_slice() else { panic!() };
-        app.update(Msg::Designed { trace: trace.clone(), result: Err("planner.design failed".into()) });
+        app.update(Msg::Designed {
+            trace: trace.clone(),
+            result: Err("planner.design failed".into()),
+            existing: vec![],
+        });
         assert!(app.task.is_none());
         assert!(log(&app).ends_with("✗ no check: planner.design failed"), "{}", log(&app));
     }
@@ -1794,6 +1886,8 @@ mod tests {
     fn quitting_keeps_a_result_still_waiting_on_the_user() {
         let mut app = App::new("/w", None);
         up(&mut app);
+        // These are about the prompts themselves.
+        app.rules.always_ask = true;
         let actions = type_in(&mut app, "/check true");
         assert!(actions.is_empty());
         let actions = type_in(&mut app, "task");
@@ -1864,6 +1958,8 @@ mod tests {
     fn the_last_diff_opens_again_after_the_task_ends() {
         let mut app = App::new("/w", None);
         up(&mut app);
+        // These are about the prompts themselves.
+        app.rules.always_ask = true;
         type_in(&mut app, "/last");
         assert_eq!(app.flash.as_deref(), Some("no task has finished with changes yet"));
         type_in(&mut app, "/check true");
@@ -1932,10 +2028,12 @@ mod tests {
         let mut app = App::new("/w", None);
         app.secrets = vec!["sk-ant-secret-1234".into()];
         up(&mut app);
+        // These are about the prompts themselves.
+        app.rules.always_ask = true;
         let actions = type_in(&mut app, "accept trailing commas");
         let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
         let trace = trace.clone();
-        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()) });
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
         let actions = app.update(key(KeyCode::Enter));
         let [Action::Run { req: first, .. }] = actions.as_slice() else { panic!("{actions:?}") };
         let first = first.clone();
@@ -2039,10 +2137,12 @@ mod tests {
     fn an_interrupt_keeps_the_attempts_forks_and_offers_to_start_again() {
         let mut app = App::new("/w", None);
         up(&mut app);
+        // These are about the prompts themselves.
+        app.rules.always_ask = true;
         let actions = type_in(&mut app, "task");
         let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
         let trace = trace.clone();
-        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()) });
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
         let actions = app.update(key(KeyCode::Enter));
         let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
         let first = req.clone();
@@ -2074,5 +2174,91 @@ mod tests {
         let actions = app.update(key(KeyCode::Char('r')));
         let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
         assert_eq!((&req.check, &req.check_files), (&first.check, &first.check_files));
+    }
+
+    #[test]
+    fn confirm_mode_goes_through_a_clean_task_without_a_key() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "accept trailing commas");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        let actions = app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("no stop for the check: {actions:?}") };
+        assert_eq!(req.check.as_deref(), Some("cargo test --test commas"));
+        assert!(app.prompt.is_none());
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-1"))) });
+        assert_eq!(actions, [Action::Apply { fork: "/d/work/fork-1".into() }, Action::Learn { trace }]);
+        assert!(app.prompt.is_none());
+        app.update(Msg::Applied(Ok(())));
+        let log = log(&app);
+        assert!(log.contains("  $ cargo test --test commas") && log.ends_with("  applied"), "{log}");
+        assert!(app.task.is_none());
+    }
+
+    /// The check's prompt, and why it is up, for a design and the files it would replace.
+    fn check_stop(d: DesignResponse, existing: &[&str]) -> Vec<String> {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "task");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let existing = existing.iter().map(|e| e.to_string()).collect();
+        let actions = app.update(Msg::Designed { trace: trace.clone(), result: Ok(d), existing });
+        assert!(actions.is_empty() && matches!(app.prompt, Some(Prompt::Check(_))), "{actions:?}");
+        app.task.as_ref().unwrap().stops.clone()
+    }
+
+    #[test]
+    fn confirm_mode_stops_for_a_check_that_needs_a_look() {
+        assert_eq!(
+            check_stop(DesignResponse { command: None, files: vec![], ..design() }, &[]),
+            ["no automated check"]
+        );
+        let passing = Baseline { passed: true, exit_code: Some(0), tail: String::new() };
+        assert_eq!(check_stop(DesignResponse { baseline: Some(passing), ..design() }, &[]), ["baseline passes"]);
+        assert_eq!(check_stop(DesignResponse { baseline: None, ..design() }, &[]), ["baseline not run"]);
+        assert_eq!(check_stop(design(), &["tests/commas.rs"]), ["replaces tests/commas.rs"]);
+    }
+
+    /// Why the result's prompt is up, for a result.
+    fn apply_stop(resp: RunResponse) -> Vec<String> {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "task");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+        assert!(!actions.iter().any(|a| matches!(a, Action::Apply { .. })), "{actions:?}");
+        assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
+        app.task.as_ref().unwrap().stops.clone()
+    }
+
+    #[test]
+    fn confirm_mode_stops_for_a_result_that_needs_a_look() {
+        let ok = || passed(false, Some("/d/work/fork-1"));
+        assert_eq!(apply_stop(RunResponse { outcome: Outcome::Unverified, ..ok() }), ["unverified"]);
+        let patch = format!("--- a/x\n+++ b/x\n@@\n{}", "+line\n".repeat(301));
+        assert_eq!(apply_stop(RunResponse { patch, ..ok() }), ["301 lines changed"]);
+        let changes = (0..11).map(|i| Change { path: format!("src/f{i}.rs"), kind: ChangeKind::Modified }).collect();
+        assert_eq!(apply_stop(RunResponse { changes, ..ok() }), ["11 files"]);
+        let changes = vec![
+            Change { path: "src/old.rs".into(), kind: ChangeKind::Deleted },
+            Change { path: "src/new.rs".into(), kind: ChangeKind::Added },
+        ];
+        assert_eq!(apply_stop(RunResponse { changes, ..ok() }), ["deletes 1 file"]);
+        let changes = vec![Change { path: "crates/a/Cargo.toml".into(), kind: ChangeKind::Modified }];
+        assert_eq!(apply_stop(RunResponse { changes, ..ok() }), ["touches crates/a/Cargo.toml"]);
+        assert_eq!(apply_stop(RunResponse { patch_truncated: true, ..ok() }), ["diff cut short"]);
+    }
+
+    #[test]
+    fn protected_paths_match_files_directories_and_names() {
+        assert!(covers(".github/", ".github/workflows/ci.yml"));
+        assert!(covers("migrations/", "db/migrations/001.sql"));
+        assert!(!covers("migrations/", "src/migrations.rs"));
+        assert!(covers("db/schema/", "db/schema/a.sql") && !covers("db/schema/", "x/db/schema/a.sql"));
+        assert!(covers("Cargo.toml", "Cargo.toml") && covers("Cargo.toml", "crates/a/Cargo.toml"));
+        assert!(!covers("Cargo.toml", "Cargo.toml.bak"));
+        assert!(covers("src/lib.rs", "src/lib.rs") && !covers("src/lib.rs", "a/src/lib.rs"));
     }
 }

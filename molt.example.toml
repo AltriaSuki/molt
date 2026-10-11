@@ -97,3 +97,10 @@ requests = [
   { target = "memory.recall", budget = { calls = 10000000 } },
   { target = "memory.symbols", budget = { calls = 10000000 } },
 ]
+
+# When the interface's confirm mode stops for you; these are the defaults.
+# [confirm]
+# max_lines = 300
+# max_files = 10
+# ask_paths = [".github/", "Cargo.toml", "Cargo.lock", "package.json", "go.mod", "migrations/"]
+# always_ask = false

@@ -449,7 +449,7 @@ async fn consolidate(
 /// `molt memory forget` uses, so that the change is in the audit log.
 pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::Result<Value> {
     let service = cfg.service(MEMORY).context("the config has no memory service")?.clone();
-    let alone = Config { kernel: cfg.kernel.clone(), services: vec![service] };
+    let alone = Config { kernel: cfg.kernel.clone(), services: vec![service], confirm: cfg.confirm.clone() };
     let running = crate::start(&alone).await?;
     let result = async {
         let kernel = running.kernel();
