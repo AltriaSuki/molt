@@ -27,6 +27,28 @@ enum Cmd {
     Fs(RootArgs),
     /// Serve `shell.*`: commands run in a workspace.
     Shell(ShellArgs),
+    /// Inspect, resume or undo durable workspace applies, without starting services.
+    Apply(ApplyArgs),
+}
+
+#[derive(Args)]
+struct ApplyArgs {
+    #[command(flatten)]
+    roots: RootArgs,
+    #[command(subcommand)]
+    action: ApplyAction,
+}
+
+#[derive(Subcommand)]
+enum ApplyAction {
+    /// List this workspace's durable operations and observed file states.
+    List,
+    /// Inspect one operation.
+    Inspect { operation: String },
+    /// Finish applying the same staged candidate, refusing later edits.
+    Resume { operation: String },
+    /// Restore the preimages, refusing later edits.
+    Undo { operation: String },
 }
 
 #[derive(Args)]
@@ -66,6 +88,24 @@ impl RootArgs {
 async fn main() -> anyhow::Result<()> {
     molt::init_tracing("info");
     match Cli::parse().cmd {
+        Cmd::Apply(args) => {
+            let workspace = args.roots.root.canonicalize()?.to_string_lossy().into_owned();
+            let fs = Fs::new(args.roots.roots())?;
+            let (method, payload) = match args.action {
+                ApplyAction::List => ("applies", serde_json::json!({"workspace": workspace})),
+                ApplyAction::Inspect { operation } => {
+                    ("applies", serde_json::json!({"workspace": workspace, "operation": operation}))
+                }
+                ApplyAction::Resume { operation } => {
+                    ("recover", serde_json::json!({"workspace": workspace, "operation": operation, "action": "resume"}))
+                }
+                ApplyAction::Undo { operation } => {
+                    ("recover", serde_json::json!({"workspace": workspace, "operation": operation, "action": "undo"}))
+                }
+            };
+            let result = fs.handle(method, payload).await.map_err(|e| anyhow::anyhow!(e.message))?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
         Cmd::Fs(args) => {
             let fs = Arc::new(Fs::new(args.roots())?);
             let svc = Arc::new(Service::connect_from_env().await?);
