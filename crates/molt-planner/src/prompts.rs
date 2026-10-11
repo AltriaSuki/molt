@@ -227,6 +227,10 @@ Write big files in smaller pieces: several smaller files, or a first part follow
 pub(crate) const CUT_OFF: &str = "This call was cut off because your reply reached the output length limit, \
 so it was not run. Write big files in smaller pieces and try again.";
 
+/// The result of a tool call a stopped run left running.
+pub(crate) const INTERRUPTED: &str = "The run was stopped while this call ran, and has now been resumed. Whether the \
+     call took effect is not known: look at the files (or run a command that only reads) before doing it again.";
+
 pub(crate) const FINAL_REPLY: &str = "Your reply was empty. If you are done, give your final reply now: the answer, \
 or a short summary of what you changed. Otherwise, carry on.";
 

@@ -90,6 +90,28 @@ pub struct RunRequest {
     /// approved result is merged.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub review: bool,
+    /// Save a checkpoint as the run goes, so that a run stopped before it
+    /// finished (interrupted, out of budget, killed) can go on with
+    /// `resume`. Needs a planner that keeps checkpoints.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkpoint: bool,
+    /// Go on with the checkpointed run named here rather than start one. The
+    /// task, check, attempts, model and limits are the checkpoint's; `apply`,
+    /// `stream` and a `budget_usd` given here replace its own, and the
+    /// workspace must be its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<Resume>,
+}
+
+/// Which checkpointed run to go on with, and how.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resume {
+    /// The run's id: the trace it ran under.
+    pub run: String,
+    /// Leave the stopped attempts where they are and start new ones, with the
+    /// same check and the cost so far.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retry: bool,
 }
 
 impl RunRequest {
@@ -108,6 +130,8 @@ impl RunRequest {
             budget_usd: None,
             apply: true,
             stream: false,
+            checkpoint: false,
+            resume: None,
             review: true,
         }
     }
@@ -258,6 +282,10 @@ pub struct RunResponse {
     /// price. cost_usd is only a subtotal when this is nonzero.
     #[serde(default)]
     pub uncounted_calls: u32,
+    /// The run stopped before it finished and its checkpoint is kept: the
+    /// run id to resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
 }
 
 /// Names and inputs of the tools the planner offers the model. Each maps to
