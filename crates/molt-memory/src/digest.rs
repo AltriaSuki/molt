@@ -543,6 +543,7 @@ mod tests {
             patch_truncated: false,
             applied: true,
             fork: None,
+            review: None,
             attempts: vec![AttemptReport {
                 index: 1,
                 status: AttemptStatus::Passed,
@@ -555,6 +556,7 @@ mod tests {
             usage: Usage::default(),
             cost_usd: 0.2,
             uncounted_calls: 0,
+            checkpoint: None,
         }
     }
 

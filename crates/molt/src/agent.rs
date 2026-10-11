@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context};
 use molt_api::fs::ChangeKind;
 use molt_api::memory::{self, ConsolidateRequest, ConsolidateResponse};
-use molt_api::planner::{self, AttemptStatus, Outcome, RunRequest, RunResponse};
+use molt_api::planner::{self, AttemptStatus, Outcome, RunRequest, RunResponse, Verdict};
 use molt_api::progress::{self, Progress};
 use molt_kernel::Kernel;
 use molt_proto::{Budget, CapId, Envelope, ErrorCode, Kind, ServiceId, Target, TraceId};
@@ -229,6 +229,26 @@ pub fn require_services(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How memory learns from a run.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Learn {
+    /// The model memory learns with; `None` for memory's own default
+    /// (`MOLT_MEMORY_MODEL`, else sonnet).
+    pub model: Option<String>,
+}
+
+/// The model memory learns with, from what the user asked for: a model,
+/// [`SAME_MODEL`] for the attempts' model, or nothing for memory's default.
+pub fn memory_model(asked: Option<&str>, attempts: Option<&str>) -> Option<String> {
+    match asked.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(SAME_MODEL) => attempts.map(str::to_owned),
+        other => other.map(str::to_owned),
+    }
+}
+
+/// Asks memory to learn with the model the attempts used.
+pub const SAME_MODEL: &str = "same";
+
 /// What a run produced.
 #[derive(Debug)]
 pub struct Done {
@@ -251,44 +271,54 @@ pub struct Done {
 pub async fn run_task(
     cfg: &Config,
     req: RunRequest,
-    learn: bool,
+    learn: Option<Learn>,
+    on_progress: impl FnMut(&Progress),
+    stop: impl Future<Output = ()>,
+) -> anyhow::Result<Done> {
+    run_task_as(cfg, req, TraceId::random(), learn, on_progress, stop).await
+}
+
+/// [`run_task`] under the run id `trace`: a resumed run goes on under its
+/// own. A checkpointed run that stops before it finishes keeps every fork
+/// it made, for the resume.
+pub async fn run_task_as(
+    cfg: &Config,
+    req: RunRequest,
+    trace: TraceId,
+    learn: Option<Learn>,
     mut on_progress: impl FnMut(&Progress),
     stop: impl Future<Output = ()>,
 ) -> anyhow::Result<Done> {
     require_services(cfg)?;
     if req.stream {
-        let target: Target = format!("topic:{}", progress::TOPIC).parse()?;
-        let allowed =
-            cfg.service("model").is_some_and(|s| s.requests.iter().any(|r| r.target == target && r.budget.calls > 0));
-        if !allowed {
-            bail!("--stream requires the model service to request a topic:progress capability with a nonzero calls budget");
-        }
+        require_stream_capability(cfg)?;
     }
     let running = crate::start(cfg).await?;
     // Before planner.run, the only caller that makes forks.
     let forks = RunForks::before(cfg);
     let workspace = req.workspace.clone();
     let budget_usd = req.budget_usd;
+    let checkpointed = req.checkpoint || req.resume.is_some();
     tokio::pin!(stop);
     let result = tokio::select! {
         // A Ctrl-C in a terminal also reaches the services, and the run may
         // fail from their exit at the same moment: the interruption wins.
         biased;
         () = &mut stop => Err(Interrupted.into()),
-        result = drive(&running, cfg, req, &mut on_progress) => result,
+        result = drive(&running, cfg, req, trace, &mut on_progress) => result,
     };
     let done = match result {
         Ok(ran) => {
             let learned = match (learn, ran.memory) {
-                (false, _) | (true, None) => None,
-                (true, Some(Err(e))) => Some(Err(e)),
+                (None, _) | (Some(_), None) => None,
+                (Some(_), Some(Err(e))) => Some(Err(e)),
                 // Learning is a model call too: the run's budget covers it.
-                (true, Some(Ok(())))
+                (Some(_), Some(Ok(())))
                     if (ran.resp.uncounted_calls > 0 || budget_usd.is_some_and(|b| ran.resp.cost_usd >= b)) =>
                 {
                     Some(Err("skipped: the budget is exhausted or model settlement is incomplete".to_owned()))
                 }
-                (true, Some(Ok(()))) => {
+                (Some(learn), Some(Ok(()))) => {
                     on_progress(&Progress::Note {
                         run: ran.trace.to_string(),
                         message: "learning from the run".into(),
@@ -299,7 +329,7 @@ pub async fn run_task(
                         wait_until_up(kernel, &ran.cli, MEMORY, Instant::now() + LEARN_PROBE)
                             .await
                             .map_err(|e| format!("{e:#}"))?;
-                        consolidate(kernel, &ran.cli, &ran.trace, &workspace).await
+                        consolidate(kernel, &ran.cli, &ran.trace, &workspace, learn.model).await
                     };
                     tokio::select! {
                         biased;
@@ -313,11 +343,28 @@ pub async fn run_task(
         Err(e) => Err(e),
     };
     running.shutdown().await;
-    if let Some(forks) = forks {
+    let kept = checkpointed && done.as_ref().map_or(true, |d| d.run.checkpoint.is_some());
+    if let Some(forks) = forks.filter(|_| !kept) {
         let keep = done.as_ref().ok().and_then(|d| d.run.fork.as_deref());
         forks.remove_new(keep.as_slice());
     }
     done
+}
+
+/// Where the planner of `cfg` keeps run checkpoints: its `--state` argument.
+pub fn checkpoint_dir(cfg: &Config) -> Option<PathBuf> {
+    let args = &cfg.service("planner")?.exec.as_ref()?.args;
+    args.iter().skip_while(|a| *a != "--state").nth(1).map(PathBuf::from)
+}
+
+fn require_stream_capability(cfg: &Config) -> anyhow::Result<()> {
+    let target: Target = format!("topic:publish:{}", progress::TOPIC).parse()?;
+    let allowed =
+        cfg.service("model").is_some_and(|s| s.requests.iter().any(|r| r.target.covers(&target) && r.budget.calls > 0));
+    if !allowed {
+        bail!("--stream requires the model service to request a topic:publish:progress capability (legacy topic:progress also permits publication) with a nonzero calls budget");
+    }
+    Ok(())
 }
 
 /// The forks in the `fs` service's scratch dir when a run starts. A planner
@@ -383,6 +430,7 @@ async fn drive(
     running: &Running,
     cfg: &Config,
     req: RunRequest,
+    trace: TraceId,
     mut on_progress: impl FnMut(&Progress),
 ) -> anyhow::Result<Ran> {
     let kernel = running.kernel();
@@ -391,7 +439,6 @@ async fn drive(
     for service in SERVICES {
         wait_until_up(kernel, &cli, service, deadline).await?;
     }
-    let trace = TraceId::random();
     // A run goes ahead without memory: the planner finds it unavailable.
     let memory = match cfg.service(MEMORY) {
         None => None,
@@ -402,7 +449,7 @@ async fn drive(
         on_progress(&Progress::Note { run: trace.to_string(), message });
     }
     grant(kernel, &cli, planner::RUN, Budget::new(0, 0, 1_000)).await?;
-    grant(kernel, &cli, &format!("topic:{}", progress::TOPIC), Budget::new(0, 0, 1_000)).await?;
+    grant(kernel, &cli, &format!("topic:subscribe:{}", progress::TOPIC), Budget::new(0, 0, 1_000)).await?;
     cli.subscribe(progress::TOPIC).await?;
 
     let mut preview = PreviewFilter::default();
@@ -439,9 +486,10 @@ async fn consolidate(
     cli: &Service,
     episode: &TraceId,
     workspace: &str,
+    model: Option<String>,
 ) -> Result<ConsolidateResponse, String> {
     grant(kernel, cli, memory::CONSOLIDATE, Budget::new(0, 0, 10)).await.map_err(|e| format!("{e:#}"))?;
-    let req = ConsolidateRequest { episode: episode.to_string(), workspace: workspace.to_owned(), model: None };
+    let req = ConsolidateRequest { episode: episode.to_string(), workspace: workspace.to_owned(), model };
     let payload = serde_json::to_value(req).map_err(|e| e.to_string())?;
     let opts = CallOpts { cap: None, budget: Budget::new(0, LEARN_MS, 0), trace: None };
     let reply = cli.call(memory::CONSOLIDATE, payload, opts).await.map_err(|e| e.to_string())?;
@@ -452,7 +500,7 @@ async fn consolidate(
 /// `molt memory forget` uses, so that the change is in the audit log.
 pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::Result<Value> {
     let service = cfg.service(MEMORY).context("the config has no memory service")?.clone();
-    let alone = Config { kernel: cfg.kernel.clone(), services: vec![service] };
+    let alone = Config { kernel: cfg.kernel.clone(), services: vec![service], confirm: cfg.confirm.clone() };
     let running = crate::start(&alone).await?;
     let result = async {
         let kernel = running.kernel();
@@ -664,6 +712,15 @@ pub fn report(resp: &RunResponse) -> String {
         lines.push("changes:".to_owned());
         lines.extend(resp.changes.iter().map(|c| format!("  {:<9}{}", change_name(c.kind), c.path)));
     }
+    if let Some(review) = &resp.review {
+        let verdict = match review.verdict {
+            Verdict::Approve => "approve",
+            Verdict::Concern => "concern",
+            Verdict::Reject => "reject",
+        };
+        lines.push(format!("review: {verdict}"));
+        lines.extend(review.findings.iter().map(|f| format!("  - {f}")));
+    }
     if resp.applied {
         lines.push("applied to the workspace".to_owned());
     } else if let Some(fork) = &resp.fork {
@@ -767,10 +824,19 @@ fn change_name(kind: ChangeKind) -> &'static str {
 mod tests {
     use molt_api::fs::Change;
     use molt_api::model::Usage;
-    use molt_api::planner::CheckSpec;
+    use molt_api::planner::{CheckSpec, Review};
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn memory_learns_with_the_model_asked_for_or_the_attempts_one() {
+        assert_eq!(memory_model(None, Some("opus")), None);
+        assert_eq!(memory_model(Some(" "), Some("opus")), None);
+        assert_eq!(memory_model(Some("haiku"), Some("opus")).as_deref(), Some("haiku"));
+        assert_eq!(memory_model(Some("same"), Some("opus")).as_deref(), Some("opus"));
+        assert_eq!(memory_model(Some("same"), None), None);
+    }
 
     #[test]
     fn data_dir_names_are_short_plain_and_tied_to_the_path() {
@@ -826,13 +892,19 @@ mod tests {
             std::fs::write(work.join(id).join("src/lib.rs"), "").unwrap();
             std::fs::write(work.join(format!("{id}.json")), "{}").unwrap();
         }
+        std::fs::create_dir_all(work.join(".molt/applies/apply-0000000000000001")).unwrap();
+        std::fs::write(work.join(".molt/applies/apply-0000000000000001/journal.json"), "recovery material").unwrap();
         forks.remove_new(&[work.join("fork-000000000003").to_str().unwrap()]);
+        assert_eq!(
+            std::fs::read_to_string(work.join(".molt/applies/apply-0000000000000001/journal.json")).unwrap(),
+            "recovery material"
+        );
         let mut left: Vec<_> =
             std::fs::read_dir(&work).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         left.sort();
         assert_eq!(
             left,
-            ["fork-000000000001", "fork-000000000001.json", "fork-000000000003", "fork-000000000003.json"]
+            [".molt", "fork-000000000001", "fork-000000000001.json", "fork-000000000003", "fork-000000000003.json"]
         );
 
         // A scratch dir outside the data dir may be shared with other runs.
@@ -884,9 +956,22 @@ mod tests {
         let mut cfg = Config::agent(Path::new("/w"), &data, Path::new("/b")).unwrap();
         cfg.service_mut("model").unwrap().requests.clear();
         let request = RunRequest { stream: true, ..RunRequest::new("task", "/w") };
-        let error = run_task(&cfg, request, false, |_| {}, std::future::pending()).await.unwrap_err();
+        let error = run_task(&cfg, request, None, |_| {}, std::future::pending()).await.unwrap_err();
         assert!(error.to_string().contains("topic:progress"));
         assert!(!data.exists());
+    }
+
+    #[test]
+    fn streaming_accepts_legacy_publication_but_not_a_subscription_grant() {
+        let mut cfg = Config::agent(Path::new("/w"), Path::new("/d"), Path::new("/b")).unwrap();
+        for (right, allowed) in
+            [("topic:publish:progress", true), ("topic:progress", true), ("topic:subscribe:progress", false)]
+        {
+            cfg.service_mut("model").unwrap().requests[0].target = right.parse().unwrap();
+            assert_eq!(require_stream_capability(&cfg).is_ok(), allowed);
+        }
+        cfg.service_mut("model").unwrap().requests[0].budget.calls = 0;
+        assert!(require_stream_capability(&cfg).is_err());
     }
 
     #[test]
@@ -897,7 +982,7 @@ mod tests {
         };
         assert_eq!(
             progress_of(&event("trace_a"), "trace_a"),
-            Some(Progress::AttemptStarted { run: "trace_a".into(), attempt: 1 })
+            Some(Progress::AttemptStarted { run: "trace_a".into(), attempt: 1, fork: None })
         );
         assert_eq!(progress_of(&event("trace_b"), "trace_a"), None);
         let mut other = event("trace_a");
@@ -1003,7 +1088,7 @@ mod tests {
                 tool: "read_file".into(),
                 detail: "read a.rs".into(),
             },
-            Progress::CheckRan { run: run.clone(), attempt: 0, passed: false, exit_code: Some(1) },
+            Progress::CheckRan { run: run.clone(), attempt: 0, passed: false, exit_code: Some(1), tail: "boom".into() },
             Progress::AttemptFinished { run, attempt: 1, status: AttemptStatus::Cancelled },
         ]
         .iter()
@@ -1034,10 +1119,12 @@ mod tests {
             patch_truncated: false,
             applied: true,
             fork: None,
+            review: None,
             attempts: vec![],
             usage: Usage { input_tokens: 1000, output_tokens: 200, ..Usage::default() },
             cost_usd: 0.012,
             uncounted_calls: 0,
+            checkpoint: None,
         };
         assert_eq!(
             report(&resp),
@@ -1052,6 +1139,13 @@ mod tests {
             report(&resp).contains("known cost: $0.0120 (1200 tokens), 2 model calls have unknown or unsettled cost\n")
         );
         resp.uncounted_calls = 0;
+        resp.review = Some(Review { verdict: Verdict::Reject, findings: vec!["src/lib.rs:3 returns 42.".into()] });
+        assert!(
+            report(&resp).contains("review: reject\n  - src/lib.rs:3 returns 42.\nnot applied"),
+            "{}",
+            report(&resp)
+        );
+        resp.review = None;
         resp.changes = vec![Change { path: "\x1b[1Aevil".into(), kind: ChangeKind::Added }];
         resp.summary = "Done.\x1b]0;title\x07\n".into();
         let shown = report(&resp);

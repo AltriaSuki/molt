@@ -12,13 +12,16 @@ mod view;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::Context;
 use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
 use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen};
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -89,7 +92,8 @@ async fn event_loop(
 ) -> anyhow::Result<Vec<String>> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (sessions, mut started) = mpsc::unbounded_channel();
-    read_terminal(tx.clone());
+    let pause = Arc::new(Pause::default());
+    read_terminal(tx.clone(), pause.clone());
     let ticks = tx.clone();
     tokio::spawn(async move {
         let mut every = tokio::time::interval(TICK);
@@ -104,6 +108,8 @@ async fn event_loop(
     });
 
     let mut app = App::new(&workspace, home);
+    app.secrets = secrets_in_env();
+    app.rules = cfg.confirm.clone();
     let mut rt =
         Runtime { cfg: Arc::new(cfg), workspace, tx, sessions, session: None, starting: false, work: Vec::new() };
     rt.exec(Action::StartSession);
@@ -119,10 +125,13 @@ async fn event_loop(
             actions.extend(app.update(msg));
         }
         for action in actions {
-            if let Action::Quit { keep: k } = action {
-                keep = k;
-            } else {
-                rt.exec(action);
+            match action {
+                Action::Quit { keep: k } => keep = k,
+                Action::Edit { text } => {
+                    let edited = edit_outside(terminal, &pause, &rt.cfg.kernel.data_dir, &text);
+                    let _ = rt.tx.send(Msg::Edited(edited));
+                }
+                action => rt.exec(action),
             }
         }
         if app.quit {
@@ -143,21 +152,56 @@ async fn event_loop(
     Ok(keep)
 }
 
+/// Keeps the terminal reader off the terminal while another program has it.
+#[derive(Default)]
+struct Pause {
+    paused: AtomicBool,
+    /// Held by the reader while it waits on the terminal.
+    reading: Mutex<()>,
+}
+
 /// Keys, pastes and resizes, read on a thread of their own: crossterm's
 /// reads block.
-fn read_terminal(tx: UnboundedSender<Msg>) {
+fn read_terminal(tx: UnboundedSender<Msg>, pause: Arc<Pause>) {
     std::thread::spawn(move || loop {
-        let msg = match event::read() {
-            Ok(Event::Key(key)) => Msg::Key(key),
-            Ok(Event::Paste(text)) => Msg::Paste(text),
-            Ok(Event::Resize(..)) => Msg::Tick,
-            Ok(_) => continue,
-            Err(_) => break,
+        if pause.paused.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let msg = {
+            let _reading = pause.reading.lock().unwrap_or_else(PoisonError::into_inner);
+            if pause.paused.load(Ordering::SeqCst) {
+                continue;
+            }
+            // A bounded wait, so a pause never waits long for the reader to let go.
+            match event::poll(Duration::from_millis(100)) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => break,
+            }
+            match event::read() {
+                Ok(Event::Key(key)) => Msg::Key(key),
+                Ok(Event::Paste(text)) => Msg::Paste(text),
+                Ok(Event::Resize(..)) => Msg::Tick,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
         };
         if tx.send(msg).is_err() {
             break;
         }
     });
+}
+
+/// Values of environment variables named like credentials. Commands never
+/// get them, but a user can pass any variable to the shell, so the interface
+/// hides them in what commands print.
+fn secrets_in_env() -> Vec<String> {
+    const NAMES: &[&str] = &["API_KEY", "TOKEN", "SECRET", "PASSWORD"];
+    std::env::vars()
+        .filter(|(name, value)| value.len() >= 8 && NAMES.iter().any(|n| name.to_ascii_uppercase().contains(n)))
+        .map(|(_, value)| value)
+        .collect()
 }
 
 struct Runtime {
@@ -208,14 +252,26 @@ impl Runtime {
             }
             Action::Design { req, trace } => self.call(move |s| async move {
                 let result = s.design(&req, &trace).await.map_err(|e| format!("{e:#}"));
-                Msg::Designed { trace, result }
+                // Which check files would replace the workspace's own, for confirm mode to stop on.
+                let existing = match &result {
+                    Ok(d) => {
+                        let root = Path::new(s.workspace());
+                        d.files
+                            .iter()
+                            .filter(|f| root.join(&f.path).symlink_metadata().is_ok())
+                            .map(|f| f.path.clone())
+                            .collect()
+                    }
+                    Err(_) => Vec::new(),
+                };
+                Msg::Designed { trace, result, existing }
             }),
             Action::Run { req, trace } => self.call(move |s| async move {
                 let result = s.run(&req, &trace).await.map_err(|e| format!("{e:#}"));
                 Msg::Ran { trace, result }
             }),
-            Action::Learn { trace } => self.call(move |s| async move {
-                let result = s.learn(&trace).await;
+            Action::Learn { trace, model } => self.call(move |s| async move {
+                let result = s.learn(&trace, model).await;
                 Msg::Learned { trace, result }
             }),
             Action::Apply { fork } => self.call(move |s| async move {
@@ -231,7 +287,7 @@ impl Runtime {
                 let result = s.forget(&id, &reason).await.map_err(|e| format!("{e:#}"));
                 Msg::Forgot { id, result }
             }),
-            Action::Interrupt { keep } => {
+            Action::Interrupt { keep, attempts, check_files } => {
                 for work in self.work.drain(..) {
                     work.abort();
                 }
@@ -239,18 +295,28 @@ impl Runtime {
                 match self.session.take() {
                     Some(session) => {
                         tokio::spawn(async move {
-                            session.shutdown(&keep).await;
-                            let _ = tx.send(Msg::Stopped);
+                            let mut kept = Vec::new();
+                            for fork in attempts {
+                                // A fork with nothing but the check's own files holds no work.
+                                match session.changes(&fork).await {
+                                    Ok(paths) if paths.iter().any(|p| !check_files.contains(p)) => kept.push(fork),
+                                    Ok(_) => {}
+                                    Err(e) => tracing::warn!("could not list the changes in {fork}: {e:#}"),
+                                }
+                            }
+                            let all: Vec<String> = keep.into_iter().chain(kept.iter().cloned()).collect();
+                            session.shutdown(&all).await;
+                            let _ = tx.send(Msg::Stopped { kept });
                         });
                     }
                     None if self.starting => {}
                     None => {
-                        let _ = tx.send(Msg::Stopped);
+                        let _ = tx.send(Msg::Stopped { kept: Vec::new() });
                     }
                 }
             }
-            // The loop handles quitting.
-            Action::Quit { .. } => {}
+            // The loop handles these: they need the terminal.
+            Action::Quit { .. } | Action::Edit { .. } => {}
         }
     }
 
@@ -268,6 +334,52 @@ impl Runtime {
         self.work.push(tokio::spawn(async move {
             let _ = tx.send(work(session).await);
         }));
+    }
+}
+
+/// `text` as the user leaves it in `$VISUAL` or `$EDITOR` (`vi` without
+/// either), run on the terminal while the interface steps aside.
+fn edit_outside(terminal: &mut DefaultTerminal, pause: &Pause, dir: &Path, text: &str) -> Result<String, String> {
+    use std::io::Write;
+
+    let editor = ["VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|v| std::env::var(v).ok().filter(|e| !e.trim().is_empty()))
+        .unwrap_or_else(|| "vi".into());
+    // In the private data dir: the draft may hold anything the user typed.
+    let path = dir.join(format!("task-{}.md", std::process::id()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+
+    pause.paused.store(true, Ordering::SeqCst);
+    let reading = pause.reading.lock().unwrap_or_else(PoisonError::into_inner);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    ratatui::restore();
+    // `sh` splits the variable as a shell would, so `EDITOR="code --wait"` works.
+    let status = tokio::task::block_in_place(|| {
+        std::process::Command::new("sh").arg("-c").arg(format!("{editor} \"$1\"")).arg("sh").arg(&path).status()
+    });
+    // Not `terminal.clear()`: it asks the terminal where the cursor is. An empty frame over the
+    // cleared screen makes the next draw a full one.
+    let back = terminal::enable_raw_mode()
+        .and_then(|()| execute!(std::io::stdout(), EnterAlternateScreen, Clear(ClearType::All), EnableBracketedPaste))
+        .and_then(|()| terminal.draw(|_| {}).map(|_| ()));
+    drop(reading);
+    pause.paused.store(false, Ordering::SeqCst);
+
+    let edited = std::fs::read_to_string(&path).map_err(|e| format!("could not read {}: {e}", path.display()));
+    let _ = std::fs::remove_file(&path);
+    back.map_err(|e| format!("could not take the terminal back: {e}"))?;
+    match status {
+        Ok(s) if s.success() => edited,
+        Ok(s) => Err(format!("{editor} {s}")),
+        Err(e) => Err(format!("could not start {editor}: {e}")),
     }
 }
 

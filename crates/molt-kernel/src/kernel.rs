@@ -18,7 +18,7 @@
 //! scan holds up no other message, and its reply is recorded as the range of
 //! entries it returned rather than copied into the log a second time.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -121,7 +121,7 @@ struct Inner {
     mailboxes: Mutex<HashMap<ServiceId, Mailbox>>,
     pending: Mutex<HashMap<MsgId, Pending>>,
     late: Mutex<HashMap<MsgId, (ServiceId, Instant)>>,
-    topics: Mutex<HashMap<String, BTreeSet<ServiceId>>>,
+    topics: Mutex<HashMap<String, HashMap<ServiceId, CapId>>>,
     status: Mutex<HashMap<ServiceId, ServiceStatus>>,
     /// `kernel.audit.read`s scanning the log at once. Each holds a blocking
     /// thread, so readers cannot crowd out the audit writer.
@@ -712,7 +712,8 @@ impl Inner {
         let Target::Topic { name } = &msg.to else {
             return self.deny(&from, &msg, ErrorCode::Invalid, "an event must target topic:<name>".into()).await;
         };
-        let cap = match self.caps.verify(msg.cap.as_ref(), &from, &msg.to) {
+        let publish = Target::TopicPublish { name: name.clone() };
+        let cap = match self.caps.verify(msg.cap.as_ref(), &from, &publish) {
             Ok(c) => c,
             Err(e) => return self.deny(&from, &msg, ErrorCode::Denied, e.to_string()).await,
         };
@@ -724,7 +725,14 @@ impl Inner {
             .lock()
             .unwrap()
             .get(name)
-            .map(|s| s.iter().filter(|s| **s != from).cloned().collect())
+            .map(|subscribers| {
+                let subscribe = Target::TopicSubscribe { name: name.clone() };
+                subscribers
+                    .iter()
+                    .filter(|(sub, cap)| **sub != from && self.caps.verify(Some(cap), sub, &subscribe).is_ok())
+                    .map(|(sub, _)| sub.clone())
+                    .collect()
+            })
             .unwrap_or_default();
         for sub in subscribers {
             // Events are at most once: a full mailbox drops the event for that subscriber.
@@ -903,9 +911,13 @@ impl Inner {
             }
             "subscribe" => {
                 let a: SubscribeArgs = serde_json::from_value(msg.payload.clone()).map_err(invalid)?;
-                let topic = Target::Topic { name: a.topic.clone() };
-                self.caps.verify(msg.cap.as_ref(), from, &topic).map_err(|e| denied(&e))?;
-                self.topics.lock().unwrap().entry(a.topic).or_default().insert(from.clone());
+                let topic = format!("topic:subscribe:{}", a.topic)
+                    .parse::<Target>()
+                    .map_err(|e| (ErrorCode::Invalid, e.to_string()))?;
+                let cap = self.caps.verify(msg.cap.as_ref(), from, &topic).map_err(|e| denied(&e))?;
+                // Retain the lease and check it again at delivery: revoking or
+                // expiring a subscription must end access to future events.
+                self.topics.lock().unwrap().entry(a.topic).or_default().insert(from.clone(), cap.id.clone());
                 Ok(json!({ "subscribed": true }))
             }
             "registry.propose" => {

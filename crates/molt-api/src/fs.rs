@@ -21,8 +21,11 @@ pub const LIST: &str = "fs.list";
 pub const SEARCH: &str = "fs.search";
 pub const FORK: &str = "fs.fork";
 pub const DIFF: &str = "fs.diff";
+pub const VIEW: &str = "fs.view";
 pub const MERGE: &str = "fs.merge";
 pub const DROP: &str = "fs.drop";
+pub const APPLIES: &str = "fs.applies";
+pub const RECOVER: &str = "fs.recover";
 
 /// The topic the service publishes [`FilesChanged`] on, when it may.
 pub const CHANGED: &str = "fs.changed";
@@ -209,11 +212,28 @@ pub struct DiffResponse {
     pub truncated: bool,
 }
 
+/// Validate a service-created fork and identify its complete current contents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewRequest {
+    pub fork: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewResponse {
+    pub workspace: String,
+    pub fork: String,
+    /// Hash of the fork-time file inventory.
+    pub baseline: String,
+    /// Hash of the current file inventory, including shell edits.
+    pub version: String,
+}
+
 /// Copy a fork's changes back into its original workspace. Fails with a
 /// `failed` error starting with `conflict:` and naming the paths if the
 /// original changed any of the same files since the fork; nothing is
-/// written in that case. If writing fails partway, the `failed` error starts
-/// with `partial:` and names the paths already written.
+/// written in that case. Writes are preceded by durable recovery material.
+/// A failure after a write starts uses `partial:` and names the operation;
+/// [`APPLIES`] reports actual path states and [`RECOVER`] can resume or undo.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeRequest {
     pub fork: String,
@@ -225,6 +245,78 @@ pub struct MergeRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeResponse {
     pub changes: Vec<Change>,
+    /// Durable recovery record, when the merge wrote any files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyStatus {
+    Preparing,
+    Staged,
+    Applying,
+    Applied,
+    Undoing,
+    Undone,
+    NeedsRecovery,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyPathStatus {
+    Pending,
+    Applied,
+    Conflict,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyPath {
+    pub path: String,
+    pub status: ApplyPathStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyOperation {
+    pub id: String,
+    pub workspace: String,
+    pub fork: String,
+    pub candidate: String,
+    pub status: ApplyStatus,
+    /// Observed disk state, independent of the last journal write.
+    pub paths: Vec<ApplyPath>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliesRequest {
+    pub workspace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliesResponse {
+    pub operations: Vec<ApplyOperation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryAction {
+    Resume,
+    Undo,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoverRequest {
+    pub workspace: String,
+    pub operation: String,
+    pub action: RecoveryAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoverResponse {
+    pub operation: ApplyOperation,
 }
 
 /// Delete a fork. Only forks the service created can be dropped.
