@@ -9,6 +9,7 @@ mod consolidate;
 pub mod db;
 mod digest;
 mod error;
+mod forks;
 mod notes;
 pub mod project;
 mod review;
@@ -56,6 +57,9 @@ pub struct Config {
     /// Directories the project model leaves out: Molt's data directory,
     /// with the `fs` service's forks in it, when it is inside the root.
     pub skip: Vec<PathBuf>,
+    /// Trusted fs scratch directory. Only `fork_symbols` may access its
+    /// service-verified direct children; ordinary workspace roots stay strict.
+    pub fork_root: Option<PathBuf>,
     /// The project the service works for, when the user's registry knows it.
     pub project: Option<Project>,
 }
@@ -97,6 +101,7 @@ impl Default for Config {
             model_timeout: Duration::from_secs(300),
             max_concurrent: 8,
             skip: Vec::new(),
+            fork_root: None,
             project: None,
         }
     }
@@ -139,6 +144,7 @@ impl Config {
             model_timeout: Duration::from_secs(number("MOLT_MEMORY_MODEL_TIMEOUT_S", d.model_timeout.as_secs())?),
             max_concurrent: d.max_concurrent,
             skip: d.skip,
+            fork_root: d.fork_root,
             project: d.project,
         })
     }
@@ -229,6 +235,7 @@ pub struct Memory {
     indexing: tokio::sync::Mutex<()>,
     /// Files `fs` changed that are waiting to be indexed again.
     changes: std::sync::Mutex<Waiting>,
+    fork_views: tokio::sync::Mutex<forks::Views>,
 }
 
 /// Changed files waiting to be indexed again, by workspace. While one event
@@ -247,6 +254,9 @@ impl Memory {
         let mut cfg = cfg;
         // The walk sees canonical paths; a directory not made yet cannot hold forks.
         cfg.skip = cfg.skip.iter().filter_map(|d| d.canonicalize().ok()).collect();
+        if let Some(forks) = &cfg.fork_root {
+            ensure!(forks.is_absolute(), "the fork root must be absolute");
+        }
         if let Some(project) = &mut cfg.project {
             project.paths = project.paths.iter().map(|p| p.canonicalize().unwrap_or_else(|_| p.clone())).collect();
             adopt(&db, project)?;
@@ -259,6 +269,7 @@ impl Memory {
             bus,
             indexing: tokio::sync::Mutex::new(()),
             changes: std::sync::Mutex::default(),
+            fork_views: tokio::sync::Mutex::default(),
         })
     }
 
@@ -431,6 +442,10 @@ impl Memory {
                 let r: SymbolsRequest = parse(&method, req.payload)?;
                 let ws = self.workspace(&r.workspace)?;
                 reply(self.blocking(move |db| project::symbols(db, &ws, &r)).await?)
+            }
+            "fork_symbols" => {
+                let r = parse(&method, req.payload)?;
+                reply(self.fork_symbols(r, &req.trace_id, req.budget).await?)
             }
             other => Err(invalid(format!("unknown method memory.{other}"))),
         }

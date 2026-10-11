@@ -198,17 +198,18 @@ async fn secrets_are_not_passed_to_commands() {
     // Only this test sets these, and std serializes environment access.
     std::env::set_var("MOLT_SECRET", "bus-secret");
     std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+    std::env::set_var("OPENAI_API_KEY", "sk-openai-test");
     std::env::set_var("MOLT_TOOLS_TEST_VISIBLE", "no");
     std::env::set_var("TOOLS_TEST_VISIBLE", "yes");
     let env = Env::new();
     let r = env
         .run(
-            "echo \"${MOLT_SECRET:-unset} ${ANTHROPIC_API_KEY:-unset} ${MOLT_TOOLS_TEST_VISIBLE:-unset} \
-             $TOOLS_TEST_VISIBLE $TERM $NO_COLOR $CI $GIT_TERMINAL_PROMPT $PAGER $GIT_PAGER\"; env | grep -c -E '^(MOLT|ANTHROPIC)_'",
+            "echo \"${MOLT_SECRET:-unset} ${ANTHROPIC_API_KEY:-unset} ${OPENAI_API_KEY:-unset} ${MOLT_TOOLS_TEST_VISIBLE:-unset} \
+             $TOOLS_TEST_VISIBLE $TERM $NO_COLOR $CI $GIT_TERMINAL_PROMPT $PAGER $GIT_PAGER\"; env | grep -c -E '^(MOLT|ANTHROPIC|OPENAI)_'",
             None,
         )
         .await;
-    assert_eq!(r.stdout, "unset unset unset yes dumb 1 1 0 cat cat\n0\n");
+    assert_eq!(r.stdout, "unset unset unset unset yes dumb 1 1 0 cat cat\n0\n");
 }
 
 #[tokio::test]

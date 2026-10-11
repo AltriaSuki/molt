@@ -134,6 +134,21 @@ pub(crate) fn index(
     skip: &[PathBuf],
     max_files: usize,
 ) -> Result<IndexResponse, RemoteError> {
+    index_mode(db, root, paths, skip, max_files, false)
+}
+
+pub(crate) fn index_verified(db: &Db, root: &Path) -> Result<IndexResponse, RemoteError> {
+    index_mode(db, root, None, &[], MAX_FILES, true)
+}
+
+fn index_mode(
+    db: &Db,
+    root: &Path,
+    paths: Option<&[String]>,
+    skip: &[PathBuf],
+    max_files: usize,
+    verify: bool,
+) -> Result<IndexResponse, RemoteError> {
     let clock = Instant::now();
     let started_ns = now_ns();
     let key = project_key(root)?;
@@ -164,7 +179,7 @@ pub(crate) fn index(
     while next < candidates.len() && kept < room {
         let batch = &candidates[next..candidates.len().min(next + (room - kept).min(BATCH))];
         next += batch.len();
-        let outcomes: Vec<Outcome> = batch.par_iter().map(|c| examine(c, model.stored.get(&c.rel))).collect();
+        let outcomes: Vec<Outcome> = batch.par_iter().map(|c| examine(c, model.stored.get(&c.rel), verify)).collect();
         let mut changes = Changes::default();
         for (candidate, outcome) in batch.iter().zip(outcomes) {
             if outcome.in_model() {
@@ -387,12 +402,12 @@ fn candidate(rel: String, abs: PathBuf, lang: Lang, meta: &Metadata) -> Option<C
 /// Decide what to do with one file, reading and parsing it if need be. A
 /// file parsed by another extractor (an older grammar or query) is parsed
 /// again whatever its contents.
-fn examine(file: &Candidate, stored: Option<&Stored>) -> Outcome {
+fn examine(file: &Candidate, stored: Option<&Stored>, verify: bool) -> Outcome {
     let extractor = file.lang.fingerprint();
     let stored = stored.filter(|s| extractor == Some(s.extractor.as_str()));
     if let Some(s) = stored {
         let trusted = s.mtime_ns.saturating_add(RACY_NS) <= s.verified_ns;
-        if trusted && s.size == file.size && s.mtime_ns == file.mtime_ns {
+        if !verify && trusted && s.size == file.size && s.mtime_ns == file.mtime_ns {
             return Outcome::Unchanged;
         }
     }
@@ -604,7 +619,7 @@ mod tests {
         // Saved by an editor that writes a new file and renames it over the old.
         fs::write(root.join("a.rs.tmp"), "fn saved() {}\n").unwrap();
         fs::rename(root.join("a.rs.tmp"), &abs).unwrap();
-        match examine(&file, None) {
+        match examine(&file, None, false) {
             Outcome::Parsed { symbols, seen, .. } => {
                 assert_eq!(symbols.defs[0].name, "saved");
                 assert_eq!(seen.size, 14);
@@ -615,13 +630,13 @@ mod tests {
         let file = seen(&abs);
         fs::remove_file(&abs).unwrap();
         std::os::unix::fs::symlink(root.join("b.rs"), &abs).unwrap();
-        assert!(matches!(examine(&file, None), Outcome::Gone));
+        assert!(matches!(examine(&file, None, false), Outcome::Gone));
         // Nor is a FIFO waited on.
         fs::remove_file(&abs).unwrap();
         let fifo = std::ffi::CString::new(abs.clone().into_os_string().into_encoded_bytes()).unwrap();
         // SAFETY: a valid NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
-        assert!(matches!(examine(&file, None), Outcome::Gone));
+        assert!(matches!(examine(&file, None, false), Outcome::Gone));
     }
 
     #[test]

@@ -75,9 +75,12 @@ pub fn resolve_config(
         }
         return Ok(cfg);
     }
-    if std::env::var_os("ANTHROPIC_API_KEY").is_none_or(|key| key.is_empty()) {
+    if ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+        .iter()
+        .all(|name| std::env::var_os(name).is_none_or(|key| key.is_empty()))
+    {
         bail!(
-            "ANTHROPIC_API_KEY is not set: export your Anthropic API key, or pass --config with services of your own"
+            "ANTHROPIC_API_KEY or OPENAI_API_KEY is not set: export your provider API key, or pass --config with services of your own"
         );
     }
     let data_dir = match (data_dir, project) {
@@ -658,7 +661,14 @@ async fn call_planner(cli: &Service, req: &RunRequest, trace: &TraceId) -> anyho
 }
 
 /// The progress event `msg` carries, if it is one of run `run`'s.
-fn progress_of(msg: &Envelope, run: &str) -> Option<Progress> {
+pub(crate) fn progress_of(msg: &Envelope, run: &str) -> Option<Progress> {
+    progress_event(msg).filter(|event| event.run() == run)
+}
+
+/// Authenticate model previews before either front end sees them. Ordinary
+/// planner events carry their run in the payload; their publication request
+/// may have its own trace, so do not impose a model-call trace on those.
+pub(crate) fn progress_event(msg: &Envelope) -> Option<Progress> {
     let on_topic = matches!(&msg.to, Target::Topic { name } if name == progress::TOPIC);
     if msg.kind != Kind::Event || !on_topic {
         return None;
@@ -667,11 +677,11 @@ fn progress_of(msg: &Envelope, run: &str) -> Option<Progress> {
     // The kernel stamps the sender. A service with topic access cannot
     // impersonate the gateway by choosing a model event payload.
     if event.model_call().is_some()
-        && (msg.from.as_ref().map(ServiceId::as_str) != Some("model") || msg.trace_id.as_str() != run)
+        && (msg.from.as_ref().map(ServiceId::as_str) != Some("model") || msg.trace_id.as_str() != event.run())
     {
         return None;
     }
-    (event.run() == run).then_some(event)
+    Some(event)
 }
 
 #[derive(Default)]
@@ -1053,6 +1063,12 @@ mod tests {
             Some(Progress::AttemptStarted { run: "trace_a".into(), attempt: 1, fork: None })
         );
         assert_eq!(progress_of(&event("trace_b"), "trace_a"), None);
+        // The session's shared filter must preserve planner publications
+        // whose envelope trace differs from the run in their payload.
+        assert_eq!(
+            progress_event(&event("trace_a")),
+            Some(Progress::AttemptStarted { run: "trace_a".into(), attempt: 1, fork: None })
+        );
         let mut other = event("trace_a");
         other.to = "topic:builds".parse().unwrap();
         assert_eq!(progress_of(&other, "trace_a"), None);
