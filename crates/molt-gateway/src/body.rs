@@ -92,6 +92,7 @@ mod tests {
             max_in_flight: 1,
             fallbacks: true,
             retry_base: Duration::from_millis(1),
+            prices: Default::default(),
         }
     }
 

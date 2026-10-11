@@ -9,6 +9,7 @@
 
 mod api;
 mod body;
+pub mod prices;
 mod profile;
 mod stream;
 
@@ -26,7 +27,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::profile::profile;
+use crate::prices::PriceTable;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 /// Kept back from a caller's deadline so the reply reaches it before the
@@ -56,6 +57,8 @@ pub struct Config {
     /// First retry delay when the API gives no `retry-after`; it doubles on
     /// each retry up to 30 s. One second outside tests.
     pub retry_base: Duration,
+    /// What each model costs; see [`prices`].
+    pub prices: Arc<PriceTable>,
 }
 
 // Written out so that logging a config never prints the key.
@@ -72,6 +75,7 @@ impl fmt::Debug for Config {
             .field("max_in_flight", &self.max_in_flight)
             .field("fallbacks", &self.fallbacks)
             .field("retry_base", &self.retry_base)
+            .field("prices", &self.prices.sources())
             .finish()
     }
 }
@@ -90,6 +94,7 @@ impl Config {
     /// | `MOLT_MODEL_RETRIES` | `4` |
     /// | `MOLT_MODEL_CONCURRENCY` | `16` |
     /// | `MOLT_FALLBACKS` | `1` (`0` turns them off) |
+    /// | `MOLT_MODEL_PRICES`, `MOLT_PRICES_FILE` | see [`prices`] |
     ///
     /// An empty variable counts as unset. `MOLT_MAX_TOKENS`,
     /// `MOLT_MODEL_TIMEOUT_S` and `MOLT_MODEL_CONCURRENCY` must be above 0:
@@ -131,6 +136,7 @@ impl Config {
                 .context("MOLT_MODEL_CONCURRENCY is too large")?,
             fallbacks,
             retry_base: Duration::from_secs(1),
+            prices: Arc::new(PriceTable::from_vars(&var)?),
         })
     }
 }
@@ -147,11 +153,11 @@ pub fn resolve_model(name: &str) -> String {
     .to_owned()
 }
 
-/// Whether the gateway knows what `model` (an alias or a model id) costs.
-/// Calls to a model it has no price for report no cost, so no spending
-/// limit holds them back.
-pub fn has_price(model: &str) -> bool {
-    profile::profile(&resolve_model(model)).prices.is_some()
+/// Whether `prices` has what `model` (an alias or a model id) costs.
+/// Calls to a model with no price report no cost, so no spending limit
+/// holds them back.
+pub fn has_price(prices: &PriceTable, model: &str) -> bool {
+    prices.lookup(&resolve_model(model)).is_some()
 }
 
 pub struct Gateway {
@@ -229,8 +235,21 @@ impl Gateway {
             });
         }
         let usage = Usage::from(msg.usage);
-        // After a fallback another model answered, and its prices apply.
-        let cost_usd = profile(&msg.model).prices.or(profile(&model).prices).map(|p| p.cost(&usage));
+        // After a fallback or a router's choice another model answered, and its prices apply.
+        let priced = self.cfg.prices.lookup(&msg.model).or_else(|| self.cfg.prices.lookup(&model));
+        if priced.is_none() {
+            let mut looked_for = prices::names(&msg.model);
+            for name in prices::names(&model) {
+                if !looked_for.contains(&name) {
+                    looked_for.push(name);
+                }
+            }
+            tracing::warn!(
+                ?looked_for,
+                "no price for the model: the call's cost is unknown; run `molt prices update` or set MOLT_MODEL_PRICES"
+            );
+        }
+        let cost_usd = priced.as_ref().map(|(p, _)| p.cost(&usage));
         if msg.stop_reason.as_deref() == Some(STOP_REFUSAL) {
             let category = msg.stop_details.as_ref().and_then(|d| d.get("category")).cloned().unwrap_or(Value::Null);
             tracing::info!(model = %msg.model, %category, "the model declined the request");
@@ -244,6 +263,8 @@ impl Gateway {
             cache_write_tokens = usage.cache_creation_input_tokens,
             cache_read_tokens = usage.cache_read_input_tokens,
             ?cost_usd,
+            price_source = priced.as_ref().map(|(_, s)| s.source.as_str()),
+            price_entry = priced.as_ref().map(|(_, s)| s.entry.as_str()),
             "model call"
         );
         Ok(CompleteResponse {
@@ -254,6 +275,7 @@ impl Gateway {
             stop_details: msg.stop_details,
             usage,
             cost_usd,
+            price_source: priced.map(|(_, s)| s),
         })
     }
 }

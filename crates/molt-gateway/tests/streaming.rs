@@ -25,6 +25,7 @@ fn config(base_url: String) -> Config {
         max_in_flight: 4,
         fallbacks: true,
         retry_base: Duration::from_millis(1),
+        prices: Default::default(),
     }
 }
 

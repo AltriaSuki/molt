@@ -3,6 +3,7 @@
 use std::time::{Duration, Instant};
 
 use molt_api::model::{user_text, CompleteRequest, Effort, Usage};
+use molt_gateway::prices::{self, PriceTable};
 use molt_gateway::{Config, Gateway};
 use molt_proto::ErrorCode;
 use serde_json::{json, Value};
@@ -21,6 +22,7 @@ fn config(server: &MockServer) -> Config {
         max_in_flight: 4,
         fallbacks: true,
         retry_base: Duration::from_millis(2),
+        prices: Default::default(),
     }
 }
 
@@ -429,6 +431,7 @@ async fn an_unreachable_api_is_unavailable() {
         max_in_flight: 1,
         fallbacks: true,
         retry_base: Duration::from_millis(1),
+        prices: Default::default(),
     };
     let err = Gateway::new(cfg).unwrap().complete(request()).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Unavailable, "{}", err.message);
@@ -553,4 +556,37 @@ async fn the_answering_models_prices_win_over_the_requested_ones() {
     let gw = Gateway::new(config(&server)).unwrap();
     let resp = gw.complete(request()).await.unwrap();
     assert!((resp.cost_usd.unwrap() - 20.0).abs() < 1e-9, "{:?}", resp.cost_usd);
+}
+
+#[tokio::test]
+async fn a_snapshot_prices_a_third_party_model_and_the_reply_says_which_price_was_used() {
+    let list = json!({
+        "deepseek-chat": {"mode": "chat", "input_cost_per_token": 2.8e-7, "output_cost_per_token": 4.2e-7},
+    });
+    let snapshot =
+        prices::convert(prices::Source::Litellm, "https://example.test/p.json", list.to_string().as_bytes(), 7)
+            .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("prices.json");
+    snapshot.write(&file).unwrap();
+    let table = PriceTable::from_vars(|name| (name == prices::FILE_VAR).then(|| file.display().to_string())).unwrap();
+
+    let server = MockServer::start().await;
+    let mut reply = message("deepseek-chat");
+    reply["usage"] = json!({ "input_tokens": 1_000_000, "output_tokens": 1_000_000 });
+    answer_with(&server, ok(reply)).await;
+    let gw = Gateway::new(Config { prices: table.into(), ..config(&server) }).unwrap();
+    let resp = gw.complete(CompleteRequest { model: Some("deepseek-chat".into()), ..request() }).await.unwrap();
+    assert!((resp.cost_usd.unwrap() - 0.70).abs() < 1e-9, "{:?}", resp.cost_usd);
+    let source = resp.price_source.unwrap();
+    assert_eq!((source.entry.as_str(), source.source.as_str()), ("deepseek-chat", "litellm"));
+    assert_eq!(source.sha256, Some(snapshot.sha256));
+    assert_eq!(source.fetched_at_ms, Some(7));
+
+    // A model no source prices stays unknown, as before.
+    let server = MockServer::start().await;
+    answer_with(&server, ok(message("no-such-model"))).await;
+    let gw = Gateway::new(config(&server)).unwrap();
+    let resp = gw.complete(CompleteRequest { model: Some("no-such-model".into()), ..request() }).await.unwrap();
+    assert_eq!((resp.cost_usd, resp.price_source), (None, None));
 }

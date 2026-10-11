@@ -177,7 +177,8 @@ pub struct Molt {
     /// Options for every arm, such as `--model opus`.
     pub options: Vec<String>,
     /// Variables set for every run. Every `MOLT_*` variable of the
-    /// benchmark's own environment is removed first.
+    /// benchmark's own environment is removed first, except those that give
+    /// the runs the prices the benchmark checked models against.
     pub env: Vec<(String, String)>,
     /// Keep each run's audit log, which records every model call, among its logs.
     pub keep_audit: bool,
@@ -258,6 +259,8 @@ impl Agent for Molt {
                 cmd.env_remove(name);
             }
         }
+        // Each run has its own home directory, so the user's price snapshot is named outright.
+        cmd.envs(molt_gateway::prices::forward_env());
         cmd.envs(self.env.iter().map(|(k, v)| (k, v)));
         cmd.envs(proc::home_env(job.home));
         #[cfg(target_os = "linux")]

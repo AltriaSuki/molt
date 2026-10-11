@@ -163,6 +163,9 @@ const GATEWAY_ENV: &[&str] = &[
     "MOLT_MODEL_RETRIES",
     "MOLT_MODEL_CONCURRENCY",
     "MOLT_FALLBACKS",
+    "MOLT_MODEL_PRICES",
+    "MOLT_PRICES_FILE",
+    "XDG_DATA_HOME",
 ];
 
 /// What the planner reads from its environment (see `molt_planner::Config::from_env`).

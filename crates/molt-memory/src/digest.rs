@@ -518,6 +518,7 @@ mod tests {
                 stop_details: None,
                 usage: Usage::default(),
                 cost_usd: None,
+                price_source: None,
             };
             self.push(req.reply(serde_json::to_value(resp).unwrap()));
         }
