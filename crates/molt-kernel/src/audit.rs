@@ -19,6 +19,7 @@
 //! Services read it back one trace at a time through `kernel.audit.read`
 //! ([`read_trace`]).
 
+use std::collections::VecDeque;
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -32,6 +33,10 @@ use tokio::sync::{mpsc, oneshot};
 
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const MAX_BATCH: usize = 512;
+/// Maximum serialized entry size, including its terminating newline. This
+/// leaves room for the audit wrapper around an 8 MiB transport frame and caps
+/// memory use even when a damaged file contains no line breaks.
+pub const MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -191,12 +196,10 @@ impl AuditLog {
         }
         let (mut seq, mut prev) = (0u64, GENESIS.to_owned());
         if tokio::fs::try_exists(&path).await? {
-            let n = verify(&path).await?;
-            if let Some(last) = tail(&path, 1).await?.pop() {
-                seq = last.seq;
-                prev = last.hash;
-            }
-            tracing::info!(entries = n, "continuing audit log");
+            let (head, _) = scan(path.clone(), 0, true).await?;
+            seq = head.seq;
+            prev = head.hash;
+            tracing::info!(entries = seq, "continuing audit log");
         }
         let mut options = tokio::fs::OpenOptions::new();
         options.create(true).append(true);
@@ -213,7 +216,8 @@ impl AuditLog {
     }
 
     /// Queue an event. Entries are written in submission order; await the
-    /// receipt to know it is durable.
+    /// receipt to know it is durable. An entry larger than [`MAX_ENTRY_BYTES`]
+    /// stops the writer without writing that batch or acknowledging its events.
     pub async fn submit(&self, event: AuditEvent) -> Result<Receipt, AuditError> {
         let (ack, rx) = oneshot::channel();
         self.tx.send(Job::Append(Box::new(event), ack)).await.map_err(|_| AuditError::Stopped)?;
@@ -255,9 +259,15 @@ async fn writer(mut file: tokio::fs::File, mut rx: mpsc::Receiver<Job>, mut seq:
             let ts_ms = now_ms();
             let raw = serde_json::value::to_raw_value(&event).expect("audit events always serialize");
             let hash = digest(&prev, seq, ts_ms, raw.get());
+            let start = buf.len();
             serde_json::to_writer(&mut buf, &EntryOut { seq, ts_ms, prev: &prev, hash: &hash, event: &raw })
                 .expect("audit entries always serialize");
             buf.push(b'\n');
+            if buf.len() - start > MAX_ENTRY_BYTES {
+                // Never write a record that the bounded readers cannot reopen.
+                tracing::error!(limit = MAX_ENTRY_BYTES, "audit entry is too large; stopping the writer");
+                return;
+            }
             prev = hash;
             acks.push((seq, ack));
             if acks.len() < MAX_BATCH {
@@ -293,50 +303,89 @@ async fn writer(mut file: tokio::fs::File, mut rx: mpsc::Receiver<Job>, mut seq:
     }
 }
 
-/// Check the whole chain. Returns the number of entries.
-pub async fn verify(path: &Path) -> Result<u64, AuditError> {
-    let text = tokio::fs::read_to_string(path).await?;
-    let mut prev = GENESIS.to_owned();
-    let mut expected_seq = 1u64;
-    for (i, line) in text.lines().enumerate() {
-        let corrupt = |reason: String| AuditError::Corrupt { line: i + 1, reason };
-        let e: EntryIn = serde_json::from_str(line).map_err(|e| corrupt(e.to_string()))?;
-        if e.seq != expected_seq {
-            return Err(corrupt(format!("sequence {} where {expected_seq} was expected", e.seq)));
-        }
-        if e.prev != prev {
-            return Err(corrupt("previous-hash link is broken".into()));
-        }
-        if digest(&e.prev, e.seq, e.ts_ms, e.event.get()) != e.hash {
-            return Err(corrupt("hash does not match the entry".into()));
-        }
-        serde_json::from_str::<AuditEvent>(e.event.get()).map_err(|e| corrupt(e.to_string()))?;
-        prev = e.hash;
-        expected_seq += 1;
-    }
-    Ok(expected_seq - 1)
+struct ChainHead {
+    seq: u64,
+    hash: String,
 }
 
-/// Read every entry (verifying nothing; call [`verify`] for that).
+// File IO, hashing and JSON parsing all run off the async runtime. Only the
+// current line and at most `keep` decoded entries survive each iteration.
+async fn scan(path: PathBuf, keep: usize, verify_chain: bool) -> Result<(ChainHead, Vec<Entry>), AuditError> {
+    tokio::task::spawn_blocking(move || scan_file(&path, keep, verify_chain)).await.map_err(std::io::Error::other)?
+}
+
+fn scan_file(path: &Path, keep: usize, verify_chain: bool) -> Result<(ChainHead, Vec<Entry>), AuditError> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let mut head = ChainHead { seq: 0, hash: GENESIS.to_owned() };
+    let mut entries = VecDeque::new();
+    let mut line = Vec::new();
+    let mut line_number = 0;
+    loop {
+        line.clear();
+        // `take` caps the allocation before read_until can encounter an
+        // arbitrarily long or unterminated record. The extra byte distinguishes
+        // an exactly full, valid record from an oversized one.
+        let n = reader.by_ref().take(MAX_ENTRY_BYTES as u64 + 1).read_until(b'\n', &mut line)?;
+        if n == 0 {
+            break;
+        }
+        line_number += 1;
+        let corrupt = |reason: String| AuditError::Corrupt { line: line_number, reason };
+        if n > MAX_ENTRY_BYTES {
+            return Err(corrupt(format!("entry exceeds the {MAX_ENTRY_BYTES}-byte limit")));
+        }
+        if line.last() != Some(&b'\n') {
+            return Err(corrupt("entry is missing its terminating newline".into()));
+        }
+        let e: EntryIn = serde_json::from_slice(&line).map_err(|e| corrupt(e.to_string()))?;
+        if verify_chain {
+            let expected_seq = head.seq.checked_add(1).ok_or_else(|| corrupt("sequence overflow".into()))?;
+            if e.seq != expected_seq {
+                return Err(corrupt(format!("sequence {} where {expected_seq} was expected", e.seq)));
+            }
+            if e.prev != head.hash {
+                return Err(corrupt("previous-hash link is broken".into()));
+            }
+            if digest(&e.prev, e.seq, e.ts_ms, e.event.get()) != e.hash {
+                return Err(corrupt("hash does not match the entry".into()));
+            }
+        }
+        // Even discarded records must be valid events: corruption before the
+        // requested tail must not disappear just because fewer entries are kept.
+        let event = serde_json::from_str(e.event.get()).map_err(|e| corrupt(e.to_string()))?;
+        head = ChainHead { seq: e.seq, hash: e.hash };
+        if keep > 0 {
+            if entries.len() == keep {
+                entries.pop_front();
+            }
+            entries.push_back(Entry { seq: e.seq, ts_ms: e.ts_ms, hash: head.hash.clone(), event });
+        }
+    }
+    Ok((head, entries.into()))
+}
+
+/// Check the whole chain in one pass, keeping only one bounded record at a
+/// time. Returns the number of entries. Oversized or incomplete records fail.
+pub async fn verify(path: &Path) -> Result<u64, AuditError> {
+    Ok(scan(path.to_owned(), 0, true).await?.0.seq)
+}
+
+/// Read every entry, checking record syntax but not the hash chain (call
+/// [`verify`] for that). Memory necessarily grows with the returned records.
 pub async fn read_all(path: &Path) -> Result<Vec<Entry>, AuditError> {
     tail(path, usize::MAX).await
 }
 
-/// The last `n` entries.
+/// The last `n` entries in file order, retaining at most `n` decoded records.
+/// Scans and validates record syntax throughout the file, but does not verify
+/// the hash chain. For `n == 0`, opens the file without reading any records.
 pub async fn tail(path: &Path, n: usize) -> Result<Vec<Entry>, AuditError> {
-    let text = tokio::fs::read_to_string(path).await?;
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..]
-        .iter()
-        .enumerate()
-        .map(|(i, line)| {
-            let corrupt = |reason: String| AuditError::Corrupt { line: start + i + 1, reason };
-            let e: EntryIn = serde_json::from_str(line).map_err(|e| corrupt(e.to_string()))?;
-            let event = serde_json::from_str(e.event.get()).map_err(|e| corrupt(e.to_string()))?;
-            Ok(Entry { seq: e.seq, ts_ms: e.ts_ms, hash: e.hash, event })
-        })
-        .collect()
+    if n == 0 {
+        tokio::fs::File::open(path).await?;
+        return Ok(Vec::new());
+    }
+    Ok(scan(path.to_owned(), n, false).await?.1)
 }
 
 /// Default size of one page of [`read_trace`], in bytes of log.
@@ -435,6 +484,162 @@ mod tests {
 
     fn ev(n: u32) -> AuditEvent {
         AuditEvent::ServiceStarted { service: ServiceId::new("s").unwrap(), pid: Some(n) }
+    }
+
+    fn record(seq: u64, prev: &str, event: &str) -> String {
+        let event = RawValue::from_string(event.to_owned()).unwrap();
+        let hash = digest(prev, seq, 123, event.get());
+        let mut line = serde_json::to_string(&EntryOut { seq, ts_ms: 123, prev, hash: &hash, event: &event }).unwrap();
+        line.push('\n');
+        line
+    }
+
+    #[tokio::test]
+    async fn empty_logs_and_zero_length_tails_are_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(verify(&path).await.unwrap(), 0);
+        assert!(tail(&path, 3).await.unwrap().is_empty());
+        assert!(read_all(&path).await.unwrap().is_empty());
+        let log = AuditLog::open(&path, false).await.unwrap();
+        assert_eq!(log.append(ev(1)).await.unwrap(), 1);
+        log.close().await;
+        assert!(tail(&path, 0).await.unwrap().is_empty());
+        std::fs::write(&path, b"not JSON\xff").unwrap();
+        assert!(tail(&path, 0).await.unwrap().is_empty(), "zero entries does not scan");
+        assert!(matches!(tail(&dir.path().join("missing"), 0).await, Err(AuditError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn a_tail_keeps_only_the_requested_entries_in_file_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open(&path, false).await.unwrap();
+        for n in 0..20 {
+            log.append(ev(n)).await.unwrap();
+        }
+        log.close().await;
+        for n in [1, 3, 20, 30, usize::MAX] {
+            let entries = tail(&path, n).await.unwrap();
+            let first = 20 - n.min(20);
+            assert_eq!(entries.len(), n.min(20));
+            for (i, entry) in entries.iter().enumerate() {
+                assert_eq!(entry.seq, (first + i + 1) as u64);
+                assert_eq!(entry.event, ev((first + i) as u32));
+            }
+        }
+        assert_eq!(read_all(&path).await.unwrap().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn verification_hashes_the_original_event_bytes_and_resumes_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let event = r#"{ "status" : "退出 café 🚀 \u0061", "service":"s", "type" : "service_exited" }"#;
+        std::fs::write(&path, record(1, GENESIS, event)).unwrap();
+        assert_eq!(verify(&path).await.unwrap(), 1);
+        let entries = tail(&path, 1).await.unwrap();
+        assert_eq!(entries[0].event, serde_json::from_str::<AuditEvent>(event).unwrap());
+        let log = AuditLog::open(&path, false).await.unwrap();
+        assert_eq!(log.append(ev(2)).await.unwrap(), 2);
+        log.close().await;
+        assert_eq!(verify(&path).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn verification_and_open_refuse_sequence_link_and_content_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let first = record(1, GENESIS, &serde_json::to_string(&ev(1)).unwrap());
+        let head: EntryIn = serde_json::from_str(&first).unwrap();
+        let second = record(2, &head.hash, &serde_json::to_string(&ev(2)).unwrap());
+        let mut cases = Vec::new();
+        for (key, value, reason) in [
+            ("seq", serde_json::json!(9), "sequence"),
+            ("prev", serde_json::json!(GENESIS), "previous-hash"),
+            ("hash", serde_json::json!(GENESIS), "hash does not match"),
+            ("event", serde_json::to_value(ev(99)).unwrap(), "hash does not match"),
+        ] {
+            let mut changed: serde_json::Value = serde_json::from_str(&second).unwrap();
+            changed[key] = value;
+            cases.push((format!("{first}{changed}\n"), reason));
+        }
+        cases.push((format!("{first}{first}"), "sequence"));
+        for (text, expected) in cases {
+            std::fs::write(&path, &text).unwrap();
+            let err = verify(&path).await.unwrap_err();
+            assert!(matches!(&err, AuditError::Corrupt { line: 2, reason } if reason.contains(expected)), "{err}");
+            assert!(AuditLog::open(&path, false).await.is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "rejected logs are never changed");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_oversized_and_unterminated_records_are_never_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let valid = record(1, GENESIS, &serde_json::to_string(&ev(1)).unwrap());
+        let cases = [
+            b"{broken JSON}\n".to_vec(),
+            b"\xff\n".to_vec(),
+            b"\n".to_vec(),
+            valid.as_bytes()[..valid.len() / 2].to_vec(),
+            valid.trim_end_matches('\n').as_bytes().to_vec(),
+            record(2, GENESIS, r#"{"type":"not_an_event"}"#).into_bytes(),
+            vec![b'x'; MAX_ENTRY_BYTES + 1],
+        ];
+        for bad in cases {
+            let mut bytes = valid.as_bytes().to_vec();
+            bytes.extend_from_slice(&bad);
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(matches!(verify(&path).await, Err(AuditError::Corrupt { line: 2, .. })));
+            assert!(matches!(tail(&path, 1).await, Err(AuditError::Corrupt { line: 2, .. })));
+            assert!(AuditLog::open(&path, false).await.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        // The corrupt record would be outside the returned tail.
+        std::fs::write(&path, format!("not JSON\n{valid}")).unwrap();
+        assert!(matches!(tail(&path, 1).await, Err(AuditError::Corrupt { line: 1, .. })));
+    }
+
+    #[tokio::test]
+    async fn an_entry_at_the_size_limit_can_be_verified_and_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut event = AuditEvent::ServiceExited { service: ServiceId::new("s").unwrap(), status: String::new() };
+        let overhead = record(1, GENESIS, &serde_json::to_string(&event).unwrap()).len();
+        if let AuditEvent::ServiceExited { status, .. } = &mut event {
+            *status = "x".repeat(MAX_ENTRY_BYTES - overhead);
+        }
+        let line = record(1, GENESIS, &serde_json::to_string(&event).unwrap());
+        assert_eq!(line.len(), MAX_ENTRY_BYTES);
+        std::fs::write(&path, &line).unwrap();
+        assert_eq!(verify(&path).await.unwrap(), 1);
+        assert_eq!(tail(&path, 1).await.unwrap()[0].event, event);
+        let log = AuditLog::open(&path, false).await.unwrap();
+        assert_eq!(log.append(ev(2)).await.unwrap(), 2);
+        log.close().await;
+        assert_eq!(verify(&path).await.unwrap(), 2);
+        std::fs::write(&path, format!(" {}", line)).unwrap();
+        assert!(matches!(verify(&path).await, Err(AuditError::Corrupt { line: 1, .. })));
+    }
+
+    #[tokio::test]
+    async fn the_writer_never_persists_an_entry_the_readers_would_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open(&path, false).await.unwrap();
+        log.append(ev(1)).await.unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let event =
+            AuditEvent::ServiceExited { service: ServiceId::new("s").unwrap(), status: "x".repeat(MAX_ENTRY_BYTES) };
+        assert!(matches!(log.append(event).await, Err(AuditError::Stopped)));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let log = AuditLog::open(&path, false).await.unwrap();
+        assert_eq!(log.append(ev(2)).await.unwrap(), 2);
+        log.close().await;
+        assert_eq!(verify(&path).await.unwrap(), 2);
     }
 
     #[tokio::test]
