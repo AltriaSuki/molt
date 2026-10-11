@@ -141,7 +141,8 @@ the same project is refused until it closes.
 ```
 molt do TASK [--check CMD | --no-check] [--attempts N] [--model M] [--effort E] [--max-turns N]
         [--budget-usd X] [--no-apply] [--json] [--stream] [--workspace DIR] [--data-dir DIR]
-        [--pass-env NAME]... [--no-memory] [--no-learn] [--config FILE]
+        [--pass-env NAME]... [--no-memory] [--no-learn] [--checkpoint] [--config FILE]
+molt resume [RUN] [--retry] [--list] [--budget-usd X] [--no-apply] [--json] [--workspace DIR] ...
 ```
 
 | Flag | Meaning |
@@ -159,10 +160,43 @@ molt do TASK [--check CMD | --no-check] [--attempts N] [--model M] [--effort E] 
 | `--pass-env NAME` | Pass a variable from your environment to the commands the agent runs, the check included. Repeatable. |
 | `--no-memory` | Run without memory: no map or notes for the model, nothing learned. |
 | `--no-learn` | Use memory, but do not learn from this run (learning is one more model call after it). |
+| `--checkpoint` | Save a checkpoint as the run goes, so a run that stops before it finishes can go on with `molt resume` (below). |
 | `--config FILE` | Run your own service setup (see `molt.example.toml`) instead of the default one. |
 
 Progress goes to stderr and the result to stdout. Control characters in text
 from the model or from file names are printed escaped.
+
+### Checkpoints and `molt resume`
+
+With `--checkpoint`, the planner saves the run in the data dir
+(`runs/<run>.json`, readable by you only) at every boundary: a model call
+starting or answered, an attempt's tool calls about to run or done, a check
+run, an attempt ending. The file holds the task, the check, each attempt's
+fork and conversation, and the spend so far.
+
+A run that finishes removes its checkpoint. One that stops first keeps it,
+along with its forks: interrupted (Ctrl-C, a signal, the process killed) or
+out of budget. `molt resume --list` shows the stopped runs of the workspace.
+`molt resume [RUN]` goes on with one (the latest by default), under the same
+run id:
+
+- Attempts go on from their last checkpoint, in their forks.
+- The cost so far counts against the budget; `--budget-usd` gives the run
+  more.
+- A model call that was unanswered when the run stopped is reported as
+  uncounted, never as free.
+- Tool calls that a stop cut short are not run again. The model is told
+  their effect is unknown and to look before redoing them.
+- A check that was running runs again.
+- `--retry` leaves the stopped attempts as they are and starts new ones with
+  the same check; the earlier record and cost stay.
+
+The result is applied as any run's is, so changes made to the workspace in
+the meantime are never silently overwritten: a conflicting path keeps the
+result in its fork, with exit status 3. A damaged checkpoint, one in another
+format, or one for another workspace is refused with the reason. The ten
+newest checkpoints are kept; older ones are removed with their forks when a
+new checkpointed run starts.
 
 With `--stream`, previews identify the attempt (or check designer), turn and
 model call. These are provisional text, not verified results. Thinking and
@@ -452,7 +486,8 @@ its tasks with a notice, except on CI.
 - Audit startup, verification and nonempty tail reads still scan the whole log, but memory is bounded by one record plus the requested tail. A record is limited to 16 MiB including its newline; oversized, malformed or unterminated records are refused, including on restart. The writer stops before persisting an oversized entry. `tail -n 0` opens the file without scanning; `read_all` intentionally retains every returned entry. Tail validates record syntax throughout the file, but only verification and startup check the hash chain.
 - Reading one trace back from the audit log scans the log from the start: there is no index yet. One read looks through at most 256 MiB and keeps to its deadline, and two run at once.
 - The kernel drops a message nested more than 100 levels deep, so every logged message can be read back.
-- After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none.
+- After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none. A run with `--checkpoint` that stops keeps its forks for `molt resume`.
+- A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.
 - Recall matches keywords (with stemming), not meaning: there is no vector index, since the Anthropic API has no embeddings endpoint. A note worded differently from the task can be missed; the strongest notes about the project are always shown.
