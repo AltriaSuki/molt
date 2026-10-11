@@ -105,7 +105,7 @@ impl Session {
             while let Some(msg) = pump.next().await {
                 // Share the CLI's gateway-origin and trace checks. Topic
                 // access alone must not let a peer impersonate a model call.
-                if let Some(event) = agent::progress_of(&msg, msg.trace_id.as_str()) {
+                if let Some(event) = agent::progress_event(&msg) {
                     if events.send(event).is_err() {
                         break;
                     }
