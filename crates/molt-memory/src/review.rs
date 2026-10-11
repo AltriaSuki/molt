@@ -102,7 +102,7 @@ struct Changed {
 
 /// Hash off the database lock. The revision lease below prevents an older
 /// check from overwriting a user review that happened during the file read.
-fn changed(db: &Db, workspace: &str) -> Result<Vec<Changed>, RemoteError> {
+fn changed(db: &Db, workspace: &str, path: &Path) -> Result<Vec<Changed>, RemoteError> {
     let candidates: Vec<(String, i64, String)> = db.with(|conn| {
         let mut stmt = conn.prepare("SELECT n.id, n.rev, d.details FROM notes n JOIN note_details d ON d.note = n.id WHERE n.workspace = ?1 AND n.forgotten_ms IS NULL")?;
         let rows = stmt.query_map([workspace], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>();
@@ -114,7 +114,7 @@ fn changed(db: &Db, workspace: &str) -> Result<Vec<Changed>, RemoteError> {
         let before = details.needs_review.len();
         for dep in &details.dependencies {
             if !details.needs_review.contains(&dep.path)
-                && fingerprint(Path::new(workspace), &dep.path).as_deref() != Ok(dep.sha256.as_str())
+                && fingerprint(path, &dep.path).as_deref() != Ok(dep.sha256.as_str())
             {
                 details.needs_review.push(dep.path.clone());
             }
@@ -154,8 +154,9 @@ fn apply(conn: &Connection, changes: Vec<Changed>, trace: &str, now: u64) -> rus
     Ok(())
 }
 
-pub(crate) fn refresh(db: &Db, workspace: &str, trace: &str, now: u64) -> Result<(), RemoteError> {
-    let changes = changed(db, workspace)?;
+/// Mark the notes kept under `workspace` whose dependency files in `path` changed.
+pub(crate) fn refresh(db: &Db, workspace: &str, path: &Path, trace: &str, now: u64) -> Result<(), RemoteError> {
+    let changes = changed(db, workspace, path)?;
     db.with(|conn| {
         let tx = conn.transaction()?;
         apply(&tx, changes, trace, now)?;
@@ -167,6 +168,7 @@ pub(crate) fn refresh(db: &Db, workspace: &str, trace: &str, now: u64) -> Result
 pub(crate) fn recall(
     db: &Db,
     req: &RecallRequest,
+    path: Option<&Path>,
     identity: Option<(&str, &str)>,
     now: u64,
 ) -> Result<Vec<Recalled>, RemoteError> {
@@ -174,7 +176,11 @@ pub(crate) fn recall(
     if req.capture.is_some() && identity.is_none() {
         return Err(invalid("captured recall requires an authenticated request"));
     }
-    let changes = req.workspace.as_deref().map(|ws| changed(db, ws)).transpose()?.unwrap_or_default();
+    let changes = match (req.workspace.as_deref(), path) {
+        (Some(ws), Some(path)) => changed(db, ws, path)?,
+        (Some(ws), None) => changed(db, ws, Path::new(ws))?,
+        (None, _) => Vec::new(),
+    };
     db.with(|conn| -> rusqlite::Result<_> {
         let tx = conn.transaction()?;
         apply(&tx, changes, identity.map_or("inspection", |i| i.0), now)?;
@@ -238,6 +244,7 @@ pub(crate) fn snapshots(db: &Db, workspace: &str, run: &str) -> Result<Vec<Recal
 pub(crate) fn review(
     db: &Db,
     req: &ReviewRequest,
+    path: &Path,
     correction: Option<&str>,
     provenance: Provenance,
     now: u64,
@@ -246,10 +253,9 @@ pub(crate) fn review(
         return Err(invalid("give a reason of at most 2000 bytes and at most 16 dependency files"));
     }
     let mut dependencies = Vec::new();
-    for path in &req.depends_on {
-        if !dependencies.iter().any(|d: &FileDependency| &d.path == path) {
-            dependencies
-                .push(FileDependency { path: path.clone(), sha256: fingerprint(Path::new(&req.workspace), path)? });
+    for dep in &req.depends_on {
+        if !dependencies.iter().any(|d: &FileDependency| &d.path == dep) {
+            dependencies.push(FileDependency { path: dep.clone(), sha256: fingerprint(path, dep)? });
         }
     }
     let new_text = correction
@@ -369,34 +375,37 @@ mod tests {
         let old = note(&db, ws, "Tests run with cargo test.");
         let unrelated = note(&db, ws, "Use snake case for functions.");
         let req = ReviewRequest { depends_on: vec!["Cargo.toml".into()], temporary: true, ..request(ws, &old) };
-        let reviewed = review(&db, &req, None, author(), 2).unwrap();
+        let reviewed = review(&db, &req, Path::new(&req.workspace), None, author(), 2).unwrap();
         let q = RecallRequest { query: "tests".into(), capture: Some("context".into()), ..query(ws) };
-        let found = recall(&db, &q, Some(("run_a", "call_a")), 3).unwrap();
+        let found = recall(&db, &q, None, Some(("run_a", "call_a")), 3).unwrap();
         assert_eq!(found[0].note, reviewed.note);
         assert!(found[0].details.temporary && found[0].reason.keywords.is_some());
         assert_eq!(found[0].reason.relevance, Some(1.0));
         let snapshot = snapshots(&db, ws, "run_a").unwrap();
         std::fs::write(root.path().join("unrelated.rs"), "fn other() {}").unwrap();
-        assert_eq!(recall(&db, &query(ws), None, 4).unwrap().len(), 2);
+        assert_eq!(recall(&db, &query(ws), None, None, 4).unwrap().len(), 2);
         std::fs::write(root.path().join("Cargo.toml"), "new config").unwrap();
-        assert_eq!(recall(&db, &query(ws), None, 5).unwrap()[0].note.id, unrelated.id);
+        assert_eq!(recall(&db, &query(ws), None, None, 5).unwrap()[0].note.id, unrelated.id);
         let inspect = RecallRequest { include_review: true, query: "tests".into(), ..query(ws) };
-        let stale = recall(&db, &inspect, None, 6).unwrap().remove(0);
+        let stale = recall(&db, &inspect, None, None, 6).unwrap().remove(0);
         assert_eq!(stale.details.needs_review, ["Cargo.toml"]);
         std::fs::write(root.path().join("Cargo.toml"), "old config").unwrap();
         assert_eq!(
-            recall(&db, &query(ws), None, 7).unwrap().len(),
+            recall(&db, &query(ws), None, None, 7).unwrap().len(),
             1,
             "restoring a file cannot automatically reactivate a note"
         );
-        assert!(review(&db, &req, None, author(), 8).unwrap_err().message.contains("revision"));
+        assert!(review(&db, &req, Path::new(&req.workspace), None, author(), 8)
+            .unwrap_err()
+            .message
+            .contains("revision"));
         let req = ReviewRequest { expected_rev: stale.note.rev, ..req };
-        let rechecked = review(&db, &req, None, author(), 9).unwrap();
-        assert_eq!(recall(&db, &query(ws), None, 10).unwrap().len(), 2);
+        let rechecked = review(&db, &req, Path::new(&req.workspace), None, author(), 9).unwrap();
+        assert_eq!(recall(&db, &query(ws), None, None, 10).unwrap().len(), 2);
         notes::forget(&db, &rechecked.note.id, "removed by user", "forget_run", 11).unwrap();
         assert_eq!(snapshots(&db, ws, "run_a").unwrap(), snapshot);
         assert_eq!(
-            recall(&db, &q, Some(("run_a", "call_a")), 12).unwrap(),
+            recall(&db, &q, None, Some(("run_a", "call_a")), 12).unwrap(),
             snapshot[0].notes,
             "same envelope cannot rewrite a snapshot"
         );
@@ -409,9 +418,9 @@ mod tests {
         let ws = root.path().to_str().unwrap();
         let db = Db::in_memory().unwrap();
         let old = note(&db, ws, "Build with npm.");
-        let corrected = review(&db, &request(ws, &old), Some("Build with pnpm."), author(), 2).unwrap();
+        let corrected = review(&db, &request(ws, &old), Path::new(ws), Some("Build with pnpm."), author(), 2).unwrap();
         assert_eq!(corrected.details.supersedes.as_deref(), Some(old.id.as_str()));
-        assert_eq!(recall(&db, &query(ws), None, 3).unwrap()[0].note.id, corrected.note.id);
+        assert_eq!(recall(&db, &query(ws), None, None, 3).unwrap()[0].note.id, corrected.note.id);
         let new = NewNote {
             kind: old.kind,
             text: "build with NPM".into(),
@@ -428,8 +437,8 @@ mod tests {
             db.with(|c| c.query_row("SELECT forget_reason FROM notes WHERE id = ?1", [&old.id], |r| r.get(0))).unwrap();
         assert_eq!(reason, "verified against configuration");
         notes::retract(&db, "cli", "user", "rollback", "rollback_run", 5).unwrap();
-        assert!(recall(&db, &query(ws), None, 6).unwrap().is_empty());
-        assert!(review(&db, &request(ws, &old), None, author(), 7).is_err());
+        assert!(recall(&db, &query(ws), None, None, 6).unwrap().is_empty());
+        assert!(review(&db, &request(ws, &old), Path::new(ws), None, author(), 7).is_err());
     }
 
     #[test]
@@ -462,13 +471,13 @@ mod tests {
         let db = Db::in_memory().unwrap();
         let old = note(&db, ws, "Use the configured command.");
         let req = ReviewRequest { depends_on: vec!["config".into()], ..request(ws, &old) };
-        let first = review(&db, &req, None, author(), 2).unwrap();
+        let first = review(&db, &req, Path::new(&req.workspace), None, author(), 2).unwrap();
         std::fs::write(root.path().join("config"), "two").unwrap();
-        let pending = changed(&db, ws).unwrap();
+        let pending = changed(&db, ws, Path::new(ws)).unwrap();
         let req = ReviewRequest { expected_rev: first.note.rev, ..req };
-        let newest = review(&db, &req, None, author(), 3).unwrap();
+        let newest = review(&db, &req, Path::new(&req.workspace), None, author(), 3).unwrap();
         db.with(|c| apply(c, pending, "older_check", 4)).unwrap();
-        let found = recall(&db, &query(ws), None, 5).unwrap();
+        let found = recall(&db, &query(ws), None, None, 5).unwrap();
         assert_eq!(found[0].note.rev, newest.note.rev);
         assert!(found[0].details.needs_review.is_empty());
     }
@@ -481,18 +490,19 @@ mod tests {
         let old = note(&db, &ws, "Build the application.");
         let mut req = request(&ws, &old);
         req.reason = "2".into();
-        let first = review(&db, &req, None, author(), 2).unwrap();
+        let first = review(&db, &req, Path::new(&req.workspace), None, author(), 2).unwrap();
         let writer_db = db.clone();
         let writer = std::thread::spawn(move || {
             req.expected_rev = first.note.rev;
             for _ in 0..30 {
                 req.reason = (req.expected_rev + 1).to_string();
-                req.expected_rev = review(&writer_db, &req, None, author(), 3).unwrap().note.rev;
+                req.expected_rev =
+                    review(&writer_db, &req, Path::new(&req.workspace), None, author(), 3).unwrap().note.rev;
             }
         });
         for i in 0..30 {
             let q = RecallRequest { capture: Some("tool".into()), ..query(&ws) };
-            let found = recall(&db, &q, Some(("parallel_run", &format!("call_{i}"))), 3).unwrap();
+            let found = recall(&db, &q, None, Some(("parallel_run", &format!("call_{i}"))), 3).unwrap();
             assert_eq!(found[0].details.reason, found[0].note.rev.to_string());
         }
         writer.join().unwrap();

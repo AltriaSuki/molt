@@ -331,6 +331,21 @@ impl Config {
         })
     }
 
+    /// Have the memory service keep the notes about `paths` under the
+    /// project id `id` (see `molt_memory::Project`).
+    pub fn for_project(&mut self, id: &str, paths: &[PathBuf]) -> anyhow::Result<()> {
+        let Some(exec) = self.service_mut("memory").and_then(|s| s.exec.as_mut()) else { return Ok(()) };
+        if paths.is_empty() {
+            return Ok(());
+        }
+        exec.args.extend(["--project".into(), id.to_owned()]);
+        for path in paths {
+            let path = path.to_str().with_context(|| format!("{} is not UTF-8", path.display()))?;
+            exec.args.extend(["--project-path".into(), path.to_owned()]);
+        }
+        Ok(())
+    }
+
     pub fn service(&self, name: &str) -> Option<&ServiceSection> {
         self.services.iter().find(|s| s.name.as_str() == name)
     }

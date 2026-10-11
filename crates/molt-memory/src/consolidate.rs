@@ -509,13 +509,15 @@ pub(crate) struct Learner<'a> {
     pub writer: &'a Writer,
 }
 
-/// Learn from the episode `req.episode` in the canonical `workspace`.
+/// Learn from the episode `req.episode` in the canonical `workspace`, whose
+/// notes are kept under `key` (see [`crate::Project`]).
 /// `trace` is the consolidation's own, which its calls carry so they do not
 /// become part of the episode.
 pub(crate) async fn consolidate(
     learner: &Learner<'_>,
     req: ConsolidateRequest,
     workspace: &Path,
+    key: &str,
     trace: &TraceId,
     deadline: Deadline,
 ) -> Result<ConsolidateResponse, RemoteError> {
@@ -524,7 +526,7 @@ pub(crate) async fn consolidate(
     if &episode == trace {
         return Err(invalid("consolidate an episode from a trace of its own, not the episode's"));
     }
-    let ws = workspace.to_string_lossy().into_owned();
+    let ws = key.to_owned();
     let id = episode.as_str().to_owned();
     if blocking(db, move |db| learned_already(db, &id)).await? {
         return Ok(skipped("the episode was already learned from", Usage::default(), 0.0));
@@ -722,7 +724,7 @@ mod tests {
         let trace = TraceId::random();
         let (cfg, writer) = (config(), writer());
         let learner = Learner { bus, db, cfg: &cfg, writer: &writer };
-        consolidate(&learner, req, Path::new(WS), &trace, Deadline::after_ms(0)).await
+        consolidate(&learner, req, Path::new(WS), WS, &trace, Deadline::after_ms(0)).await
     }
 
     fn remember(db: &Db, kind: NoteKind, text: &str, confidence: f64) -> Note {
@@ -854,7 +856,7 @@ mod tests {
         let nobody = bus(vec![], 1, None);
         let learner = Learner { bus: &nobody, db: &db, cfg: &cfg, writer: &writer };
         let err =
-            consolidate(&learner, req, Path::new(WS), &TraceId::random(), Deadline::after_ms(0)).await.unwrap_err();
+            consolidate(&learner, req, Path::new(WS), WS, &TraceId::random(), Deadline::after_ms(0)).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Invalid);
 
         // An answer that is not the agreed JSON is reported, with what it cost, and not marked learned.

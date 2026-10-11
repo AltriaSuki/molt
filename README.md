@@ -350,6 +350,34 @@ records what each run saw, and the run's progress lists the files.
 `--no-memory` does not turn them off; `MOLT_INSTRUCTION_FILES` names other
 files, or `none`.
 
+## Projects
+
+A project is what molt keeps memory for. Each has a stable id and a name in
+the user's registry (`$XDG_DATA_HOME/molt/projects.json`, else
+`~/.local/share/molt/projects.json`), and any number of directories: one
+usually, several for clones, or none. The first run in a directory registers
+it under the directory's name, keeping the data dir it had before, so nothing
+is lost on upgrade. Notes about any of a project's directories are kept under
+its id, so clones share them and a moved directory keeps them once molt is
+told where it went; the data dir, with the audit log and stopped runs, stays
+with the project too. Nothing in a project's directory decides which project
+it is.
+
+```sh
+molt project list                         # ids, names, directories, data dirs
+molt project new "Japan trip"             # a project with no folder
+molt project new site --path ~/src/site   # a directory under a name of your own
+molt project add site ~/src/site-2        # another clone, with the same notes
+molt project move site ~/code/site        # the directory moved (--from DIR for one of several)
+molt do "plan five days in Kyoto" --project "Japan trip" --no-check
+```
+
+`--project ID|NAME` stands in for `--workspace` in `molt do`, `molt resume`,
+`molt ui` and `molt memory`. A project with no folder works in a private one
+of its own, `<registry dir>/projects/<id>/files`, which is where its
+research and writing end up. With `--config`, the registry is left out and
+notes are kept by the workspace's path, as before.
+
 ## Memory
 
 Memory holds two things for each project.
@@ -605,7 +633,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.
 - Recall matches keywords (with stemming), not meaning: there is no vector index, since the Anthropic API has no embeddings endpoint. A note worded differently from the task can be missed; the strongest notes about the project are always shown.
-- Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. With the default setup, memory lives in the project's data dir, so nothing is shared between projects yet.
+- Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. With the default setup, memory lives in the project's data dir, so nothing is shared between projects yet. Clones of one project share its data dir, so molt runs in one of them at a time.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.
 - Model prices are as current as the last `molt prices update` (or the release's snapshot) and as right as the community list they came from; a price that changes mid-run is not picked up until the next run. Models that LiteLLM lists only with tiered or regional prices, such as some Qwen models, have no price until declared in `MOLT_MODEL_PRICES`.
