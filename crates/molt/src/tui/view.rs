@@ -1,5 +1,6 @@
 //! Drawing [`App`] into a frame.
 
+use molt_api::memory::Layer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -479,6 +480,13 @@ fn draw_memory(frame: &mut Frame, area: Rect, view: &MemoryView, tick: u64) {
             confidence.push_str(&format!("  confirmed {}×", n.reinforced));
         }
         lines.push(field("confidence", confidence));
+        if r.layer == Layer::User {
+            lines.push(field("layer", "yours, for every project".into()));
+        } else if r.details.everywhere {
+            lines.push(field("layer", "this project; proposed for every project (p to promote)".into()));
+        } else if let Some(to) = &r.details.promoted_to {
+            lines.push(field("layer", format!("this project; promoted as {}", clean_line(to))));
+        }
         if !n.conflicts.is_empty() {
             lines.push(Line::from(vec![
                 span(format!("{:<11}", "disputes"), Tone::Dim),
@@ -513,14 +521,26 @@ fn draw_memory(frame: &mut Frame, area: Rect, view: &MemoryView, tick: u64) {
     let block = match &view.edit {
         Some(MemoryEdit::Filter(_)) => block.title(Line::from(span(" filter ", Tone::Shell))),
         Some(MemoryEdit::Reason(_)) => block.title(Line::from(span(" why is this note wrong? ", Tone::Shell))),
+        Some(MemoryEdit::Promote(_)) => {
+            block.title(Line::from(span(" why does it hold in every project? ", Tone::Shell)))
+        }
         None => block,
     };
     let inner = block.inner(bottom);
     frame.render_widget(block, bottom);
     match &view.edit {
-        Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input)) => draw_field(frame, inner, input, true),
+        Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input) | MemoryEdit::Promote(input)) => {
+            draw_field(frame, inner, input, true)
+        }
         None => {
-            let hints = keys(&[("↑↓", "select"), ("/", "filter"), ("f", "forget"), ("r", "reload"), ("esc", "back")]);
+            let hints = keys(&[
+                ("↑↓", "select"),
+                ("/", "filter"),
+                ("f", "forget"),
+                ("p", "promote"),
+                ("r", "reload"),
+                ("esc", "back"),
+            ]);
             frame.render_widget(Paragraph::new(hints), inner);
         }
     }

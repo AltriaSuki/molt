@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use molt_api::fs::ChangeKind;
-use molt_api::memory::{ConsolidateResponse, Recalled};
+use molt_api::memory::{ConsolidateResponse, Layer, Recalled};
 use molt_api::model::Effort;
 use molt_api::planner::{AttemptReport, AttemptStatus, DesignResponse, Outcome, RunRequest, RunResponse, Verdict};
 use molt_api::progress::Progress;
@@ -103,6 +103,15 @@ pub enum Action {
         id: String,
         reason: String,
     },
+    /// Keep a preference of the user's for every project.
+    Remember {
+        text: String,
+    },
+    /// Copy a project note to the user's layer, for every project.
+    Promote {
+        id: String,
+        reason: String,
+    },
     /// Stop everything in flight: the services are stopped and started again.
     Interrupt {
         keep: Vec<String>,
@@ -161,6 +170,13 @@ pub enum Msg {
     Forgot {
         id: String,
         result: Result<bool, String>,
+    },
+    /// The id of the note `/remember` kept.
+    Remembered(Result<String, String>),
+    /// The id of the user-layer copy of note `id`.
+    Promoted {
+        id: String,
+        result: Result<String, String>,
     },
 }
 
@@ -255,6 +271,8 @@ pub enum MemoryEdit {
     Filter(Input),
     /// Why the selected note is wrong.
     Reason(Input),
+    /// Why the selected note holds in every project.
+    Promote(Input),
 }
 
 /// A text field. The task input holds several lines; the others one.
@@ -581,7 +599,9 @@ impl App {
             Msg::Paste(text) => {
                 match &mut self.screen {
                     Screen::Memory(view) => match &mut view.edit {
-                        Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input)) => input.insert(&text),
+                        Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input) | MemoryEdit::Promote(input)) => {
+                            input.insert(&text)
+                        }
                         None => {}
                     },
                     // The check's command is one line; a task can be many.
@@ -673,14 +693,33 @@ impl App {
                     Ok(false) => self.flash = Some(format!("{id} was already forgotten")),
                     Err(e) => self.flash = Some(format!("could not forget {id}: {}", clean_line(&e))),
                 }
-                match &mut self.screen {
-                    Screen::Memory(view) => {
-                        view.loading = true;
-                        vec![Action::LoadNotes { query: view.query.clone() }]
-                    }
-                    Screen::Main => Vec::new(),
-                }
+                self.reload_notes()
             }
+            Msg::Remembered(result) => {
+                self.flash = Some(match result {
+                    Ok(id) => format!("remembered {id} for every project"),
+                    Err(e) => format!("could not remember that: {}", clean_line(&e)),
+                });
+                self.reload_notes()
+            }
+            Msg::Promoted { id, result } => {
+                self.flash = Some(match result {
+                    Ok(copy) => format!("{id} now holds in every project as {copy}"),
+                    Err(e) => format!("could not promote {id}: {}", clean_line(&e)),
+                });
+                self.reload_notes()
+            }
+        }
+    }
+
+    /// Load the notes again when the memory screen is open.
+    fn reload_notes(&mut self) -> Vec<Action> {
+        match &mut self.screen {
+            Screen::Memory(view) => {
+                view.loading = true;
+                vec![Action::LoadNotes { query: view.query.clone() }]
+            }
+            Screen::Main => Vec::new(),
         }
     }
 
@@ -959,6 +998,17 @@ impl App {
                     edit: None,
                 });
                 return vec![Action::LoadNotes { query }];
+            }
+            "remember" => {
+                if !self.memory_up() {
+                    self.flash = Some("memory is not running".into());
+                    return Vec::new();
+                }
+                if arg.is_empty() {
+                    self.flash = Some("/remember TEXT: a preference of yours, for every project".into());
+                    return Vec::new();
+                }
+                return vec![Action::Remember { text: arg.to_owned() }];
             }
             "check" => {
                 self.settings.check = (!arg.is_empty()).then(|| arg.to_owned());
@@ -1493,6 +1543,9 @@ impl App {
                 if !r.contradicted.is_empty() {
                     parts.push(format!("disputed {}", count(r.contradicted.len())));
                 }
+                if !r.proposed.is_empty() {
+                    parts.push(format!("proposed {} for every project (/memory, p)", count(r.proposed.len())));
+                }
                 if parts.is_empty() {
                     parts.push(match &r.skipped {
                         Some(why) => format!("nothing new: {}", clean_line(why)),
@@ -1544,10 +1597,20 @@ impl App {
                         }
                         return vec![Action::Forget { id: note.note.id.clone(), reason }];
                     }
+                    Some(MemoryEdit::Promote(mut input)) => {
+                        let reason = input.take().trim().to_owned();
+                        let Some(note) = view.notes.get(view.selected) else { return Vec::new() };
+                        if reason.is_empty() {
+                            view.edit = Some(MemoryEdit::Promote(input));
+                            self.flash = Some("say why the note holds in every project".into());
+                            return Vec::new();
+                        }
+                        return vec![Action::Promote { id: note.note.id.clone(), reason }];
+                    }
                     None => {}
                 },
                 _ => {
-                    let (MemoryEdit::Filter(input) | MemoryEdit::Reason(input)) = edit;
+                    let (MemoryEdit::Filter(input) | MemoryEdit::Reason(input) | MemoryEdit::Promote(input)) = edit;
                     input.key(key);
                 }
             }
@@ -1561,6 +1624,13 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => view.selected = view.selected.saturating_sub(1),
             KeyCode::Char('/') => view.edit = Some(MemoryEdit::Filter(Input::with(&view.query))),
             KeyCode::Char('f') if !view.notes.is_empty() => view.edit = Some(MemoryEdit::Reason(Input::default())),
+            KeyCode::Char('p') => match view.notes.get(view.selected) {
+                Some(note) if note.layer == Layer::User => {
+                    self.flash = Some("that note holds everywhere already".into())
+                }
+                Some(_) => view.edit = Some(MemoryEdit::Promote(Input::default())),
+                None => {}
+            },
             KeyCode::Char('r') => {
                 view.loading = true;
                 return vec![Action::LoadNotes { query: view.query.clone() }];
@@ -1729,6 +1799,7 @@ fn help() -> Vec<Line<'static>> {
         Line::default(),
         head("commands"),
         row("/memory [words]", "notes about this project"),
+        row("/remember TEXT", "a preference of yours, for every project"),
         row("/check [command]", "use this check for every task; empty: design one"),
         row("/attempts N", "attempts at once, 1 to 8"),
         row("/model NAME", "opus, sonnet, haiku or a model id"),
@@ -2050,6 +2121,7 @@ mod tests {
             reinforced: vec![],
             contradicted: vec![],
             skipped: Some("the episode held nothing worth keeping".into()),
+            proposed: vec![],
             usage: Usage::default(),
             cost_usd: 0.01,
         };
@@ -2082,6 +2154,48 @@ mod tests {
     }
 
     #[test]
+    fn notes_for_every_project_are_remembered_and_promoted_by_hand() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        assert_eq!(
+            type_in(&mut app, "/remember Answer in Chinese."),
+            [Action::Remember { text: "Answer in Chinese.".into() }]
+        );
+        assert!(type_in(&mut app, "/remember").is_empty(), "nothing to remember");
+        app.update(Msg::Remembered(Ok("note_u".into())));
+        assert_eq!(app.flash.as_deref(), Some("remembered note_u for every project"));
+
+        type_in(&mut app, "/memory");
+        let note = |id: &str, layer: Layer| Recalled {
+            note: serde_json::from_value(serde_json::json!({
+                "id": id, "kind": "fact", "text": "t", "confidence": 0.5, "created_ms": 0, "updated_ms": 0,
+                "provenance": { "trace": "tr", "service": "memory", "version": "v" }, "rev": 1
+            }))
+            .unwrap(),
+            score: 1.0,
+            reason: Default::default(),
+            details: Default::default(),
+            layer,
+        };
+        app.update(Msg::Notes(Ok(vec![note("note_u", Layer::User), note("note_p", Layer::Project)])));
+        app.update(key(KeyCode::Char('p')));
+        assert_eq!(app.flash.as_deref(), Some("that note holds everywhere already"));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Char('p')));
+        assert!(app.update(key(KeyCode::Enter)).is_empty(), "a reason is required");
+        app.update(Msg::Paste("all my projects use make".into()));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Action::Promote { id: "note_p".into(), reason: "all my projects use make".into() }]
+        );
+        assert_eq!(
+            app.update(Msg::Promoted { id: "note_p".into(), result: Ok("note_c".into()) }),
+            [Action::LoadNotes { query: String::new() }]
+        );
+        assert_eq!(app.flash.as_deref(), Some("note_p now holds in every project as note_c"));
+    }
+
+    #[test]
     fn the_memory_screen_lists_filters_and_forgets() {
         let mut app = App::new("/w", None);
         up(&mut app);
@@ -2095,6 +2209,7 @@ mod tests {
             score: 1.0,
             reason: Default::default(),
             details: Default::default(),
+            layer: Default::default(),
         };
         app.update(Msg::Notes(Ok(vec![note("note_a"), note("note_b")])));
         app.update(key(KeyCode::Down));

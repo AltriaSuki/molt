@@ -334,7 +334,8 @@ impl Fake {
                         note,
                         score: 1.0,
                         reason: Default::default(),
-                        details: Default::default()
+                        details: Default::default(),
+                        layer: Default::default()
                     }]
                 })
             }

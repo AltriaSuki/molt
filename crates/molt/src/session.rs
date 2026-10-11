@@ -5,8 +5,9 @@
 //! starts once and serves every task the user gives it. The CLI holds the
 //! same capabilities as in `molt do`, plus `planner.design` to show the
 //! check before the attempts start, `fs.merge` and `fs.drop` to apply or
-//! discard a result the user has looked at, and `memory.recall` and
-//! `memory.forget` for the memory screen.
+//! discard a result the user has looked at, `memory.recall`,
+//! `memory.forget` and `memory.promote` for the memory screen, and
+//! `memory.remember` for notes the user writes down.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -14,8 +15,8 @@ use std::time::Instant;
 use anyhow::Context;
 use molt_api::fs::{self, DiffRequest, DiffResponse, DropRequest, DropResponse, MergeRequest, MergeResponse};
 use molt_api::memory::{
-    self, ConsolidateRequest, ConsolidateResponse, ForgetRequest, ForgetResponse, RecallRequest, RecallResponse,
-    Recalled,
+    self, ConsolidateRequest, ConsolidateResponse, ForgetRequest, ForgetResponse, Note, NoteKind, PromoteRequest,
+    PromoteResponse, RecallRequest, RecallResponse, Recalled, RememberRequest, RememberResponse,
 };
 use molt_api::planner::{self, DesignResponse, RunRequest, RunResponse};
 use molt_api::progress::{self, Progress};
@@ -94,7 +95,7 @@ impl Session {
         let budget = Budget::new(0, 0, CALLS);
         let mut targets = vec![planner::RUN, planner::DESIGN, fs::DIFF, fs::MERGE, fs::DROP];
         if memory.is_some() {
-            targets.extend([memory::CONSOLIDATE, memory::RECALL, memory::FORGET]);
+            targets.extend([memory::CONSOLIDATE, memory::RECALL, memory::FORGET, memory::REMEMBER, memory::PROMOTE]);
         }
         for target in targets {
             agent::grant(kernel, &cli, target, budget).await?;
@@ -189,6 +190,28 @@ impl Session {
         let req = ForgetRequest { id: id.to_owned(), reason: reason.to_owned() };
         let resp: ForgetResponse = self.call(memory::FORGET, req, NOTES_MS, None).await?;
         Ok(resp.forgotten)
+    }
+
+    /// Keep `text`, a preference of the user's, in their own layer of notes,
+    /// recalled in every project.
+    pub async fn remember(&self, text: &str) -> anyhow::Result<RememberResponse> {
+        let req = RememberRequest {
+            kind: NoteKind::Preference,
+            text: text.to_owned(),
+            workspace: None,
+            confidence: Some(0.95),
+            trace: TraceId::random().to_string(),
+            events: Vec::new(),
+            version: "user".into(),
+        };
+        self.call(memory::REMEMBER, req, NOTES_MS, None).await
+    }
+
+    /// Copy the project note `id` to the user's own layer; the copy.
+    pub async fn promote(&self, id: &str, reason: &str) -> anyhow::Result<Note> {
+        let req = PromoteRequest { workspace: self.workspace.clone(), id: id.to_owned(), reason: reason.to_owned() };
+        let resp: PromoteResponse = self.call(memory::PROMOTE, req, NOTES_MS, None).await?;
+        Ok(resp.note)
     }
 
     async fn call<T: DeserializeOwned>(

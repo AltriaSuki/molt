@@ -1,5 +1,5 @@
 //! The memory service (`memory.*`), started by the kernel:
-//! `molt-memory --root DIR --db FILE [--skip DIR]... [--project ID --project-path DIR...]`.
+//! `molt-memory --root DIR --db FILE [--skip DIR]... [--project ID --project-path DIR...] [--user-db FILE]`.
 //! Its model settings come from the
 //! environment; see `molt_memory::Config::from_env`.
 
@@ -30,6 +30,10 @@ struct Cli {
     /// A directory of that project. May be given more than once.
     #[arg(long, requires = "project")]
     project_path: Vec<PathBuf>,
+    /// The user's notes for every project, shared by all of them. Without
+    /// it, notes for every project stay in `--db`.
+    #[arg(long)]
+    user_db: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -41,7 +45,11 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(Db::open(&cli.db)?);
     let svc = Arc::new(Service::connect_from_env().await?);
     let bus = Arc::new(ServiceBus(svc.clone()));
-    let memory = Arc::new(Memory::new(db, &cli.root, cfg, Writer::of(&svc), bus)?);
+    let mut memory = Memory::new(db, &cli.root, cfg, Writer::of(&svc), bus)?;
+    if let Some(path) = &cli.user_db {
+        memory = memory.with_user(Arc::new(Db::open(path)?));
+    }
+    let memory = Arc::new(memory);
     molt_memory::serve(svc, memory).await;
     Ok(())
 }
