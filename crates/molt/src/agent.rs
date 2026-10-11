@@ -249,6 +249,20 @@ pub async fn run_task(
     cfg: &Config,
     req: RunRequest,
     learn: bool,
+    on_progress: impl FnMut(&Progress),
+    stop: impl Future<Output = ()>,
+) -> anyhow::Result<Done> {
+    run_task_as(cfg, req, TraceId::random(), learn, on_progress, stop).await
+}
+
+/// [`run_task`] under the run id `trace`: a resumed run goes on under its
+/// own. A checkpointed run that stops before it finishes keeps every fork
+/// it made, for the resume.
+pub async fn run_task_as(
+    cfg: &Config,
+    req: RunRequest,
+    trace: TraceId,
+    learn: bool,
     mut on_progress: impl FnMut(&Progress),
     stop: impl Future<Output = ()>,
 ) -> anyhow::Result<Done> {
@@ -266,13 +280,14 @@ pub async fn run_task(
     let forks = RunForks::before(cfg);
     let workspace = req.workspace.clone();
     let budget_usd = req.budget_usd;
+    let checkpointed = req.checkpoint || req.resume.is_some();
     tokio::pin!(stop);
     let result = tokio::select! {
         // A Ctrl-C in a terminal also reaches the services, and the run may
         // fail from their exit at the same moment: the interruption wins.
         biased;
         () = &mut stop => Err(Interrupted.into()),
-        result = drive(&running, cfg, req, &mut on_progress) => result,
+        result = drive(&running, cfg, req, trace, &mut on_progress) => result,
     };
     let done = match result {
         Ok(ran) => {
@@ -310,11 +325,18 @@ pub async fn run_task(
         Err(e) => Err(e),
     };
     running.shutdown().await;
-    if let Some(forks) = forks {
+    let kept = checkpointed && done.as_ref().map_or(true, |d| d.run.checkpoint.is_some());
+    if let Some(forks) = forks.filter(|_| !kept) {
         let keep = done.as_ref().ok().and_then(|d| d.run.fork.as_deref());
         forks.remove_new(keep.as_slice());
     }
     done
+}
+
+/// Where the planner of `cfg` keeps run checkpoints: its `--state` argument.
+pub fn checkpoint_dir(cfg: &Config) -> Option<PathBuf> {
+    let args = &cfg.service("planner")?.exec.as_ref()?.args;
+    args.iter().skip_while(|a| *a != "--state").nth(1).map(PathBuf::from)
 }
 
 /// The forks in the `fs` service's scratch dir when a run starts. A planner
@@ -380,6 +402,7 @@ async fn drive(
     running: &Running,
     cfg: &Config,
     req: RunRequest,
+    trace: TraceId,
     mut on_progress: impl FnMut(&Progress),
 ) -> anyhow::Result<Ran> {
     let kernel = running.kernel();
@@ -388,7 +411,6 @@ async fn drive(
     for service in SERVICES {
         wait_until_up(kernel, &cli, service, deadline).await?;
     }
-    let trace = TraceId::random();
     // A run goes ahead without memory: the planner finds it unavailable.
     let memory = match cfg.service(MEMORY) {
         None => None,
@@ -1035,6 +1057,7 @@ mod tests {
             usage: Usage { input_tokens: 1000, output_tokens: 200, ..Usage::default() },
             cost_usd: 0.012,
             uncounted_calls: 0,
+            checkpoint: None,
         };
         assert_eq!(
             report(&resp),

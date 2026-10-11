@@ -6,6 +6,7 @@
 
 mod agent;
 mod attempt;
+pub mod checkpoint;
 mod ctx;
 mod designer;
 mod fit;
@@ -52,6 +53,9 @@ pub struct Config {
     pub context_tokens: Option<u32>,
     /// The largest model request the bus carries, in bytes.
     pub frame_bytes: usize,
+    /// Where checkpoints are kept; `None` keeps none, and a run asking for
+    /// one is refused.
+    pub state_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -69,6 +73,7 @@ impl Default for Config {
             late_reply_wait: Duration::from_secs(2),
             context_tokens: None,
             frame_bytes: molt_transport::MAX_FRAME,
+            state_dir: None,
         }
     }
 }
@@ -130,6 +135,7 @@ impl Config {
             late_reply_wait: d.late_reply_wait,
             context_tokens: get("MOLT_CONTEXT_TOKENS").map(|_| small("MOLT_CONTEXT_TOKENS", 0)).transpose()?,
             frame_bytes: d.frame_bytes,
+            state_dir: d.state_dir,
         })
     }
 }

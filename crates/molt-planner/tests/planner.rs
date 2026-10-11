@@ -1484,3 +1484,150 @@ async fn a_conversation_that_cannot_fit_says_which_limit() {
     assert!(resp.attempts[0].note.contains("transport frame limit"), "{}", resp.attempts[0].note);
     assert!(fake.requests().is_empty(), "nothing too big is sent");
 }
+
+/// A model scripted by call number, across runs: a resumed run goes on
+/// with the same script.
+fn scripted(
+    script: impl Fn(usize, &CompleteRequest) -> Reply + Send + Sync + 'static,
+) -> impl Fn(&CompleteRequest) -> Reply + Send + Sync + 'static {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    move |req: &CompleteRequest| script(calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1, req)
+}
+
+fn resume(run: &str, retry: bool) -> RunRequest {
+    RunRequest {
+        resume: Some(molt_api::planner::Resume { run: run.into(), retry }),
+        budget_usd: Some(10.0),
+        ..RunRequest::new("ignored", WORKSPACE)
+    }
+}
+
+#[tokio::test]
+async fn a_checkpointed_run_stopped_by_its_budget_goes_on_where_it_stopped() {
+    let model = scripted(|n, req| match n {
+        1 => use_tools(req, &[("read_file", json!({ "path": "README.md" }))]),
+        2 => write_hello(req, "hi\n"),
+        3 => use_tools(req, &[("list_files", json!({}))]),
+        _ => done("Wrote hello.txt."),
+    });
+    let fake = Fake::new(model, hello_check);
+    let state = tempfile::tempdir().unwrap();
+    let cfg = Config { state_dir: Some(state.path().into()), ..config() };
+    // The third call takes the spend past the budget, which stops the run.
+    let req = RunRequest { checkpoint: true, budget_usd: Some(0.3), ..request(Some("check"), 1) };
+    let first = run_with(&fake, cfg.clone(), req).await;
+    assert_eq!(first.outcome, Outcome::Failed);
+    assert_eq!(first.checkpoint.as_deref(), Some("trace_test"), "{}", first.summary);
+    assert!(first.summary.contains("resume run trace_test"), "{}", first.summary);
+    assert_eq!(fake.forks_alive().len(), 1, "the fork is kept for the resume");
+    let saved = molt_planner::checkpoint::load(state.path(), "trace_test").unwrap();
+    assert!(saved.settled && saved.attempts[0].end.is_none() && saved.attempts[0].turns == 3, "{saved:?}");
+    assert!((saved.spend.cost_usd - 0.375).abs() < 1e-9);
+
+    let resumed = run_with(&fake, cfg.clone(), resume("trace_test", false)).await;
+    assert_eq!(resumed.outcome, Outcome::Passed, "{}", resumed.summary);
+    assert!(resumed.applied && resumed.checkpoint.is_none());
+    assert_eq!(fake.workspace().get("hello.txt").map(String::as_str), Some("hi\n"));
+    // The cost goes on from where it was, and so do the turns.
+    assert!(close(resumed.cost_usd, 0.5), "{}", resumed.cost_usd);
+    assert_eq!(resumed.attempts[0].turns, 4);
+    // Nothing done twice, and the model picked up its own conversation.
+    assert_eq!(fake.calls_to(fs::WRITE).iter().filter(|c| c.payload["path"] == "hello.txt").count(), 1);
+    let last = fake.requests().last().unwrap().clone();
+    assert!(last.messages.len() >= 6, "{:?}", last.messages);
+    assert!(fake.forks_alive().is_empty());
+    assert!(molt_planner::checkpoint::load(state.path(), "trace_test").unwrap_err().contains("no checkpoint"));
+}
+
+#[tokio::test]
+async fn tool_calls_a_stop_cut_short_are_not_run_again() {
+    let fake = Fake::new(scripted(|_, _| done("Wrote hello.txt.")), hello_check);
+    let state = tempfile::tempdir().unwrap();
+    let cfg = Config { state_dir: Some(state.path().into()), ..config() };
+    // A run stopped while the model's write ran: whether it took effect is unknown.
+    let fork = {
+        let resp: fs::ForkResponse = parse(
+            fake.call(fs::FORK, json!({ "workspace": WORKSPACE }), Budget::default(), &TraceId::random())
+                .await
+                .unwrap(),
+        );
+        resp.fork
+    };
+    fake.set(|st| {
+        st.forks.get_mut(&fork).unwrap().1.insert("hello.txt".into(), "hi\n".into());
+    });
+    let mut saved = molt_planner::checkpoint::Saved::new("trace_test", request(Some("check"), 1));
+    saved.settled = true;
+    saved.check =
+        Some(molt_planner::checkpoint::SavedCheck { command: "check".into(), files: vec![], designed: false });
+    saved.spend.cost_usd = 0.25;
+    let attempt = saved.attempt(0);
+    attempt.fork = Some(fork.clone());
+    attempt.turns = 2;
+    attempt.messages = vec![
+        json!({ "role": "user", "content": [{ "type": "text", "text": "<task>\nAdd hello.txt saying hi.\n</task>" }] }),
+        json!({ "role": "assistant", "content": [
+            { "type": "tool_use", "id": "toolu_1", "name": "write_file", "input": { "path": "hello.txt", "content": "hi\n" } }
+        ] }),
+    ];
+    std::fs::write(state.path().join("trace_test.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+
+    let resp = run_with(&fake, cfg, resume("trace_test", false)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert!(fake.calls_to(fs::WRITE).iter().all(|c| c.payload["path"] != "hello.txt"), "the write is not run again");
+    let first = &fake.requests()[0];
+    let result = &first.messages[2]["content"][0];
+    assert_eq!((result["tool_use_id"].as_str(), result["is_error"].as_bool()), (Some("toolu_1"), Some(true)));
+    assert!(result["content"].as_str().unwrap().contains("Whether the call took effect is not known"));
+    assert!(close(resp.cost_usd, 0.375), "{}", resp.cost_usd);
+    assert!(fake.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
+        if message.contains("the run stopped while write_file ran"))));
+}
+
+#[tokio::test]
+async fn a_retry_starts_new_attempts_with_the_cost_so_far() {
+    let model = scripted(|n, req| match n {
+        1 | 2 => write_hello(req, "bye\n"),
+        3 => write_hello(req, "hi\n"),
+        _ => done("Wrote hello.txt."),
+    });
+    let fake = Fake::new(model, hello_check);
+    let state = tempfile::tempdir().unwrap();
+    let cfg = Config { state_dir: Some(state.path().into()), ..config() };
+    let req = RunRequest { checkpoint: true, budget_usd: Some(0.2), ..request(Some("check"), 1) };
+    let first = run_with(&fake, cfg.clone(), req).await;
+    assert_eq!(first.checkpoint.as_deref(), Some("trace_test"));
+
+    let resp = run_with(&fake, cfg, resume("trace_test", true)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert_eq!(resp.winner, Some(1));
+    assert_eq!(resp.attempts[0].status, AttemptStatus::Cancelled);
+    assert_eq!(resp.attempts[0].note, "left as it was for a retry");
+    assert!(close(resp.cost_usd, 0.5), "{}", resp.cost_usd);
+    assert!(fake.forks_alive().is_empty(), "the stopped attempt's fork goes with the run");
+}
+
+#[tokio::test]
+async fn checkpoints_that_cannot_be_used_are_refused_with_why() {
+    let fake = Fake::new(scripted(|_, _| done("x")), hello_check);
+    let state = tempfile::tempdir().unwrap();
+    let cfg = Config { state_dir: Some(state.path().into()), ..config() };
+    let err = |cfg: Config, req: RunRequest| {
+        let fake = fake.clone();
+        async move {
+            let bus: Arc<dyn Bus> = fake;
+            molt_planner::run(bus, Arc::new(cfg), req, TraceId::from_raw("trace_test")).await.unwrap_err()
+        }
+    };
+    std::fs::write(state.path().join("trace_bad.json"), "{\"format\":1,\"run\"").unwrap();
+    let e = err(cfg.clone(), resume("trace_bad", false)).await;
+    assert!(e.code == ErrorCode::Invalid && e.message.contains("damaged"), "{e:?}");
+    let e = err(cfg.clone(), resume("trace_none", false)).await;
+    assert!(e.message.contains("no checkpoint of run trace_none"), "{e:?}");
+    let e = err(config(), RunRequest { checkpoint: true, ..request(Some("check"), 1) }).await;
+    assert!(e.message.contains("keeps no checkpoints"), "{e:?}");
+    let saved = molt_planner::checkpoint::Saved::new("trace_other", RunRequest::new("t", "/elsewhere"));
+    std::fs::write(state.path().join("trace_other.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+    let e = err(cfg, resume("trace_other", false)).await;
+    assert!(e.message.contains("worked on /elsewhere"), "{e:?}");
+}
