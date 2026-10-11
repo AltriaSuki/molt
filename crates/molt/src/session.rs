@@ -99,7 +99,7 @@ impl Session {
         for target in targets {
             agent::grant(kernel, &cli, target, budget).await?;
         }
-        agent::grant(kernel, &cli, &format!("topic:{}", progress::TOPIC), budget).await?;
+        agent::grant(kernel, &cli, &format!("topic:subscribe:{}", progress::TOPIC), budget).await?;
         cli.subscribe(progress::TOPIC).await?;
         let cli = Arc::new(cli);
         let pump = cli.clone();
