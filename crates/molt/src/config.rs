@@ -178,6 +178,7 @@ const PLANNER_ENV: &[&str] = &[
     "MOLT_MODEL_TIMEOUT_S",
     "MOLT_CHECK_TIMEOUT_S",
     "MOLT_MAP_TOKENS",
+    "MOLT_CONTEXT_TOKENS",
 ];
 
 /// What the memory service reads from its environment (see `molt_memory::Config::from_env`).
@@ -186,6 +187,8 @@ const MEMORY_ENV: &[&str] =
 
 /// The memory database in a data dir.
 pub const MEMORY_DB: &str = "memory.db";
+/// The directory in the data dir where the planner keeps run checkpoints.
+pub const RUNS: &str = "runs";
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -249,7 +252,10 @@ impl Config {
             request(molt_proto::audit::READ, Budget::new(0, 0, 10_000_000))?,
             request(&changed, Budget::new(0, 0, 10))?,
         ];
-        let mut planner = service("planner", Tier::Mutable, bin("molt-planner")?)?;
+        let mut planner_exec = bin("molt-planner")?;
+        // Checkpoints of runs, to resume one that stopped.
+        planner_exec.args = vec!["--state".into(), text(&data_dir.join(RUNS))?];
+        let mut planner = service("planner", Tier::Mutable, planner_exec)?;
         planner.pass_env = names(PLANNER_ENV);
         // A budget of zero calls refuses every call, and `ms` 0 leaves deadlines
         // to each request; the planner enforces the run's own limits.
@@ -456,6 +462,7 @@ mod tests {
 
         let planner = cfg.service("planner").unwrap();
         assert_eq!(planner.exec.as_ref().unwrap().command, "/opt/molt/bin/molt-planner");
+        assert_eq!(planner.exec.as_ref().unwrap().args, ["--state", "/cache/molt/proj/runs"]);
         assert!(planner.pass_env.iter().any(|v| v == "MOLT_MAX_TURNS"));
         assert!(!planner.pass_env.iter().any(|v| v.starts_with("ANTHROPIC")), "the planner never sees the key");
         let targets: Vec<String> = planner.requests.iter().map(|r| r.target.to_string()).collect();
