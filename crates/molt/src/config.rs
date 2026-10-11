@@ -236,6 +236,7 @@ const PLANNER_ENV: &[&str] = &[
     "MOLT_MAP_TOKENS",
     "MOLT_CONTEXT_TOKENS",
     "MOLT_INSTRUCTION_FILES",
+    "MOLT_SYNTAX_CHECK",
 ];
 
 /// What the memory service reads from its environment (see `molt_memory::Config::from_env`).
