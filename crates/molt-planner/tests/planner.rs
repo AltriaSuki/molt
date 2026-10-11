@@ -9,7 +9,10 @@ use async_trait::async_trait;
 use molt_api::fs::{self, Change, ChangeKind};
 use molt_api::memory;
 use molt_api::model::{CompleteRequest, CompleteResponse, Usage};
-use molt_api::planner::{AttemptStatus, CheckSpec, Outcome, Review, RunRequest, RunResponse, Verdict};
+use molt_api::planner::{
+    AttemptStatus, CheckSpec, Constraint, Control, ControlRequest, ControlResponse, Earlier, Outcome, Requirement,
+    Review, RunRequest, RunResponse, RunState, Verdict,
+};
 use molt_api::progress::Progress;
 use molt_api::shell;
 use molt_planner::{Bus, Config};
@@ -1635,6 +1638,50 @@ async fn a_checkpointed_run_stopped_by_its_budget_goes_on_where_it_stopped() {
 }
 
 #[tokio::test]
+async fn requirements_added_before_a_stop_hold_after_the_resume() {
+    let model = scripted(|n, req| match n {
+        1 => {
+            let said = last_text(req);
+            assert!(said.contains("Say it in lower case."), "{said}");
+            write_hello(req, "hi\n")
+        }
+        _ => done("Wrote hello.txt."),
+    });
+    let fake = Fake::new(model, hello_check);
+    let state = tempfile::tempdir().unwrap();
+    let cfg = Config { state_dir: Some(state.path().into()), ..config() };
+    let fork = {
+        let resp: fs::ForkResponse = parse(
+            fake.call(fs::FORK, json!({ "workspace": WORKSPACE }), Budget::default(), &TraceId::random())
+                .await
+                .unwrap(),
+        );
+        resp.fork
+    };
+    // Stopped after the user added a requirement, before the attempt took it up.
+    let mut saved = molt_planner::checkpoint::Saved::new("trace_test", request(Some("check"), 1));
+    saved.settled = true;
+    saved.check =
+        Some(molt_planner::checkpoint::SavedCheck { command: "check".into(), files: vec![], designed: false });
+    let lower = Constraint { text: "Say it in lower case.".into(), ..Default::default() };
+    saved.requirements = vec![Requirement { version: 1, constraint: lower, at_ms: 1 }];
+    let attempt = saved.attempt(0);
+    attempt.fork = Some(fork);
+    attempt.turns = 1;
+    attempt.messages = vec![
+        json!({ "role": "user", "content": [{ "type": "text", "text": "<task>\nAdd hello.txt saying hi.\n</task>" }] }),
+        json!({ "role": "assistant", "content": [{ "type": "text", "text": "On it." }] }),
+        json!({ "role": "user", "content": [{ "type": "text", "text": "Go on." }] }),
+    ];
+    std::fs::write(state.path().join("trace_test.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+
+    let resp = run_with(&fake, cfg, resume("trace_test", false)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert_eq!(resp.requirements.len(), 1);
+    assert_eq!(resp.attempts[0].requirements, 1);
+}
+
+#[tokio::test]
 async fn tool_calls_a_stop_cut_short_are_not_run_again() {
     let fake = Fake::new(scripted(|_, _| done("Wrote hello.txt.")), hello_check);
     let state = tempfile::tempdir().unwrap();
@@ -1854,4 +1901,217 @@ async fn without_review_no_reviewer_runs() {
     let fake = reviewed(|_| panic!("no review was asked for"));
     let resp = run(&fake, request(Some("check"), 1)).await;
     assert!(resp.review.is_none() && resp.applied);
+}
+
+// --- Steering a run while it goes ----------------------------------------------
+
+fn slow(reply: Reply, ms: u64) -> Reply {
+    Reply { delay: Duration::from_millis(ms), ..reply }
+}
+
+/// Start a run under `trace` and wait until the model has been asked `calls` times.
+async fn start_run(
+    fake: &Arc<Fake>,
+    req: RunRequest,
+    trace: &str,
+    calls: usize,
+) -> tokio::task::JoinHandle<Result<RunResponse, RemoteError>> {
+    let bus: Arc<dyn Bus> = fake.clone();
+    let run = tokio::spawn(molt_planner::run(bus, Arc::new(config()), req, TraceId::from_raw(trace)));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fake.requests().len() < calls {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the model was not asked in time");
+    run
+}
+
+async fn steer(fake: &Arc<Fake>, trace: &str, action: Control) -> Result<ControlResponse, RemoteError> {
+    molt_planner::control(fake.as_ref(), ControlRequest { run: trace.into(), action }).await
+}
+
+async fn finished(run: tokio::task::JoinHandle<Result<RunResponse, RemoteError>>) -> RunResponse {
+    tokio::time::timeout(Duration::from_secs(5), run).await.expect("the run took too long").unwrap().unwrap()
+}
+
+fn protect(path: &str) -> Control {
+    Control::Constrain(Constraint { text: "Leave the README alone.".into(), protect: vec![path.into()], check: None })
+}
+
+#[tokio::test]
+async fn a_constraint_added_mid_run_is_taken_up_at_the_next_step_and_kept() {
+    // The model changes the README in its first turn, which is slow enough for the user to object.
+    let model = scripted(|n, req| match n {
+        1 => slow(
+            use_tools(
+                req,
+                &[
+                    ("write_file", json!({ "path": "hello.txt", "content": "hi\n" })),
+                    ("write_file", json!({ "path": "README.md", "content": "# hello\n" })),
+                ],
+            ),
+            300,
+        ),
+        2 => {
+            let said = last_text(req);
+            assert!(said.contains("Leave the README alone."), "{said}");
+            assert!(said.contains("You have already changed README.md: put them back"), "{said}");
+            // Told along with the tool results, so the roles still take turns.
+            let roles: Vec<&str> = req.messages.iter().map(|m| m["role"].as_str().unwrap()).collect();
+            assert_eq!(roles, ["user", "assistant", "user"]);
+            assert_eq!(req.messages[2]["content"][0]["type"], "tool_result");
+            use_tools(req, &[("write_file", json!({ "path": "README.md", "content": "# project\n" }))])
+        }
+        _ => done("Wrote hello.txt and left the README as it was."),
+    });
+    let fake = Fake::new(model, hello_check);
+    let run = start_run(&fake, request(Some("check"), 1), "trace_constrain", 1).await;
+    let resp = steer(&fake, "trace_constrain", protect("README.md")).await.unwrap();
+    assert_eq!(resp.version, 1);
+
+    let resp = finished(run).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert_eq!(fake.workspace().get("README.md").map(String::as_str), Some("# project\n"));
+    assert_eq!(fake.workspace().get("hello.txt").map(String::as_str), Some("hi\n"));
+    assert_eq!(resp.requirements.len(), 1);
+    assert_eq!(resp.requirements[0].constraint.protect, ["README.md"]);
+    assert_eq!(resp.attempts[0].requirements, 1);
+    // Said when it took effect: before the attempt's second turn.
+    let events = fake.events();
+    assert!(events.iter().any(|e| matches!(e, Progress::Required { requirement, .. } if requirement.version == 1)));
+    assert!(events.iter().any(|e| matches!(e, Progress::Adopted { attempt: 0, version: 1, turn: 2, .. })));
+    // Over: nothing more can be added.
+    let e = steer(&fake, "trace_constrain", protect("README.md")).await.unwrap_err();
+    assert!(e.message.contains("no run trace_constrain is going on"), "{e:?}");
+}
+
+#[tokio::test]
+async fn a_result_that_changes_a_protected_file_is_never_applied() {
+    // A model that keeps the README change whatever it is told.
+    let model = scripted(|n, req| match n {
+        1 => slow(
+            use_tools(
+                req,
+                &[
+                    ("write_file", json!({ "path": "hello.txt", "content": "hi\n" })),
+                    ("write_file", json!({ "path": "README.md", "content": "# hello\n" })),
+                ],
+            ),
+            300,
+        ),
+        _ => done("Done."),
+    });
+    let fake = Fake::new(model, hello_check);
+    let req = RunRequest { max_turns: Some(4), ..request(Some("check"), 1) };
+    let run = start_run(&fake, req, "trace_stubborn", 1).await;
+    steer(&fake, "trace_stubborn", protect("README.md")).await.unwrap();
+    let resp = finished(run).await;
+    assert_eq!(resp.outcome, Outcome::Failed, "{}", resp.summary);
+    assert!(!resp.applied);
+    assert_eq!(fake.workspace().get("README.md").map(String::as_str), Some("# project\n"));
+    // The check never ran on a result that broke the constraint.
+    assert!(fake.calls_to("shell.run").is_empty());
+    let asked: Vec<String> = fake.requests().iter().map(last_text).collect();
+    assert!(asked.iter().any(|t| t.contains("which the user asked to leave unchanged")), "{asked:?}");
+}
+
+#[tokio::test]
+async fn work_done_under_the_old_requirements_is_gone_over_and_checked_again() {
+    // The final reply is slow: the constraint comes in while the model gives it.
+    let model = scripted(|n, req| match n {
+        1 => write_hello(req, "hi\n"),
+        2 => slow(done("Wrote hello.txt."), 300),
+        3 => {
+            let said = last_text(req);
+            assert!(
+                said.contains("Answer in French.") && said.contains("checked against the task as it was"),
+                "{said}"
+            );
+            done("J'ai écrit hello.txt.")
+        }
+        _ => panic!("asked once too often"),
+    });
+    let fake = Fake::new(model, hello_check);
+    let run = start_run(&fake, request(Some("check"), 1), "trace_recheck", 2).await;
+    let french = Constraint { text: "Answer in French.".into(), ..Constraint::default() };
+    steer(&fake, "trace_recheck", Control::Constrain(french)).await.unwrap();
+    let resp = finished(run).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert_eq!(resp.summary, "J'ai écrit hello.txt.");
+    assert_eq!(resp.attempts[0].requirements, 1);
+    // Checked once: on the result given under the latest requirements.
+    assert_eq!(fake.calls_to("shell.run").len(), 1);
+}
+
+#[tokio::test]
+async fn a_replaced_check_is_the_one_the_result_passes() {
+    let model = scripted(|n, req| match n {
+        1 => slow(write_hello(req, "hi\n"), 300),
+        _ => done("Wrote hello.txt."),
+    });
+    let fake = Fake::new(model, |command: &str, files: &Files| match command {
+        "check" => hello_check(command, files),
+        "strict" => exit(0, ""),
+        _ => exit(2, "unknown"),
+    });
+    let run = start_run(&fake, request(Some("check"), 1), "trace_newcheck", 1).await;
+    let stricter = Constraint { check: Some("strict".into()), ..Constraint::default() };
+    steer(&fake, "trace_newcheck", Control::Constrain(stricter)).await.unwrap();
+    let resp = finished(run).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert_eq!(resp.check.as_ref().map(|c| c.command.as_str()), Some("strict"));
+    let ran: Vec<String> =
+        fake.calls_to("shell.run").iter().map(|c| c.payload["command"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(ran, ["strict"]);
+}
+
+#[tokio::test]
+async fn a_paused_run_starts_nothing_new_until_it_goes_on() {
+    let model = scripted(|n, req| match n {
+        1 => slow(write_hello(req, "hi\n"), 300),
+        _ => done("Wrote hello.txt."),
+    });
+    let fake = Fake::new(model, hello_check);
+    let run = start_run(&fake, request(Some("check"), 1), "trace_pause", 1).await;
+    // The model call already running cannot be stopped: the run says it waits for it.
+    let paused = steer(&fake, "trace_pause", Control::Pause).await.unwrap();
+    assert_eq!(paused.state, RunState::Pausing);
+    assert_eq!(paused.waiting, ["attempt 0: a model call"]);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Its reply is in, and nothing new has started: not even the tools it asked for.
+    assert_eq!(fake.requests().len(), 1);
+    assert!(fake.calls_to(fs::WRITE).is_empty(), "the tools wait too");
+    assert_eq!(steer(&fake, "trace_pause", Control::Pause).await.unwrap().state, RunState::Paused);
+    assert!(!run.is_finished());
+
+    assert_eq!(steer(&fake, "trace_pause", Control::Resume).await.unwrap().state, RunState::Running);
+    let resp = finished(run).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    let states: Vec<RunState> = fake
+        .events()
+        .iter()
+        .filter_map(|e| if let Progress::State { state, .. } = e { Some(*state) } else { None })
+        .collect();
+    assert_eq!(states, [RunState::Pausing, RunState::Paused, RunState::Running]);
+}
+
+#[tokio::test]
+async fn earlier_tasks_of_the_conversation_come_before_the_task() {
+    let fake = Fake::new(scripted(|n, req| if n == 1 { write_hello(req, "hi\n") } else { done("ok") }), hello_check);
+    let earlier = Earlier {
+        task: "Add a README.".into(),
+        outcome: Outcome::Passed,
+        summary: "Wrote README.md.".into(),
+        changes: vec!["README.md".into()],
+        applied: true,
+    };
+    let resp = run(&fake, RunRequest { earlier: vec![earlier], ..request(Some("check"), 1) }).await;
+    assert_eq!(resp.outcome, Outcome::Passed);
+    let first = fake.requests()[0].messages[0]["content"][0]["text"].as_str().unwrap().to_owned();
+    assert!(first.starts_with("<earlier_tasks>"), "{first}");
+    assert!(
+        first.contains("<task>Add a README.</task>") && first.contains("its changes are in the workspace: README.md")
+    );
 }
