@@ -128,6 +128,11 @@ struct DoArgs {
     /// model call after the run).
     #[arg(long)]
     no_learn: bool,
+    /// Model memory learns from the run with: opus, sonnet, haiku, a model
+    /// id, or `same` for the attempts' model. Default: MOLT_MEMORY_MODEL,
+    /// else sonnet.
+    #[arg(long, value_name = "MODEL", conflicts_with_all = ["no_learn", "no_memory"])]
+    memory_model: Option<String>,
 }
 
 #[derive(Args, Default)]
@@ -503,6 +508,8 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     req.check = args.check;
     req.verify = !args.no_check;
     req.attempts = args.attempts;
+    let learn = (!args.no_learn)
+        .then(|| agent::Learn { model: agent::memory_model(args.memory_model.as_deref(), args.model.as_deref()) });
     req.model = args.model;
     req.effort = args.effort;
     req.max_turns = args.max_turns;
@@ -514,7 +521,7 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     let mut signal = None;
     let stopped = async { signal = Some(stop.await) };
     let progress = |event: &_| eprintln!("{}", agent::describe(event));
-    let result = agent::run_task(&cfg, req, !args.no_learn, progress, stopped).await;
+    let result = agent::run_task(&cfg, req, learn, progress, stopped).await;
     let done = match result {
         Ok(done) => done,
         Err(e) if e.is::<Interrupted>() => {

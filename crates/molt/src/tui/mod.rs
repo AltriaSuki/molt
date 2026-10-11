@@ -214,8 +214,8 @@ impl Runtime {
                 let result = s.run(&req, &trace).await.map_err(|e| format!("{e:#}"));
                 Msg::Ran { trace, result }
             }),
-            Action::Learn { trace } => self.call(move |s| async move {
-                let result = s.learn(&trace).await;
+            Action::Learn { trace, model } => self.call(move |s| async move {
+                let result = s.learn(&trace, model).await;
                 Msg::Learned { trace, result }
             }),
             Action::Apply { fork } => self.call(move |s| async move {
