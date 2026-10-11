@@ -449,7 +449,7 @@ async fn consolidate(
 /// `molt memory forget` uses, so that the change is in the audit log.
 pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::Result<Value> {
     let service = cfg.service(MEMORY).context("the config has no memory service")?.clone();
-    let alone = Config { kernel: cfg.kernel.clone(), services: vec![service] };
+    let alone = Config { kernel: cfg.kernel.clone(), services: vec![service], confirm: cfg.confirm.clone() };
     let running = crate::start(&alone).await?;
     let result = async {
         let kernel = running.kernel();
@@ -894,7 +894,7 @@ mod tests {
         };
         assert_eq!(
             progress_of(&event("trace_a"), "trace_a"),
-            Some(Progress::AttemptStarted { run: "trace_a".into(), attempt: 1 })
+            Some(Progress::AttemptStarted { run: "trace_a".into(), attempt: 1, fork: None })
         );
         assert_eq!(progress_of(&event("trace_b"), "trace_a"), None);
         let mut other = event("trace_a");
@@ -1000,7 +1000,7 @@ mod tests {
                 tool: "read_file".into(),
                 detail: "read a.rs".into(),
             },
-            Progress::CheckRan { run: run.clone(), attempt: 0, passed: false, exit_code: Some(1) },
+            Progress::CheckRan { run: run.clone(), attempt: 0, passed: false, exit_code: Some(1), tail: "boom".into() },
             Progress::AttemptFinished { run, attempt: 1, status: AttemptStatus::Cancelled },
         ]
         .iter()

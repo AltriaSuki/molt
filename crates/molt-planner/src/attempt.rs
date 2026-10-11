@@ -17,6 +17,8 @@ use crate::tools::{self, Actor};
 
 /// Bytes of check output kept in a failed attempt's note.
 const NOTE_TAIL: usize = 2000;
+/// Bytes of a failed check's output in its progress event.
+const PROGRESS_TAIL: usize = 400;
 
 /// A done-check as the attempts run it.
 pub(crate) struct Check {
@@ -89,7 +91,6 @@ impl From<Stop> for End {
 
 /// Run attempt `index` to its end. `check` is `None` for an unverified run.
 pub(crate) async fn run(ctx: Arc<Ctx>, index: u32, check: Option<Arc<Check>>, cancel: CancellationToken) -> Finished {
-    ctx.progress(Progress::AttemptStarted { run: ctx.run_id(), attempt: index }).await;
     let mut attempt =
         Attempt { ctx: ctx.clone(), index, check, cancel, meter: Meter::default(), check_runs: 0, fork: None };
     let (status, note, summary) = match attempt.work().await {
@@ -125,7 +126,11 @@ impl Attempt {
     async fn work(&mut self) -> Result<String, End> {
         let ctx = self.ctx.clone();
         // Not raced against cancellation: a fork created after we stopped waiting would never be dropped.
-        let fork = ctx.fork().await.map_err(|e| End::error(format!("could not fork the workspace: {e}")))?;
+        let fork = ctx.fork().await;
+        // Started once it has a fork, so a caller that stops the run can keep what the attempt did there.
+        let started = fork.as_ref().ok().cloned();
+        ctx.progress(Progress::AttemptStarted { run: ctx.run_id(), attempt: self.index, fork: started }).await;
+        let fork = fork.map_err(|e| End::error(format!("could not fork the workspace: {e}")))?;
         self.fork = Some(fork.clone());
         if self.cancel.is_cancelled() {
             return Err(if ctx.over_budget() { End::from(Stop::Budget) } else { End::cancelled() });
@@ -187,6 +192,7 @@ impl Attempt {
                 attempt: self.index,
                 passed,
                 exit_code: ran.exit_code,
+                tail: if passed { String::new() } else { prompts::output_tail(&ran, PROGRESS_TAIL) },
             })
             .await;
             if passed {

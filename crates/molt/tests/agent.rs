@@ -1121,6 +1121,8 @@ async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
     assert_eq!(bodies(&server).await.iter().filter(|b| offers_submit_check(b)).count(), 2);
     assert_eq!(setup.files(), ["README.txt"], "nothing is applied before the user says so");
     let fork = resp.fork.clone().expect("the result is kept for the user");
+    // What an interrupt asks of a fork, to keep it only when it holds work.
+    assert_eq!(session.changes(&fork).await.unwrap(), ["check.sh", "greeting.txt"]);
     session.apply(&fork).await.unwrap();
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
     assert_eq!(setup.file("check.sh").as_deref(), Some(format!("{CHECK}\n").as_str()));
@@ -1131,6 +1133,7 @@ async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
     }
     assert!(seen.iter().all(|e| e.run() == trace.as_str()), "{seen:#?}");
     assert!(seen.iter().any(|e| matches!(e, Progress::CheckReady { designed: true, .. })), "{seen:#?}");
+    assert!(seen.iter().any(|e| matches!(e, Progress::AttemptStarted { fork: Some(_), .. })), "{seen:#?}");
 
     let learned = session.learn(&trace).await.unwrap();
     assert_eq!(learned.added.len(), 1, "{learned:#?}");

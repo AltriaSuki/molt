@@ -97,9 +97,23 @@ to generate per-service credentials, put the printed `authorization` block and
 `molt` with no subcommand (or `molt ui [--workspace DIR] [--data-dir DIR]
 [--pass-env NAME]...`) opens a terminal interface on the workspace. It starts
 the services once and keeps them up, so tasks follow one another without a
-restart. Type a task and press Enter.
+restart. Type a task and press Enter. A task can run over several lines:
+Shift+Enter, Ctrl+J, or `\` then Enter starts a new one, and a paste keeps
+its line breaks and indentation (a paste of more than 20 lines shows as
+`[pasted #1: 143 lines]` and is sent in full). Ctrl+G opens the task in
+`$VISUAL` or `$EDITOR`.
 
-In the default mode, **confirm**, a task stops twice for you:
+In the default mode, **confirm**, a task can stop twice for you, and does
+only when something calls for a look; otherwise it runs through and the log
+shows the check and the result as usual. The check stops when no automated
+check fits, its baseline already passes or did not run, or its files would
+replace files in the workspace. The result stops when it is not `passed`,
+changes more than 300 lines or 10 files, deletes a file, touches a protected
+path (`.github/`, `Cargo.toml`, `Cargo.lock`, `package.json`, `go.mod`,
+`migrations/`), or its diff was cut short. Each stop names its reasons in one
+line, such as `stopped: baseline passes · deletes 2 files`. A config given
+with `--config` can change these in a `[confirm]` section (`max_lines`,
+`max_files`, `ask_paths`), or set `always_ask = true` to stop every time:
 
 1. The planner designs the done-check (`planner.design`) and runs it once on
    the workspace as it is. You see the command, its files, why it fits and
@@ -110,11 +124,23 @@ In the default mode, **confirm**, a task stops twice for you:
 2. The attempts run side by side, one box each, with their tool calls and
    check runs as they happen (Tab shows one large). When one passes, you see
    its message, the files it changed and, with `d`, the diff. Enter applies
-   it; `k` keeps it in its fork, `n` discards it.
+   it; `k` keeps it in its fork, `n` discards it. `/last` opens the diff of
+   the last finished task again, whatever was done with it. When no attempt
+   passes, each one shows the end of why it stopped, and a failed check shows
+   its last lines in its box; `v` opens the whole story and `r` runs the task
+   again with the same check, without designing it anew. `/lanes` shows the
+   last task's tool calls after it has ended.
 
 Shift+Tab switches to **auto** (design the check and apply what passes) or
 **plan only** (results stay in their forks). Esc stops a task: the services
-are stopped, with every command the agent started, and started again.
+are stopped, with every command the agent started, and started again. The
+forks of attempts that had changed files are kept (`kept 2 · interrupted`),
+and with a check known in full `r` starts the task again with it. Ctrl+C
+on an empty input, or Ctrl+D, quits only when pressed twice within about a
+second; the first press says what quitting keeps.
+The log keeps everything a task reports, in full; PgUp and PgDn scroll it,
+and Ctrl+Home and Ctrl+End (or Home and End with an empty input) jump to its
+start and end.
 
 `/memory [words]` lists the notes about the project, strongest first, with
 where each came from: the run, the service version that wrote it and the
