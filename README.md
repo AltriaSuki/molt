@@ -34,7 +34,7 @@ that starts with milestone 5.
 | Capabilities | Unforgeable, budgeted rights to call one target; delegation can split a budget, never grow it | `molt-kernel/src/caps.rs` |
 | Supervisor | Runs services as processes with rlimits, restarts with backoff, drains on stop | `molt-kernel/src/supervisor.rs` |
 | Module registry | Content-addressed versions; promotion is compare-and-swap; tier rules enforced | `molt-kernel/src/registry.rs` |
-| Audit log | Append-only, hash-chained, written before delivery, batched fsync | `molt-kernel/src/audit.rs` |
+| Audit log | Append-only, hash-chained, written before delivery, batched fsync; large payload values (a model conversation's messages) written once and referenced after | `molt-kernel/src/audit.rs` |
 | Transports | `Transport` trait with Unix-socket and NATS implementations | `molt-transport` |
 | Service SDK | Calls, replies, events, delegation | `molt-sdk` |
 | Agent payloads | The request and reply types of every agent service | `molt-api` |
@@ -59,6 +59,7 @@ sender from that.
 | A failing service never takes the kernel down | `a_service_that_never_replies…`, `a_crashed_and_reconnected…`, `a_flooding_service…`, `garbage_on_the_wire_is_ignored`, `crates/molt/tests/e2e.rs` |
 | Both transports behave the same: ordering, at-most-once, sender stamping, isolation, bounded inboxes | `crates/molt-transport/src/testkit.rs`, run by `conformance_unix.rs` and `conformance_nats.rs` |
 | `molt do` never runs a config the project ships, and the API key never reaches the commands it runs | `crates/molt/tests/agent.rs` (`the_cli_carries_out_a_task`) |
+| A conversation sent whole every turn grows the log by its new messages, and reads back byte for byte; a changed or missing referenced value fails verification | `a_conversation_sent_whole_every_turn_is_logged_once_and_read_back_exactly`, `a_changed_or_missing_blob_is_found` |
 | Reading the audit log takes a capability, and a read is recorded without a second copy of what it returned | `reading_the_log_takes_a_capability_and_is_recorded_without_a_second_copy` |
 | Every learned note cites the messages behind it, and a run is learned from once | `crates/molt/tests/agent.rs` (`a_second_run_starts_with_what_the_first_learned…`), `crates/molt-memory/src/consolidate.rs` |
 | A benchmark run is graded by tests the agent is not given, which its own edits cannot replace | `crates/molt-bench/src/grade.rs` (`grading_overwrites_the_agents_copy_of_a_hidden_file`), `crates/molt-bench/src/task.rs` (`overlay_replaces_files_links_and_directories_and_stays_inside`) |
@@ -110,11 +111,15 @@ In the default mode, **confirm**, a task stops twice for you:
 2. The attempts run side by side, one box each, with their tool calls and
    check runs as they happen (Tab shows one large). When one passes, you see
    its message, the files it changed and, with `d`, the diff. Enter applies
-   it; `k` keeps it in its fork, `n` discards it.
+   it; `k` keeps it in its fork, `n` discards it. `/last` opens the diff of
+   the last finished task again, whatever was done with it.
 
 Shift+Tab switches to **auto** (design the check and apply what passes) or
 **plan only** (results stay in their forks). Esc stops a task: the services
 are stopped, with every command the agent started, and started again.
+The log keeps everything a task reports, in full; PgUp and PgDn scroll it,
+and Ctrl+Home and Ctrl+End (or Home and End with an empty input) jump to its
+start and end.
 
 `/memory [words]` lists the notes about the project, strongest first, with
 where each came from: the run, the service version that wrote it and the
@@ -453,8 +458,18 @@ cargo test --workspace
 
 The NATS conformance and end-to-end tests need a `nats-server` binary. Set
 `MOLT_NATS_SERVER=/path/to/nats-server` or put it on `PATH`
-(`go install github.com/nats-io/nats-server/v2@latest`). Without it they print
+(`go install github.com/nats-io/nats-server/v2@v2.15.1`, using the Go version
+in `.github/ci-versions.toml`). Without it they print
 a notice and pass; CI always runs them.
+
+The Rust release and components are pinned in `rust-toolchain.toml`, and CI
+reads that file too. Go and nats-server are pinned in `.github/ci-versions.toml`;
+Go cannot fetch a newer toolchain automatically. NATS binaries use an exact
+version/OS/architecture/Go cache key and are version-checked on every run,
+including cache hits. Actions are pinned to commit SHAs. Toolchain upgrades
+belong in a separate PR so ordinary changes keep the same tool versions when
+rerun. The runner image and apt's isolation backend still receive OS updates;
+these pins do not claim a bit-for-bit identical machine image.
 
 `crates/molt-bench/tests/tasks.rs` validates every benchmark task, which takes
 `python3`, `node` (20 or newer), `go` and `cargo`. A missing toolchain skips
