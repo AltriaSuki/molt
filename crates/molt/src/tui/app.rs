@@ -8,19 +8,28 @@ use std::collections::HashSet;
 use molt_api::fs::ChangeKind;
 use molt_api::memory::{ConsolidateResponse, Recalled};
 use molt_api::model::Effort;
-use molt_api::planner::{AttemptStatus, DesignResponse, Outcome, RunRequest, RunResponse};
+use molt_api::planner::{AttemptReport, AttemptStatus, DesignResponse, Outcome, RunRequest, RunResponse, Verdict};
 use molt_api::progress::Progress;
 use molt_proto::TraceId;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::Line;
 
 use super::text::{self, block, clean_line, span, Tone};
+use crate::agent;
 use crate::agent::outcome_name;
+use crate::config::ConfirmSection;
 
-/// Lines of a winner's final message shown in the log; the rest is cut.
-const SUMMARY_LINES: usize = 40;
+/// Bytes of one summary written to the log. Only a runaway message reaches
+/// this; the log keeps everything a normal task says.
+const SUMMARY_BYTES: usize = 1 << 20;
 /// Lines kept per attempt while it runs.
 const LANE_LINES: usize = 200;
+/// Ticks within which a second Ctrl+C or Ctrl+D quits: about a second.
+const QUIT_TICKS: u64 = 7;
+/// Lines of a failed attempt's note shown under it in the log.
+const NOTE_LINES: usize = 6;
+/// Lines of a failed check's output shown in its lane.
+const CHECK_TAIL_LINES: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -59,6 +68,9 @@ pub struct Settings {
     pub budget_usd: Option<f64>,
     /// A check command of the user's, used instead of a designed one.
     pub check: Option<String>,
+    /// The model memory learns with: a model, [`agent::SAME_MODEL`], or
+    /// `None` for memory's default.
+    pub memory_model: Option<String>,
 }
 
 /// Work for the runtime.
@@ -75,6 +87,8 @@ pub enum Action {
     },
     Learn {
         trace: TraceId,
+        /// `None`: memory's default model.
+        model: Option<String>,
     },
     Apply {
         fork: String,
@@ -92,9 +106,17 @@ pub enum Action {
     /// Stop everything in flight: the services are stopped and started again.
     Interrupt {
         keep: Vec<String>,
+        /// Forks of the attempts that were running, kept when they hold
+        /// changes to more than `check_files`.
+        attempts: Vec<String>,
+        check_files: Vec<String>,
     },
     Quit {
         keep: Vec<String>,
+    },
+    /// Edit the input in the user's editor; the result comes back as [`Msg::Edited`].
+    Edit {
+        text: String,
     },
 }
 
@@ -111,12 +133,17 @@ pub enum Msg {
         memory_problem: Option<String>,
     },
     SessionFailed(String),
-    /// The services of an interrupted session have stopped.
-    Stopped,
+    /// The services of an interrupted session have stopped; `kept` are the
+    /// forks of interrupted attempts kept for their changes.
+    Stopped {
+        kept: Vec<String>,
+    },
     Progress(Progress),
     Designed {
         trace: TraceId,
         result: Result<DesignResponse, String>,
+        /// The check's files that already exist in the workspace.
+        existing: Vec<String>,
     },
     Ran {
         trace: TraceId,
@@ -129,6 +156,8 @@ pub enum Msg {
     Applied(Result<(), String>),
     Discarded(Result<(), String>),
     Notes(Result<Vec<Recalled>, String>),
+    /// The input as the user's editor left it.
+    Edited(Result<String, String>),
     Forgot {
         id: String,
         result: Result<bool, String>,
@@ -156,6 +185,8 @@ pub enum Phase {
 
 pub struct Lane {
     pub index: u32,
+    /// The attempt's fork, once the planner has said which.
+    pub fork: Option<String>,
     pub turn: u32,
     pub status: Option<AttemptStatus>,
     pub lines: Vec<Line<'static>>,
@@ -170,6 +201,8 @@ pub struct Task {
     check_shown: bool,
     recalled_shown: bool,
     notes_seen: HashSet<String>,
+    /// Why confirm mode stopped for the user, in short labels.
+    pub stops: Vec<String>,
 }
 
 pub enum Prompt {
@@ -180,6 +213,21 @@ pub enum Prompt {
         resp: Box<RunResponse>,
         fork: String,
     },
+    /// No attempt passed. The input stays live; with it empty, `r` runs the
+    /// task again with the same check and `v` shows why each attempt ended.
+    Retry {
+        req: Box<RunRequest>,
+        designed: bool,
+        /// The user stopped the run, rather than every attempt failing.
+        stopped: bool,
+        attempts: Vec<AttemptReport>,
+    },
+}
+
+/// A finished task's diff, kept after the task is applied, kept or discarded.
+struct LastDiff {
+    patch: String,
+    truncated: bool,
 }
 
 /// Text shown over everything else: a diff, a check's files, help.
@@ -209,45 +257,118 @@ pub enum MemoryEdit {
     Reason(Input),
 }
 
-/// A one-line text field.
+/// A text field. The task input holds several lines; the others one.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Input {
     pub text: String,
     /// In characters.
     pub cursor: usize,
+    /// Long pastes, each shown as its placeholder in `text` and put back by [`Input::take`].
+    pastes: Vec<(String, String)>,
 }
+
+/// Pasted lines shown as they are; a longer paste shows as one placeholder.
+const PASTE_LINES: usize = 20;
 
 impl Input {
     pub fn with(text: &str) -> Self {
-        Self { text: text.to_owned(), cursor: text.chars().count() }
+        Self { text: text.to_owned(), cursor: text.chars().count(), pastes: Vec::new() }
     }
 
     fn byte(&self, at: usize) -> usize {
         self.text.char_indices().nth(at).map_or(self.text.len(), |(i, _)| i)
     }
 
+    /// Insert `s` on one line: control characters, line breaks too, become spaces.
     pub fn insert(&mut self, s: &str) {
-        let at = self.byte(self.cursor);
         let s: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
-        self.text.insert_str(at, &s);
+        self.put(&s);
+    }
+
+    /// Insert pasted text with its line breaks and tabs. Escape sequences
+    /// and other control characters are dropped, and a paste of more than
+    /// [`PASTE_LINES`] lines shows as a placeholder.
+    pub fn paste(&mut self, s: &str) {
+        let s = pasted(s);
+        let lines = s.lines().count();
+        if lines <= PASTE_LINES {
+            return self.put(&s);
+        }
+        let placeholder = format!("[pasted #{}: {lines} lines]", self.pastes.len() + 1);
+        self.put(&placeholder);
+        self.pastes.push((placeholder, s));
+    }
+
+    /// The character just before the cursor.
+    fn key_before(&self) -> Option<char> {
+        self.cursor.checked_sub(1).and_then(|at| self.text.chars().nth(at))
+    }
+
+    pub fn newline(&mut self) {
+        self.put("\n");
+    }
+
+    fn put(&mut self, s: &str) {
+        let at = self.byte(self.cursor);
+        self.text.insert_str(at, s);
         self.cursor += s.chars().count();
     }
 
+    /// The text, with every long paste in full, and an empty field.
     pub fn take(&mut self) -> String {
         self.cursor = 0;
-        std::mem::take(&mut self.text)
+        let mut text = std::mem::take(&mut self.text);
+        for (placeholder, pasted) in std::mem::take(&mut self.pastes) {
+            text = text.replacen(&placeholder, &pasted, 1);
+        }
+        text
+    }
+
+    /// The text with every long paste in full, leaving the field as it is.
+    pub fn full(&self) -> String {
+        self.clone().take()
+    }
+
+    /// The character index where the cursor's line starts, and where it ends.
+    fn line_bounds(&self) -> (usize, usize) {
+        let chars: Vec<char> = self.text.chars().collect();
+        let start = chars[..self.cursor].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
+        let end = chars[self.cursor..].iter().position(|&c| c == '\n').map_or(chars.len(), |i| self.cursor + i);
+        (start, end)
+    }
+
+    /// Move to the line above (`up`) or below, keeping the column; false on the first or last line.
+    pub fn line_step(&mut self, up: bool) -> bool {
+        let chars: Vec<char> = self.text.chars().collect();
+        let (start, end) = self.line_bounds();
+        let column = self.cursor - start;
+        if up {
+            if start == 0 {
+                return false;
+            }
+            let above = chars[..start - 1].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
+            self.cursor = above + column.min(start - 1 - above);
+        } else {
+            if end == chars.len() {
+                return false;
+            }
+            let below_end = chars[end + 1..].iter().position(|&c| c == '\n').map_or(chars.len(), |i| end + 1 + i);
+            self.cursor = end + 1 + column.min(below_end - end - 1);
+        }
+        true
     }
 
     /// Handle an editing key; false when the key is not one.
     pub fn key(&mut self, key: &KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('a') if ctrl => self.cursor = 0,
-            KeyCode::Char('e') if ctrl => self.cursor = self.text.chars().count(),
+            KeyCode::Char('a') if ctrl => self.cursor = self.line_bounds().0,
+            KeyCode::Char('e') if ctrl => self.cursor = self.line_bounds().1,
             KeyCode::Char('u') if ctrl => {
-                let at = self.byte(self.cursor);
-                self.text.replace_range(..at, "");
-                self.cursor = 0;
+                let start = self.line_bounds().0;
+                let (a, b) = (self.byte(start), self.byte(self.cursor));
+                self.text.replace_range(a..b, "");
+                self.cursor = start;
             }
             KeyCode::Char('w') if ctrl => {
                 let chars: Vec<char> = self.text.chars().collect();
@@ -255,7 +376,7 @@ impl Input {
                 while start > 0 && chars[start - 1] == ' ' {
                     start -= 1;
                 }
-                while start > 0 && chars[start - 1] != ' ' {
+                while start > 0 && !matches!(chars[start - 1], ' ' | '\n') {
                     start -= 1;
                 }
                 let (a, b) = (self.byte(start), self.byte(self.cursor));
@@ -274,13 +395,53 @@ impl Input {
             }
             KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.text.chars().count()),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.text.chars().count(),
+            KeyCode::Home => self.cursor = self.line_bounds().0,
+            KeyCode::End => self.cursor = self.line_bounds().1,
             KeyCode::Backspace | KeyCode::Delete => {}
             _ => return false,
         }
         true
     }
+}
+
+/// Pasted text as the input keeps it: line breaks as `\n`, tabs kept, and
+/// escape sequences and other control characters dropped, so a paste cannot
+/// reach the terminal or the model as anything but text.
+fn pasted(s: &str) -> String {
+    let s = s.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' | '\t' => out.push(c),
+            '\u{1b}' => match chars.peek() {
+                // CSI: parameters, then one final byte from @ to ~.
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: up to BEL or ESC \.
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            },
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 pub struct App {
@@ -309,11 +470,22 @@ pub struct App {
     pub learning: HashSet<String>,
     /// Results the user kept in their forks; never removed.
     pub kept: Vec<String>,
+    /// The diff of the last task that finished, for `/last`.
+    last: Option<LastDiff>,
+    /// The attempts of the last task that finished, for `/lanes`.
+    last_lanes: Vec<Lane>,
+    /// Values never to show, such as API keys: replaced wherever text from
+    /// commands is shown.
+    pub secrets: Vec<String>,
+    /// When confirm mode stops.
+    pub rules: ConfirmSection,
     /// The attempt drawn alone, large.
     pub zoom: Option<u32>,
     /// A short message in the status bar, until the next key.
     pub flash: Option<String>,
     pub tick: u64,
+    /// The tick of a first Ctrl+C or Ctrl+D; a second soon after quits.
+    quit_armed: Option<u64>,
     pub quit: bool,
 }
 
@@ -350,9 +522,14 @@ impl App {
             uncounted_calls: 0,
             learning: HashSet::new(),
             kept: Vec::new(),
+            last: None,
+            last_lanes: Vec::new(),
+            secrets: Vec::new(),
+            rules: ConfirmSection::default(),
             zoom: None,
             flash: None,
             tick: 0,
+            quit_armed: None,
             quit: false,
         }
     }
@@ -363,6 +540,14 @@ impl App {
 
     fn push(&mut self, line: Line<'static>) {
         self.log.push(line);
+    }
+
+    /// A task in the log, as typed: its lines under the prompt mark.
+    fn echo(&mut self, task: &str) {
+        for (i, l) in text::clean(task).into_iter().enumerate() {
+            let mark = if i == 0 { span("› ", Tone::Shell) } else { span("  ", Tone::Plain) };
+            self.push(Line::from(vec![mark, span(l, Tone::Plain)]));
+        }
     }
 
     fn gap(&mut self) {
@@ -402,7 +587,9 @@ impl App {
                         Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input)) => input.insert(&text),
                         None => {}
                     },
-                    Screen::Main => self.input.insert(&text),
+                    // The check's command is one line; a task can be many.
+                    Screen::Main if matches!(self.prompt, Some(Prompt::EditCheck(_))) => self.input.insert(&text),
+                    Screen::Main => self.input.paste(&text),
                 }
                 Vec::new()
             }
@@ -426,7 +613,14 @@ impl App {
                 self.session = SessionState::Down(clean_line(&e));
                 Vec::new()
             }
-            Msg::Stopped => {
+            Msg::Stopped { kept } => {
+                if !kept.is_empty() {
+                    self.push(Line::from(span(format!("  kept {} · interrupted", kept.len()), Tone::Dim)));
+                    for fork in &kept {
+                        self.push(Line::from(span(format!("  kept in {}", clean_line(fork)), Tone::Dim)));
+                    }
+                    self.kept.extend(kept);
+                }
                 self.session = SessionState::Starting;
                 vec![Action::StartSession]
             }
@@ -434,7 +628,7 @@ impl App {
                 self.progress(event);
                 Vec::new()
             }
-            Msg::Designed { trace, result } => self.designed(trace, result),
+            Msg::Designed { trace, result, existing } => self.designed(trace, result, &existing),
             Msg::Ran { trace, result } => self.ran(trace, result),
             Msg::Learned { trace, result } => {
                 self.learning.remove(trace.as_str());
@@ -452,6 +646,13 @@ impl App {
             Msg::Discarded(result) => {
                 if let Err(e) = result {
                     self.error("could not remove the result", &e);
+                }
+                Vec::new()
+            }
+            Msg::Edited(result) => {
+                match result {
+                    Ok(text) => self.input = Input::with(text.trim_end_matches('\n')),
+                    Err(e) => self.flash = Some(format!("the editor failed: {}", clean_line(&e))),
                 }
                 Vec::new()
             }
@@ -488,9 +689,15 @@ impl App {
 
     fn key(&mut self, key: KeyEvent) -> Vec<Action> {
         if ctrl(&key, 'd') || (ctrl(&key, 'c') && self.task.is_none() && self.input.text.is_empty()) {
-            self.quit = true;
-            return vec![Action::Quit { keep: self.keep() }];
+            if self.quit_armed.is_some_and(|at| self.tick.wrapping_sub(at) <= QUIT_TICKS) {
+                self.quit = true;
+                return vec![Action::Quit { keep: self.keep() }];
+            }
+            self.quit_armed = Some(self.tick);
+            self.flash = Some(self.quit_warning(if ctrl(&key, 'd') { "ctrl+d" } else { "ctrl+c" }));
+            return Vec::new();
         }
+        self.quit_armed = None;
         if self.viewer.is_some() {
             self.viewer_key(&key);
             return Vec::new();
@@ -508,8 +715,14 @@ impl App {
         match &self.prompt {
             Some(Prompt::Check(_)) => return self.check_key(&key),
             Some(Prompt::Apply { .. }) => return self.apply_key(&key),
+            Some(Prompt::Retry { .. }) => {
+                if let Some(actions) = self.retry_key(&key) {
+                    return actions;
+                }
+            }
             Some(Prompt::EditCheck(_)) | None => {}
         }
+        let editing_check = matches!(self.prompt, Some(Prompt::EditCheck(_)));
         match key.code {
             KeyCode::BackTab => {
                 self.mode = self.mode.next();
@@ -533,12 +746,43 @@ impl App {
                 self.scroll = self.scroll.saturating_sub(10);
                 return Vec::new();
             }
+            // Home and End move the cursor while there is text to move it in.
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) || self.input.text.is_empty() => {
+                // The view clamps this to the top of the log.
+                self.scroll = usize::MAX;
+                return Vec::new();
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) || self.input.text.is_empty() => {
+                self.scroll = 0;
+                return Vec::new();
+            }
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) && !editing_check => {
+                self.input.newline();
+                return Vec::new();
+            }
+            KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) && !editing_check => {
+                self.input.newline();
+                return Vec::new();
+            }
+            // A backslash before Enter continues the task on a new line, for terminals that send no Shift+Enter.
+            KeyCode::Enter if !editing_check && self.input.cursor > 0 && self.input.key_before() == Some('\\') => {
+                self.input.key(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+                self.input.newline();
+                return Vec::new();
+            }
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) && !editing_check => {
+                return vec![Action::Edit { text: self.input.full() }];
+            }
             KeyCode::Up if self.prompt.is_none() => {
-                self.history_step(true);
+                if !self.input.line_step(true) {
+                    self.history_step(true);
+                }
                 return Vec::new();
             }
             KeyCode::Down if self.prompt.is_none() => {
-                self.history_step(false);
+                if !self.input.line_step(false) {
+                    self.history_step(false);
+                }
                 return Vec::new();
             }
             KeyCode::Esc => {
@@ -575,6 +819,21 @@ impl App {
         self.task.as_ref().is_some_and(|t| matches!(t.phase, Phase::Designing | Phase::Running | Phase::Applying))
     }
 
+    /// What a first Ctrl+C or Ctrl+D says: press again, and what quitting keeps.
+    fn quit_warning(&self, keys: &str) -> String {
+        let mut parts = vec![format!("{keys} again to quit")];
+        if self.busy() {
+            parts.push("the running task stops".into());
+        }
+        let keep = self.keep().len();
+        match keep {
+            0 => {}
+            1 => parts.push("1 result stays in its fork".into()),
+            n => parts.push(format!("{n} results stay in their forks")),
+        }
+        parts.join("; ")
+    }
+
     fn interrupt(&mut self) -> Vec<Action> {
         if self.task.is_none() && self.learning.is_empty() {
             return Vec::new();
@@ -585,12 +844,26 @@ impl App {
             self.push(Line::from(span(format!("  kept in {}", clean_line(&fork)), Tone::Dim)));
         }
         self.prompt = None;
-        self.task = None;
+        let mut attempts = Vec::new();
+        let mut check_files = Vec::new();
+        if let Some(mut task) = self.task.take() {
+            if matches!(task.phase, Phase::Running) {
+                attempts = task.lanes.iter().filter_map(|l| l.fork.clone()).collect();
+                check_files = task.req.check_files.iter().map(|f| f.path.clone()).collect();
+                self.last_lanes = std::mem::take(&mut task.lanes);
+                // Starting again needs the check in full; a designed one is only known once accepted.
+                if task.req.check.is_some() {
+                    let designed = self.settings.check.as_deref() != task.req.check.as_deref();
+                    self.prompt =
+                        Some(Prompt::Retry { req: Box::new(task.req), designed, stopped: true, attempts: Vec::new() });
+                }
+            }
+        }
         self.zoom = None;
         self.learning.clear();
         self.push(Line::from(span("■ stopped; restarting the services", Tone::Warn)));
         self.session = SessionState::Starting;
-        vec![Action::Interrupt { keep }]
+        vec![Action::Interrupt { keep, attempts, check_files }]
     }
 
     fn history_step(&mut self, back: bool) {
@@ -642,7 +915,7 @@ impl App {
         req.apply = self.mode == Mode::Auto;
 
         self.gap();
-        self.push(Line::from(vec![span("› ", Tone::Shell), span(clean_line(&line), Tone::Plain)]));
+        self.echo(&line);
         let mut task = Task {
             trace: trace.clone(),
             req,
@@ -651,6 +924,7 @@ impl App {
             check_shown: false,
             recalled_shown: false,
             notes_seen: HashSet::new(),
+            stops: Vec::new(),
         };
         let action = if let Some(check) = &self.settings.check {
             task.req.check = Some(check.clone());
@@ -708,6 +982,15 @@ impl App {
                 self.settings.model = (!arg.is_empty() && arg != "default").then(|| arg.to_owned());
                 self.flash = Some(set("model", self.settings.model.as_deref().unwrap_or("default")));
             }
+            "memory-model" => {
+                self.settings.memory_model = (!arg.is_empty() && arg != "default").then(|| arg.to_owned());
+                let shown = match self.settings.memory_model.as_deref() {
+                    None => "default",
+                    Some(agent::SAME_MODEL) => "the attempts' model",
+                    Some(m) => m,
+                };
+                self.flash = Some(set("memory model", shown));
+            }
             "effort" => {
                 if arg.is_empty() || arg == "default" {
                     self.settings.effort = None;
@@ -732,6 +1015,18 @@ impl App {
                     self.flash = Some(set("budget", "default"));
                 }
                 _ => self.flash = Some("budget: a positive amount of US dollars".into()),
+            },
+            "lanes" => {
+                if self.last_lanes.is_empty() {
+                    self.flash = Some("no task has finished yet".into());
+                } else {
+                    self.viewer =
+                        Some(Viewer { title: "attempts".into(), lines: lane_lines(&self.last_lanes), scroll: 0 });
+                }
+            }
+            "last" => match &self.last {
+                Some(last) => self.viewer = Some(diff_viewer(&last.patch, last.truncated)),
+                None => self.flash = Some("no task has finished with changes yet".into()),
             },
             "clear" => {
                 self.log.clear();
@@ -785,14 +1080,11 @@ impl App {
                 });
                 head.push(span(format!("  {}", parts.join(" · ")), Tone::Dim));
                 self.log.push(Line::from(head));
-                for n in notes.iter().take(5) {
+                for n in &notes {
                     self.log.push(Line::from(vec![
                         span(format!("  {:.2} ", n.confidence), Tone::Mem),
                         span(clean_line(&n.text), Tone::Plain),
                     ]));
-                }
-                if notes.len() > 5 {
-                    self.log.push(Line::from(span(format!("  and {} more", notes.len() - 5), Tone::Dim)));
                 }
             }
             // Model streaming is opt-in and the terminal interface does not ask for it.
@@ -802,9 +1094,11 @@ impl App {
                     self.log.push(Line::from(span(format!("  {}", clean_line(&message)), Tone::Dim)));
                 }
             }
-            Progress::AttemptStarted { attempt, .. } => {
-                if !task.lanes.iter().any(|l| l.index == attempt) {
-                    task.lanes.push(Lane { index: attempt, turn: 0, status: None, lines: Vec::new() });
+            Progress::AttemptStarted { attempt, fork, .. } => {
+                if let Some(lane) = lane(task, attempt) {
+                    lane.fork = lane.fork.take().or(fork);
+                } else {
+                    task.lanes.push(Lane { index: attempt, fork, turn: 0, status: None, lines: Vec::new() });
                     task.lanes.sort_by_key(|l| l.index);
                 }
             }
@@ -817,7 +1111,8 @@ impl App {
                     ]));
                 }
             }
-            Progress::CheckRan { attempt, passed, exit_code, .. } => {
+            Progress::CheckRan { attempt, passed, exit_code, tail, .. } => {
+                let tail = scrub(&tail, &self.secrets);
                 if let Some(lane) = lane(task, attempt) {
                     let line = match (passed, exit_code) {
                         (true, _) => span("   check passed", Tone::Ok),
@@ -825,6 +1120,9 @@ impl App {
                         (false, None) => span("   check failed (killed or timed out)", Tone::Bad),
                     };
                     lane.push(Line::from(line));
+                    for l in last_lines(&tail, CHECK_TAIL_LINES) {
+                        lane.push(Line::from(span(format!("   {l}"), Tone::Dim)));
+                    }
                 }
             }
             Progress::AttemptFinished { attempt, status, .. } => {
@@ -835,7 +1133,7 @@ impl App {
         }
     }
 
-    fn designed(&mut self, trace: TraceId, result: Result<DesignResponse, String>) -> Vec<Action> {
+    fn designed(&mut self, trace: TraceId, result: Result<DesignResponse, String>, existing: &[String]) -> Vec<Action> {
         let Some(task) = &mut self.task else { return Vec::new() };
         if task.trace != trace {
             return Vec::new();
@@ -856,6 +1154,10 @@ impl App {
                         ),
                     );
                     return Vec::new();
+                }
+                task.stops = check_stops(&d, existing);
+                if task.stops.is_empty() && !self.rules.always_ask {
+                    return self.start_after_check(d, true);
                 }
                 task.phase = Phase::Confirming;
                 self.prompt = Some(Prompt::Check(d));
@@ -955,8 +1257,9 @@ impl App {
         if task.trace != trace {
             return Vec::new();
         }
-        let task = self.task.take().expect("checked above");
+        let mut task = self.task.take().expect("checked above");
         self.zoom = None;
+        self.last_lanes = std::mem::take(&mut task.lanes);
         let resp = match result {
             Ok(resp) => resp,
             Err(e) => {
@@ -967,6 +1270,7 @@ impl App {
         self.spent_usd += resp.cost_usd;
         self.uncounted_calls = self.uncounted_calls.saturating_add(resp.uncounted_calls);
         let mut actions = Vec::new();
+        let memory_model = agent::memory_model(self.settings.memory_model.as_deref(), task.req.model.as_deref());
 
         for a in &resp.attempts {
             let (mark, tone) = match a.status {
@@ -990,6 +1294,11 @@ impl App {
                 span(format!("  {mark} attempt {} ", a.index + 1), tone),
                 span(format!("{status} · {} turns{checks} · ${:.2}", a.turns, a.cost_usd), Tone::Dim),
             ]));
+            if matches!(a.status, AttemptStatus::Failed | AttemptStatus::Error) {
+                for l in last_lines(&scrub(&a.note, &self.secrets), NOTE_LINES) {
+                    self.push(Line::from(span(format!("      {l}"), Tone::Dim)));
+                }
+            }
         }
 
         let (added, removed) = text::diff_counts(&resp.patch);
@@ -1003,11 +1312,17 @@ impl App {
             span(" ", Tone::Plain),
             span(format!("−{removed}"), Tone::Bad),
         ];
-        let summary = resp.summary.trim();
+        let summary = scrub(&resp.summary, &self.secrets);
+        let (summary, cut) = bounded(summary.trim(), SUMMARY_BYTES);
+        let cut_note = cut.then(|| {
+            let note = format!("  (cut at 1 MB; the whole text is in the audit log, trace {trace})");
+            Line::from(span(note, Tone::Warn))
+        });
         match resp.outcome {
             Outcome::Failed => {
                 self.push(Line::from(span("✗ no attempt passed", Tone::Bad)));
-                self.log.extend(block(summary, "  ", Tone::Dim).into_iter().take(SUMMARY_LINES));
+                self.log.extend(block(summary, "  ", Tone::Dim));
+                self.log.extend(cut_note);
             }
             Outcome::Passed | Outcome::Unverified => {
                 let tone = if resp.outcome == Outcome::Passed { Tone::Ok } else { Tone::Warn };
@@ -1016,22 +1331,15 @@ impl App {
                     head.extend(size);
                 }
                 self.push(Line::from(head));
-                let lines = block(summary, "  ", Tone::Plain);
-                let cut = lines.len().saturating_sub(SUMMARY_LINES);
-                self.log.extend(lines.into_iter().take(SUMMARY_LINES));
-                if cut > 0 {
-                    self.push(Line::from(span(format!("  ({cut} more lines)"), Tone::Dim)));
-                }
-                for c in resp.changes.iter().take(20) {
+                self.log.extend(block(summary, "  ", Tone::Plain));
+                self.log.extend(cut_note);
+                for c in &resp.changes {
                     let kind = match c.kind {
                         ChangeKind::Added => "added   ",
                         ChangeKind::Modified => "modified",
                         ChangeKind::Deleted => "deleted ",
                     };
                     self.push(Line::from(span(format!("  {kind} {}", clean_line(&c.path)), Tone::Dim)));
-                }
-                if resp.changes.len() > 20 {
-                    self.push(Line::from(span(format!("  and {} more", resp.changes.len() - 20), Tone::Dim)));
                 }
             }
         }
@@ -1040,15 +1348,26 @@ impl App {
             self.push(Line::from(span(line, Tone::Dim)));
         }
 
+        if !resp.patch.is_empty() {
+            self.last = Some(LastDiff { patch: resp.patch.clone(), truncated: resp.patch_truncated });
+        }
         let mut deciding = false;
+        let mut applying = false;
         if resp.applied {
             self.push(Line::from(span("  applied", Tone::Ok)));
         } else if let Some(fork) = resp.fork.clone() {
             if resp.changes.is_empty() {
                 actions.push(Action::Discard { fork });
             } else if self.mode == Mode::Confirm && !task.req.apply && !matches!(resp.outcome, Outcome::Failed) {
-                deciding = true;
-                self.prompt = Some(Prompt::Apply { resp: Box::new(resp.clone()), fork });
+                let stops = apply_stops(&resp, &self.rules);
+                if stops.is_empty() && !self.rules.always_ask {
+                    applying = true;
+                    actions.push(Action::Apply { fork });
+                } else {
+                    deciding = true;
+                    task.stops = stops;
+                    self.prompt = Some(Prompt::Apply { resp: Box::new(resp.clone()), fork });
+                }
             } else {
                 self.push(Line::from(span(format!("  kept in {}", clean_line(&fork)), Tone::Dim)));
                 self.kept.push(fork);
@@ -1056,13 +1375,32 @@ impl App {
         }
         if deciding {
             self.task = Some(Task { phase: Phase::Deciding, lanes: Vec::new(), ..task });
+        } else if applying {
+            self.task = Some(Task { phase: Phase::Applying, lanes: Vec::new(), stops: Vec::new(), ..task });
+        } else if resp.outcome == Outcome::Failed && !resp.attempts.is_empty() {
+            // Only a check known in full can be run again without designing it anew.
+            let mut req = task.req;
+            if req.check.is_none() {
+                if let Some(spec) = resp.check.as_ref().filter(|c| c.files.is_empty()) {
+                    req.check = Some(spec.command.clone());
+                }
+            }
+            if req.check.is_some() {
+                let designed = resp.check.as_ref().is_some_and(|c| c.designed);
+                self.prompt = Some(Prompt::Retry {
+                    req: Box::new(req),
+                    designed,
+                    stopped: false,
+                    attempts: resp.attempts.clone(),
+                });
+            }
         }
 
         // Memory learns from failures too; the run's budget covers it.
         let spent_all = task_budget(&self.settings).is_some_and(|b| resp.cost_usd >= b);
         if self.memory_up() && !spent_all {
             self.learning.insert(trace.to_string());
-            actions.push(Action::Learn { trace });
+            actions.push(Action::Learn { trace, model: memory_model });
         }
         actions
     }
@@ -1086,11 +1424,7 @@ impl App {
                 vec![Action::Discard { fork }]
             }
             KeyCode::Char('d') => {
-                let mut lines = text::diff_lines(&resp.patch);
-                if resp.patch_truncated {
-                    lines.push(Line::from(span("(the diff is cut short here)", Tone::Dim)));
-                }
-                self.viewer = Some(Viewer { title: "diff".into(), lines, scroll: 0 });
+                self.viewer = Some(diff_viewer(&resp.patch, resp.patch_truncated));
                 Vec::new()
             }
             KeyCode::Char('k') | KeyCode::Esc => {
@@ -1103,6 +1437,72 @@ impl App {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Keys while a failed run offers a retry: the actions, or `None` to
+    /// handle the key as usual, once the offer is gone.
+    fn retry_key(&mut self, key: &KeyEvent) -> Option<Vec<Action>> {
+        let Some(Prompt::Retry { attempts, .. }) = &self.prompt else { return None };
+        let empty = self.input.text.is_empty();
+        match key.code {
+            KeyCode::Char('r') if empty && key.modifiers.is_empty() => {
+                if !matches!(self.session, SessionState::Up { .. }) {
+                    self.flash = Some("the services are not up".into());
+                    return Some(Vec::new());
+                }
+                let Some(Prompt::Retry { req, designed, .. }) = self.prompt.take() else { return None };
+                Some(self.retry(*req, designed))
+            }
+            KeyCode::Char('v') if empty && key.modifiers.is_empty() => {
+                let mut lines = Vec::new();
+                for a in attempts {
+                    lines.push(Line::from(span(format!("attempt {}", a.index + 1), Tone::Shell)));
+                    let note = if a.note.is_empty() { "(no note)".to_owned() } else { scrub(&a.note, &self.secrets) };
+                    lines.extend(block(&note, "  ", Tone::Plain));
+                    lines.push(Line::default());
+                }
+                lines.extend(lane_lines(&self.last_lanes));
+                self.viewer = Some(Viewer { title: "why the attempts failed".into(), lines, scroll: 0 });
+                Some(Vec::new())
+            }
+            KeyCode::Esc => {
+                self.prompt = None;
+                Some(Vec::new())
+            }
+            _ => {
+                self.prompt = None;
+                None
+            }
+        }
+    }
+
+    /// Run a failed task again with the check it ran with.
+    fn retry(&mut self, req: RunRequest, designed: bool) -> Vec<Action> {
+        let trace = TraceId::random();
+        self.gap();
+        self.echo(&req.task.clone());
+        let mut lines = vec![check_head(designed)];
+        if let Some(command) = &req.check {
+            lines.push(Line::from(vec![span("  $ ", Tone::Dim), span(clean_line(command), Tone::Plain)]));
+        }
+        for f in &req.check_files {
+            lines.push(Line::from(span(format!("  + {}", clean_line(&f.path)), Tone::Dim)));
+        }
+        lines.push(Line::from(span("  again, with the same check", Tone::Dim)));
+        self.log.extend(lines);
+        self.scroll = 0;
+        self.zoom = None;
+        self.task = Some(Task {
+            trace: trace.clone(),
+            req: req.clone(),
+            phase: Phase::Running,
+            lanes: Vec::new(),
+            check_shown: true,
+            recalled_shown: false,
+            notes_seen: HashSet::new(),
+            stops: Vec::new(),
+        });
+        vec![Action::Run { req, trace }]
     }
 
     fn learned(&mut self, result: Result<ConsolidateResponse, String>) {
@@ -1123,7 +1523,10 @@ impl App {
                     parts.push(format!("disputed {}", count(r.contradicted.len())));
                 }
                 if parts.is_empty() {
-                    parts.push("nothing new".into());
+                    parts.push(match &r.skipped {
+                        Some(why) => format!("nothing new: {}", clean_line(why)),
+                        None => "nothing new".into(),
+                    });
                 }
                 self.push(head(parts.join(" · ")));
                 for note in &r.added {
@@ -1210,6 +1613,124 @@ fn lane(task: &mut Task, attempt: u32) -> Option<&mut Lane> {
     task.lanes.iter_mut().find(|l| l.index == attempt)
 }
 
+fn diff_viewer(patch: &str, truncated: bool) -> Viewer {
+    let mut lines = text::diff_lines(patch);
+    if truncated {
+        lines.push(Line::from(span("(the diff is cut short here)", Tone::Dim)));
+    }
+    Viewer { title: "diff".into(), lines, scroll: 0 }
+}
+
+/// Why a designed check needs the user's look before the attempts start.
+fn check_stops(d: &DesignResponse, existing: &[String]) -> Vec<String> {
+    if d.command.is_none() {
+        return vec!["no automated check".into()];
+    }
+    let mut stops = Vec::new();
+    if d.uncounted_calls > 0 {
+        stops.push("design cost incomplete".into());
+    }
+    match &d.baseline {
+        Some(b) if b.passed => stops.push("baseline passes".into()),
+        Some(_) => {}
+        None => stops.push("baseline not run".into()),
+    }
+    match existing.len() {
+        0 => {}
+        1 => stops.push(format!("replaces {}", clean_line(&existing[0]))),
+        n => stops.push(format!("replaces {n} files")),
+    }
+    stops
+}
+
+/// Why a result needs the user's look before it is applied.
+fn apply_stops(resp: &RunResponse, rules: &ConfirmSection) -> Vec<String> {
+    let mut stops = Vec::new();
+    if resp.outcome != Outcome::Passed {
+        stops.push(outcome_name(resp.outcome).to_owned());
+    }
+    // The planner holds back what its reviewer did not approve; so does confirm mode.
+    match resp.review.as_ref().map(|r| r.verdict) {
+        Some(Verdict::Reject) => stops.push("review rejected".into()),
+        Some(Verdict::Concern) => stops.push("review questioned".into()),
+        Some(Verdict::Approve) | None => {}
+    }
+    let (added, removed) = text::diff_counts(&resp.patch);
+    if added + removed > rules.max_lines {
+        stops.push(format!("{} lines changed", added + removed));
+    }
+    if resp.changes.len() > rules.max_files {
+        stops.push(format!("{} files", resp.changes.len()));
+    }
+    let deleted = resp.changes.iter().filter(|c| c.kind == ChangeKind::Deleted).count();
+    match deleted {
+        0 => {}
+        1 => stops.push("deletes 1 file".into()),
+        n => stops.push(format!("deletes {n} files")),
+    }
+    let touched: Vec<&str> =
+        resp.changes.iter().map(|c| c.path.as_str()).filter(|p| rules.ask_paths.iter().any(|a| covers(a, p))).collect();
+    match touched.as_slice() {
+        [] => {}
+        [one] => stops.push(format!("touches {}", clean_line(one))),
+        many => stops.push(format!("touches {} protected paths", many.len())),
+    }
+    if resp.patch_truncated {
+        stops.push("diff cut short".into());
+    }
+    stops
+}
+
+/// `rule` names `path`: the same path, a directory above it (`dir/`), or its file name.
+fn covers(rule: &str, path: &str) -> bool {
+    match rule.strip_suffix('/') {
+        // A directory named alone (`migrations/`) is matched at any depth.
+        Some(dir) if !dir.contains('/') => path.starts_with(rule) || path.contains(&format!("/{rule}")),
+        Some(_) => path.starts_with(rule),
+        None => path == rule || (!rule.contains('/') && path.rsplit('/').next() == Some(rule)),
+    }
+}
+
+/// Each lane's lines under its attempt's name, for the viewer.
+fn lane_lines(lanes: &[Lane]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for lane in lanes {
+        lines.push(Line::from(span(format!("attempt {} · tool calls", lane.index + 1), Tone::Shell)));
+        lines.extend(lane.lines.iter().cloned());
+        lines.push(Line::default());
+    }
+    lines
+}
+
+/// The last `n` non-empty lines of `text`, made safe to show.
+fn last_lines(text: &str, n: usize) -> Vec<String> {
+    let lines: Vec<String> = text::clean(text.trim_end()).into_iter().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].to_vec()
+}
+
+/// `text` with every secret in it replaced.
+fn scrub(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_owned();
+    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        if out.contains(secret.as_str()) {
+            out = out.replace(secret.as_str(), "[redacted]");
+        }
+    }
+    out
+}
+
+/// `text` cut to at most `max` bytes at a character boundary, and whether it was cut.
+fn bounded(text: &str, max: usize) -> (&str, bool) {
+    if text.len() <= max {
+        return (text, false);
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
 fn check_head(designed: bool) -> Line<'static> {
     let by = if designed { "designed" } else { "yours" };
     Line::from(vec![span("◆ check", Tone::Shell), span(format!("  {by}"), Tone::Dim)])
@@ -1232,22 +1753,28 @@ fn help() -> Vec<Line<'static>> {
         row("tab", "show one attempt large; again for the next"),
         row("esc", "stop the task"),
         row("pgup / pgdn", "scroll the log"),
-        row("↑ / ↓", "earlier inputs"),
-        row("ctrl+d", "quit"),
+        row("ctrl+home / end", "the start or end of the log"),
+        row("shift+enter", "a new line in the task; also ctrl+j, or \\ then enter"),
+        row("ctrl+g", "write the task in $VISUAL or $EDITOR"),
+        row("↑ / ↓", "the line above or below, then earlier inputs"),
+        row("ctrl+d twice", "quit"),
         Line::default(),
         head("commands"),
         row("/memory [words]", "notes about this project"),
         row("/check [command]", "use this check for every task; empty: design one"),
         row("/attempts N", "attempts at once, 1 to 8"),
         row("/model NAME", "opus, sonnet, haiku or a model id"),
+        row("/memory-model NAME", "model memory learns with; same: the attempts'"),
         row("/effort LEVEL", "low, medium, high, xhigh or max"),
         row("/budget USD", "spending limit per task"),
+        row("/last", "the diff of the last finished task"),
+        row("/lanes", "the tool calls of the last finished task"),
         row("/clear", "clear the log"),
         row("/quit", "quit"),
         Line::default(),
         head("modes"),
         row("plan only", "results stay in their forks; the workspace is not changed"),
-        row("confirm", "stop to accept the check, and again before applying"),
+        row("confirm", "stop for the check or the result when one needs a look"),
         row("auto", "design the check and apply what passes"),
     ]
 }
@@ -1325,6 +1852,7 @@ mod tests {
             patch_truncated: false,
             applied: apply,
             fork: fork.map(str::to_owned),
+            review: None,
             attempts: vec![
                 AttemptReport {
                     index: 0,
@@ -1348,6 +1876,7 @@ mod tests {
             usage: Usage::default(),
             cost_usd: 0.3,
             uncounted_calls: 0,
+            checkpoint: None,
         }
     }
 
@@ -1357,12 +1886,13 @@ mod tests {
         assert_eq!(app.workspace, "~/parser");
         assert_eq!(app.mode, Mode::Confirm);
         up(&mut app);
+        app.rules.always_ask = true;
         let actions = type_in(&mut app, "accept trailing commas");
         let [Action::Design { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
         assert!(!req.apply && req.check.is_none());
         let trace = trace.clone();
 
-        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()) });
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
         assert!(matches!(app.prompt, Some(Prompt::Check(_))));
         // Typing goes nowhere while the check waits on the user.
         assert!(app.update(key(KeyCode::Char('x'))).is_empty());
@@ -1378,8 +1908,8 @@ mod tests {
         );
 
         let run = trace.to_string();
-        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 1 }));
-        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 0 }));
+        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 1, fork: None }));
+        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 0, fork: None }));
         app.update(Msg::Progress(Progress::ToolCall {
             run: run.clone(),
             attempt: 1,
@@ -1392,15 +1922,16 @@ mod tests {
             attempt: 1,
             passed: true,
             exit_code: Some(0),
+            tail: String::new(),
         }));
         // Another run's events are not this task's.
-        app.update(Msg::Progress(Progress::AttemptStarted { run: "other".into(), attempt: 5 }));
+        app.update(Msg::Progress(Progress::AttemptStarted { run: "other".into(), attempt: 5, fork: None }));
         let task = app.task.as_ref().unwrap();
         assert_eq!(task.lanes.iter().map(|l| l.index).collect::<Vec<_>>(), [0, 1]);
         assert_eq!(plain(&task.lanes[1].lines), [" 3 edit src/parser.rs", "   check passed"]);
 
         let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-1"))) });
-        assert_eq!(actions, [Action::Learn { trace: trace.clone() }]);
+        assert_eq!(actions, [Action::Learn { trace: trace.clone(), model: None }]);
         assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
         assert!(
             log(&app).contains("✓ passed  1 file  +2 −1\n  Trailing commas parse.\n  modified src/parser.rs"),
@@ -1453,10 +1984,12 @@ mod tests {
     fn the_check_can_be_edited_dropped_or_refused() {
         let mut app = App::new("/w", None);
         up(&mut app);
+        // These are about the prompts themselves.
+        app.rules.always_ask = true;
         let actions = type_in(&mut app, "task");
         let [Action::Design { trace, .. }] = actions.as_slice() else { panic!() };
         let trace = trace.clone();
-        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()) });
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
         app.update(key(KeyCode::Char('e')));
         assert_eq!(app.input.text, "cargo test --test commas");
         app.update(ctrl_key('u'));
@@ -1470,16 +2003,20 @@ mod tests {
 
         // Esc while it runs stops everything.
         let actions = app.update(key(KeyCode::Esc));
-        assert_eq!(actions, [Action::Interrupt { keep: vec![] }]);
+        assert_eq!(actions, [Action::Interrupt { keep: vec![], attempts: vec![], check_files: vec![] }]);
         assert!(app.task.is_none());
         assert_eq!(app.session, SessionState::Starting);
-        assert_eq!(app.update(Msg::Stopped), [Action::StartSession]);
+        assert_eq!(app.update(Msg::Stopped { kept: vec![] }), [Action::StartSession]);
 
         // A design that fails ends the task.
         up(&mut app);
         let actions = type_in(&mut app, "task");
         let [Action::Design { trace, .. }] = actions.as_slice() else { panic!() };
-        app.update(Msg::Designed { trace: trace.clone(), result: Err("planner.design failed".into()) });
+        app.update(Msg::Designed {
+            trace: trace.clone(),
+            result: Err("planner.design failed".into()),
+            existing: vec![],
+        });
         assert!(app.task.is_none());
         assert!(log(&app).ends_with("✗ no check: planner.design failed"), "{}", log(&app));
     }
@@ -1507,6 +2044,53 @@ mod tests {
             "{}",
             log(&app)
         );
+    }
+
+    #[test]
+    fn memory_learns_with_the_model_set_for_it() {
+        // What the next run's learning asks for, after `commands`.
+        let learns_with = |commands: &[&str]| {
+            let mut app = App::new("/w", None);
+            up(&mut app);
+            for c in commands.iter().chain(&["/check make test"]) {
+                assert!(type_in(&mut app, c).is_empty(), "{c}");
+            }
+            let actions = type_in(&mut app, "task");
+            let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+            let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/f"))) });
+            // Confirm mode applies the passing result first.
+            let [Action::Apply { .. }, Action::Learn { model, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+            model.clone()
+        };
+        assert_eq!(learns_with(&[]), None, "memory's own default");
+        assert_eq!(learns_with(&["/model opus"]), None, "/model is for the attempts only");
+        assert_eq!(learns_with(&["/memory-model glm-4.6"]).as_deref(), Some("glm-4.6"));
+        assert_eq!(learns_with(&["/model glm-4.6", "/memory-model same"]).as_deref(), Some("glm-4.6"));
+        assert_eq!(learns_with(&["/memory-model same"]), None, "the attempts use the default too");
+        assert_eq!(learns_with(&["/memory-model haiku", "/memory-model default"]), None);
+
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/memory-model glm-4.6");
+        assert_eq!(app.flash.as_deref(), Some("memory model: glm-4.6"));
+        type_in(&mut app, "/memory-model same");
+        assert_eq!(app.flash.as_deref(), Some("memory model: the attempts' model"));
+        assert!(plain(&help()).iter().any(|l| l.contains("/memory-model NAME")));
+    }
+
+    #[test]
+    fn learning_that_was_skipped_says_why() {
+        let mut app = App::new("/w", None);
+        let skipped = ConsolidateResponse {
+            added: vec![],
+            reinforced: vec![],
+            contradicted: vec![],
+            skipped: Some("the episode held nothing worth keeping".into()),
+            usage: Usage::default(),
+            cost_usd: 0.01,
+        };
+        app.learned(Ok(skipped));
+        assert!(log(&app).ends_with("◇ memory  nothing new: the episode held nothing worth keeping"), "{}", log(&app));
     }
 
     #[test]
@@ -1582,7 +2166,7 @@ mod tests {
         type_in(&mut app, "task");
         let trace = app.task.as_ref().unwrap().trace.clone();
         let d = DesignResponse { uncounted_calls: 2, ..design() };
-        app.update(Msg::Designed { trace, result: Ok(d) });
+        app.update(Msg::Designed { trace, result: Ok(d), existing: vec![] });
         let frame = frame_text(&mut app);
         assert!(
             frame.contains("cost incomplete")
@@ -1610,11 +2194,12 @@ mod tests {
             type_in(&mut app, "task");
             let trace = app.task.as_ref().unwrap().trace.clone();
             app.settings.budget_usd = Some(100.0); // Next-task settings cannot raise this task's budget.
-            app.update(Msg::Designed {
+                                                   // Nothing stops confirm mode here, so the attempts start right away.
+            let actions = app.update(Msg::Designed {
                 trace,
                 result: Ok(DesignResponse { remaining_budget_usd: remaining, ..design() }),
+                existing: vec![],
             });
-            let actions = app.update(key(KeyCode::Enter));
             match expected {
                 Some(budget) => {
                     let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
@@ -1643,12 +2228,12 @@ mod tests {
             uncounted_calls: 1,
             ..design()
         };
-        assert!(app.update(Msg::Designed { trace: trace.clone(), result: Ok(d) }).is_empty());
+        assert!(app.update(Msg::Designed { trace: trace.clone(), result: Ok(d), existing: vec![] }).is_empty());
         assert!(app.task.is_none() && app.prompt.is_none());
         assert_eq!((app.spent_usd, app.uncounted_calls), (0.25, 1));
         assert!(log(&app).contains("$0.25 known · 1 calls uncounted"));
         assert!(frame_text(&mut app).contains("1 calls uncounted"));
-        app.update(Msg::Designed { trace, result: Ok(design()) });
+        app.update(Msg::Designed { trace, result: Ok(design()), existing: vec![] });
         assert_eq!(app.spent_usd, 0.25, "late replies are not counted twice");
     }
 
@@ -1656,12 +2241,454 @@ mod tests {
     fn quitting_keeps_a_result_still_waiting_on_the_user() {
         let mut app = App::new("/w", None);
         up(&mut app);
+        // These are about the prompts themselves.
+        app.rules.always_ask = true;
         let actions = type_in(&mut app, "/check true");
         assert!(actions.is_empty());
         let actions = type_in(&mut app, "task");
         let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
         app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-9"))) });
         assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
+        assert!(app.update(ctrl_key('d')).is_empty());
+        assert_eq!(app.flash.as_deref(), Some("ctrl+d again to quit; 1 result stays in its fork"));
         assert_eq!(app.update(ctrl_key('d')), [Action::Quit { keep: vec!["/d/work/fork-9".into()] }]);
+    }
+
+    #[test]
+    fn the_log_shows_long_summaries_every_change_and_every_note_in_full() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "/check true");
+        assert!(actions.is_empty());
+        let actions = type_in(&mut app, "task");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
+        let trace = trace.clone();
+        let notes = (0..8)
+            .map(|i| RecalledNote { id: format!("note_{i}"), text: format!("fact {i}"), confidence: 0.5 })
+            .collect();
+        app.update(Msg::Progress(Progress::Recalled { run: trace.to_string(), notes, map_tokens: None }));
+        let mut resp = passed(false, Some("/d/work/fork-3"));
+        resp.summary = (0..200).map(|i| format!("summary line {i}")).collect::<Vec<_>>().join("\n");
+        resp.changes = (0..30).map(|i| Change { path: format!("src/f{i}.rs"), kind: ChangeKind::Modified }).collect();
+        app.update(Msg::Ran { trace, result: Ok(resp) });
+        let log = log(&app);
+        for i in 0..8 {
+            assert!(log.contains(&format!("0.50 fact {i}")), "{log}");
+        }
+        for i in 0..200 {
+            assert!(log.contains(&format!("  summary line {i}\n")), "{log}");
+        }
+        for i in 0..30 {
+            assert!(log.contains(&format!("  modified src/f{i}.rs")), "{log}");
+        }
+        assert!(!log.contains("more lines") && !log.contains(" more\n"), "{log}");
+    }
+
+    #[test]
+    fn a_failed_summary_is_shown_in_full_and_only_a_runaway_one_is_cut() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "task");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
+        let mut resp = passed(false, None);
+        resp.outcome = Outcome::Failed;
+        resp.winner = None;
+        resp.changes = vec![];
+        resp.summary = (0..200).map(|i| format!("why {i}")).collect::<Vec<_>>().join("\n");
+        app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+        assert!(log(&app).contains("  why 0\n") && log(&app).contains("  why 199"), "{}", log(&app));
+        assert!(!log(&app).contains("cut at"), "{}", log(&app));
+
+        let actions = type_in(&mut app, "task");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
+        let mut resp = passed(false, Some("/d/work/fork-4"));
+        resp.summary = "é".repeat(SUMMARY_BYTES);
+        app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+        let note = format!("  (cut at 1 MB; the whole text is in the audit log, trace {trace})");
+        assert!(log(&app).contains(&note), "the cut is said, with where to find the rest");
+    }
+
+    #[test]
+    fn the_last_diff_opens_again_after_the_task_ends() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        // These are about the prompts themselves.
+        app.rules.always_ask = true;
+        type_in(&mut app, "/last");
+        assert_eq!(app.flash.as_deref(), Some("no task has finished with changes yet"));
+        type_in(&mut app, "/check true");
+        for end in [KeyCode::Char('y'), KeyCode::Char('k'), KeyCode::Char('n')] {
+            let actions = type_in(&mut app, "task");
+            let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
+            app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-5"))) });
+            app.update(key(end));
+            if end == KeyCode::Char('y') {
+                app.update(Msg::Applied(Ok(())));
+            }
+            assert!(app.task.is_none() && app.prompt.is_none());
+            type_in(&mut app, "/last");
+            let viewer = app.viewer.take().expect("the diff opens");
+            assert_eq!(viewer.title, "diff");
+            assert!(plain(&viewer.lines).iter().any(|l| l.contains("+c")), "{:?}", plain(&viewer.lines));
+        }
+    }
+
+    #[test]
+    fn home_and_end_jump_through_the_log_unless_there_is_text_to_edit() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.update(key(KeyCode::Home));
+        assert_eq!(app.scroll, usize::MAX);
+        app.update(key(KeyCode::End));
+        assert_eq!(app.scroll, 0);
+        app.update(Msg::Paste("abc".into()));
+        app.update(key(KeyCode::Home));
+        assert_eq!((app.scroll, app.input.cursor), (0, 0), "home moves the cursor");
+        app.update(Msg::Key(KeyEvent {
+            code: KeyCode::Home,
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }));
+        assert_eq!(app.scroll, usize::MAX);
+    }
+
+    fn failed(attempts: Vec<AttemptReport>) -> RunResponse {
+        RunResponse {
+            outcome: Outcome::Failed,
+            winner: None,
+            summary: "No attempt passed the done-check.".into(),
+            changes: vec![],
+            patch: String::new(),
+            attempts,
+            ..passed(false, None)
+        }
+    }
+
+    fn attempt(index: u32, status: AttemptStatus, note: &str) -> AttemptReport {
+        AttemptReport {
+            index,
+            status,
+            turns: 3,
+            check_runs: 2,
+            usage: Usage::default(),
+            cost_usd: 0.1,
+            note: note.into(),
+        }
+    }
+
+    #[test]
+    fn a_failed_run_says_why_and_retries_with_the_same_check() {
+        let mut app = App::new("/w", None);
+        app.secrets = vec!["sk-ant-secret-1234".into()];
+        up(&mut app);
+        // These are about the prompts themselves.
+        app.rules.always_ask = true;
+        let actions = type_in(&mut app, "accept trailing commas");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
+        let actions = app.update(key(KeyCode::Enter));
+        let [Action::Run { req: first, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let first = first.clone();
+
+        let run = trace.to_string();
+        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 0, fork: None }));
+        app.update(Msg::Progress(Progress::CheckRan {
+            run: run.clone(),
+            attempt: 0,
+            passed: false,
+            exit_code: Some(101),
+            tail: "stdout:\nrunning 1 test\nkey sk-ant-secret-1234\nassertion failed: commas\n".into(),
+        }));
+        assert_eq!(
+            plain(&app.task.as_ref().unwrap().lanes[0].lines),
+            ["   check failed (exit 101)", "   key [redacted]", "   assertion failed: commas"]
+        );
+
+        let note = (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n") + "\nsk-ant-secret-1234";
+        let resp = failed(vec![
+            attempt(0, AttemptStatus::Failed, &note),
+            attempt(1, AttemptStatus::Error, "model call failed: overloaded"),
+        ]);
+        let actions = app.update(Msg::Ran { trace, result: Ok(resp) });
+        assert_eq!(actions.len(), 1, "only learning: {actions:?}");
+        let log = log(&app);
+        assert!(
+            log.contains("  ✗ attempt 1 failed · 3 turns · 2 checks · $0.10\n      line 6\n      line 7\n      line 8\n      line 9\n      line 10\n      [redacted]\n  ! attempt 2 error"),
+            "{log}"
+        );
+        assert!(log.contains("      model call failed: overloaded"), "{log}");
+        assert!(!log.contains("line 5") && !log.contains("sk-ant"), "{log}");
+
+        app.update(key(KeyCode::Char('v')));
+        let viewer = app.viewer.take().expect("why opens");
+        let shown = plain(&viewer.lines).join("\n");
+        assert!(shown.contains("  line 1\n") && shown.contains("attempt 1 · tool calls"), "{shown}");
+        assert!(!shown.contains("sk-ant"), "{shown}");
+
+        let actions = app.update(key(KeyCode::Char('r')));
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("a run, and no design: {actions:?}") };
+        assert_eq!((&req.check, &req.check_files), (&first.check, &first.check_files));
+        assert_eq!(req.check.as_deref(), Some("cargo test --test commas"));
+        assert!(app.prompt.is_none() && app.task.is_some());
+    }
+
+    #[test]
+    fn typing_after_a_failure_starts_a_new_task_and_the_lanes_stay_viewable() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/check make test");
+        let actions = type_in(&mut app, "task");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
+        let run = trace.to_string();
+        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 0, fork: None }));
+        app.update(Msg::Progress(Progress::ToolCall {
+            run,
+            attempt: 0,
+            turn: 1,
+            tool: "read_file".into(),
+            detail: "read Makefile".into(),
+        }));
+        app.update(Msg::Ran { trace: trace.clone(), result: Ok(failed(vec![attempt(0, AttemptStatus::Failed, "x")])) });
+        assert!(matches!(app.prompt, Some(Prompt::Retry { .. })));
+        // A key that is not the offer's goes to the input and ends the offer.
+        app.update(key(KeyCode::Char('f')));
+        assert!(app.prompt.is_none());
+        assert_eq!(app.input.text, "f");
+        app.update(ctrl_key('u'));
+        type_in(&mut app, "/lanes");
+        let viewer = app.viewer.take().expect("the last task's attempts");
+        assert_eq!(plain(&viewer.lines)[..2], ["attempt 1 · tool calls", " 1 read Makefile"]);
+    }
+
+    #[test]
+    fn quitting_takes_a_second_press_soon_after_the_first() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        assert!(app.update(ctrl_key('d')).is_empty());
+        assert_eq!(app.flash.as_deref(), Some("ctrl+d again to quit"));
+        assert!(!app.quit);
+        // Too late: the second press only warns again.
+        for _ in 0..=QUIT_TICKS {
+            app.update(Msg::Tick);
+        }
+        assert!(app.update(ctrl_key('c')).is_empty());
+        assert_eq!(app.flash.as_deref(), Some("ctrl+c again to quit"));
+        assert_eq!(app.update(ctrl_key('c')), [Action::Quit { keep: vec![] }]);
+
+        // Another key in between starts over.
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.update(ctrl_key('d'));
+        app.update(key(KeyCode::Left));
+        assert!(app.update(ctrl_key('d')).is_empty());
+        // A signal still quits at once.
+        assert_eq!(app.update(Msg::Signal), [Action::Quit { keep: vec![] }]);
+    }
+
+    #[test]
+    fn an_interrupt_keeps_the_attempts_forks_and_offers_to_start_again() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        // These are about the prompts themselves.
+        app.rules.always_ask = true;
+        let actions = type_in(&mut app, "task");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
+        let actions = app.update(key(KeyCode::Enter));
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let first = req.clone();
+        let run = trace.to_string();
+        for (attempt, fork) in [(0, Some("/d/work/fork-a")), (1, Some("/d/work/fork-b")), (2, None)] {
+            app.update(Msg::Progress(Progress::AttemptStarted {
+                run: run.clone(),
+                attempt,
+                fork: fork.map(str::to_owned),
+            }));
+        }
+        let actions = app.update(key(KeyCode::Esc));
+        assert_eq!(
+            actions,
+            [Action::Interrupt {
+                keep: vec![],
+                attempts: vec!["/d/work/fork-a".into(), "/d/work/fork-b".into()],
+                check_files: vec!["tests/commas.rs".into()],
+            }]
+        );
+        // The runtime found changes in one of them.
+        assert_eq!(app.update(Msg::Stopped { kept: vec!["/d/work/fork-b".into()] }), [Action::StartSession]);
+        assert_eq!(app.kept, ["/d/work/fork-b"]);
+        assert!(log(&app).ends_with("  kept 1 · interrupted\n  kept in /d/work/fork-b"), "{}", log(&app));
+
+        assert!(matches!(app.prompt, Some(Prompt::Retry { stopped: true, .. })));
+        assert!(app.update(key(KeyCode::Char('r'))).is_empty(), "not while the services restart");
+        up(&mut app);
+        let actions = app.update(key(KeyCode::Char('r')));
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!((&req.check, &req.check_files), (&first.check, &first.check_files));
+    }
+
+    #[test]
+    fn confirm_mode_goes_through_a_clean_task_without_a_key() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "accept trailing commas");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        let actions = app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("no stop for the check: {actions:?}") };
+        assert_eq!(req.check.as_deref(), Some("cargo test --test commas"));
+        assert!(app.prompt.is_none());
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-1"))) });
+        assert_eq!(actions, [Action::Apply { fork: "/d/work/fork-1".into() }, Action::Learn { trace, model: None }]);
+        assert!(app.prompt.is_none());
+        app.update(Msg::Applied(Ok(())));
+        let log = log(&app);
+        assert!(log.contains("  $ cargo test --test commas") && log.ends_with("  applied"), "{log}");
+        assert!(app.task.is_none());
+    }
+
+    /// The check's prompt, and why it is up, for a design and the files it would replace.
+    fn check_stop(d: DesignResponse, existing: &[&str]) -> Vec<String> {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "task");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let existing = existing.iter().map(|e| e.to_string()).collect();
+        let actions = app.update(Msg::Designed { trace: trace.clone(), result: Ok(d), existing });
+        assert!(actions.is_empty() && matches!(app.prompt, Some(Prompt::Check(_))), "{actions:?}");
+        app.task.as_ref().unwrap().stops.clone()
+    }
+
+    #[test]
+    fn confirm_mode_stops_for_a_check_that_needs_a_look() {
+        assert_eq!(
+            check_stop(DesignResponse { command: None, files: vec![], ..design() }, &[]),
+            ["no automated check"]
+        );
+        let passing = Baseline { passed: true, exit_code: Some(0), tail: String::new() };
+        assert_eq!(check_stop(DesignResponse { baseline: Some(passing), ..design() }, &[]), ["baseline passes"]);
+        assert_eq!(check_stop(DesignResponse { baseline: None, ..design() }, &[]), ["baseline not run"]);
+        assert_eq!(check_stop(design(), &["tests/commas.rs"]), ["replaces tests/commas.rs"]);
+    }
+
+    /// Why the result's prompt is up, for a result.
+    fn apply_stop(resp: RunResponse) -> Vec<String> {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "task");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+        assert!(!actions.iter().any(|a| matches!(a, Action::Apply { .. })), "{actions:?}");
+        assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
+        app.task.as_ref().unwrap().stops.clone()
+    }
+
+    #[test]
+    fn confirm_mode_stops_for_a_result_that_needs_a_look() {
+        let ok = || passed(false, Some("/d/work/fork-1"));
+        assert_eq!(apply_stop(RunResponse { outcome: Outcome::Unverified, ..ok() }), ["unverified"]);
+        let patch = format!("--- a/x\n+++ b/x\n@@\n{}", "+line\n".repeat(301));
+        assert_eq!(apply_stop(RunResponse { patch, ..ok() }), ["301 lines changed"]);
+        let changes = (0..11).map(|i| Change { path: format!("src/f{i}.rs"), kind: ChangeKind::Modified }).collect();
+        assert_eq!(apply_stop(RunResponse { changes, ..ok() }), ["11 files"]);
+        let changes = vec![
+            Change { path: "src/old.rs".into(), kind: ChangeKind::Deleted },
+            Change { path: "src/new.rs".into(), kind: ChangeKind::Added },
+        ];
+        assert_eq!(apply_stop(RunResponse { changes, ..ok() }), ["deletes 1 file"]);
+        let changes = vec![Change { path: "crates/a/Cargo.toml".into(), kind: ChangeKind::Modified }];
+        assert_eq!(apply_stop(RunResponse { changes, ..ok() }), ["touches crates/a/Cargo.toml"]);
+        assert_eq!(apply_stop(RunResponse { patch_truncated: true, ..ok() }), ["diff cut short"]);
+        let review = |verdict| Some(molt_api::planner::Review { verdict, findings: vec![] });
+        assert_eq!(apply_stop(RunResponse { review: review(Verdict::Reject), ..ok() }), ["review rejected"]);
+        assert_eq!(apply_stop(RunResponse { review: review(Verdict::Concern), ..ok() }), ["review questioned"]);
+    }
+
+    #[test]
+    fn protected_paths_match_files_directories_and_names() {
+        assert!(covers(".github/", ".github/workflows/ci.yml"));
+        assert!(covers("migrations/", "db/migrations/001.sql"));
+        assert!(!covers("migrations/", "src/migrations.rs"));
+        assert!(covers("db/schema/", "db/schema/a.sql") && !covers("db/schema/", "x/db/schema/a.sql"));
+        assert!(covers("Cargo.toml", "Cargo.toml") && covers("Cargo.toml", "crates/a/Cargo.toml"));
+        assert!(!covers("Cargo.toml", "Cargo.toml.bak"));
+        assert!(covers("src/lib.rs", "src/lib.rs") && !covers("src/lib.rs", "a/src/lib.rs"));
+    }
+
+    fn with_mods(code: KeyCode, modifiers: KeyModifiers) -> Msg {
+        Msg::Key(KeyEvent { code, modifiers, kind: KeyEventKind::Press, state: KeyEventState::NONE })
+    }
+
+    #[test]
+    fn a_task_can_hold_several_lines() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.update(Msg::Paste("fix the parser".into()));
+        app.update(with_mods(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.update(Msg::Paste("keep the API".into()));
+        app.update(ctrl_key('j'));
+        app.update(Msg::Paste("and the docs\\".into()));
+        app.update(key(KeyCode::Enter));
+        app.update(Msg::Paste("too".into()));
+        assert_eq!(app.input.text, "fix the parser\nkeep the API\nand the docs\ntoo");
+
+        // Up and Down move between the lines before they reach the history.
+        app.update(key(KeyCode::Up));
+        app.update(key(KeyCode::Up));
+        assert_eq!(app.input.cursor, "fix the parser\nkeep".chars().count() - 1);
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Down));
+        assert_eq!(app.input.cursor, app.input.text.chars().count());
+
+        let actions = app.update(key(KeyCode::Enter));
+        let [Action::Design { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.task, "fix the parser\nkeep the API\nand the docs\ntoo");
+        assert!(log(&app).ends_with("› fix the parser\n  keep the API\n  and the docs\n  too"), "{}", log(&app));
+    }
+
+    #[test]
+    fn a_paste_keeps_its_lines_and_tabs_and_loses_escape_sequences() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.update(Msg::Paste("error[E0308]:\r\n\tmismatched \u{1b}[31mtypes\u{1b}[0m\u{1b}]0;title\u{7}\u{8}".into()));
+        assert_eq!(app.input.text, "error[E0308]:\n\tmismatched types");
+        let actions = app.update(key(KeyCode::Enter));
+        let [Action::Design { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.task, "error[E0308]:\n\tmismatched types");
+    }
+
+    #[test]
+    fn a_long_paste_shows_folded_and_is_sent_in_full() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let trace = (1..=143).map(|i| format!("frame {i}")).collect::<Vec<_>>().join("\n");
+        app.update(Msg::Paste("why does this panic?\n".into()));
+        app.update(Msg::Paste(trace.clone()));
+        assert_eq!(app.input.text, "why does this panic?\n[pasted #1: 143 lines]");
+        // The editor gets it in full.
+        let actions = app.update(ctrl_key('g'));
+        assert_eq!(actions, [Action::Edit { text: format!("why does this panic?\n{trace}") }]);
+        let actions = app.update(key(KeyCode::Enter));
+        let [Action::Design { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.task, format!("why does this panic?\n{trace}"));
+    }
+
+    #[test]
+    fn the_editor_fills_the_input() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.update(Msg::Paste("draft".into()));
+        assert_eq!(app.update(ctrl_key('g')), [Action::Edit { text: "draft".into() }]);
+        app.update(Msg::Edited(Ok("step one\nstep two\n".into())));
+        assert_eq!((app.input.text.as_str(), app.input.cursor), ("step one\nstep two", 17));
+        app.update(Msg::Edited(Err("vi exit status: 1".into())));
+        assert_eq!(app.flash.as_deref(), Some("the editor failed: vi exit status: 1"));
+        assert_eq!(app.input.text, "step one\nstep two", "a failed edit keeps the input");
     }
 }
