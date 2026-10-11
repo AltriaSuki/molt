@@ -30,9 +30,11 @@ and the README are in English.
 
 You need:
 
-- Rust stable with `rustfmt` and `clippy` (`rustup component add rustfmt clippy`).
+- Rust via rustup: `rust-toolchain.toml` pins the release, `rustfmt` and `clippy`.
+  Keep the release fixed for a change; upgrade it in its own PR and run the full suite.
 - `nats-server` for the NATS conformance and end-to-end tests:
-  `go install github.com/nats-io/nats-server/v2@latest`, then
+  use the Go release and NATS version in `.github/ci-versions.toml`, then
+  `go install github.com/nats-io/nats-server/v2@v2.15.1` and
   `export MOLT_NATS_SERVER=$(go env GOPATH)/bin/nats-server`. Without it those
   tests print a notice and pass; CI always runs them.
 - On Linux, `bubblewrap` 0.9+ and working unprivileged user namespaces for
@@ -57,6 +59,14 @@ If you touched `bench/tasks`, also run `molt bench validate` (or
 A change that fixes a bug comes with a test that fails without the fix. A
 CI-only failure is still yours to root-cause: "flaky" is not a cause. Never
 skip, disable or loosen a test to get green.
+
+CI reads the Rust pin from `rust-toolchain.toml` and the Go/NATS pins from
+`.github/ci-versions.toml`; it never selects `stable` or `latest`. NATS binaries
+are cached by OS, architecture, Go version and server version with no fallback
+key, and their reported version is checked even on cache hits. Go's automatic
+toolchain downloads are disabled. Action implementations are pinned to commit
+SHAs. Upgrade dependencies in a dedicated PR, update the setup instructions
+when needed, and verify the full CI suite before considering the upgrade ready.
 
 ## What every change must keep true
 

@@ -1,0 +1,3 @@
+# Upgrade build dependencies in a dedicated PR, validated by the full CI suite.
+go = "1.27.2"
+nats = "v2.15.1"

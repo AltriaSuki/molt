@@ -1631,6 +1631,7 @@ dependencies = [
  "molt-api",
  "molt-proto",
  "molt-sdk",
+ "molt-transport",
  "serde",
  "serde_json",
  "tempfile",

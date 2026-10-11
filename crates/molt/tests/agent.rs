@@ -17,7 +17,7 @@ use molt::agent::{run_task, Done, Interrupted, Learn};
 use molt::{Config, Secrets, TransportKind};
 use molt_api::fs::{ChangeKind, DROP, FORK, MERGE, WRITE};
 use molt_api::model::COMPLETE;
-use molt_api::planner::tools::{RUN, SUBMIT_CHECK, WRITE_FILE};
+use molt_api::planner::tools::{RUN, SUBMIT_CHECK, SUBMIT_REVIEW, WRITE_FILE};
 use molt_api::planner::{AttemptStatus, CheckSpec, Outcome, RunRequest, RunResponse, RUN as PLANNER_RUN};
 use molt_api::progress::Progress;
 use molt_api::shell::RUN as RUN_CHECK;
@@ -88,6 +88,15 @@ impl Respond for FakeApi {
                 json!({ "type": "text", "text": text }),
             ];
             return message(n, model, content, "end_turn", stream);
+        }
+        // The reviewer of a passing result approves it.
+        if body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_REVIEW)) {
+            let input = json!({ "verdict": "approve", "findings": [] });
+            let content = vec![
+                json!({ "type": "thinking", "thinking": "", "signature": signature(n) }),
+                tool_use(n, SUBMIT_REVIEW, input),
+            ];
+            return message(n, model, content, "tool_use", stream);
         }
         let designer = body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_CHECK));
         let last = messages.last().cloned().unwrap_or(Value::Null);
@@ -441,6 +450,7 @@ fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) ->
         "MOLT_BUDGET_USD",
         "MOLT_CHECK_TIMEOUT_S",
         "MOLT_MAP_TOKENS",
+        "MOLT_CONTEXT_TOKENS",
         "MOLT_MEMORY_MODEL",
         "MOLT_MEMORY_EFFORT",
         "MOLT_MEMORY_MAX_TOKENS",
@@ -1127,6 +1137,8 @@ async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
     assert_eq!(bodies(&server).await.iter().filter(|b| offers_submit_check(b)).count(), 2);
     assert_eq!(setup.files(), ["README.txt"], "nothing is applied before the user says so");
     let fork = resp.fork.clone().expect("the result is kept for the user");
+    // What an interrupt asks of a fork, to keep it only when it holds work.
+    assert_eq!(session.changes(&fork).await.unwrap(), ["check.sh", "greeting.txt"]);
     session.apply(&fork).await.unwrap();
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
     assert_eq!(setup.file("check.sh").as_deref(), Some(format!("{CHECK}\n").as_str()));
@@ -1137,6 +1149,7 @@ async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
     }
     assert!(seen.iter().all(|e| e.run() == trace.as_str()), "{seen:#?}");
     assert!(seen.iter().any(|e| matches!(e, Progress::CheckReady { designed: true, .. })), "{seen:#?}");
+    assert!(seen.iter().any(|e| matches!(e, Progress::AttemptStarted { fork: Some(_), .. })), "{seen:#?}");
 
     let learned = session.learn(&trace, Some("haiku".into())).await.unwrap();
     assert_eq!(learned.added.len(), 1, "{learned:#?}");
@@ -1151,4 +1164,34 @@ async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
     session.shutdown(&[]).await;
     assert_requests_valid(&server).await;
     setup.assert_forks_dropped();
+}
+
+#[tokio::test]
+async fn a_checkpointed_run_that_runs_out_of_budget_is_resumed_with_its_fork() {
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let mut req = setup.request(Some(CHECK), 1);
+    req.checkpoint = true;
+    // The first model call spends it all.
+    req.budget_usd = Some(0.000_001);
+    let trace = molt_proto::TraceId::random();
+    let stopped = molt::agent::run_task_as(&setup.cfg, req, trace.clone(), None, |_| {}, std::future::pending());
+    let stopped = tokio::time::timeout(RUN_LIMIT, stopped).await.expect("the run hung").unwrap().run;
+    assert_eq!(stopped.checkpoint.as_deref(), Some(trace.as_str()), "{stopped:#?}");
+    let runs = setup.data.path().join(molt::config::RUNS);
+    let saved = molt_planner::checkpoint::load(&runs, trace.as_str()).unwrap();
+    let fork = saved.attempts[0].fork.clone().expect("the attempt had a fork");
+    assert!(std::path::Path::new(&fork).is_dir(), "the fork is kept for the resume");
+    assert_eq!(setup.file("greeting.txt"), None);
+
+    let mut req = saved.request.clone();
+    req.resume = Some(molt_api::planner::Resume { run: trace.to_string(), retry: false });
+    req.budget_usd = Some(10.0);
+    let resumed = molt::agent::run_task_as(&setup.cfg, req, trace.clone(), None, |_| {}, std::future::pending());
+    let resumed = tokio::time::timeout(RUN_LIMIT, resumed).await.expect("the run hung").unwrap().run;
+    assert_eq!(resumed.outcome, Outcome::Passed, "{resumed:#?}");
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    assert!(resumed.cost_usd > stopped.cost_usd, "the cost goes on: {} then {}", stopped.cost_usd, resumed.cost_usd);
+    assert!(molt_planner::checkpoint::load(&runs, trace.as_str()).is_err(), "a finished run keeps no checkpoint");
+    assert!(!std::path::Path::new(&fork).exists());
 }
