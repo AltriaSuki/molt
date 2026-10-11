@@ -543,6 +543,7 @@ mod tests {
             patch_truncated: false,
             applied: true,
             fork: None,
+            review: None,
             attempts: vec![AttemptReport {
                 index: 1,
                 status: AttemptStatus::Passed,

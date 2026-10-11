@@ -146,6 +146,10 @@ struct RunArgs {
     /// model call after the run).
     #[arg(long)]
     no_learn: bool,
+    /// Do not have a reviewer look at a passing result before it is applied
+    /// (the review is more model calls, and holds back what it questions).
+    #[arg(long)]
+    no_review: bool,
 }
 
 #[derive(Args)]
@@ -555,6 +559,7 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     req.apply = !args.common.no_apply;
     req.stream = args.common.stream;
     req.checkpoint = args.checkpoint;
+    req.review = !args.common.no_review;
     execute(&cfg, req, TraceId::random(), &args.common, stop).await
 }
 

@@ -85,6 +85,11 @@ pub struct RunRequest {
     /// Publish model text previews while calls are in flight.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stream: bool,
+    /// Have a reviewer look at a winner that passed its check, for changes
+    /// that game the check, before it is applied. With `apply`, only an
+    /// approved result is merged.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub review: bool,
     /// Save a checkpoint as the run goes, so that a run stopped before it
     /// finished (interrupted, out of budget, killed) can go on with
     /// `resume`. Needs a planner that keeps checkpoints.
@@ -127,6 +132,7 @@ impl RunRequest {
             stream: false,
             checkpoint: false,
             resume: None,
+            review: true,
         }
     }
 }
@@ -193,6 +199,28 @@ pub struct DesignResponse {
     pub cost_usd: f64,
 }
 
+/// What the reviewer made of a winner's changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// The changes do the task.
+    Approve,
+    /// Something needs a person's look before the changes are used.
+    Concern,
+    /// The changes game the check rather than do the task.
+    Reject,
+}
+
+/// The review of a winner that passed its check.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Review {
+    pub verdict: Verdict,
+    /// What it rests on, each citing the diff where it can: the fixed rules'
+    /// findings first, then the reviewer model's.
+    #[serde(default)]
+    pub findings: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptStatus {
@@ -241,6 +269,10 @@ pub struct RunResponse {
     /// Where the winner's files are when they were not merged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork: Option<String>,
+    /// The winner's review; absent when there was none (no winner, no
+    /// check, no changes, or review turned off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<Review>,
     pub attempts: Vec<AttemptReport>,
     /// Totals over the designer and every attempt.
     pub usage: Usage,
@@ -273,6 +305,8 @@ pub mod tools {
     pub const RECALL: &str = "recall";
     /// Offered only to the check designer: the check it settled on.
     pub const SUBMIT_CHECK: &str = "submit_check";
+    /// Offered only to the reviewer: its verdict.
+    pub const SUBMIT_REVIEW: &str = "submit_review";
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ReadFile {
@@ -348,6 +382,13 @@ pub mod tools {
         pub files: Vec<String>,
         pub rationale: String,
     }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SubmitReview {
+        pub verdict: super::Verdict,
+        #[serde(default)]
+        pub findings: Vec<String>,
+    }
 }
 
 #[cfg(test)]
@@ -362,7 +403,9 @@ mod tests {
         assert!(req.apply);
         assert!(req.verify);
         // Requests from callers that know neither field stay as they were.
+        assert!(req.review);
         let wire = serde_json::to_value(&req).unwrap();
         assert!(wire.get("verify").is_none() && wire.get("check_files").is_none(), "{wire}");
+        assert!(wire.get("review").is_none(), "{wire}");
     }
 }

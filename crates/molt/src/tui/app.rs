@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use molt_api::fs::ChangeKind;
 use molt_api::memory::{ConsolidateResponse, Recalled};
 use molt_api::model::Effort;
-use molt_api::planner::{AttemptReport, AttemptStatus, DesignResponse, Outcome, RunRequest, RunResponse};
+use molt_api::planner::{AttemptReport, AttemptStatus, DesignResponse, Outcome, RunRequest, RunResponse, Verdict};
 use molt_api::progress::Progress;
 use molt_proto::TraceId;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -1598,6 +1598,12 @@ fn apply_stops(resp: &RunResponse, rules: &ConfirmSection) -> Vec<String> {
     if resp.outcome != Outcome::Passed {
         stops.push(outcome_name(resp.outcome).to_owned());
     }
+    // The planner holds back what its reviewer did not approve; so does confirm mode.
+    match resp.review.as_ref().map(|r| r.verdict) {
+        Some(Verdict::Reject) => stops.push("review rejected".into()),
+        Some(Verdict::Concern) => stops.push("review questioned".into()),
+        Some(Verdict::Approve) | None => {}
+    }
     let (added, removed) = text::diff_counts(&resp.patch);
     if added + removed > rules.max_lines {
         stops.push(format!("{} lines changed", added + removed));
@@ -1790,6 +1796,7 @@ mod tests {
             patch_truncated: false,
             applied: apply,
             fork: fork.map(str::to_owned),
+            review: None,
             attempts: vec![
                 AttemptReport {
                     index: 0,
@@ -2410,6 +2417,9 @@ mod tests {
         let changes = vec![Change { path: "crates/a/Cargo.toml".into(), kind: ChangeKind::Modified }];
         assert_eq!(apply_stop(RunResponse { changes, ..ok() }), ["touches crates/a/Cargo.toml"]);
         assert_eq!(apply_stop(RunResponse { patch_truncated: true, ..ok() }), ["diff cut short"]);
+        let review = |verdict| Some(molt_api::planner::Review { verdict, findings: vec![] });
+        assert_eq!(apply_stop(RunResponse { review: review(Verdict::Reject), ..ok() }), ["review rejected"]);
+        assert_eq!(apply_stop(RunResponse { review: review(Verdict::Concern), ..ok() }), ["review questioned"]);
     }
 
     #[test]
