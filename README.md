@@ -110,11 +110,15 @@ In the default mode, **confirm**, a task stops twice for you:
 2. The attempts run side by side, one box each, with their tool calls and
    check runs as they happen (Tab shows one large). When one passes, you see
    its message, the files it changed and, with `d`, the diff. Enter applies
-   it; `k` keeps it in its fork, `n` discards it.
+   it; `k` keeps it in its fork, `n` discards it. `/last` opens the diff of
+   the last finished task again, whatever was done with it.
 
 Shift+Tab switches to **auto** (design the check and apply what passes) or
 **plan only** (results stay in their forks). Esc stops a task: the services
 are stopped, with every command the agent started, and started again.
+The log keeps everything a task reports, in full; PgUp and PgDn scroll it,
+and Ctrl+Home and Ctrl+End (or Home and End with an empty input) jump to its
+start and end.
 
 `/memory [words]` lists the notes about the project, strongest first, with
 where each came from: the run, the service version that wrote it and the
