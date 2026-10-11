@@ -98,7 +98,10 @@ impl SandboxPolicy {
                 "invalid environment name"
             );
             ensure!(
-                !name.starts_with("MOLT_") && !name.starts_with("ANTHROPIC_") && name != "HOME",
+                !name.starts_with("MOLT_")
+                    && !name.starts_with("ANTHROPIC_")
+                    && !name.starts_with("OPENAI_")
+                    && name != "HOME",
                 "service secrets and host HOME cannot be passed to a sandbox"
             );
         }

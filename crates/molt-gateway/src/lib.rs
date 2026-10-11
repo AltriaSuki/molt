@@ -1,5 +1,5 @@
-//! The model gateway: serves `model.complete` by calling the Anthropic
-//! Messages API.
+//! The model gateway: serves `model.complete` through explicit Anthropic
+//! Messages and OpenAI Chat Completions adapters.
 //!
 //! It is the only process that holds the API key. It turns a
 //! [`CompleteRequest`] into a Messages API request shaped for the chosen
@@ -9,8 +9,10 @@
 
 mod api;
 mod body;
+mod openai;
 pub mod prices;
 mod profile;
+pub mod provider;
 mod stream;
 
 use std::fmt;
@@ -38,6 +40,8 @@ const REPLY_MARGIN: Duration = Duration::from_millis(500);
 #[derive(Clone)]
 pub struct Config {
     pub api_key: String,
+    /// Provider routing and the optional second provider, held only here.
+    pub providers: provider::Providers,
     /// Without a trailing slash, e.g. `https://api.anthropic.com`.
     pub base_url: String,
     /// Model alias or id used when a request names none.
@@ -66,6 +70,7 @@ impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("api_key", &"<redacted>")
+            .field("providers", &self.providers)
             .field("base_url", &self.base_url)
             .field("default_model", &self.default_model)
             .field("max_tokens", &self.max_tokens)
@@ -108,7 +113,12 @@ impl Config {
         let parse = |name: &str, default: u64| -> anyhow::Result<u64> {
             get(name).map_or(Ok(default), |v| v.parse().with_context(|| format!("{name}={v:?} is not a number")))
         };
-        let api_key = get("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY is not set")?;
+        let providers = provider::Providers::from_vars(&get)?;
+        let api_key = get("ANTHROPIC_API_KEY").unwrap_or_default();
+        ensure!(
+            !api_key.is_empty() || providers.openai_key.is_some(),
+            "ANTHROPIC_API_KEY or OPENAI_API_KEY is not set"
+        );
         let base_url = get("ANTHROPIC_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.into());
         let effort = match get("MOLT_EFFORT") {
             Some(v) => Some(Effort::from_str(&v).map_err(|e| anyhow!("MOLT_EFFORT: {e}"))?),
@@ -125,9 +135,16 @@ impl Config {
             Ok(v)
         };
         Ok(Self {
+            providers,
             api_key,
             base_url: base_url.trim_end_matches('/').to_owned(),
-            default_model: get("MOLT_MODEL").unwrap_or_else(|| "opus".into()),
+            default_model: get("MOLT_MODEL").unwrap_or_else(|| {
+                if get("MOLT_PROVIDER").as_deref() == Some("openai") {
+                    "openai/gpt-4.1".into()
+                } else {
+                    "opus".into()
+                }
+            }),
             max_tokens: u32::try_from(positive("MOLT_MAX_TOKENS", 32_000)?).context("MOLT_MAX_TOKENS is too large")?,
             effort,
             timeout: Duration::from_secs(positive("MOLT_MODEL_TIMEOUT_S", 1200)?),
@@ -162,13 +179,16 @@ pub fn has_price(prices: &PriceTable, model: &str) -> bool {
 
 pub struct Gateway {
     cfg: Config,
-    api: api::Api,
+    anthropic: Option<api::Api>,
+    openai: Option<api::Api>,
 }
 
 impl Gateway {
     pub fn new(cfg: Config) -> anyhow::Result<Self> {
-        let api = api::Api::new(&cfg)?;
-        Ok(Self { cfg, api })
+        let anthropic = (!cfg.api_key.is_empty()).then(|| api::Api::new(&cfg)).transpose()?;
+        let openai = cfg.providers.openai_key.as_ref().map(|key| api::Api::openai(&cfg, key)).transpose()?;
+        ensure!(anthropic.is_some() || openai.is_some(), "no model provider API key");
+        Ok(Self { cfg, anthropic, openai })
     }
 
     /// One Messages API call, with retries.
@@ -212,10 +232,22 @@ impl Gateway {
         // A deadline too far off to represent is no deadline.
         let deadline = within.and_then(|d| Instant::now().checked_add(d));
         let named = req.model.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or(&self.cfg.default_model);
-        let model = resolve_model(named);
+        let (provider, model) = self.cfg.providers.resolve(named)?;
+        let api = match provider {
+            provider::Provider::Anthropic => self.anthropic.as_ref(),
+            provider::Provider::Openai => self.openai.as_ref(),
+        }
+        .ok_or_else(|| RemoteError {
+            code: ErrorCode::Invalid,
+            message: format!("no API key configured for {provider}"),
+        })?;
         let messages = req.messages.len();
-        let call = body::build(&self.cfg, &model, req)?;
+        let call = match provider {
+            provider::Provider::Anthropic => body::build(&self.cfg, &model, req)?,
+            provider::Provider::Openai => openai::build(&self.cfg, &model, req)?,
+        };
         tracing::debug!(
+            %provider,
             %model,
             messages,
             max_tokens = call.max_tokens,
@@ -224,9 +256,9 @@ impl Gateway {
         );
 
         let msg = if on_text.is_some() {
-            self.api.create_observed(&call.body, call.fallbacks, deadline, on_text).await?
+            api.create_observed(&call.body, call.fallbacks, deadline, on_text).await?
         } else {
-            self.api.create(&call.body, call.fallbacks, deadline).await?
+            api.create(&call.body, call.fallbacks, deadline).await?
         };
         if !msg.usage.known() {
             return Err(RemoteError {
@@ -236,7 +268,10 @@ impl Gateway {
         }
         let usage = Usage::from(msg.usage);
         // After a fallback or a router's choice another model answered, and its prices apply.
-        let priced = self.cfg.prices.lookup(&msg.model).or_else(|| self.cfg.prices.lookup(&model));
+        let priced =
+            self.cfg.prices.lookup(&msg.model).or_else(|| {
+                (provider == provider::Provider::Anthropic).then(|| self.cfg.prices.lookup(&model)).flatten()
+            });
         if priced.is_none() {
             let mut looked_for = prices::names(&msg.model);
             for name in prices::names(&model) {
@@ -570,38 +605,48 @@ mod tests {
     }
     #[tokio::test]
     async fn cancellation_stops_local_http_without_inventing_usage_or_retrying() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
-            .mount(&server)
-            .await;
-        let mut cfg = from(&[("ANTHROPIC_API_KEY", "k"), ("MOLT_MODEL_RETRIES", "4")]).unwrap();
-        cfg.base_url = server.uri();
-        let gateway = Gateway::new(cfg).unwrap();
-        let request = envelope(
-            "model.complete",
-            serde_json::to_value(CompleteRequest { messages: vec![user_text("hi")], ..Default::default() }).unwrap(),
-        );
-        let id = request.id.clone();
-        let cancel = CancellationToken::new();
-        let work = handle_observed(&gateway, request, None, cancel.clone());
-        tokio::pin!(work);
-        tokio::select! {
-            result = &mut work => panic!("HTTP finished early: {result:?}"),
-            _ = async { while server.received_requests().await.unwrap().is_empty() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }} => {}
+        for (provider, endpoint) in [("anthropic", "/v1/messages"), ("openai", "/v1/chat/completions")] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+                .mount(&server)
+                .await;
+            let mut cfg = from(&[
+                ("ANTHROPIC_API_KEY", "k"),
+                ("OPENAI_API_KEY", "o"),
+                ("MOLT_PROVIDER", provider),
+                ("MOLT_MODEL_RETRIES", "4"),
+            ])
+            .unwrap();
+            cfg.base_url = server.uri();
+            cfg.providers.openai_base_url = server.uri();
+            let gateway = Gateway::new(cfg).unwrap();
+            let request = envelope(
+                "model.complete",
+                serde_json::to_value(CompleteRequest { messages: vec![user_text("hi")], ..Default::default() })
+                    .unwrap(),
+            );
+            let id = request.id.clone();
+            let cancel = CancellationToken::new();
+            let work = handle_observed(&gateway, request, None, cancel.clone());
+            tokio::pin!(work);
+            tokio::select! {
+                result = &mut work => panic!("HTTP finished early: {result:?}"),
+                _ = async { while server.received_requests().await.unwrap().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }} => {}
+            }
+            cancel.cancel();
+            let result = tokio::time::timeout(Duration::from_secs(1), work).await.unwrap().unwrap();
+            assert_eq!(result["error"]["code"], "cancelled");
+            assert_eq!(result["settlement"]["request_id"], json!(id));
+            assert_eq!(result["settlement"]["local_stopped"], true);
+            assert!(result["settlement"]["remote_cancel_confirmed"].is_null());
+            assert!(result["settlement"]["usage"].is_null());
+            assert!(result["settlement"]["cost_usd"].is_null());
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
         }
-        cancel.cancel();
-        let result = tokio::time::timeout(Duration::from_secs(1), work).await.unwrap().unwrap();
-        assert_eq!(result["error"]["code"], "cancelled");
-        assert_eq!(result["settlement"]["request_id"], json!(id));
-        assert_eq!(result["settlement"]["local_stopped"], true);
-        assert!(result["settlement"]["remote_cancel_confirmed"].is_null());
-        assert!(result["settlement"]["usage"].is_null());
-        assert!(result["settlement"]["cost_usd"].is_null());
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
     #[tokio::test]
     async fn missing_usage_is_unknown_and_is_not_priced_as_zero() {
