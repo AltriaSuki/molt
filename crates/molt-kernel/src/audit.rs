@@ -18,6 +18,10 @@
 //!
 //! Services read it back one trace at a time through `kernel.audit.read`
 //! ([`read_trace`]).
+//!
+//! Large payload values, model conversations above all, are written once
+//! and referenced after that; the `refs` module says which lines this adds
+//! and how the hash chain still covers every byte.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, Read, Seek, SeekFrom};
@@ -30,6 +34,10 @@ use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
+
+use refs::{Lines, Store};
+
+mod refs;
 
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const MAX_BATCH: usize = 512;
@@ -112,6 +120,8 @@ struct EntryOut<'a> {
     prev: &'a str,
     hash: &'a str,
     event: &'a RawValue,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    refs: &'a [[u64; 2]],
 }
 
 #[derive(Deserialize)]
@@ -122,6 +132,22 @@ struct EntryIn<'a> {
     hash: String,
     #[serde(borrow)]
     event: &'a RawValue,
+    #[serde(default)]
+    refs: Vec<[u64; 2]>,
+}
+
+impl EntryIn<'_> {
+    /// The event as written, its taken-out values put back.
+    fn restore(&self, lines: &mut Option<Lines>, path: &Path, here: u64) -> Result<std::borrow::Cow<'_, str>, String> {
+        if self.refs.is_empty() {
+            return Ok(self.event.get().into());
+        }
+        let lines = match lines {
+            Some(lines) => lines,
+            None => lines.insert(Lines::open(path).map_err(|e| e.to_string())?),
+        };
+        lines.restore(self.event.get(), &self.refs, here).map(Into::into)
+    }
 }
 
 /// One entry as read back from the log.
@@ -194,11 +220,12 @@ impl AuditLog {
             dirs.mode(0o700);
             dirs.create(dir).await?;
         }
-        let (mut seq, mut prev) = (0u64, GENESIS.to_owned());
+        let (mut seq, mut prev, mut store) = (0u64, GENESIS.to_owned(), Store::default());
         if tokio::fs::try_exists(&path).await? {
             let (head, _) = scan(path.clone(), 0, true).await?;
             seq = head.seq;
             prev = head.hash;
+            store = head.store;
             tracing::info!(entries = seq, "continuing audit log");
         }
         let mut options = tokio::fs::OpenOptions::new();
@@ -207,7 +234,7 @@ impl AuditLog {
         options.mode(0o600);
         let file = options.open(&path).await?;
         let (tx, rx) = mpsc::channel(4096);
-        tokio::spawn(writer(file, rx, seq, prev, fsync));
+        tokio::spawn(writer(file, rx, seq, prev, store, fsync));
         Ok(Self { tx, path })
     }
 
@@ -241,7 +268,14 @@ impl AuditLog {
     }
 }
 
-async fn writer(mut file: tokio::fs::File, mut rx: mpsc::Receiver<Job>, mut seq: u64, mut prev: String, fsync: bool) {
+async fn writer(
+    mut file: tokio::fs::File,
+    mut rx: mpsc::Receiver<Job>,
+    mut seq: u64,
+    mut prev: String,
+    mut store: Store,
+    fsync: bool,
+) {
     let mut buf = Vec::new();
     let mut acks = Vec::new();
     let mut closed = None;
@@ -259,11 +293,17 @@ async fn writer(mut file: tokio::fs::File, mut rx: mpsc::Receiver<Job>, mut seq:
             let ts_ms = now_ms();
             let raw = serde_json::value::to_raw_value(&event).expect("audit events always serialize");
             let hash = digest(&prev, seq, ts_ms, raw.get());
+            let (compacted, refs) = match store.compact(raw.get(), &mut buf) {
+                Some((text, refs)) => (Some(RawValue::from_string(text).expect("compacted events stay JSON")), refs),
+                None => (None, Vec::new()),
+            };
+            let event = compacted.as_deref().unwrap_or(&raw);
             let start = buf.len();
-            serde_json::to_writer(&mut buf, &EntryOut { seq, ts_ms, prev: &prev, hash: &hash, event: &raw })
+            serde_json::to_writer(&mut buf, &EntryOut { seq, ts_ms, prev: &prev, hash: &hash, event, refs: &refs })
                 .expect("audit entries always serialize");
             buf.push(b'\n');
-            if buf.len() - start > MAX_ENTRY_BYTES {
+            // Readers restore the entry whole, so its whole size counts.
+            if buf.len() - start - event.get().len() + raw.get().len() > MAX_ENTRY_BYTES {
                 // Never write a record that the bounded readers cannot reopen.
                 tracing::error!(limit = MAX_ENTRY_BYTES, "audit entry is too large; stopping the writer");
                 return;
@@ -286,6 +326,7 @@ async fn writer(mut file: tokio::fs::File, mut rx: mpsc::Receiver<Job>, mut seq:
             std::io::Result::Ok(())
         }
         .await;
+        store.len += buf.len() as u64;
         buf.clear();
         if let Err(e) = written {
             // Without a durable log the kernel must not deliver anything:
@@ -306,6 +347,8 @@ async fn writer(mut file: tokio::fs::File, mut rx: mpsc::Receiver<Job>, mut seq:
 struct ChainHead {
     seq: u64,
     hash: String,
+    /// The blobs and runs written, to reference them again.
+    store: Store,
 }
 
 // File IO, hashing and JSON parsing all run off the async runtime. Only the
@@ -317,11 +360,13 @@ async fn scan(path: PathBuf, keep: usize, verify_chain: bool) -> Result<(ChainHe
 fn scan_file(path: &Path, keep: usize, verify_chain: bool) -> Result<(ChainHead, Vec<Entry>), AuditError> {
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
-    let mut head = ChainHead { seq: 0, hash: GENESIS.to_owned() };
+    let mut head = ChainHead { seq: 0, hash: GENESIS.to_owned(), store: Store::default() };
     let mut entries = VecDeque::new();
     let mut line = Vec::new();
     let mut line_number = 0;
+    let mut lines = None;
     loop {
+        let here = head.store.len;
         line.clear();
         // `take` caps the allocation before read_until can encounter an
         // arbitrarily long or unterminated record. The extra byte distinguishes
@@ -338,7 +383,14 @@ fn scan_file(path: &Path, keep: usize, verify_chain: bool) -> Result<(ChainHead,
         if line.last() != Some(&b'\n') {
             return Err(corrupt("entry is missing its terminating newline".into()));
         }
+        head.store.len += n as u64;
+        if refs::is_stored(&line) {
+            refs::check_stored(&line, here).map_err(corrupt)?;
+            head.store.learn(&line, here);
+            continue;
+        }
         let e: EntryIn = serde_json::from_slice(&line).map_err(|e| corrupt(e.to_string()))?;
+        let event = e.restore(&mut lines, path, here).map_err(corrupt)?;
         if verify_chain {
             let expected_seq = head.seq.checked_add(1).ok_or_else(|| corrupt("sequence overflow".into()))?;
             if e.seq != expected_seq {
@@ -347,14 +399,15 @@ fn scan_file(path: &Path, keep: usize, verify_chain: bool) -> Result<(ChainHead,
             if e.prev != head.hash {
                 return Err(corrupt("previous-hash link is broken".into()));
             }
-            if digest(&e.prev, e.seq, e.ts_ms, e.event.get()) != e.hash {
+            if digest(&e.prev, e.seq, e.ts_ms, &event) != e.hash {
                 return Err(corrupt("hash does not match the entry".into()));
             }
         }
         // Even discarded records must be valid events: corruption before the
         // requested tail must not disappear just because fewer entries are kept.
-        let event = serde_json::from_str(e.event.get()).map_err(|e| corrupt(e.to_string()))?;
-        head = ChainHead { seq: e.seq, hash: e.hash };
+        let event = serde_json::from_str(&event).map_err(|e| corrupt(e.to_string()))?;
+        head.seq = e.seq;
+        head.hash = e.hash;
         if keep > 0 {
             if entries.len() == keep {
                 entries.pop_front();
@@ -441,6 +494,7 @@ pub fn read_trace_within(path: &Path, req: &ReadRequest, scan: Scan) -> Result<R
     let (mut offset, mut used) = (start, 0u64);
     let mut entries = Vec::new();
     let mut line = Vec::new();
+    let mut lines = None;
     loop {
         line.clear();
         let n = reader.read_until(b'\n', &mut line)? as u64;
@@ -451,7 +505,7 @@ pub fn read_trace_within(path: &Path, req: &ReadRequest, scan: Scan) -> Result<R
         offset += n;
         let corrupt = |reason: String| AuditError::CorruptAt { offset: here, reason };
         let text = std::str::from_utf8(&line).map_err(|e| corrupt(e.to_string()))?;
-        if !text.contains(&needle) {
+        if refs::is_stored(&line) || !text.contains(&needle) {
             let out_of_time = scan.until.is_some_and(|until| std::time::Instant::now() >= until);
             if offset - start >= scan.max_bytes || out_of_time {
                 return Ok(ReadResponse { entries, next: Some(offset) });
@@ -459,12 +513,25 @@ pub fn read_trace_within(path: &Path, req: &ReadRequest, scan: Scan) -> Result<R
             continue;
         }
         let entry: EntryIn = serde_json::from_str(text).map_err(|e| corrupt(e.to_string()))?;
+        // Taken-out values leave a `0` in their place, so the envelope reads
+        // without them; they are put back only for a message of the page.
         let event: AuditEvent = serde_json::from_str(entry.event.get()).map_err(|e| corrupt(e.to_string()))?;
         let AuditEvent::Message { mut envelope } = event else { continue };
         let skipped =
             envelope.kind == Kind::Request && envelope.to.service().is_some_and(|s| req.skip_requests_to.contains(s));
         if envelope.trace_id != req.trace || skipped {
             continue;
+        }
+        let mut n = n;
+        if !entry.refs.is_empty() {
+            let restored = entry.restore(&mut lines, path, here).map_err(corrupt)?;
+            // The page holds the restored message, so that is what it costs.
+            n = n - entry.event.get().len() as u64 + restored.len() as u64;
+            let event = serde_json::from_str(&restored).map_err(|e| corrupt(e.to_string()))?;
+            let AuditEvent::Message { envelope: whole } = event else {
+                return Err(corrupt("restored entry is not a message".into()));
+            };
+            envelope = whole;
         }
         if used + n > max && !entries.is_empty() {
             return Ok(ReadResponse { entries, next: Some(here) });
@@ -489,7 +556,8 @@ mod tests {
     fn record(seq: u64, prev: &str, event: &str) -> String {
         let event = RawValue::from_string(event.to_owned()).unwrap();
         let hash = digest(prev, seq, 123, event.get());
-        let mut line = serde_json::to_string(&EntryOut { seq, ts_ms: 123, prev, hash: &hash, event: &event }).unwrap();
+        let mut line =
+            serde_json::to_string(&EntryOut { seq, ts_ms: 123, prev, hash: &hash, event: &event, refs: &[] }).unwrap();
         line.push('\n');
         line
     }
@@ -804,5 +872,122 @@ mod tests {
         for (i, r) in receipts.into_iter().enumerate() {
             assert_eq!(r.durable().await.unwrap(), i as u64 + 1);
         }
+    }
+
+    /// A model request of `turns` turns: the same system prompt and tools
+    /// every turn, and the conversation so far.
+    fn conversation(trace: &TraceId, turns: usize) -> AuditEvent {
+        let mut messages = Vec::new();
+        for n in 0..turns {
+            messages
+                .push(serde_json::json!({ "role": "user", "content": format!("result {n}: {}", "r".repeat(2000)) }));
+            messages.push(serde_json::json!({ "role": "assistant", "content": [{ "type": "text", "text": format!("turn {n}") }] }));
+        }
+        let tools: Vec<_> =
+            (0..5).map(|n| serde_json::json!({ "name": format!("tool{n}"), "description": "d".repeat(300) })).collect();
+        let payload =
+            serde_json::json!({ "system": "s".repeat(5000), "messages": messages, "tools": tools, "max_tokens": 100 });
+        message(trace, "model.complete", Kind::Request, payload)
+    }
+
+    #[tokio::test]
+    async fn a_conversation_sent_whole_every_turn_is_logged_once_and_read_back_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let trace = TraceId::random();
+        let len = || std::fs::metadata(&path).unwrap().len();
+        let mut sizes = vec![0];
+        let events: Vec<AuditEvent> = (1..=50).map(|turn| conversation(&trace, turn)).collect();
+        let mut log = AuditLog::open(&path, false).await.unwrap();
+        for turn in 1..=50 {
+            if turn == 25 {
+                // Reopened, the log still references what it wrote before.
+                log.close().await;
+                log = AuditLog::open(&path, false).await.unwrap();
+            }
+            log.append(events[turn - 1].clone()).await.unwrap();
+            log.append(ev(turn as u32)).await.unwrap();
+            sizes.push(len());
+        }
+        log.close().await;
+        let added: Vec<u64> = sizes.windows(2).map(|w| w[1] - w[0]).collect();
+        let whole = serde_json::to_string(&events[49]).unwrap().len() as u64;
+        // Each turn adds about its two new messages, not the conversation again.
+        assert!(added[49] < added[1] + 300, "{added:?}");
+        assert!(added[24] < added[1] + 300, "{added:?}");
+        assert!(len() < 2 * whole, "{} bytes for a {whole}-byte conversation", len());
+
+        assert_eq!(verify(&path).await.unwrap(), 100);
+        let entries = read_all(&path).await.unwrap();
+        let read: Vec<&AuditEvent> = entries.iter().step_by(2).map(|e| &e.event).collect();
+        assert!(read.iter().zip(&events).all(|(r, e)| *r == e));
+        // Pages are as big as the messages they restore.
+        let mut req = ReadRequest::new(trace.clone());
+        let mut logged = Vec::new();
+        loop {
+            let page = read_trace(&path, &req).unwrap();
+            let size: usize = page.entries.iter().map(|e| serde_json::to_string(&e.envelope).unwrap().len()).sum();
+            assert!(size as u64 <= READ_PAGE, "{size}");
+            logged.extend(page.entries);
+            match page.next {
+                Some(next) => req.cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(logged.len(), 50);
+        for (logged, event) in logged.iter().zip(&events) {
+            let AuditEvent::Message { envelope } = event else { unreachable!() };
+            assert_eq!((&logged.envelope, logged.omitted), (envelope, None));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_changed_or_missing_blob_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let trace = TraceId::random();
+        let log = AuditLog::open(&path, false).await.unwrap();
+        log.append(conversation(&trace, 1)).await.unwrap();
+        log.append(conversation(&trace, 2)).await.unwrap();
+        log.close().await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.lines().next().unwrap().starts_with("{\"blob\":"));
+
+        // The data no longer matches the blob's hash.
+        std::fs::write(&path, text.replacen("result 0", "result 9", 1)).unwrap();
+        assert!(matches!(verify(&path).await, Err(AuditError::Corrupt { .. })));
+        assert!(read_trace(&path, &ReadRequest::new(trace.clone())).is_err());
+
+        // A consistent blob with other content changes what the entry restores to.
+        let blob = text.lines().find(|l| l.contains("result 0")).unwrap();
+        let data = &blob[blob.find("\"data\":").unwrap() + 7..blob.len() - 1];
+        let forged = data.replacen("result 0", "result 9", 1);
+        let key = hex::encode(Sha256::digest(forged.as_bytes()));
+        let line = format!("{{\"blob\":\"{key}\",\"data\":{forged}}}");
+        assert_eq!(line.len(), blob.len());
+        std::fs::write(&path, text.replacen(blob, &line, 1)).unwrap();
+        assert!(matches!(verify(&path).await, Err(AuditError::Corrupt { .. })));
+
+        // A run whose blob is gone cannot be restored.
+        let without: String = text.lines().filter(|l| *l != blob).map(|l| format!("{l}\n")).collect();
+        std::fs::write(&path, without).unwrap();
+        assert!(matches!(verify(&path).await, Err(AuditError::Corrupt { .. })));
+        assert!(read_all(&path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn small_payloads_are_written_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open(&path, false).await.unwrap();
+        let trace = TraceId::random();
+        let event =
+            message(&trace, "fs.read", Kind::Request, serde_json::json!({ "path": "a.rs", "text": "x".repeat(200) }));
+        log.append(event.clone()).await.unwrap();
+        log.close().await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(!text.contains("\"refs\""));
+        assert_eq!(read_all(&path).await.unwrap()[0].event, event);
     }
 }
