@@ -254,12 +254,7 @@ pub async fn run_task(
 ) -> anyhow::Result<Done> {
     require_services(cfg)?;
     if req.stream {
-        let target: Target = format!("topic:{}", progress::TOPIC).parse()?;
-        let allowed =
-            cfg.service("model").is_some_and(|s| s.requests.iter().any(|r| r.target == target && r.budget.calls > 0));
-        if !allowed {
-            bail!("--stream requires the model service to request a topic:progress capability with a nonzero calls budget");
-        }
+        require_stream_capability(cfg)?;
     }
     let running = crate::start(cfg).await?;
     // Before planner.run, the only caller that makes forks.
@@ -315,6 +310,16 @@ pub async fn run_task(
         forks.remove_new(keep.as_slice());
     }
     done
+}
+
+fn require_stream_capability(cfg: &Config) -> anyhow::Result<()> {
+    let target: Target = format!("topic:publish:{}", progress::TOPIC).parse()?;
+    let allowed =
+        cfg.service("model").is_some_and(|s| s.requests.iter().any(|r| r.target.covers(&target) && r.budget.calls > 0));
+    if !allowed {
+        bail!("--stream requires the model service to request a topic:publish:progress capability (legacy topic:progress also permits publication) with a nonzero calls budget");
+    }
+    Ok(())
 }
 
 /// The forks in the `fs` service's scratch dir when a run starts. A planner
@@ -399,7 +404,7 @@ async fn drive(
         on_progress(&Progress::Note { run: trace.to_string(), message });
     }
     grant(kernel, &cli, planner::RUN, Budget::new(0, 0, 1_000)).await?;
-    grant(kernel, &cli, &format!("topic:{}", progress::TOPIC), Budget::new(0, 0, 1_000)).await?;
+    grant(kernel, &cli, &format!("topic:subscribe:{}", progress::TOPIC), Budget::new(0, 0, 1_000)).await?;
     cli.subscribe(progress::TOPIC).await?;
 
     let mut preview = PreviewFilter::default();
@@ -884,6 +889,19 @@ mod tests {
         let error = run_task(&cfg, request, false, |_| {}, std::future::pending()).await.unwrap_err();
         assert!(error.to_string().contains("topic:progress"));
         assert!(!data.exists());
+    }
+
+    #[test]
+    fn streaming_accepts_legacy_publication_but_not_a_subscription_grant() {
+        let mut cfg = Config::agent(Path::new("/w"), Path::new("/d"), Path::new("/b")).unwrap();
+        for (right, allowed) in
+            [("topic:publish:progress", true), ("topic:progress", true), ("topic:subscribe:progress", false)]
+        {
+            cfg.service_mut("model").unwrap().requests[0].target = right.parse().unwrap();
+            assert_eq!(require_stream_capability(&cfg).is_ok(), allowed);
+        }
+        cfg.service_mut("model").unwrap().requests[0].budget.calls = 0;
+        assert!(require_stream_capability(&cfg).is_err());
     }
 
     #[test]

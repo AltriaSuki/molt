@@ -26,7 +26,7 @@ name = "model"
 tier = "protected"
 exec = { command = "molt-gateway" }
 provides = ["model.*"]
-requests = [{ target = "topic:progress", budget = { calls = 10000000 } }]
+requests = [{ target = "topic:publish:progress", budget = { calls = 10000000 } }]
 pass_env = [
   "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "MOLT_MODEL", "MOLT_EFFORT", "MOLT_MAX_TOKENS",
   "MOLT_MODEL_TIMEOUT_S", "MOLT_MODEL_RETRIES", "MOLT_MODEL_CONCURRENCY", "MOLT_FALLBACKS",
@@ -49,7 +49,7 @@ name = "fs"
 tier = "mutable"
 exec = { command = "molt-tools", args = ["fs", "--root", ".", "--scratch", "/home/you/.cache/molt/work"] }
 provides = ["fs.*"]
-requests = [{ target = "topic:fs.changed", budget = { calls = 100000000 } }]
+requests = [{ target = "topic:publish:fs.changed", budget = { calls = 100000000 } }]
 
 # Commands run as you, unsandboxed, with a scrubbed environment; add what
 # your builds and tests need with pass_env (`molt do --pass-env NAME` does the
@@ -73,7 +73,7 @@ pass_env = ["MOLT_MEMORY_MODEL", "MOLT_MEMORY_EFFORT", "MOLT_MEMORY_MAX_TOKENS",
 requests = [
   { target = "model.complete", budget = { tokens = 1000000000, calls = 1000000 } },
   { target = "kernel.audit.read", budget = { calls = 10000000 } },
-  { target = "topic:fs.changed", budget = { calls = 10 } },
+  { target = "topic:subscribe:fs.changed", budget = { calls = 10 } },
 ]
 
 # Calls 0 would refuse every call; ms 0 leaves deadlines to each request.
@@ -91,7 +91,7 @@ requests = [
   { target = "model.complete", budget = { tokens = 4000000000, calls = 1000000 } },
   { target = "fs.*", budget = { calls = 10000000 } },
   { target = "shell.run", budget = { calls = 1000000 } },
-  { target = "topic:progress", budget = { calls = 10000000 } },
+  { target = "topic:publish:progress", budget = { calls = 10000000 } },
   { target = "memory.index", budget = { calls = 10000000 } },
   { target = "memory.map", budget = { calls = 10000000 } },
   { target = "memory.recall", budget = { calls = 10000000 } },
