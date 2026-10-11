@@ -12,6 +12,7 @@ mod designer;
 mod fit;
 mod memory;
 mod prompts;
+mod review;
 mod runner;
 mod tools;
 

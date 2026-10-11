@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use molt_api::fs::{self, Change, ChangeKind};
 use molt_api::memory;
 use molt_api::model::{CompleteRequest, CompleteResponse, Usage};
-use molt_api::planner::{AttemptStatus, CheckSpec, Outcome, RunRequest, RunResponse};
+use molt_api::planner::{AttemptStatus, CheckSpec, Outcome, Review, RunRequest, RunResponse, Verdict};
 use molt_api::progress::Progress;
 use molt_api::shell;
 use molt_planner::{Bus, Config};
@@ -436,6 +436,14 @@ fn is_designer(req: &CompleteRequest) -> bool {
     req.tools.iter().any(|t| t["name"] == "submit_check")
 }
 
+fn is_reviewer(req: &CompleteRequest) -> bool {
+    req.tools.iter().any(|t| t["name"] == "submit_review")
+}
+
+fn submit_review(req: &CompleteRequest, verdict: &str, findings: &[&str]) -> Reply {
+    use_tools(req, &[("submit_review", json!({ "verdict": verdict, "findings": findings }))])
+}
+
 /// Which attempt sent `req`, from the approach hint in its first message.
 fn attempt_of(req: &CompleteRequest) -> u32 {
     match req.messages[0]["content"][1]["text"].as_str() {
@@ -462,8 +470,14 @@ fn config() -> Config {
     }
 }
 
+/// A request with no review: tests of the review turn it on.
 fn request(check: Option<&str>, attempts: u32) -> RunRequest {
-    RunRequest { check: check.map(Into::into), attempts, ..RunRequest::new("Add hello.txt saying hi.", WORKSPACE) }
+    RunRequest {
+        check: check.map(Into::into),
+        attempts,
+        review: false,
+        ..RunRequest::new("Add hello.txt saying hi.", WORKSPACE)
+    }
 }
 
 async fn run(fake: &Arc<Fake>, req: RunRequest) -> RunResponse {
@@ -1630,4 +1644,133 @@ async fn checkpoints_that_cannot_be_used_are_refused_with_why() {
     std::fs::write(state.path().join("trace_other.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
     let e = err(cfg, resume("trace_other", false)).await;
     assert!(e.message.contains("worked on /elsewhere"), "{e:?}");
+}
+
+/// An attempt that writes hello.txt and is done, with `reviewer` answering the review.
+fn reviewed(reviewer: impl Fn(&CompleteRequest) -> Reply + Send + Sync + 'static) -> Arc<Fake> {
+    Fake::new(
+        move |req| {
+            if is_reviewer(req) {
+                return reviewer(req);
+            }
+            match turn(req) {
+                1 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            }
+        },
+        hello_check,
+    )
+}
+
+#[tokio::test]
+async fn an_approved_winner_is_applied_and_the_review_reported() {
+    let fake = reviewed(|req| submit_review(req, "approve", &[]));
+    let resp = run(&fake, RunRequest { review: true, ..request(Some("check"), 1) }).await;
+    assert_eq!(resp.review, Some(Review { verdict: Verdict::Approve, findings: vec![] }));
+    assert!(resp.applied, "{}", resp.summary);
+    assert_eq!(fake.workspace()["hello.txt"], "hi\n");
+
+    // The reviewer saw the task, the check and the diff, and had only reading tools.
+    let review = fake.requests().into_iter().find(is_reviewer).unwrap();
+    let first = review.messages[0]["content"][0]["text"].as_str().unwrap().to_owned();
+    assert!(first.contains("<task>\nAdd hello.txt saying hi.\n</task>"), "{first}");
+    assert!(first.contains("The done-check is `check`.") && first.contains("+hi"), "{first}");
+    let tools: Vec<&str> = review.tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert_eq!(tools, ["read_file", "list_files", "search", "submit_review"]);
+    // Its calls count toward the run.
+    assert!(close(resp.cost_usd, 0.375), "{}", resp.cost_usd);
+}
+
+#[tokio::test]
+async fn a_rejected_winner_is_not_applied_and_stays_in_its_fork() {
+    let fake = reviewed(|req| submit_review(req, "reject", &["hello.txt:1 hard-codes what the check expects."]));
+    let resp = run(&fake, RunRequest { review: true, ..request(Some("check"), 1) }).await;
+    let review = resp.review.clone().unwrap();
+    assert_eq!(review.verdict, Verdict::Reject);
+    assert_eq!(review.findings, ["hello.txt:1 hard-codes what the check expects."]);
+    assert_eq!(resp.outcome, Outcome::Passed);
+    assert!(!resp.applied);
+    let fork = resp.fork.clone().expect("kept for the user");
+    assert!(resp.summary.ends_with(&format!("Not applied: the review rejected the changes. They are kept in {fork}.")));
+    assert!(!fake.workspace().contains_key("hello.txt"));
+    assert_eq!(fake.forks_alive(), [fork]);
+}
+
+#[tokio::test]
+async fn a_skip_marker_is_a_concern_whatever_the_reviewer_says() {
+    let fake = Fake::new(
+        |req| {
+            if is_reviewer(req) {
+                let first = req.messages[0]["content"][0]["text"].as_str().unwrap();
+                assert!(first.contains("Fixed rules flagged these"), "{first}");
+                return submit_review(req, "approve", &[]);
+            }
+            match turn(req) {
+                1 => use_tools(
+                    req,
+                    &[
+                        ("write_file", json!({ "path": "hello.txt", "content": "hi\n" })),
+                        (
+                            "write_file",
+                            json!({ "path": "tests/slow.rs", "content": "#[ignore]\n#[test]\nfn slow() {}\n" }),
+                        ),
+                    ],
+                ),
+                _ => done("Done."),
+            }
+        },
+        hello_check,
+    );
+    fake.set(|st| {
+        st.workspace.insert("tests/slow.rs".into(), "#[test]\nfn slow() {}\n".into());
+    });
+    let resp = run(&fake, RunRequest { review: true, ..request(Some("check"), 1) }).await;
+    let review = resp.review.clone().unwrap();
+    assert_eq!(review.verdict, Verdict::Concern);
+    assert!(review.findings[0].starts_with("tests/slow.rs adds `#[ignore`"), "{:?}", review.findings);
+    assert!(!resp.applied && resp.summary.contains("the review questioned the changes"), "{}", resp.summary);
+}
+
+#[tokio::test]
+async fn the_reviewer_cannot_change_the_fork() {
+    let fake = reviewed(|req| match turn(req) {
+        1 => use_tools(
+            req,
+            &[
+                ("write_file", json!({ "path": "hello.txt", "content": "bye\n" })),
+                ("run", json!({ "command": "rm hello.txt" })),
+                ("read_file", json!({ "path": "hello.txt" })),
+            ],
+        ),
+        _ => {
+            let results = last_text(req);
+            assert!(results.contains("The reviewer cannot use write_file: it only reads."), "{results}");
+            assert!(results.contains("The reviewer cannot use run: it only reads."), "{results}");
+            assert!(results.contains("hi"), "{results}");
+            submit_review(req, "approve", &[])
+        }
+    });
+    let resp = run(&fake, RunRequest { review: true, ..request(Some("check"), 1) }).await;
+    assert!(resp.applied, "{}", resp.summary);
+    assert_eq!(fake.workspace()["hello.txt"], "hi\n");
+    // One write, the attempt's, and the check its one command.
+    assert_eq!(fake.calls_to("fs.write").len(), 1);
+    assert_eq!(fake.calls_to("shell.run").len(), 1);
+}
+
+#[tokio::test]
+async fn a_review_that_does_not_finish_approves_nothing() {
+    let fake = reviewed(|_| done("Looks fine to me."));
+    let resp = run(&fake, RunRequest { review: true, ..request(Some("check"), 1) }).await;
+    let review = resp.review.clone().unwrap();
+    assert_eq!(review.verdict, Verdict::Concern);
+    assert_eq!(review.findings, ["The reviewer did not finish: it stopped without a verdict."]);
+    assert!(!resp.applied && resp.fork.is_some());
+}
+
+#[tokio::test]
+async fn without_review_no_reviewer_runs() {
+    let fake = reviewed(|_| panic!("no review was asked for"));
+    let resp = run(&fake, request(Some("check"), 1)).await;
+    assert!(resp.review.is_none() && resp.applied);
 }
