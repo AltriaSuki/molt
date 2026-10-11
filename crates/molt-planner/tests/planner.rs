@@ -1389,3 +1389,98 @@ async fn unknown_model_prices_are_reported_and_stop_further_actions() {
     assert!(fake.calls_to("fs.write").is_empty());
     assert!(fake.calls_to("shell.run").is_empty());
 }
+
+/// An attempt that reads a big file `reads` times, then writes hello.txt.
+/// Its usage reports what it was sent, about four bytes a token, as a real
+/// model's would.
+fn long_reader(reads: usize) -> impl Fn(&CompleteRequest) -> Reply + Send + Sync + 'static {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    move |req: &CompleteRequest| {
+        let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let mut reply = match n {
+            n if n <= reads => use_tools(req, &[("read_file", json!({ "path": "big.txt" }))]),
+            n if n == reads + 1 => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        };
+        let sent = serde_json::to_vec(&req.messages).unwrap().len() + serde_json::to_vec(&req.tools).unwrap().len();
+        reply.resp.as_mut().unwrap().usage.input_tokens = (sent / 4) as u64;
+        reply
+    }
+}
+
+/// Every tool_use has its result in the next message, and turns alternate.
+fn well_formed(req: &CompleteRequest) -> bool {
+    let m = &req.messages;
+    let blocks = |v: &Value| v["content"].as_array().cloned().unwrap_or_default();
+    let alternate = m.iter().enumerate().all(|(i, msg)| msg["role"] == if i % 2 == 0 { "user" } else { "assistant" });
+    alternate
+        && m.windows(2).all(|w| {
+            blocks(&w[0])
+                .iter()
+                .filter(|b| b["type"] == "tool_use")
+                .all(|u| blocks(&w[1]).iter().any(|r| r["type"] == "tool_result" && r["tool_use_id"] == u["id"]))
+        })
+}
+
+#[tokio::test]
+async fn a_long_task_leaves_out_its_earliest_turns_to_fit_and_still_finishes() {
+    // Unicode and quotes: the serialized request is bigger than the text.
+    let big: String = (0..1500).map(|i| format!("line {i}: “quoted” é\n")).collect();
+    for (name, cfg) in [
+        // The model's input fills first.
+        ("tokens", Config { context_tokens: Some(40_000), ..config() }),
+        // The bus frame fills first.
+        ("frame", Config { context_tokens: Some(10_000_000), frame_bytes: 300_000, ..config() }),
+    ] {
+        let fake = Fake::new(long_reader(16), hello_check);
+        fake.set(|st| {
+            st.workspace.insert("big.txt".into(), big.clone());
+        });
+        let resp = run_with(&fake, cfg.clone(), request(Some("check"), 1)).await;
+        assert_eq!(resp.outcome, Outcome::Passed, "{name}: {}", resp.summary);
+        assert_eq!(resp.attempts[0].turns, 18, "{name}: no turn is lost");
+        assert!(close(resp.cost_usd, 18.0 * 0.125), "{name}: {}", resp.cost_usd);
+
+        let requests = fake.requests();
+        let limits_tokens = 40_000 - 1000;
+        let fitted: Vec<&CompleteRequest> = requests
+            .iter()
+            .filter(|r| {
+                r.messages[0]["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|b| b["text"].as_str().is_some_and(|t| t.starts_with("<earlier_turns>")))
+            })
+            .collect();
+        assert!(!fitted.is_empty(), "{name}: the conversation was fitted");
+        for req in &requests {
+            assert!(well_formed(req), "{name}: {:?}", req.messages);
+            // The task and the check are never left out.
+            assert!(req.messages[0]["content"][0]["text"].as_str().unwrap().contains("<task>"), "{name}");
+            let bytes = serde_json::to_vec(req).unwrap().len();
+            match name {
+                "frame" => assert!(bytes <= 300_000, "{name}: {bytes}"),
+                _ => assert!(bytes / 4 <= limits_tokens, "{name}: {bytes}"),
+            }
+        }
+        // Nothing done twice: the reads and the write happened once each.
+        assert_eq!(fake.calls_to(fs::WRITE).len(), 1, "{name}");
+        assert!(
+            fake.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
+            if message.starts_with("attempt 0: ") && message.contains("earlier messages left out"))),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_conversation_that_cannot_fit_says_which_limit() {
+    let fake = Fake::new(long_reader(1), hello_check);
+    let cfg = Config { frame_bytes: 64 * 1024 + 1000, ..config() };
+    let req = RunRequest { task: format!("Say hi. {}", "Context. ".repeat(500)), ..request(Some("check"), 1) };
+    let resp = run_with(&fake, cfg, req).await;
+    assert_eq!(resp.outcome, Outcome::Failed);
+    assert!(resp.attempts[0].note.contains("transport frame limit"), "{}", resp.attempts[0].note);
+    assert!(fake.requests().is_empty(), "nothing too big is sent");
+}

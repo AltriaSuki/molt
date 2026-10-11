@@ -15,6 +15,7 @@ use serde_json::Value;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::fit::Limits;
 use crate::memory::Memory;
 use crate::{Bus, Config};
 
@@ -75,19 +76,22 @@ pub(crate) struct Ctx {
     pub run_cancel: CancellationToken,
 }
 
-/// A conversation that only ever grows. `system` and `tools` stay the same
-/// for its whole life: thinking blocks are bound to the exact prefix, and an
-/// unchanged prefix keeps the prompt cache warm.
+/// A conversation that grows until it no longer fits a model call (see
+/// [`crate::fit`]). `system` and `tools` stay the same for its whole life:
+/// an unchanged prefix keeps the prompt cache warm.
 pub(crate) struct Conversation {
-    system: &'static str,
-    tools: Arc<Vec<Value>>,
-    messages: Vec<Value>,
-    attempt: Option<u32>,
+    pub(crate) system: &'static str,
+    pub(crate) tools: Arc<Vec<Value>>,
+    pub(crate) messages: Vec<Value>,
+    pub(crate) attempt: Option<u32>,
+    /// How many messages the model last measured, and the tokens it counted
+    /// for them, its reply included.
+    pub(crate) known: Option<(usize, u64)>,
 }
 
 impl Conversation {
     pub fn new(system: &'static str, tools: Arc<Vec<Value>>, first: Value, attempt: Option<u32>) -> Self {
-        Self { system, tools, messages: vec![first], attempt }
+        Self { system, tools, messages: vec![first], attempt, known: None }
     }
 
     pub fn push(&mut self, message: Value) {
@@ -117,6 +121,12 @@ impl Ctx {
             cancel: CancellationToken::new(),
             run_cancel: CancellationToken::new(),
         }
+    }
+
+    /// What one model call of this run can take.
+    pub fn limits(&self) -> Limits {
+        let context = self.cfg.context_tokens.unwrap_or_else(|| Limits::context_of(self.model.as_deref()));
+        Limits::new(context, self.cfg.max_tokens, self.cfg.frame_bytes)
     }
 
     pub fn scoped(&self, cancel: CancellationToken) -> Arc<Self> {
