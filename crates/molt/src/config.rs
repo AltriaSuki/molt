@@ -154,6 +154,11 @@ pub struct Config {
 
 /// What the gateway reads from its environment (see `molt_gateway::Config::from_env`).
 const GATEWAY_ENV: &[&str] = &[
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "MOLT_PROVIDER",
+    "MOLT_MODEL_ALIASES",
+    "MOLT_OPENAI_MODELS",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "MOLT_MODEL",
@@ -430,6 +435,10 @@ mod tests {
         assert_eq!(model.tier, Tier::Protected);
         assert_eq!(model.requests.iter().map(|r| r.target.to_string()).collect::<Vec<_>>(), ["topic:progress"]);
         assert!(model.pass_env.iter().any(|v| v == "ANTHROPIC_API_KEY"));
+        assert!(model.pass_env.iter().any(|v| v == "OPENAI_API_KEY"));
+        for service in cfg.services.iter().filter(|s| s.name.as_str() != "model") {
+            assert!(!service.pass_env.iter().any(|v| v.starts_with("OPENAI_")));
+        }
         assert!(model.pass_env.iter().any(|v| v == "ANTHROPIC_BASE_URL"));
 
         for kind in ["fs", "shell"] {

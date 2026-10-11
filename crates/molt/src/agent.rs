@@ -67,9 +67,12 @@ pub fn resolve_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&P
         }
         return Ok(cfg);
     }
-    if std::env::var_os("ANTHROPIC_API_KEY").is_none_or(|key| key.is_empty()) {
+    if ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+        .iter()
+        .all(|name| std::env::var_os(name).is_none_or(|key| key.is_empty()))
+    {
         bail!(
-            "ANTHROPIC_API_KEY is not set: export your Anthropic API key, or pass --config with services of your own"
+            "ANTHROPIC_API_KEY or OPENAI_API_KEY is not set: export your provider API key, or pass --config with services of your own"
         );
     }
     let data_dir = match data_dir {

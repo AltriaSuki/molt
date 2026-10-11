@@ -242,8 +242,8 @@ fn env_name(name: &str) -> Result<String, String> {
     if name.is_empty() || name.contains(['=', '\0']) {
         return Err(format!("{name:?} is not a variable name"));
     }
-    if name.starts_with("MOLT_") || name.starts_with("ANTHROPIC_") {
-        return Err("commands never see MOLT_* or ANTHROPIC_* variables".into());
+    if name.starts_with("MOLT_") || name.starts_with("ANTHROPIC_") || name.starts_with("OPENAI_") {
+        return Err("commands never see MOLT_*, ANTHROPIC_* or OPENAI_* variables".into());
     }
     Ok(name.to_owned())
 }
