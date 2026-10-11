@@ -89,6 +89,10 @@ async fn network_policy_and_read_only_dependencies_are_enforced() {
         .success());
     let response = allowed.run("python3 -c 'import socket; socket.socket(socket.AF_UNIX)' ").await;
     assert!(!response.success() && response.stderr.contains("Operation not permitted"), "{}", response.stderr);
+    // Child processes still start: Rust's and libuv's use socket pairs.
+    let spawn =
+        "python3 -c 'import socket; socket.socketpair(); socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)'";
+    assert!(allowed.run(spawn).await.success());
     assert!(!allowed.run("unshare -Ur /bin/true").await.success());
     assert!(allowed.run("test $(ulimit -n) = 256 && test $(ulimit -t) = 600").await.success());
 }

@@ -11,11 +11,11 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{self, Arm, Job, Molt};
-use crate::grade;
 use crate::record::{self, Setup};
-use crate::report;
 use crate::run::{self, Event, Plan, Settings, Stop};
+use crate::sandbox::{self, Toolchains};
 use crate::task::{Language, Select, Split, Task};
+use crate::{grade, proc, report};
 
 /// Exit status when a benchmark stopped at its spending limit.
 const STOPPED_AT_BUDGET: u8 = 3;
@@ -118,6 +118,11 @@ pub struct RunArgs {
     /// Keep each run's audit log, which holds every model call, with its logs.
     #[arg(long)]
     pub keep_audit: bool,
+    /// Run the agent's commands, its check included, with your files and
+    /// network, outside Molt's sandbox. By default they run in the sandbox
+    /// with the tasks' toolchains mounted read-only; results record which.
+    #[arg(long)]
+    pub no_sandbox: bool,
     /// Run again the runs that ended in an error, such as an API outage.
     #[arg(long)]
     pub retry_errors: bool,
@@ -221,6 +226,26 @@ async fn run_cmd(args: RunArgs) -> anyhow::Result<ExitCode> {
     if let Some(turns) = args.max_turns {
         options.extend(["--max-turns".to_owned(), turns.to_string()]);
     }
+    let scratch = args.scratch.clone().unwrap_or_else(std::env::temp_dir);
+    let logs = args.logs.clone().unwrap_or_else(|| args.results.with_extension("logs"));
+    let toolchains = if args.no_sandbox {
+        options.push("--no-sandbox".to_owned());
+        None
+    } else {
+        let languages: Vec<Language> = plan.tasks.iter().map(|t| t.spec.language).collect();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let keep_out: Vec<&Path> =
+            [Some(args.tasks.tasks.as_path()), Some(scratch.as_path()), Some(logs.as_path()), home.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let toolchains = Toolchains::find(&languages, &path, proc::rustup_home().as_deref(), &keep_out)?;
+        toolchains.check(&scratch).await?;
+        let policy = std::path::absolute(logs.join("sandbox-policy.json"))?;
+        options.extend(["--sandbox-policy".to_owned(), policy.display().to_string()]);
+        Some((toolchains, policy))
+    };
     let setup = Setup {
         molt_build: agent::build_id(&exe).with_context(|| format!("hashing {}", exe.display()))?,
         model: args.model.clone(),
@@ -229,14 +254,14 @@ async fn run_cmd(args: RunArgs) -> anyhow::Result<ExitCode> {
         task_usd: args.task_usd,
         timeout_s: args.timeout_s,
         env: args.env.iter().filter_map(|(k, v)| recorded(k, v)).collect(),
+        sandboxed: !args.no_sandbox,
     };
-    let logs = args.logs.clone().unwrap_or_else(|| args.results.with_extension("logs"));
     let settings = Settings {
         run_id: run_id(),
         setup,
         max_usd: args.max_usd.unwrap_or(f64::INFINITY),
         jobs: args.jobs as usize,
-        scratch: args.scratch.clone().unwrap_or_else(std::env::temp_dir),
+        scratch,
         logs,
         molt_version: env!("CARGO_PKG_VERSION").to_owned(),
         git_commit: git_commit(&args.tasks.tasks),
@@ -245,12 +270,15 @@ async fn run_cmd(args: RunArgs) -> anyhow::Result<ExitCode> {
     let molt = Molt { exe, options, env: args.env.clone(), keep_audit: args.keep_audit };
 
     if args.dry_run {
-        dry_run(&plan, &settings, &args.results, &molt)?;
+        dry_run(&plan, &settings, &args.results, &molt, toolchains.as_ref().map(|(t, _)| t))?;
         return Ok(ExitCode::SUCCESS);
     }
     let has_key = std::env::var_os("ANTHROPIC_API_KEY").is_some_and(|v| !v.is_empty())
         || args.env.iter().any(|(k, v)| k == "ANTHROPIC_API_KEY" && !v.is_empty());
     ensure!(has_key, "molt do needs ANTHROPIC_API_KEY; set it, or pass it with --env");
+    if let Some((toolchains, path)) = &toolchains {
+        sandbox::write_policy(path, &toolchains.policy())?;
+    }
 
     let cancel = CancellationToken::new();
     let on_signal = cancel.clone();
@@ -332,7 +360,13 @@ fn progress(event: Event) {
     }
 }
 
-fn dry_run(plan: &Plan, settings: &Settings, results: &Path, molt: &Molt) -> anyhow::Result<()> {
+fn dry_run(
+    plan: &Plan,
+    settings: &Settings,
+    results: &Path,
+    molt: &Molt,
+    toolchains: Option<&Toolchains>,
+) -> anyhow::Result<()> {
     let old = if results.exists() { record::load(results)? } else { Vec::new() };
     let done = run::already_done(plan, settings, &old)?;
     let total = plan.slots().len();
@@ -367,6 +401,20 @@ fn dry_run(plan: &Plan, settings: &Settings, results: &Path, molt: &Molt) -> any
         let mut args = molt.args(&job);
         args.pop();
         println!("{}: {} {} PROMPT", arm.name, molt.exe.display(), args.join(" "));
+    }
+    match toolchains {
+        None => println!("The agent's commands run outside Molt's sandbox."),
+        Some(t) if t.read_only.is_empty() => {
+            println!("The agent's commands run in Molt's sandbox, which works here, as do the tasks' toolchains.")
+        }
+        Some(t) => {
+            let dirs: Vec<String> = t.read_only.iter().map(|d| d.display().to_string()).collect();
+            println!(
+                "The agent's commands run in Molt's sandbox, which works here, as do the tasks' toolchains, \
+                 with {} mounted read-only.",
+                dirs.join(", ")
+            );
+        }
     }
     Ok(())
 }

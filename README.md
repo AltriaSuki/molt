@@ -55,6 +55,7 @@ sender from that.
 | No service can grant itself a capability or raise its own budget | `crates/molt-kernel/tests/invariants.rs` (`a_service_cannot_use…`, `delegation_can_split…`, `budgets_are_enforced…`) |
 | No service can promote a kernel or protected component, change a tier, or add capabilities without a human | `only_humans_promote_protected_and_kernel_components` |
 | No service can delete or rewrite audit entries; every message is on the record before delivery | `every_message_is_logged_before_it_is_delivered`, `the_audit_log_has_no_write_path_and_detects_tampering` |
+| Audit verification and startup retain one bounded record; tail retains only the requested entries, independent of total log size | `audit_readers_keep_memory_bounded_as_the_log_grows`, `malformed_oversized_and_unterminated_records_are_never_discarded` |
 | A failing service never takes the kernel down | `a_service_that_never_replies…`, `a_crashed_and_reconnected…`, `a_flooding_service…`, `garbage_on_the_wire_is_ignored`, `crates/molt/tests/e2e.rs` |
 | Both transports behave the same: ordering, at-most-once, sender stamping, isolation, bounded inboxes | `crates/molt-transport/src/testkit.rs`, run by `conformance_unix.rs` and `conformance_nats.rs` |
 | `molt do` never runs a config the project ships, and the API key never reaches the commands it runs | `crates/molt/tests/agent.rs` (`the_cli_carries_out_a_task`) |
@@ -368,6 +369,14 @@ each run. The report gives each arm's success rate with a 95% interval, the
 runs where it said it was done and was not, and compares two arms on the
 same runs with an exact McNemar test.
 
+The agent's commands, its check included, run in Molt's sandbox, as
+`molt do` runs them by default. The tasks' toolchains are found on `PATH`
+and mounted into it read-only (a rustup install with its home, a Node in
+`/opt`); the tasks, the runs and your home directory never are, so the
+agent's commands cannot see the hidden tests. Before it starts, `run`
+checks that the sandbox works here and that each toolchain runs in it.
+`--no-sandbox` runs the commands as you instead; results record which.
+
 The tasks are in `bench/tasks`, in Python, JavaScript, Rust and Go, each a
 small project with a ticket, hidden tests and a reference solution, split
 into `dev` and `heldout` for the evaluator to come. `bench/README.md` has
@@ -375,11 +384,11 @@ the format.
 
 Known limits:
 
-- **Runs are not sandboxed.** `molt do` runs commands as you, so an agent
-  could read a task's hidden tests or solution by their absolute path, or
-  game the grade on purpose, such as with a module that shadows the test
-  framework. Nothing points it there, and each run's diff is kept so such
-  a run can be spotted, but nothing prevents it.
+- **An agent could game the grade on purpose**, such as with a module that
+  shadows the test framework, since the hidden tests run in its workspace.
+  With `--no-sandbox` it could also read a task's hidden tests or solution
+  by their absolute path. Nothing points it there, and each run's diff is
+  kept so such a run can be spotted, but nothing prevents it.
 - **Spending can pass the limits a little.** Molt checks its budget before
   each model call, so a run can pass `--task-usd` by up to one call for
   each of its parallel attempts, and the benchmark can pass `--max-usd` by
@@ -416,6 +425,7 @@ its tasks with a notice, except on CI.
 - The default shell requires Linux x86_64 with bubblewrap 0.9+ and usable user namespaces. Unsupported hosts must explicitly choose --no-sandbox; namespace policy never silently falls back.
 - Model text streams only with `--stream`; thinking is not shown and tool calls wait for the complete message. Preview delivery is best effort, and the final reply remains complete.
 - The audit log records every message, file contents and model conversations included, and is never rotated; it grows with every run in a data dir.
+- Audit startup, verification and nonempty tail reads still scan the whole log, but memory is bounded by one record plus the requested tail. A record is limited to 16 MiB including its newline; oversized, malformed or unterminated records are refused, including on restart. The writer stops before persisting an oversized entry. `tail -n 0` opens the file without scanning; `read_all` intentionally retains every returned entry. Tail validates record syntax throughout the file, but only verification and startup check the hash chain.
 - Reading one trace back from the audit log scans the log from the start: there is no index yet. One read looks through at most 256 MiB and keeps to its deadline, and two run at once.
 - The kernel drops a message nested more than 100 levels deep, so every logged message can be read back.
 - After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none.
@@ -448,7 +458,7 @@ The read-only system runtime includes `/etc/alternatives` so distribution-provid
 
 The default `molt do` shell and done-check use the same Linux x86_64 backend, requiring `/usr/bin/bwrap` (bubblewrap 0.9+) and working unprivileged user namespaces. Startup probes the backend and fails if required capabilities are missing. `molt do --no-sandbox` and `molt-tools shell --no-sandbox` are explicit host choices; the library equivalent is `Shell::with_policy(..., ExecutionPolicy::Unconfined)`. Other architectures and macOS currently need that explicit choice.
 
-Each command starts from an empty mount namespace with read-only system runtime paths, a read-only original project, its writable `fs.fork` directory, private tmp/home, and isolated PID, user, IPC, UTS and network namespaces. Direct isolated shell calls on the original project are refused. Ignored entries linked back to the project remain read-only; shared build directories are not writable. `/proc` shows only sandbox processes. User namespaces cannot be nested, capabilities are dropped, and a seccomp filter blocks AF_UNIX sockets (including access to host service sockets through mounted paths), io_uring (which could bypass syscall socket filtering), and alternate syscall ABIs. Programs must use ordinary file/socket I/O rather than requiring io_uring. The default denies network access. With explicit host networking enabled, IP connections, including localhost, are allowed; AF_UNIX stays denied.
+Each command starts from an empty mount namespace with read-only system runtime paths, a read-only original project, its writable `fs.fork` directory, private tmp/home, and isolated PID, user, IPC, UTS and network namespaces. Direct isolated shell calls on the original project are refused. Ignored entries linked back to the project remain read-only; shared build directories are not writable. `/proc` shows only sandbox processes. User namespaces cannot be nested, capabilities are dropped, and a seccomp filter blocks creating AF_UNIX sockets (so no host service socket is reachable through a mounted path or, with host networking, an abstract name) and AF_UNIX datagram socket pairs (which could send to such sockets by address), io_uring (which could bypass syscall socket filtering), and alternate syscall ABIs. Programs must use ordinary file/socket I/O rather than requiring io_uring. The default denies network access. With explicit host networking enabled, IP connections, including localhost, are allowed; AF_UNIX stays denied. Stream and seqpacket socket pairs, which reach only each other, are allowed: Rust's standard library and Node's libuv start child processes with them, so `cargo test` and `node --test` need them.
 
 `molt do --sandbox-policy /trusted/path/policy.json` supplies a JSON policy. It must be owned by the current user, not writable by others, and outside the canonical project and scratch roots. Each canonical path component is opened without following replacement symlinks; file permissions and content are checked through the same descriptor, and reads are bounded to 64 KiB. The shell reads it at startup; no request payload or repository file selects a policy. The default shell service is protected from service-driven replacement. A custom service configuration is still an explicit trusted user choice, and custom shell implementations are responsible for their own isolation.
 
