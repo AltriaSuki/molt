@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use molt::agent::{run_task, Done, Interrupted};
+use molt::agent::{run_task, Done, Interrupted, Learn};
 use molt::{Config, Secrets, TransportKind};
 use molt_api::fs::{ChangeKind, DROP, FORK, MERGE, WRITE};
 use molt_api::model::COMPLETE;
@@ -323,7 +323,13 @@ impl Setup {
 
     async fn run_done(&self, req: RunRequest) -> (Done, Vec<Progress>) {
         let mut events = Vec::new();
-        let run = run_task(&self.cfg, req, self.learn, |e| events.push(e.clone()), std::future::pending());
+        let run = run_task(
+            &self.cfg,
+            req,
+            self.learn.then(Learn::default),
+            |e| events.push(e.clone()),
+            std::future::pending(),
+        );
         let done = tokio::time::timeout(RUN_LIMIT, run).await.expect("the run hung").unwrap();
         (done, events)
     }
@@ -667,7 +673,7 @@ async fn stopping_a_run_kills_the_commands_it_started() {
     // lifecycle coverage lives in molt-tools/tests/sandbox.rs.
     setup.cfg.service_mut("shell").unwrap().exec.as_mut().unwrap().args.push("--no-sandbox".into());
     let started = wait_for_pid(&pidfile);
-    let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), false, |_| {}, async {
+    let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), None, |_| {}, async {
         started.await;
     });
     let err = tokio::time::timeout(RUN_LIMIT, run).await.expect("the run hung").unwrap_err();
@@ -711,7 +717,7 @@ async fn a_planner_that_dies_mid_run_ends_the_run_rather_than_starting_it_again(
         assert_eq!(unsafe { libc::kill(planner, libc::SIGKILL) }, 0);
         sleep
     };
-    let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), false, |_| {}, std::future::pending());
+    let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), None, |_| {}, std::future::pending());
     // Sent again, planner.run would start the hanging task over on the restarted planner.
     let (result, sleep) = tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(run, kill_planner) })
         .await
@@ -732,7 +738,7 @@ async fn a_service_that_cannot_start_ends_the_run_at_once_and_says_why() {
     exec.command = format!("{}/missing-gateway", bin_dir().display());
     model.max_restarts = 1;
     let started = Instant::now();
-    let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), false, |_| {}, std::future::pending());
+    let run = run_task(&setup.cfg, setup.request(Some(CHECK), 1), None, |_| {}, std::future::pending());
     let err = tokio::time::timeout(RUN_LIMIT, run).await.expect("the run hung").unwrap_err();
     let err = format!("{err:#}");
     assert!(err.contains("the model service did not come up: gave up after 1 restarts"), "{err}");
@@ -1145,8 +1151,11 @@ async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
     assert!(seen.iter().any(|e| matches!(e, Progress::CheckReady { designed: true, .. })), "{seen:#?}");
     assert!(seen.iter().any(|e| matches!(e, Progress::AttemptStarted { fork: Some(_), .. })), "{seen:#?}");
 
-    let learned = session.learn(&trace).await.unwrap();
+    let learned = session.learn(&trace, Some("haiku".into())).await.unwrap();
     assert_eq!(learned.added.len(), 1, "{learned:#?}");
+    // Memory learned with the model it was given, not its default.
+    let learning = bodies(&server).await.into_iter().filter(|b| b["output_config"]["format"]["type"] == "json_schema");
+    assert_eq!(learning.map(|b| b["model"].clone()).collect::<Vec<_>>(), [json!("claude-haiku-4-5")]);
     let notes = session.notes("").await.unwrap();
     assert_eq!(notes.iter().map(|r| r.note.text.as_str()).collect::<Vec<_>>(), [LEARNED_TEXT]);
     assert!(session.forget(&notes[0].note.id, "the check moved").await.unwrap());
@@ -1166,7 +1175,7 @@ async fn a_checkpointed_run_that_runs_out_of_budget_is_resumed_with_its_fork() {
     // The first model call spends it all.
     req.budget_usd = Some(0.000_001);
     let trace = molt_proto::TraceId::random();
-    let stopped = molt::agent::run_task_as(&setup.cfg, req, trace.clone(), false, |_| {}, std::future::pending());
+    let stopped = molt::agent::run_task_as(&setup.cfg, req, trace.clone(), None, |_| {}, std::future::pending());
     let stopped = tokio::time::timeout(RUN_LIMIT, stopped).await.expect("the run hung").unwrap().run;
     assert_eq!(stopped.checkpoint.as_deref(), Some(trace.as_str()), "{stopped:#?}");
     let runs = setup.data.path().join(molt::config::RUNS);
@@ -1178,7 +1187,7 @@ async fn a_checkpointed_run_that_runs_out_of_budget_is_resumed_with_its_fork() {
     let mut req = saved.request.clone();
     req.resume = Some(molt_api::planner::Resume { run: trace.to_string(), retry: false });
     req.budget_usd = Some(10.0);
-    let resumed = molt::agent::run_task_as(&setup.cfg, req, trace.clone(), false, |_| {}, std::future::pending());
+    let resumed = molt::agent::run_task_as(&setup.cfg, req, trace.clone(), None, |_| {}, std::future::pending());
     let resumed = tokio::time::timeout(RUN_LIMIT, resumed).await.expect("the run hung").unwrap().run;
     assert_eq!(resumed.outcome, Outcome::Passed, "{resumed:#?}");
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));

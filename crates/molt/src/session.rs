@@ -145,13 +145,14 @@ impl Session {
         self.call(planner::RUN, req, RUN_MS, Some(trace)).await
     }
 
-    /// Have memory learn from the run `trace`, as `molt do` does after a run.
-    pub async fn learn(&self, trace: &TraceId) -> Result<ConsolidateResponse, String> {
+    /// Have memory learn from the run `trace`, as `molt do` does after a
+    /// run, with `model`, or memory's own default without one.
+    pub async fn learn(&self, trace: &TraceId, model: Option<String>) -> Result<ConsolidateResponse, String> {
         if let Some(problem) = self.memory_problem() {
             return Err(problem);
         }
         // A trace of its own, so the learning does not become part of the episode.
-        let req = ConsolidateRequest { episode: trace.to_string(), workspace: self.workspace.clone(), model: None };
+        let req = ConsolidateRequest { episode: trace.to_string(), workspace: self.workspace.clone(), model };
         self.call(memory::CONSOLIDATE, req, LEARN_MS, None).await.map_err(|e| format!("{e:#}"))
     }
 

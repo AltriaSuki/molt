@@ -15,6 +15,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::Line;
 
 use super::text::{self, block, clean_line, span, Tone};
+use crate::agent;
 use crate::agent::outcome_name;
 use crate::config::ConfirmSection;
 
@@ -67,6 +68,9 @@ pub struct Settings {
     pub budget_usd: Option<f64>,
     /// A check command of the user's, used instead of a designed one.
     pub check: Option<String>,
+    /// The model memory learns with: a model, [`agent::SAME_MODEL`], or
+    /// `None` for memory's default.
+    pub memory_model: Option<String>,
 }
 
 /// Work for the runtime.
@@ -83,6 +87,8 @@ pub enum Action {
     },
     Learn {
         trace: TraceId,
+        /// `None`: memory's default model.
+        model: Option<String>,
     },
     Apply {
         fork: String,
@@ -973,6 +979,15 @@ impl App {
                 self.settings.model = (!arg.is_empty() && arg != "default").then(|| arg.to_owned());
                 self.flash = Some(set("model", self.settings.model.as_deref().unwrap_or("default")));
             }
+            "memory-model" => {
+                self.settings.memory_model = (!arg.is_empty() && arg != "default").then(|| arg.to_owned());
+                let shown = match self.settings.memory_model.as_deref() {
+                    None => "default",
+                    Some(agent::SAME_MODEL) => "the attempts' model",
+                    Some(m) => m,
+                };
+                self.flash = Some(set("memory model", shown));
+            }
             "effort" => {
                 if arg.is_empty() || arg == "default" {
                     self.settings.effort = None;
@@ -1226,6 +1241,7 @@ impl App {
         };
         self.spent_usd += resp.cost_usd;
         let mut actions = Vec::new();
+        let memory_model = agent::memory_model(self.settings.memory_model.as_deref(), task.req.model.as_deref());
 
         for a in &resp.attempts {
             let (mark, tone) = match a.status {
@@ -1355,7 +1371,7 @@ impl App {
         let spent_all = task_budget(&self.settings).is_some_and(|b| resp.cost_usd >= b);
         if self.memory_up() && !spent_all {
             self.learning.insert(trace.to_string());
-            actions.push(Action::Learn { trace });
+            actions.push(Action::Learn { trace, model: memory_model });
         }
         actions
     }
@@ -1478,7 +1494,10 @@ impl App {
                     parts.push(format!("disputed {}", count(r.contradicted.len())));
                 }
                 if parts.is_empty() {
-                    parts.push("nothing new".into());
+                    parts.push(match &r.skipped {
+                        Some(why) => format!("nothing new: {}", clean_line(why)),
+                        None => "nothing new".into(),
+                    });
                 }
                 self.push(head(parts.join(" · ")));
                 for note in &r.added {
@@ -1713,6 +1732,7 @@ fn help() -> Vec<Line<'static>> {
         row("/check [command]", "use this check for every task; empty: design one"),
         row("/attempts N", "attempts at once, 1 to 8"),
         row("/model NAME", "opus, sonnet, haiku or a model id"),
+        row("/memory-model NAME", "model memory learns with; same: the attempts'"),
         row("/effort LEVEL", "low, medium, high, xhigh or max"),
         row("/budget USD", "spending limit per task"),
         row("/last", "the diff of the last finished task"),
@@ -1875,7 +1895,7 @@ mod tests {
         assert_eq!(plain(&task.lanes[1].lines), [" 3 edit src/parser.rs", "   check passed"]);
 
         let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-1"))) });
-        assert_eq!(actions, [Action::Learn { trace: trace.clone() }]);
+        assert_eq!(actions, [Action::Learn { trace: trace.clone(), model: None }]);
         assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
         assert!(
             log(&app).contains("✓ passed  1 file  +2 −1\n  Trailing commas parse.\n  modified src/parser.rs"),
@@ -1988,6 +2008,52 @@ mod tests {
             "{}",
             log(&app)
         );
+    }
+
+    #[test]
+    fn memory_learns_with_the_model_set_for_it() {
+        // What the next run's learning asks for, after `commands`.
+        let learns_with = |commands: &[&str]| {
+            let mut app = App::new("/w", None);
+            up(&mut app);
+            for c in commands.iter().chain(&["/check make test"]) {
+                assert!(type_in(&mut app, c).is_empty(), "{c}");
+            }
+            let actions = type_in(&mut app, "task");
+            let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+            let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/f"))) });
+            let [Action::Learn { model, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+            model.clone()
+        };
+        assert_eq!(learns_with(&[]), None, "memory's own default");
+        assert_eq!(learns_with(&["/model opus"]), None, "/model is for the attempts only");
+        assert_eq!(learns_with(&["/memory-model glm-4.6"]).as_deref(), Some("glm-4.6"));
+        assert_eq!(learns_with(&["/model glm-4.6", "/memory-model same"]).as_deref(), Some("glm-4.6"));
+        assert_eq!(learns_with(&["/memory-model same"]), None, "the attempts use the default too");
+        assert_eq!(learns_with(&["/memory-model haiku", "/memory-model default"]), None);
+
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/memory-model glm-4.6");
+        assert_eq!(app.flash.as_deref(), Some("memory model: glm-4.6"));
+        type_in(&mut app, "/memory-model same");
+        assert_eq!(app.flash.as_deref(), Some("memory model: the attempts' model"));
+        assert!(plain(&help()).iter().any(|l| l.contains("/memory-model NAME")));
+    }
+
+    #[test]
+    fn learning_that_was_skipped_says_why() {
+        let mut app = App::new("/w", None);
+        let skipped = ConsolidateResponse {
+            added: vec![],
+            reinforced: vec![],
+            contradicted: vec![],
+            skipped: Some("the episode held nothing worth keeping".into()),
+            usage: Usage::default(),
+            cost_usd: 0.01,
+        };
+        app.learned(Ok(skipped));
+        assert!(log(&app).ends_with("◇ memory  nothing new: the episode held nothing worth keeping"), "{}", log(&app));
     }
 
     #[test]
@@ -2356,7 +2422,7 @@ mod tests {
         assert_eq!(req.check.as_deref(), Some("cargo test --test commas"));
         assert!(app.prompt.is_none());
         let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-1"))) });
-        assert_eq!(actions, [Action::Apply { fork: "/d/work/fork-1".into() }, Action::Learn { trace }]);
+        assert_eq!(actions, [Action::Apply { fork: "/d/work/fork-1".into() }, Action::Learn { trace, model: None }]);
         assert!(app.prompt.is_none());
         app.update(Msg::Applied(Ok(())));
         let log = log(&app);
