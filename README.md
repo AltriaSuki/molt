@@ -98,7 +98,11 @@ to generate per-service credentials, put the printed `authorization` block and
 `molt` with no subcommand (or `molt ui [--workspace DIR] [--data-dir DIR]
 [--pass-env NAME]...`) opens a terminal interface on the workspace. It starts
 the services once and keeps them up, so tasks follow one another without a
-restart. Type a task and press Enter.
+restart. Type a task and press Enter. A task can run over several lines:
+Shift+Enter, Ctrl+J, or `\` then Enter starts a new one, and a paste keeps
+its line breaks and indentation (a paste of more than 20 lines shows as
+`[pasted #1: 143 lines]` and is sent in full). Ctrl+G opens the task in
+`$VISUAL` or `$EDITOR`.
 
 In the default mode, **confirm**, a task can stop twice for you, and does
 only when something calls for a look; otherwise it runs through and the log
