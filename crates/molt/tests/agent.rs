@@ -451,6 +451,7 @@ fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) ->
         "MOLT_CHECK_TIMEOUT_S",
         "MOLT_MAP_TOKENS",
         "MOLT_CONTEXT_TOKENS",
+        "MOLT_INSTRUCTION_FILES",
         "MOLT_MEMORY_MODEL",
         "MOLT_MEMORY_EFFORT",
         "MOLT_MEMORY_MAX_TOKENS",

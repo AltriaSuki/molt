@@ -293,6 +293,7 @@ Defaults come from the environment:
 | `MOLT_MAX_CHECK_ROUNDS`, `MOLT_CHECK_TIMEOUT_S` | planner | `3` check runs per attempt, `900` |
 | `MOLT_MAP_TOKENS` | planner | `3000` (the project map a run starts with; at most `32000`) |
 | `MOLT_CONTEXT_TOKENS` | planner | the model's context window: `200000` for Claude models, `128000` for others |
+| `MOLT_INSTRUCTION_FILES` | planner | `AGENTS.md,CLAUDE.md` (the project's instruction files; `none` reads none) |
 | `MOLT_MEMORY_MODEL`, `MOLT_MEMORY_EFFORT`, `MOLT_MEMORY_MAX_TOKENS`, `MOLT_MEMORY_MODEL_TIMEOUT_S` | memory | `sonnet`, `low`, `8000`, `300` |
 
 The planner reads `MOLT_MAX_TOKENS` and `MOLT_MODEL_TIMEOUT_S` too: a model
@@ -313,6 +314,22 @@ single result too big to fit even alone is cut down, and says so. Progress
 notes each time this happens, and the full conversation stays in the audit
 log. When even that cannot fit, the attempt ends with an error that names
 the limit, the model's input or the transport frame.
+
+### Project instructions
+
+A run starts by reading the project's instruction files, `AGENTS.md` and
+`CLAUDE.md`, from the workspace root and from every directory on the way to a
+path the task names (`crates/molt/src/x.rs` brings in `crates/AGENTS.md` and
+`crates/molt/AGENTS.md` too). They go into the first message of the check's
+designer and of every attempt, as a `<project_instructions>` block before the
+task, at most 16 KiB of them; a file under the same text by another name is
+shown once. They are data, like memory's notes: they never go into the
+system prompt, nothing in them runs, and they change neither the sandbox
+nor the done-check. The block says the task wins where they disagree, and
+that they win over notes. They are read with `fs.read`, so the audit log
+records what each run saw, and the run's progress lists the files.
+`--no-memory` does not turn them off; `MOLT_INSTRUCTION_FILES` names other
+files, or `none`.
 
 ## Memory
 

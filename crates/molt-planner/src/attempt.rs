@@ -221,7 +221,7 @@ impl Attempt {
                     &ctx.task,
                     self.check.as_ref().map(|c| (c.command.as_str(), paths.as_slice())),
                     self.index,
-                    ctx.memory.context.as_deref(),
+                    &ctx.preamble(),
                 );
                 (fork, Conversation::new(system, tools, first, Some(self.index)))
             }

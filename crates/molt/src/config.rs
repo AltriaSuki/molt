@@ -230,6 +230,7 @@ const PLANNER_ENV: &[&str] = &[
     "MOLT_CHECK_TIMEOUT_S",
     "MOLT_MAP_TOKENS",
     "MOLT_CONTEXT_TOKENS",
+    "MOLT_INSTRUCTION_FILES",
 ];
 
 /// What the memory service reads from its environment (see `molt_memory::Config::from_env`).
