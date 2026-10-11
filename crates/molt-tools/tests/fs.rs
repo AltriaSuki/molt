@@ -12,6 +12,67 @@ use molt_tools::{Fs, Roots};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+#[tokio::test]
+async fn a_durable_merge_retains_preimages_for_files_links_modes_and_dropped_forks() {
+    use molt_api::fs::{AppliesResponse, ApplyStatus, RecoverResponse};
+    let env = Env::new();
+    Env::put(&env.ws, &[("modified.txt", "old\n"), ("deleted.txt", "restore me\n"), ("run.sh", "echo hello\n")]);
+    fs::set_permissions(env.ws.join("modified.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+    symlink("modified.txt", env.ws.join("link")).unwrap();
+    let fork = env.fork().await;
+    Env::put(&fork, &[("modified.txt", "new\n"), ("new/added.txt", "added\n")]);
+    fs::remove_file(fork.join("deleted.txt")).unwrap();
+    fs::set_permissions(fork.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_file(fork.join("link")).unwrap();
+    symlink("new/added.txt", fork.join("link")).unwrap();
+    let merged = env.ok("merge", json!({"fork": fork, "drop": true})).await;
+    let id = merged["operation"].as_str().unwrap();
+    assert!(!fork.exists());
+    let operations: AppliesResponse =
+        serde_json::from_value(env.ok("applies", json!({"workspace": "ws"})).await).unwrap();
+    assert_eq!(operations.operations[0].status, ApplyStatus::Applied);
+    assert_eq!(fs::read_to_string(env.ws.join("modified.txt")).unwrap(), "new\n");
+    assert!(!env.ws.join("deleted.txt").exists());
+    assert_eq!(fs::read_link(env.ws.join("link")).unwrap(), Path::new("new/added.txt"));
+    for _ in 0..2 {
+        let (reply, changed) =
+            env.fs.handle_reporting("recover", json!({"workspace": "ws", "operation": id, "action": "undo"})).await;
+        let reply: RecoverResponse = serde_json::from_value(reply.unwrap()).unwrap();
+        assert_eq!(reply.operation.status, ApplyStatus::Undone);
+        if let Some(changed) = changed {
+            assert_eq!(changed.paths.len(), 5);
+        }
+    }
+    assert_eq!(fs::read_to_string(env.ws.join("modified.txt")).unwrap(), "old\n");
+    assert_eq!(fs::read_to_string(env.ws.join("deleted.txt")).unwrap(), "restore me\n");
+    assert!(!env.ws.join("new").exists());
+    assert_eq!(fs::read_link(env.ws.join("link")).unwrap(), Path::new("modified.txt"));
+    assert_eq!(fs::metadata(env.ws.join("modified.txt")).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(fs::metadata(env.ws.join("run.sh")).unwrap().permissions().mode() & 0o111, 0);
+    let record = env.scratch.join(".molt/applies").join(id);
+    assert_eq!(fs::metadata(&record).unwrap().permissions().mode() & 0o777, 0o700);
+    for f in fs::read_dir(record).unwrap() {
+        assert_eq!(f.unwrap().metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    assert!(env
+        .invalid(
+            "write",
+            json!({"workspace": env.scratch, "path": format!(".molt/applies/{id}/journal.json"), "content": "{}"})
+        )
+        .await
+        .contains("Molt's own data"));
+    assert!(env
+        .invalid("read", json!({"workspace": env.scratch.join(".molt/applies").join(id), "path": "journal.json"}))
+        .await
+        .contains("Molt's own data"));
+    let resumed: RecoverResponse = serde_json::from_value(
+        env.ok("recover", json!({"workspace": "ws", "operation": id, "action": "resume"})).await,
+    )
+    .unwrap();
+    assert_eq!(resumed.operation.status, ApplyStatus::Applied);
+    assert_eq!(fs::read_to_string(env.ws.join("modified.txt")).unwrap(), "new\n");
+}
+
 struct Env {
     tmp: TempDir,
     scratch: PathBuf,
@@ -445,7 +506,14 @@ async fn diff_and_merge_carry_changes_back() {
     assert!(env.ws.join("node_modules/pkg/index.js").is_file());
     assert!(env.ws.join(".git/HEAD").is_file());
     assert!(!fork.exists(), "drop: true removes the fork");
-    assert!(fs::read_dir(&env.scratch).unwrap().next().is_none(), "and its metadata");
+    assert!(!fork.with_extension("json").exists(), "drop removes the fork metadata");
+    assert_eq!(fs::read_dir(&env.scratch).unwrap().map(|e| e.unwrap().file_name()).collect::<Vec<_>>(), [".molt"]);
+    assert!(env
+        .scratch
+        .join(".molt/applies")
+        .join(reply["operation"].as_str().unwrap())
+        .join("journal.json")
+        .is_file());
 }
 
 fn mode(path: &Path) -> u32 {

@@ -277,7 +277,7 @@ impl Fake {
                 if m.drop {
                     st.forks.remove(&m.fork);
                 }
-                json!(fs::MergeResponse { changes })
+                json!(fs::MergeResponse { changes, operation: None })
             }
             fs::DROP => {
                 let d: fs::DropRequest = parse(payload);
@@ -1281,7 +1281,7 @@ async fn a_merge_that_stops_partway_is_reported_as_partial() {
     assert_eq!((resp.outcome, resp.applied), (Outcome::Passed, false));
     assert_eq!(resp.fork.as_deref(), Some("/scratch/fork-0"));
     assert!(
-        resp.summary.contains("The merge stopped partway, so the workspace has only some of the changes: partial:")
+        resp.summary.contains("The apply needs recovery; the workspace may contain changes: partial:")
             && resp.summary.contains("written: a.txt")
             && resp.summary.contains("/scratch/fork-0"),
         "{}",
