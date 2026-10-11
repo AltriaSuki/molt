@@ -2466,11 +2466,10 @@ mod tests {
         up(&mut app);
         app.settings.budget_usd = Some(1.0);
         type_in(&mut app, "/check true");
-        type_in(&mut app, "/stream off");
         let actions = type_in(&mut app, "implement it");
         let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
         let trace = trace.clone();
-        // Spending is counted even with previews off, and only once a call.
+        // Each call counts once.
         app.update(finished(&app, Some(0), "a", Some(0.3)));
         app.update(finished(&app, Some(0), "a", Some(0.3)));
         app.update(finished(&app, Some(1), "b", None));
@@ -2479,7 +2478,7 @@ mod tests {
         assert_eq!(task.lanes[1].spend.label(), "≥ $0.00");
         assert_eq!(task.spend().label(), "≥ $0.30");
         let shown = frame_text(&mut app);
-        assert!(shown.contains("turn 0 · 0s · $0.30"), "{shown}");
+        assert!(shown.contains("turn 1 · 0s · $0.30"), "{shown}");
         assert!(shown.contains("task ≥ $0.30 / $1.00"), "{shown}");
         assert_eq!(app.spent_usd, 0.0, "progress events do not settle spending");
 

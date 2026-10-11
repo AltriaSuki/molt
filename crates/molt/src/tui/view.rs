@@ -299,7 +299,9 @@ fn draw_lanes(frame: &mut Frame, area: Rect, app: &App) {
                 name = format!(" {} ", lane.index + 1);
             }
             let room = room(&name);
-            let status = lane_status(&base, &text::duration(lane.elapsed()), &lane.spend.label(), room);
+            // Without previews no call's cost arrives before the reply.
+            let cost = task.req.stream.then(|| lane.spend.label());
+            let status = lane_status(&base, &text::duration(lane.elapsed()), cost.as_deref(), room);
             let border = match lane.status {
                 Some(molt_api::planner::AttemptStatus::Passed) => Tone::Ok,
                 _ => Tone::Dim,
@@ -325,9 +327,11 @@ fn draw_lanes(frame: &mut Frame, area: Rect, app: &App) {
 
 /// A lane's status with its running time and cost, as many as fit in `room`
 /// cells: the cost goes first, then the time.
-fn lane_status(base: &str, time: &str, cost: &str, room: usize) -> String {
-    [format!("{base} · {time} · {cost}"), format!("{base} · {time}")]
+fn lane_status(base: &str, time: &str, cost: Option<&str>, room: usize) -> String {
+    let with_cost = cost.map(|cost| format!("{base} · {time} · {cost}"));
+    with_cost
         .into_iter()
+        .chain([format!("{base} · {time}")])
         .find(|s| text::width(s) <= room)
         .unwrap_or_else(|| base.to_owned())
 }
@@ -446,7 +450,8 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     if app.uncounted_calls > 0 {
         cost.push_str(&format!(" known · {} calls uncounted", app.uncounted_calls));
     }
-    let task = app.task.as_ref().filter(|t| matches!(t.phase, Phase::Designing | Phase::Running));
+    // Without previews no call's cost arrives before the reply.
+    let task = app.task.as_ref().filter(|t| t.req.stream && matches!(t.phase, Phase::Designing | Phase::Running));
     if let (Some(b), None) = (s.budget_usd, task) {
         cost.push_str(&format!(" · ${b:.2}/task"));
     }
@@ -641,12 +646,13 @@ mod tests {
 
     #[test]
     fn a_lane_status_drops_the_cost_then_the_time_when_narrow() {
-        let status = |room| lane_status("◐ turn 7", "2m14s", "$0.18", room);
+        let status = |room| lane_status("◐ turn 7", "2m14s", Some("$0.18"), room);
         assert_eq!(status(40), "◐ turn 7 · 2m14s · $0.18");
         assert_eq!(status(24), "◐ turn 7 · 2m14s · $0.18");
         assert_eq!(status(23), "◐ turn 7 · 2m14s");
         assert_eq!(status(16), "◐ turn 7 · 2m14s");
         assert_eq!(status(15), "◐ turn 7");
         assert_eq!(status(0), "◐ turn 7");
+        assert_eq!(lane_status("◐ turn 7", "2m14s", None, 40), "◐ turn 7 · 2m14s");
     }
 }
