@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod git;
 mod lock;
 pub mod session;
 pub mod tui;

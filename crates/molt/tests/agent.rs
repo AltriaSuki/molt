@@ -844,6 +844,92 @@ async fn the_cli_carries_out_a_task() {
     assert_forks_dropped(data.path());
 }
 
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn a_committed_run_can_be_undone_and_memory_stops_counting_it() {
+    let server = fake_api(Fake::Greets).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let w = workspace.path();
+    git(w, &["init", "-q", "-b", "main"]);
+    for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")] {
+        git(w, &["config", key, value]);
+    }
+    std::fs::write(w.join("notes.txt"), "draft\n").unwrap();
+    git(w, &["add", "."]);
+    git(w, &["commit", "-q", "-m", "start"]);
+    // The user's own change, staged before the run, stays out of its commit.
+    std::fs::write(w.join("notes.txt"), "mine\n").unwrap();
+    git(w, &["add", "notes.txt"]);
+
+    let args = ["--check", CHECK, "--attempts", "1", "--commit"];
+    let out = tokio::time::timeout(RUN_LIMIT, molt_do(&server, w, data.path(), &args).output())
+        .await
+        .expect("molt do hung")
+        .unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}", out.status);
+    assert!(stderr.contains("committed ") && stderr.contains("on branch main"), "{stderr}");
+    assert_eq!(git(w, &["show", "--name-only", "--format=", "HEAD"]), "greeting.txt\n");
+    let run = git(w, &["log", "-1", "--format=%(trailers:key=Molt-Run,valueonly)"]).trim().to_owned();
+    assert!(run.starts_with("trace_"), "{run}");
+    assert!(git(w, &["log", "-1", "--format=%B"]).contains(&format!("Molt-Check: {CHECK}")));
+    assert_eq!(git(w, &["diff", "--cached", "--name-only"]), "notes.txt\n");
+    let memory = || {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+            .args(["memory", "show", "--data-dir"])
+            .arg(data.path())
+            .current_dir(w)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
+    };
+    assert!(memory().contains(LEARNED_TEXT));
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+        .args(["undo", "--data-dir"])
+        .arg(data.path())
+        .current_dir(w)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.starts_with(&format!("undid run {run}: reverted ")), "{stdout}");
+    assert!(stderr.contains("memory no longer counts the run: 1 notes only it showed forgotten"), "{stderr}");
+    assert!(!w.join("greeting.txt").exists());
+    assert!(git(w, &["log", "-1", "--format=%B"]).contains(&format!("Molt-Undo: {run}")));
+    assert_eq!(git(w, &["diff", "--cached", "--name-only"]), "notes.txt\n");
+    assert_eq!(memory(), "no notes\n");
+    // The memory service did the undo, so the audit log has it.
+    let audit = molt_kernel::audit::read_all(&data.path().join("audit.jsonl")).await.unwrap();
+    assert!(audit.iter().any(|e| matches!(&e.event, AuditEvent::Message { envelope }
+        if envelope.to.to_string() == "memory.undo" && envelope.payload["run"] == run.as_str())));
+}
+
+#[tokio::test]
+async fn commit_outside_git_still_applies_and_exits_4() {
+    let server = fake_api(Fake::Greets).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let args = ["--check", CHECK, "--attempts", "1", "--commit", "--no-learn"];
+    let out = tokio::time::timeout(RUN_LIMIT, molt_do(&server, workspace.path(), data.path(), &args).output())
+        .await
+        .expect("molt do hung")
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert!(stderr.contains("is not in a git work tree; the result will be applied but not committed"), "{stderr}");
+    assert!(stderr.contains("not committed: --commit: "), "{stderr}");
+    assert_eq!(std::fs::read_to_string(workspace.path().join("greeting.txt")).unwrap(), "hello\n");
+}
+
 #[tokio::test]
 async fn streamed_calls_keep_tools_signatures_and_parallel_call_identity() {
     let server = fake_api(Fake::Greets).await;
