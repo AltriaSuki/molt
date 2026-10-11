@@ -17,8 +17,9 @@ use ratatui::text::Line;
 use super::text::{self, block, clean_line, span, Tone};
 use crate::agent::outcome_name;
 
-/// Lines of a winner's final message shown in the log; the rest is cut.
-const SUMMARY_LINES: usize = 40;
+/// Bytes of one summary written to the log. Only a runaway message reaches
+/// this; the log keeps everything a normal task says.
+const SUMMARY_BYTES: usize = 1 << 20;
 /// Lines kept per attempt while it runs.
 const LANE_LINES: usize = 200;
 
@@ -182,6 +183,12 @@ pub enum Prompt {
     },
 }
 
+/// A finished task's diff, kept after the task is applied, kept or discarded.
+struct LastDiff {
+    patch: String,
+    truncated: bool,
+}
+
 /// Text shown over everything else: a diff, a check's files, help.
 pub struct Viewer {
     pub title: String,
@@ -307,6 +314,8 @@ pub struct App {
     pub learning: HashSet<String>,
     /// Results the user kept in their forks; never removed.
     pub kept: Vec<String>,
+    /// The diff of the last task that finished, for `/last`.
+    last: Option<LastDiff>,
     /// The attempt drawn alone, large.
     pub zoom: Option<u32>,
     /// A short message in the status bar, until the next key.
@@ -347,6 +356,7 @@ impl App {
             spent_usd: 0.0,
             learning: HashSet::new(),
             kept: Vec::new(),
+            last: None,
             zoom: None,
             flash: None,
             tick: 0,
@@ -528,6 +538,16 @@ impl App {
             }
             KeyCode::PageDown => {
                 self.scroll = self.scroll.saturating_sub(10);
+                return Vec::new();
+            }
+            // Home and End move the cursor while there is text to move it in.
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) || self.input.text.is_empty() => {
+                // The view clamps this to the top of the log.
+                self.scroll = usize::MAX;
+                return Vec::new();
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) || self.input.text.is_empty() => {
+                self.scroll = 0;
                 return Vec::new();
             }
             KeyCode::Up if self.prompt.is_none() => {
@@ -730,6 +750,10 @@ impl App {
                 }
                 _ => self.flash = Some("budget: a positive amount of US dollars".into()),
             },
+            "last" => match &self.last {
+                Some(last) => self.viewer = Some(diff_viewer(&last.patch, last.truncated)),
+                None => self.flash = Some("no task has finished with changes yet".into()),
+            },
             "clear" => {
                 self.log.clear();
                 self.scroll = 0;
@@ -782,14 +806,11 @@ impl App {
                 });
                 head.push(span(format!("  {}", parts.join(" · ")), Tone::Dim));
                 self.log.push(Line::from(head));
-                for n in notes.iter().take(5) {
+                for n in &notes {
                     self.log.push(Line::from(vec![
                         span(format!("  {:.2} ", n.confidence), Tone::Mem),
                         span(clean_line(&n.text), Tone::Plain),
                     ]));
-                }
-                if notes.len() > 5 {
-                    self.log.push(Line::from(span(format!("  and {} more", notes.len() - 5), Tone::Dim)));
                 }
             }
             // Model streaming is opt-in and the terminal interface does not ask for it.
@@ -974,11 +995,16 @@ impl App {
             span(" ", Tone::Plain),
             span(format!("−{removed}"), Tone::Bad),
         ];
-        let summary = resp.summary.trim();
+        let (summary, cut) = bounded(resp.summary.trim(), SUMMARY_BYTES);
+        let cut_note = cut.then(|| {
+            let note = format!("  (cut at 1 MB; the whole text is in the audit log, trace {trace})");
+            Line::from(span(note, Tone::Warn))
+        });
         match resp.outcome {
             Outcome::Failed => {
                 self.push(Line::from(span("✗ no attempt passed", Tone::Bad)));
-                self.log.extend(block(summary, "  ", Tone::Dim).into_iter().take(SUMMARY_LINES));
+                self.log.extend(block(summary, "  ", Tone::Dim));
+                self.log.extend(cut_note);
             }
             Outcome::Passed | Outcome::Unverified => {
                 let tone = if resp.outcome == Outcome::Passed { Tone::Ok } else { Tone::Warn };
@@ -987,22 +1013,15 @@ impl App {
                     head.extend(size);
                 }
                 self.push(Line::from(head));
-                let lines = block(summary, "  ", Tone::Plain);
-                let cut = lines.len().saturating_sub(SUMMARY_LINES);
-                self.log.extend(lines.into_iter().take(SUMMARY_LINES));
-                if cut > 0 {
-                    self.push(Line::from(span(format!("  ({cut} more lines)"), Tone::Dim)));
-                }
-                for c in resp.changes.iter().take(20) {
+                self.log.extend(block(summary, "  ", Tone::Plain));
+                self.log.extend(cut_note);
+                for c in &resp.changes {
                     let kind = match c.kind {
                         ChangeKind::Added => "added   ",
                         ChangeKind::Modified => "modified",
                         ChangeKind::Deleted => "deleted ",
                     };
                     self.push(Line::from(span(format!("  {kind} {}", clean_line(&c.path)), Tone::Dim)));
-                }
-                if resp.changes.len() > 20 {
-                    self.push(Line::from(span(format!("  and {} more", resp.changes.len() - 20), Tone::Dim)));
                 }
             }
         }
@@ -1011,6 +1030,9 @@ impl App {
             self.push(Line::from(span(line, Tone::Dim)));
         }
 
+        if !resp.patch.is_empty() {
+            self.last = Some(LastDiff { patch: resp.patch.clone(), truncated: resp.patch_truncated });
+        }
         let mut deciding = false;
         if resp.applied {
             self.push(Line::from(span("  applied", Tone::Ok)));
@@ -1057,11 +1079,7 @@ impl App {
                 vec![Action::Discard { fork }]
             }
             KeyCode::Char('d') => {
-                let mut lines = text::diff_lines(&resp.patch);
-                if resp.patch_truncated {
-                    lines.push(Line::from(span("(the diff is cut short here)", Tone::Dim)));
-                }
-                self.viewer = Some(Viewer { title: "diff".into(), lines, scroll: 0 });
+                self.viewer = Some(diff_viewer(&resp.patch, resp.patch_truncated));
                 Vec::new()
             }
             KeyCode::Char('k') | KeyCode::Esc => {
@@ -1181,6 +1199,26 @@ fn lane(task: &mut Task, attempt: u32) -> Option<&mut Lane> {
     task.lanes.iter_mut().find(|l| l.index == attempt)
 }
 
+fn diff_viewer(patch: &str, truncated: bool) -> Viewer {
+    let mut lines = text::diff_lines(patch);
+    if truncated {
+        lines.push(Line::from(span("(the diff is cut short here)", Tone::Dim)));
+    }
+    Viewer { title: "diff".into(), lines, scroll: 0 }
+}
+
+/// `text` cut to at most `max` bytes at a character boundary, and whether it was cut.
+fn bounded(text: &str, max: usize) -> (&str, bool) {
+    if text.len() <= max {
+        return (text, false);
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
 fn check_head(designed: bool) -> Line<'static> {
     let by = if designed { "designed" } else { "yours" };
     Line::from(vec![span("◆ check", Tone::Shell), span(format!("  {by}"), Tone::Dim)])
@@ -1203,6 +1241,7 @@ fn help() -> Vec<Line<'static>> {
         row("tab", "show one attempt large; again for the next"),
         row("esc", "stop the task"),
         row("pgup / pgdn", "scroll the log"),
+        row("ctrl+home / end", "the start or end of the log"),
         row("↑ / ↓", "earlier inputs"),
         row("ctrl+d", "quit"),
         Line::default(),
@@ -1213,6 +1252,7 @@ fn help() -> Vec<Line<'static>> {
         row("/model NAME", "opus, sonnet, haiku or a model id"),
         row("/effort LEVEL", "low, medium, high, xhigh or max"),
         row("/budget USD", "spending limit per task"),
+        row("/last", "the diff of the last finished task"),
         row("/clear", "clear the log"),
         row("/quit", "quit"),
         Line::default(),
@@ -1547,5 +1587,103 @@ mod tests {
         app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-9"))) });
         assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
         assert_eq!(app.update(ctrl_key('d')), [Action::Quit { keep: vec!["/d/work/fork-9".into()] }]);
+    }
+
+    #[test]
+    fn the_log_shows_long_summaries_every_change_and_every_note_in_full() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "/check true");
+        assert!(actions.is_empty());
+        let actions = type_in(&mut app, "task");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
+        let trace = trace.clone();
+        let notes = (0..8)
+            .map(|i| RecalledNote { id: format!("note_{i}"), text: format!("fact {i}"), confidence: 0.5 })
+            .collect();
+        app.update(Msg::Progress(Progress::Recalled { run: trace.to_string(), notes, map_tokens: None }));
+        let mut resp = passed(false, Some("/d/work/fork-3"));
+        resp.summary = (0..200).map(|i| format!("summary line {i}")).collect::<Vec<_>>().join("\n");
+        resp.changes = (0..30).map(|i| Change { path: format!("src/f{i}.rs"), kind: ChangeKind::Modified }).collect();
+        app.update(Msg::Ran { trace, result: Ok(resp) });
+        let log = log(&app);
+        for i in 0..8 {
+            assert!(log.contains(&format!("0.50 fact {i}")), "{log}");
+        }
+        for i in 0..200 {
+            assert!(log.contains(&format!("  summary line {i}\n")), "{log}");
+        }
+        for i in 0..30 {
+            assert!(log.contains(&format!("  modified src/f{i}.rs")), "{log}");
+        }
+        assert!(!log.contains("more lines") && !log.contains(" more\n"), "{log}");
+    }
+
+    #[test]
+    fn a_failed_summary_is_shown_in_full_and_only_a_runaway_one_is_cut() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "task");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
+        let mut resp = passed(false, None);
+        resp.outcome = Outcome::Failed;
+        resp.winner = None;
+        resp.changes = vec![];
+        resp.summary = (0..200).map(|i| format!("why {i}")).collect::<Vec<_>>().join("\n");
+        app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+        assert!(log(&app).contains("  why 0\n") && log(&app).contains("  why 199"), "{}", log(&app));
+        assert!(!log(&app).contains("cut at"), "{}", log(&app));
+
+        let actions = type_in(&mut app, "task");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
+        let mut resp = passed(false, Some("/d/work/fork-4"));
+        resp.summary = "é".repeat(SUMMARY_BYTES);
+        app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+        let note = format!("  (cut at 1 MB; the whole text is in the audit log, trace {trace})");
+        assert!(log(&app).contains(&note), "the cut is said, with where to find the rest");
+    }
+
+    #[test]
+    fn the_last_diff_opens_again_after_the_task_ends() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/last");
+        assert_eq!(app.flash.as_deref(), Some("no task has finished with changes yet"));
+        type_in(&mut app, "/check true");
+        for end in [KeyCode::Char('y'), KeyCode::Char('k'), KeyCode::Char('n')] {
+            let actions = type_in(&mut app, "task");
+            let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
+            app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-5"))) });
+            app.update(key(end));
+            if end == KeyCode::Char('y') {
+                app.update(Msg::Applied(Ok(())));
+            }
+            assert!(app.task.is_none() && app.prompt.is_none());
+            type_in(&mut app, "/last");
+            let viewer = app.viewer.take().expect("the diff opens");
+            assert_eq!(viewer.title, "diff");
+            assert!(plain(&viewer.lines).iter().any(|l| l.contains("+c")), "{:?}", plain(&viewer.lines));
+        }
+    }
+
+    #[test]
+    fn home_and_end_jump_through_the_log_unless_there_is_text_to_edit() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.update(key(KeyCode::Home));
+        assert_eq!(app.scroll, usize::MAX);
+        app.update(key(KeyCode::End));
+        assert_eq!(app.scroll, 0);
+        app.update(Msg::Paste("abc".into()));
+        app.update(key(KeyCode::Home));
+        assert_eq!((app.scroll, app.input.cursor), (0, 0), "home moves the cursor");
+        app.update(Msg::Key(KeyEvent {
+            code: KeyCode::Home,
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }));
+        assert_eq!(app.scroll, usize::MAX);
     }
 }
