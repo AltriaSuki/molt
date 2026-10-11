@@ -63,6 +63,9 @@ pub struct Config {
     /// Names of the project's instruction files, looked for in the
     /// workspace root and the directories the task names.
     pub instruction_files: Vec<String>,
+    /// What the model's file writes and edits do about syntax errors they
+    /// introduce, for runs that do not say.
+    pub syntax_check: molt_api::fs::SyntaxCheck,
 }
 
 impl Default for Config {
@@ -82,6 +85,7 @@ impl Default for Config {
             frame_bytes: molt_transport::MAX_FRAME,
             state_dir: None,
             instruction_files: vec!["AGENTS.md".into(), "CLAUDE.md".into()],
+            syntax_check: molt_api::fs::SyntaxCheck::Report,
         }
     }
 }
@@ -90,7 +94,8 @@ impl Config {
     /// [`Config::default`] overridden by `MOLT_PLANNER_MODEL`,
     /// `MOLT_MAX_TURNS`, `MOLT_MAX_CHECK_ROUNDS`, `MOLT_BUDGET_USD`,
     /// `MOLT_MAX_TOKENS`, `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
-    /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS` and `MOLT_INSTRUCTION_FILES`.
+    /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES` and
+    /// `MOLT_SYNTAX_CHECK`.
     ///
     /// | Variable | Default |
     /// |---|---|
@@ -104,6 +109,7 @@ impl Config {
     /// | `MOLT_MAP_TOKENS` | `3000` (at most 32000) |
     /// | `MOLT_CONTEXT_TOKENS` | unset: 200000 for Claude models, 128000 for others |
     /// | `MOLT_INSTRUCTION_FILES` | `AGENTS.md,CLAUDE.md`; `none` reads none |
+    /// | `MOLT_SYNTAX_CHECK` | `report`; or `reject`, or `off` |
     ///
     /// An empty variable counts as unset. A value that does not parse is an
     /// error, and so is a zero: none of these limits has a "no limit" value.
@@ -158,6 +164,11 @@ impl Config {
                     );
                     names
                 }
+            },
+            syntax_check: match get("MOLT_SYNTAX_CHECK") {
+                None => d.syntax_check,
+                Some(v) => serde_json::from_value(Value::String(v.clone()))
+                    .map_err(|_| anyhow::anyhow!("MOLT_SYNTAX_CHECK={v:?}: use report, reject or off"))?,
             },
         })
     }
@@ -388,6 +399,7 @@ mod tests {
         assert_eq!(cfg.max_concurrent_runs, d.max_concurrent_runs);
         assert_eq!(cfg.map_tokens, 3_000);
         assert_eq!(cfg.instruction_files, ["AGENTS.md", "CLAUDE.md"]);
+        assert_eq!(cfg.syntax_check, molt_api::fs::SyntaxCheck::Report);
     }
 
     #[test]
@@ -414,6 +426,9 @@ mod tests {
         let files = |v: &str| from(&[("MOLT_INSTRUCTION_FILES", v)]).unwrap().instruction_files;
         assert_eq!(files("AGENTS.md, .cursorrules,"), ["AGENTS.md", ".cursorrules"]);
         assert!(files("none").is_empty());
+        let syntax = |v: &str| from(&[("MOLT_SYNTAX_CHECK", v)]).unwrap().syntax_check;
+        assert_eq!(syntax("reject"), molt_api::fs::SyntaxCheck::Reject);
+        assert_eq!(syntax(" off "), molt_api::fs::SyntaxCheck::Off);
     }
 
     #[test]
@@ -438,6 +453,7 @@ mod tests {
         assert!(from(&[("MOLT_CHECK_TIMEOUT_S", "1.5")]).is_err());
         assert!(from(&[("MOLT_INSTRUCTION_FILES", "docs/AGENTS.md")]).is_err());
         assert!(from(&[("MOLT_INSTRUCTION_FILES", "..")]).is_err());
+        assert!(from(&[("MOLT_SYNTAX_CHECK", "strict")]).unwrap_err().to_string().contains("report, reject or off"));
         // Empty means unset.
         assert_eq!(from(&[("MOLT_PLANNER_MODEL", " ")]).unwrap().default_model, None);
     }
