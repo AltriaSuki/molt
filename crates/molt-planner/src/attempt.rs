@@ -29,6 +29,9 @@ pub(crate) struct Check {
     /// Workspace-relative path and contents of each file the check depends
     /// on, written into every fork and restored before every check run.
     pub files: Vec<(String, String)>,
+    /// The project's own test command, run on passing results to compare
+    /// them; attempts never run it.
+    pub suite: Option<String>,
 }
 
 impl Check {
@@ -191,7 +194,9 @@ impl Attempt {
     fn check_at(&self, version: u32) -> Option<Arc<Check>> {
         let check = self.check.clone()?;
         match self.ctx.control.check(version) {
-            Some(command) if command != check.command => Some(Arc::new(Check { command, files: check.files.clone() })),
+            Some(command) if command != check.command => {
+                Some(Arc::new(Check { command, files: check.files.clone(), suite: check.suite.clone() }))
+            }
             _ => Some(check),
         }
     }

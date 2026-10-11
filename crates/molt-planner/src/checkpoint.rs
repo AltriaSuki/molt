@@ -62,6 +62,8 @@ pub struct SavedCheck {
     pub files: Vec<CheckFile>,
     #[serde(default)]
     pub designed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suite: Option<String>,
 }
 
 /// The run's spend so far, every resume of it included.

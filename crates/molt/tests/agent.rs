@@ -477,7 +477,7 @@ async fn a_given_check_passes_and_the_result_is_applied() {
     let (resp, events) = setup.run(setup.request(Some(CHECK), 2)).await;
 
     assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
-    assert_eq!(resp.check, Some(CheckSpec { command: CHECK.into(), files: vec![], designed: false }));
+    assert_eq!(resp.check, Some(CheckSpec { command: CHECK.into(), files: vec![], designed: false, suite: None }));
     assert!(resp.applied);
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
     assert_eq!(resp.changes.len(), 1, "{resp:#?}");
@@ -611,7 +611,7 @@ async fn without_a_check_the_designer_writes_one_and_it_is_merged_too() {
     assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
     assert_eq!(
         resp.check,
-        Some(CheckSpec { command: "sh check.sh".into(), files: vec!["check.sh".into()], designed: true })
+        Some(CheckSpec { command: "sh check.sh".into(), files: vec!["check.sh".into()], designed: true, suite: None })
     );
     assert!(resp.applied);
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
@@ -1140,7 +1140,7 @@ async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
     assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
     assert_eq!(
         resp.check,
-        Some(CheckSpec { command: "sh check.sh".into(), files: vec!["check.sh".into()], designed: true })
+        Some(CheckSpec { command: "sh check.sh".into(), files: vec!["check.sh".into()], designed: true, suite: None })
     );
     assert!(!resp.applied);
     // Only the run's own designer: the accepted check was not designed again.

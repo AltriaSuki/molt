@@ -10,7 +10,7 @@ use molt_api::memory::{
     ReviewResponse,
 };
 use molt_api::model::Effort;
-use molt_api::planner::{Outcome, Resume, RunRequest};
+use molt_api::planner::{Outcome, Resume, RunRequest, Select};
 use molt_planner::checkpoint;
 use molt_proto::{ServiceId, TraceId};
 
@@ -86,6 +86,12 @@ struct DoArgs {
     /// Parallel attempts.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=8))]
     attempts: u32,
+    /// How to pick among attempts that pass: `first` takes the first and
+    /// cancels the rest; `wait:<seconds>` gives the others that long to pass
+    /// too, and `all` lets every attempt finish, then the passing ones are
+    /// compared (project suite, diff size, review).
+    #[arg(long, default_value = "first", value_name = "first|wait:<seconds>|all")]
+    select: Select,
     /// Model for the attempts: opus, sonnet, haiku or a model id.
     #[arg(long)]
     model: Option<String>,
@@ -557,6 +563,7 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     req.check = args.check;
     req.verify = !args.no_check;
     req.attempts = args.attempts;
+    req.select = args.select;
     req.model = args.model;
     req.effort = args.effort;
     req.max_turns = args.max_turns;

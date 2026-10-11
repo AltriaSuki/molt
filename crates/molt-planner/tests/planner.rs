@@ -11,7 +11,7 @@ use molt_api::memory;
 use molt_api::model::{CompleteRequest, CompleteResponse, Usage};
 use molt_api::planner::{
     AttemptStatus, CheckSpec, Constraint, Control, ControlRequest, ControlResponse, Earlier, Outcome, Requirement,
-    Review, RunRequest, RunResponse, RunState, Verdict,
+    Review, RunRequest, RunResponse, RunState, Select, Verdict,
 };
 use molt_api::progress::Progress;
 use molt_api::shell;
@@ -236,11 +236,9 @@ impl Fake {
                 let patch = changes
                     .iter()
                     .map(|c| {
-                        let body: String = now
-                            .get(&c.path)
-                            .map(|t| t.lines().map(|l| format!("+{l}\n")).collect())
-                            .unwrap_or_default();
-                        format!("--- a/{0}\n+++ b/{0}\n{body}", c.path)
+                        let lines: Vec<&str> = now.get(&c.path).map(|t| t.lines().collect()).unwrap_or_default();
+                        let body: String = lines.iter().map(|l| format!("+{l}\n")).collect();
+                        format!("--- a/{0}\n+++ b/{0}\n@@ -0,0 +1,{1} @@\n{body}", c.path, lines.len())
                     })
                     .collect();
                 json!(fs::DiffResponse { changes, patch, truncated: st.patch_truncated })
@@ -534,7 +532,7 @@ async fn an_explicit_check_passes_and_the_winner_is_merged() {
     let resp = run(&fake, request(Some("check"), 1)).await;
 
     assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
-    assert_eq!(resp.check, Some(CheckSpec { command: "check".into(), files: vec![], designed: false }));
+    assert_eq!(resp.check, Some(CheckSpec { command: "check".into(), files: vec![], designed: false, suite: None }));
     assert_eq!((resp.winner, resp.applied, resp.fork.as_deref()), (Some(0), true, None));
     assert_eq!(resp.summary, "Wrote hello.txt.");
     assert_eq!(resp.changes, vec![Change { path: "hello.txt".into(), kind: ChangeKind::Added }]);
@@ -784,8 +782,12 @@ async fn designed_check_files_are_written_into_every_attempt_fork() {
     let resp = run(&fake, request(None, 2)).await;
 
     assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
-    let spec =
-        CheckSpec { command: "sh tests/feature.sh".into(), files: vec!["tests/feature.sh".into()], designed: true };
+    let spec = CheckSpec {
+        command: "sh tests/feature.sh".into(),
+        files: vec!["tests/feature.sh".into()],
+        designed: true,
+        suite: None,
+    };
     assert_eq!(resp.check, Some(spec));
 
     // The designer's fork is dropped before the attempts fork.
@@ -1661,8 +1663,12 @@ async fn requirements_added_before_a_stop_hold_after_the_resume() {
     // Stopped after the user added a requirement, before the attempt took it up.
     let mut saved = molt_planner::checkpoint::Saved::new("trace_test", request(Some("check"), 1));
     saved.settled = true;
-    saved.check =
-        Some(molt_planner::checkpoint::SavedCheck { command: "check".into(), files: vec![], designed: false });
+    saved.check = Some(molt_planner::checkpoint::SavedCheck {
+        command: "check".into(),
+        files: vec![],
+        designed: false,
+        suite: None,
+    });
     let lower = Constraint { text: "Say it in lower case.".into(), ..Default::default() };
     saved.requirements = vec![Requirement { version: 1, constraint: lower, at_ms: 1 }];
     let attempt = saved.attempt(0);
@@ -1700,8 +1706,12 @@ async fn tool_calls_a_stop_cut_short_are_not_run_again() {
     });
     let mut saved = molt_planner::checkpoint::Saved::new("trace_test", request(Some("check"), 1));
     saved.settled = true;
-    saved.check =
-        Some(molt_planner::checkpoint::SavedCheck { command: "check".into(), files: vec![], designed: false });
+    saved.check = Some(molt_planner::checkpoint::SavedCheck {
+        command: "check".into(),
+        files: vec![],
+        designed: false,
+        suite: None,
+    });
     saved.spend.cost_usd = 0.25;
     let attempt = saved.attempt(0);
     attempt.fork = Some(fork.clone());
@@ -2114,4 +2124,157 @@ async fn earlier_tasks_of_the_conversation_come_before_the_task() {
     assert!(
         first.contains("<task>Add a README.</task>") && first.contains("its changes are in the workspace: README.md")
     );
+}
+
+// --- Picking among passing attempts (#40) --------------------------------------
+
+/// Two attempts that both pass: attempt 0 quickly, with a stray extra file;
+/// attempt 1 a little later, with only what the task asks for.
+fn two_passing(reviewer: impl Fn(&CompleteRequest) -> Reply + Send + Sync + 'static) -> Arc<Fake> {
+    Fake::new(
+        move |req| {
+            if is_reviewer(req) {
+                return reviewer(req);
+            }
+            match (attempt_of(req), turn(req)) {
+                (0, 1) => use_tools(
+                    req,
+                    &[
+                        ("write_file", json!({ "path": "hello.txt", "content": "hi\n" })),
+                        ("write_file", json!({ "path": "stray.txt", "content": "a\nb\nc\n" })),
+                    ],
+                ),
+                (0, _) => done("Mine, with extras."),
+                (_, 1) => Reply { delay: Duration::from_millis(100), ..write_hello(req, "hi\n") },
+                _ => done("Mine, minimal."),
+            }
+        },
+        // The project's suite fails when stray.txt is there.
+        |command, files| match command {
+            "suite" if files.contains_key("stray.txt") => exit(1, "stray.txt breaks the suite\n"),
+            "suite" => exit(0, ""),
+            _ => hello_check(command, files),
+        },
+    )
+}
+
+#[tokio::test]
+async fn with_select_all_the_better_scored_of_two_passing_attempts_wins() {
+    let fake = two_passing(|req| submit_review(req, "approve", &[]));
+    let req =
+        RunRequest { select: Select::All, suite: Some("suite".into()), review: true, ..request(Some("check"), 2) };
+    let resp = run(&fake, req).await;
+
+    assert_eq!((resp.outcome, resp.winner), (Outcome::Passed, Some(1)), "{}", resp.summary);
+    assert_eq!(resp.summary, "Mine, minimal.");
+    let statuses: Vec<AttemptStatus> = resp.attempts.iter().map(|a| a.status).collect();
+    assert_eq!(statuses, [AttemptStatus::Passed, AttemptStatus::Passed]);
+    let selection = resp.selection.clone().expect("two passed, so they were compared");
+    assert!(selection.rule.contains("suite") && selection.rule.contains("changed lines"), "{}", selection.rule);
+    let scores: Vec<(u32, Option<bool>, u32, u32)> =
+        selection.candidates.iter().map(|c| (c.attempt, c.suite_passed, c.lines_changed, c.files_changed)).collect();
+    assert_eq!(scores, [(1, Some(true), 1, 1), (0, Some(false), 4, 2)]);
+    assert_eq!(selection.candidates[0].verdict, Some(Verdict::Approve));
+    // The approved best is enough: the other was never reviewed.
+    assert_eq!(selection.candidates[1].verdict, None);
+    assert_eq!(fake.requests().into_iter().filter(is_reviewer).count(), 1);
+    assert_eq!(resp.check.as_ref().and_then(|c| c.suite.as_deref()), Some("suite"));
+
+    assert_eq!(fake.workspace()["hello.txt"], "hi\n");
+    assert!(!fake.workspace().contains_key("stray.txt"));
+    assert!(fake.forks_alive().is_empty());
+    let notes: Vec<String> = fake
+        .events()
+        .into_iter()
+        .filter_map(|e| if let Progress::Note { message, .. } = e { Some(message) } else { None })
+        .collect();
+    assert!(
+        notes.iter().any(|n| n == "picked attempt 1 of 2 passing: the suite passed, 1 lines changed in 1 file"),
+        "{notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn first_takes_the_first_to_pass_and_reports_no_comparison() {
+    let fake = two_passing(|req| submit_review(req, "approve", &[]));
+    let resp = run(&fake, RunRequest { suite: Some("suite".into()), ..request(Some("check"), 2) }).await;
+
+    assert_eq!(resp.winner, Some(0));
+    assert_eq!(resp.attempts[1].status, AttemptStatus::Cancelled);
+    assert!(resp.selection.is_none());
+    assert!(serde_json::to_value(&resp).unwrap().get("selection").is_none());
+    // The suite only compares; with nothing to compare it is not run.
+    assert!(fake.calls_to("shell.run").iter().all(|c| c.payload["command"] != "suite"));
+}
+
+#[tokio::test]
+async fn a_candidate_the_review_rejects_gives_way_to_the_next_best() {
+    // The best-ranked one (attempt 1, no suite here to tell them apart: the smaller diff) is rejected.
+    let fake = two_passing(|req| {
+        let first = req.messages[0]["content"][0]["text"].as_str().unwrap();
+        if first.contains("stray.txt") {
+            submit_review(req, "approve", &[])
+        } else {
+            submit_review(req, "reject", &["hello.txt:1 hard-codes the answer."])
+        }
+    });
+    let resp = run(&fake, RunRequest { select: Select::All, review: true, ..request(Some("check"), 2) }).await;
+
+    assert_eq!(resp.winner, Some(0), "{}", resp.summary);
+    assert!(resp.applied);
+    assert_eq!(resp.review.as_ref().map(|r| r.verdict), Some(Verdict::Approve));
+    let verdicts: Vec<(u32, Option<Verdict>)> =
+        resp.selection.unwrap().candidates.iter().map(|c| (c.attempt, c.verdict)).collect();
+    assert_eq!(verdicts, [(1, Some(Verdict::Reject)), (0, Some(Verdict::Approve))]);
+    assert!(fake.workspace().contains_key("stray.txt"));
+}
+
+/// Attempt 0 passes at once; the others are stuck in a long model call.
+fn one_fast_one_stuck() -> Arc<Fake> {
+    Fake::new(
+        |req| match (attempt_of(req), turn(req)) {
+            (0, 1) => write_hello(req, "hi\n"),
+            (0, _) => done("Mine passed."),
+            _ => Reply { delay: Duration::from_secs(60), ..done("Too late.") },
+        },
+        hello_check,
+    )
+}
+
+#[tokio::test]
+async fn wait_cancels_the_attempts_still_going_when_its_time_is_up() {
+    let fake = one_fast_one_stuck();
+    let started = tokio::time::Instant::now();
+    let resp = run(&fake, RunRequest { select: Select::Wait { secs: 1 }, ..request(Some("check"), 2) }).await;
+
+    assert!(started.elapsed() >= Duration::from_secs(1), "{:?}", started.elapsed());
+    assert_eq!((resp.winner, resp.applied), (Some(0), true));
+    assert_eq!(resp.attempts[1].status, AttemptStatus::Cancelled);
+    // One passed: nothing to compare.
+    assert!(resp.selection.is_none());
+    let noted = fake
+        .events()
+        .into_iter()
+        .any(|e| matches!(e, Progress::Note { message, .. } if message.contains("time to wait")));
+    assert!(noted);
+}
+
+#[tokio::test]
+async fn without_the_budget_to_wait_all_takes_the_first_at_once() {
+    let fake = one_fast_one_stuck();
+    // Attempt 0 costs 0.25; with less than that left, waiting for the stuck one would hang the run.
+    let req = RunRequest { select: Select::All, budget_usd: Some(0.4), ..request(Some("check"), 2) };
+    let resp = run(&fake, req).await;
+
+    assert_eq!((resp.winner, resp.applied), (Some(0), true));
+    assert_eq!(resp.attempts[1].status, AttemptStatus::Cancelled);
+    let note = fake
+        .events()
+        .into_iter()
+        .find_map(|e| match e {
+            Progress::Note { message, .. } if message.contains("of the budget is left") => Some(message),
+            _ => None,
+        })
+        .expect("the run says why it did not wait");
+    assert!(note.starts_with("attempt 0 passed; $0.15 of the budget is left, less than it cost ($0.25)"), "{note}");
 }
