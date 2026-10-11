@@ -244,12 +244,27 @@ Defaults come from the environment:
 | `MOLT_PLANNER_MODEL`, `MOLT_MAX_TURNS`, `MOLT_BUDGET_USD` | planner | the gateway's model, `50`, `10` |
 | `MOLT_MAX_CHECK_ROUNDS`, `MOLT_CHECK_TIMEOUT_S` | planner | `3` check runs per attempt, `900` |
 | `MOLT_MAP_TOKENS` | planner | `3000` (the project map a run starts with; at most `32000`) |
+| `MOLT_CONTEXT_TOKENS` | planner | the model's context window: `200000` for Claude models, `128000` for others |
 | `MOLT_MEMORY_MODEL`, `MOLT_MEMORY_EFFORT`, `MOLT_MEMORY_MAX_TOKENS`, `MOLT_MEMORY_MODEL_TIMEOUT_S` | memory | `sonnet`, `low`, `8000`, `300` |
 
 The planner reads `MOLT_MAX_TOKENS` and `MOLT_MODEL_TIMEOUT_S` too: a model
 call ends at that deadline, the gateway's retries included. `MOLT_FALLBACKS`
 is `1` or `0` (off) and `MOLT_MODEL_RETRIES` may be `0`; every other number
 must be above 0.
+
+### Long tasks
+
+Before each model call, the planner checks that the conversation fits: the
+model's input (`MOLT_CONTEXT_TOKENS` less `MOLT_MAX_TOKENS` for the reply,
+counted from what the model measured on the last call) and the bus frame
+(8 MiB for the whole request). When it would not, the oldest turns are left
+out, always a whole round trip, so no tool call loses its result and no
+assistant turn is changed. Molt adds a short record of what those turns did
+to the first message, after the task and the check, which are never cut. A
+single result too big to fit even alone is cut down, and says so. Progress
+notes each time this happens, and the full conversation stays in the audit
+log. When even that cannot fit, the attempt ends with an error that names
+the limit, the model's input or the transport frame.
 
 ## Memory
 
