@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use molt_api::fs::ChangeKind;
 use molt_api::memory::{ConsolidateResponse, Recalled};
 use molt_api::model::Effort;
-use molt_api::planner::{AttemptStatus, DesignResponse, Outcome, RunRequest, RunResponse};
+use molt_api::planner::{AttemptReport, AttemptStatus, DesignResponse, Outcome, RunRequest, RunResponse};
 use molt_api::progress::Progress;
 use molt_proto::TraceId;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -22,6 +22,10 @@ use crate::agent::outcome_name;
 const SUMMARY_BYTES: usize = 1 << 20;
 /// Lines kept per attempt while it runs.
 const LANE_LINES: usize = 200;
+/// Lines of a failed attempt's note shown under it in the log.
+const NOTE_LINES: usize = 6;
+/// Lines of a failed check's output shown in its lane.
+const CHECK_TAIL_LINES: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -181,6 +185,13 @@ pub enum Prompt {
         resp: Box<RunResponse>,
         fork: String,
     },
+    /// No attempt passed. The input stays live; with it empty, `r` runs the
+    /// task again with the same check and `v` shows why each attempt ended.
+    Retry {
+        req: Box<RunRequest>,
+        designed: bool,
+        attempts: Vec<AttemptReport>,
+    },
 }
 
 /// A finished task's diff, kept after the task is applied, kept or discarded.
@@ -316,6 +327,11 @@ pub struct App {
     pub kept: Vec<String>,
     /// The diff of the last task that finished, for `/last`.
     last: Option<LastDiff>,
+    /// The attempts of the last task that finished, for `/lanes`.
+    last_lanes: Vec<Lane>,
+    /// Values never to show, such as API keys: replaced wherever text from
+    /// commands is shown.
+    pub secrets: Vec<String>,
     /// The attempt drawn alone, large.
     pub zoom: Option<u32>,
     /// A short message in the status bar, until the next key.
@@ -357,6 +373,8 @@ impl App {
             learning: HashSet::new(),
             kept: Vec::new(),
             last: None,
+            last_lanes: Vec::new(),
+            secrets: Vec::new(),
             zoom: None,
             flash: None,
             tick: 0,
@@ -515,6 +533,11 @@ impl App {
         match &self.prompt {
             Some(Prompt::Check(_)) => return self.check_key(&key),
             Some(Prompt::Apply { .. }) => return self.apply_key(&key),
+            Some(Prompt::Retry { .. }) => {
+                if let Some(actions) = self.retry_key(&key) {
+                    return actions;
+                }
+            }
             Some(Prompt::EditCheck(_)) | None => {}
         }
         match key.code {
@@ -750,6 +773,14 @@ impl App {
                 }
                 _ => self.flash = Some("budget: a positive amount of US dollars".into()),
             },
+            "lanes" => {
+                if self.last_lanes.is_empty() {
+                    self.flash = Some("no task has finished yet".into());
+                } else {
+                    self.viewer =
+                        Some(Viewer { title: "attempts".into(), lines: lane_lines(&self.last_lanes), scroll: 0 });
+                }
+            }
             "last" => match &self.last {
                 Some(last) => self.viewer = Some(diff_viewer(&last.patch, last.truncated)),
                 None => self.flash = Some("no task has finished with changes yet".into()),
@@ -835,7 +866,8 @@ impl App {
                     ]));
                 }
             }
-            Progress::CheckRan { attempt, passed, exit_code, .. } => {
+            Progress::CheckRan { attempt, passed, exit_code, tail, .. } => {
+                let tail = scrub(&tail, &self.secrets);
                 if let Some(lane) = lane(task, attempt) {
                     let line = match (passed, exit_code) {
                         (true, _) => span("   check passed", Tone::Ok),
@@ -843,6 +875,9 @@ impl App {
                         (false, None) => span("   check failed (killed or timed out)", Tone::Bad),
                     };
                     lane.push(Line::from(line));
+                    for l in last_lines(&tail, CHECK_TAIL_LINES) {
+                        lane.push(Line::from(span(format!("   {l}"), Tone::Dim)));
+                    }
                 }
             }
             Progress::AttemptFinished { attempt, status, .. } => {
@@ -948,8 +983,9 @@ impl App {
         if task.trace != trace {
             return Vec::new();
         }
-        let task = self.task.take().expect("checked above");
+        let mut task = self.task.take().expect("checked above");
         self.zoom = None;
+        self.last_lanes = std::mem::take(&mut task.lanes);
         let resp = match result {
             Ok(resp) => resp,
             Err(e) => {
@@ -982,6 +1018,11 @@ impl App {
                 span(format!("  {mark} attempt {} ", a.index + 1), tone),
                 span(format!("{status} · {} turns{checks} · ${:.2}", a.turns, a.cost_usd), Tone::Dim),
             ]));
+            if matches!(a.status, AttemptStatus::Failed | AttemptStatus::Error) {
+                for l in last_lines(&scrub(&a.note, &self.secrets), NOTE_LINES) {
+                    self.push(Line::from(span(format!("      {l}"), Tone::Dim)));
+                }
+            }
         }
 
         let (added, removed) = text::diff_counts(&resp.patch);
@@ -995,7 +1036,8 @@ impl App {
             span(" ", Tone::Plain),
             span(format!("−{removed}"), Tone::Bad),
         ];
-        let (summary, cut) = bounded(resp.summary.trim(), SUMMARY_BYTES);
+        let summary = scrub(&resp.summary, &self.secrets);
+        let (summary, cut) = bounded(summary.trim(), SUMMARY_BYTES);
         let cut_note = cut.then(|| {
             let note = format!("  (cut at 1 MB; the whole text is in the audit log, trace {trace})");
             Line::from(span(note, Tone::Warn))
@@ -1049,6 +1091,18 @@ impl App {
         }
         if deciding {
             self.task = Some(Task { phase: Phase::Deciding, lanes: Vec::new(), ..task });
+        } else if resp.outcome == Outcome::Failed && !resp.attempts.is_empty() {
+            // Only a check known in full can be run again without designing it anew.
+            let mut req = task.req;
+            if req.check.is_none() {
+                if let Some(spec) = resp.check.as_ref().filter(|c| c.files.is_empty()) {
+                    req.check = Some(spec.command.clone());
+                }
+            }
+            if req.check.is_some() {
+                let designed = resp.check.as_ref().is_some_and(|c| c.designed);
+                self.prompt = Some(Prompt::Retry { req: Box::new(req), designed, attempts: resp.attempts.clone() });
+            }
         }
 
         // Memory learns from failures too; the run's budget covers it.
@@ -1092,6 +1146,71 @@ impl App {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Keys while a failed run offers a retry: the actions, or `None` to
+    /// handle the key as usual, once the offer is gone.
+    fn retry_key(&mut self, key: &KeyEvent) -> Option<Vec<Action>> {
+        let Some(Prompt::Retry { attempts, .. }) = &self.prompt else { return None };
+        let empty = self.input.text.is_empty();
+        match key.code {
+            KeyCode::Char('r') if empty && key.modifiers.is_empty() => {
+                if !matches!(self.session, SessionState::Up { .. }) {
+                    self.flash = Some("the services are not up".into());
+                    return Some(Vec::new());
+                }
+                let Some(Prompt::Retry { req, designed, .. }) = self.prompt.take() else { return None };
+                Some(self.retry(*req, designed))
+            }
+            KeyCode::Char('v') if empty && key.modifiers.is_empty() => {
+                let mut lines = Vec::new();
+                for a in attempts {
+                    lines.push(Line::from(span(format!("attempt {}", a.index + 1), Tone::Shell)));
+                    let note = if a.note.is_empty() { "(no note)".to_owned() } else { scrub(&a.note, &self.secrets) };
+                    lines.extend(block(&note, "  ", Tone::Plain));
+                    lines.push(Line::default());
+                }
+                lines.extend(lane_lines(&self.last_lanes));
+                self.viewer = Some(Viewer { title: "why the attempts failed".into(), lines, scroll: 0 });
+                Some(Vec::new())
+            }
+            KeyCode::Esc => {
+                self.prompt = None;
+                Some(Vec::new())
+            }
+            _ => {
+                self.prompt = None;
+                None
+            }
+        }
+    }
+
+    /// Run a failed task again with the check it ran with.
+    fn retry(&mut self, req: RunRequest, designed: bool) -> Vec<Action> {
+        let trace = TraceId::random();
+        self.gap();
+        self.push(Line::from(vec![span("› ", Tone::Shell), span(clean_line(&req.task), Tone::Plain)]));
+        let mut lines = vec![check_head(designed)];
+        if let Some(command) = &req.check {
+            lines.push(Line::from(vec![span("  $ ", Tone::Dim), span(clean_line(command), Tone::Plain)]));
+        }
+        for f in &req.check_files {
+            lines.push(Line::from(span(format!("  + {}", clean_line(&f.path)), Tone::Dim)));
+        }
+        lines.push(Line::from(span("  again, with the same check", Tone::Dim)));
+        self.log.extend(lines);
+        self.scroll = 0;
+        self.zoom = None;
+        self.task = Some(Task {
+            trace: trace.clone(),
+            req: req.clone(),
+            phase: Phase::Running,
+            lanes: Vec::new(),
+            check_shown: true,
+            recalled_shown: false,
+            notes_seen: HashSet::new(),
+        });
+        vec![Action::Run { req, trace }]
     }
 
     fn learned(&mut self, result: Result<ConsolidateResponse, String>) {
@@ -1207,6 +1326,34 @@ fn diff_viewer(patch: &str, truncated: bool) -> Viewer {
     Viewer { title: "diff".into(), lines, scroll: 0 }
 }
 
+/// Each lane's lines under its attempt's name, for the viewer.
+fn lane_lines(lanes: &[Lane]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for lane in lanes {
+        lines.push(Line::from(span(format!("attempt {} · tool calls", lane.index + 1), Tone::Shell)));
+        lines.extend(lane.lines.iter().cloned());
+        lines.push(Line::default());
+    }
+    lines
+}
+
+/// The last `n` non-empty lines of `text`, made safe to show.
+fn last_lines(text: &str, n: usize) -> Vec<String> {
+    let lines: Vec<String> = text::clean(text.trim_end()).into_iter().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].to_vec()
+}
+
+/// `text` with every secret in it replaced.
+fn scrub(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_owned();
+    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        if out.contains(secret.as_str()) {
+            out = out.replace(secret.as_str(), "[redacted]");
+        }
+    }
+    out
+}
+
 /// `text` cut to at most `max` bytes at a character boundary, and whether it was cut.
 fn bounded(text: &str, max: usize) -> (&str, bool) {
     if text.len() <= max {
@@ -1253,6 +1400,7 @@ fn help() -> Vec<Line<'static>> {
         row("/effort LEVEL", "low, medium, high, xhigh or max"),
         row("/budget USD", "spending limit per task"),
         row("/last", "the diff of the last finished task"),
+        row("/lanes", "the tool calls of the last finished task"),
         row("/clear", "clear the log"),
         row("/quit", "quit"),
         Line::default(),
@@ -1399,6 +1547,7 @@ mod tests {
             attempt: 1,
             passed: true,
             exit_code: Some(0),
+            tail: String::new(),
         }));
         // Another run's events are not this task's.
         app.update(Msg::Progress(Progress::AttemptStarted { run: "other".into(), attempt: 5 }));
@@ -1685,5 +1834,112 @@ mod tests {
             state: KeyEventState::NONE,
         }));
         assert_eq!(app.scroll, usize::MAX);
+    }
+
+    fn failed(attempts: Vec<AttemptReport>) -> RunResponse {
+        RunResponse {
+            outcome: Outcome::Failed,
+            winner: None,
+            summary: "No attempt passed the done-check.".into(),
+            changes: vec![],
+            patch: String::new(),
+            attempts,
+            ..passed(false, None)
+        }
+    }
+
+    fn attempt(index: u32, status: AttemptStatus, note: &str) -> AttemptReport {
+        AttemptReport {
+            index,
+            status,
+            turns: 3,
+            check_runs: 2,
+            usage: Usage::default(),
+            cost_usd: 0.1,
+            note: note.into(),
+        }
+    }
+
+    #[test]
+    fn a_failed_run_says_why_and_retries_with_the_same_check() {
+        let mut app = App::new("/w", None);
+        app.secrets = vec!["sk-ant-secret-1234".into()];
+        up(&mut app);
+        let actions = type_in(&mut app, "accept trailing commas");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()) });
+        let actions = app.update(key(KeyCode::Enter));
+        let [Action::Run { req: first, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let first = first.clone();
+
+        let run = trace.to_string();
+        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 0 }));
+        app.update(Msg::Progress(Progress::CheckRan {
+            run: run.clone(),
+            attempt: 0,
+            passed: false,
+            exit_code: Some(101),
+            tail: "stdout:\nrunning 1 test\nkey sk-ant-secret-1234\nassertion failed: commas\n".into(),
+        }));
+        assert_eq!(
+            plain(&app.task.as_ref().unwrap().lanes[0].lines),
+            ["   check failed (exit 101)", "   key [redacted]", "   assertion failed: commas"]
+        );
+
+        let note = (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n") + "\nsk-ant-secret-1234";
+        let resp = failed(vec![
+            attempt(0, AttemptStatus::Failed, &note),
+            attempt(1, AttemptStatus::Error, "model call failed: overloaded"),
+        ]);
+        let actions = app.update(Msg::Ran { trace, result: Ok(resp) });
+        assert_eq!(actions.len(), 1, "only learning: {actions:?}");
+        let log = log(&app);
+        assert!(
+            log.contains("  ✗ attempt 1 failed · 3 turns · 2 checks · $0.10\n      line 6\n      line 7\n      line 8\n      line 9\n      line 10\n      [redacted]\n  ! attempt 2 error"),
+            "{log}"
+        );
+        assert!(log.contains("      model call failed: overloaded"), "{log}");
+        assert!(!log.contains("line 5") && !log.contains("sk-ant"), "{log}");
+
+        app.update(key(KeyCode::Char('v')));
+        let viewer = app.viewer.take().expect("why opens");
+        let shown = plain(&viewer.lines).join("\n");
+        assert!(shown.contains("  line 1\n") && shown.contains("attempt 1 · tool calls"), "{shown}");
+        assert!(!shown.contains("sk-ant"), "{shown}");
+
+        let actions = app.update(key(KeyCode::Char('r')));
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("a run, and no design: {actions:?}") };
+        assert_eq!((&req.check, &req.check_files), (&first.check, &first.check_files));
+        assert_eq!(req.check.as_deref(), Some("cargo test --test commas"));
+        assert!(app.prompt.is_none() && app.task.is_some());
+    }
+
+    #[test]
+    fn typing_after_a_failure_starts_a_new_task_and_the_lanes_stay_viewable() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/check make test");
+        let actions = type_in(&mut app, "task");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
+        let run = trace.to_string();
+        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 0 }));
+        app.update(Msg::Progress(Progress::ToolCall {
+            run,
+            attempt: 0,
+            turn: 1,
+            tool: "read_file".into(),
+            detail: "read Makefile".into(),
+        }));
+        app.update(Msg::Ran { trace: trace.clone(), result: Ok(failed(vec![attempt(0, AttemptStatus::Failed, "x")])) });
+        assert!(matches!(app.prompt, Some(Prompt::Retry { .. })));
+        // A key that is not the offer's goes to the input and ends the offer.
+        app.update(key(KeyCode::Char('f')));
+        assert!(app.prompt.is_none());
+        assert_eq!(app.input.text, "f");
+        app.update(ctrl_key('u'));
+        type_in(&mut app, "/lanes");
+        let viewer = app.viewer.take().expect("the last task's attempts");
+        assert_eq!(plain(&viewer.lines)[..2], ["attempt 1 · tool calls", " 1 read Makefile"]);
     }
 }

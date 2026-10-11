@@ -66,6 +66,10 @@ pub enum Progress {
         attempt: u32,
         passed: bool,
         exit_code: Option<i32>,
+        /// The end of a failed check's output, a few hundred bytes at most;
+        /// empty when it passed or from an older planner.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        tail: String,
     },
     AttemptFinished {
         run: String,
@@ -116,5 +120,22 @@ impl Progress {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_check_event_from_an_older_planner_still_parses() {
+        let old = r#"{"event":"check_ran","run":"r","attempt":1,"passed":false,"exit_code":2}"#;
+        let event: Progress = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            event,
+            Progress::CheckRan { run: "r".into(), attempt: 1, passed: false, exit_code: Some(2), tail: String::new() }
+        );
+        // An empty tail is left out, so older subscribers see what they always saw.
+        assert_eq!(serde_json::to_string(&event).unwrap(), old);
     }
 }

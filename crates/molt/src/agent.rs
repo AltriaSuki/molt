@@ -1000,7 +1000,7 @@ mod tests {
                 tool: "read_file".into(),
                 detail: "read a.rs".into(),
             },
-            Progress::CheckRan { run: run.clone(), attempt: 0, passed: false, exit_code: Some(1) },
+            Progress::CheckRan { run: run.clone(), attempt: 0, passed: false, exit_code: Some(1), tail: "boom".into() },
             Progress::AttemptFinished { run, attempt: 1, status: AttemptStatus::Cancelled },
         ]
         .iter()

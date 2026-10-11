@@ -201,6 +201,13 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 keys(&[("enter", "apply"), ("d", "diff"), ("k", "keep in its fork"), ("n", "discard")]),
             ]
         }
+        Some(Prompt::Retry { req, .. }) => vec![
+            Line::from(vec![
+                span("◆ no attempt passed", Tone::Bad),
+                span(format!("  $ {}", clean_line(req.check.as_deref().unwrap_or_default())), Tone::Dim),
+            ]),
+            keys(&[("r", "retry with the same check"), ("v", "why"), ("esc", "dismiss")]),
+        ],
         None => match &app.task {
             Some(Task { phase: Phase::Designing, .. }) => busy("designing the check"),
             Some(task @ Task { phase: Phase::Running, .. }) if task.lanes.is_empty() => {

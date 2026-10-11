@@ -111,7 +111,11 @@ In the default mode, **confirm**, a task stops twice for you:
    check runs as they happen (Tab shows one large). When one passes, you see
    its message, the files it changed and, with `d`, the diff. Enter applies
    it; `k` keeps it in its fork, `n` discards it. `/last` opens the diff of
-   the last finished task again, whatever was done with it.
+   the last finished task again, whatever was done with it. When no attempt
+   passes, each one shows the end of why it stopped, and a failed check shows
+   its last lines in its box; `v` opens the whole story and `r` runs the task
+   again with the same check, without designing it anew. `/lanes` shows the
+   last task's tool calls after it has ended.
 
 Shift+Tab switches to **auto** (design the check and apply what passes) or
 **plan only** (results stay in their forks). Esc stops a task: the services

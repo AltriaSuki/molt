@@ -104,6 +104,7 @@ async fn event_loop(
     });
 
     let mut app = App::new(&workspace, home);
+    app.secrets = secrets_in_env();
     let mut rt =
         Runtime { cfg: Arc::new(cfg), workspace, tx, sessions, session: None, starting: false, work: Vec::new() };
     rt.exec(Action::StartSession);
@@ -158,6 +159,17 @@ fn read_terminal(tx: UnboundedSender<Msg>) {
             break;
         }
     });
+}
+
+/// Values of environment variables named like credentials. Commands never
+/// get them, but a user can pass any variable to the shell, so the interface
+/// hides them in what commands print.
+fn secrets_in_env() -> Vec<String> {
+    const NAMES: &[&str] = &["API_KEY", "TOKEN", "SECRET", "PASSWORD"];
+    std::env::vars()
+        .filter(|(name, value)| value.len() >= 8 && NAMES.iter().any(|n| name.to_ascii_uppercase().contains(n)))
+        .map(|(_, value)| value)
+        .collect()
 }
 
 struct Runtime {
