@@ -2022,7 +2022,8 @@ mod tests {
             let actions = type_in(&mut app, "task");
             let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
             let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/f"))) });
-            let [Action::Learn { model, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+            // Confirm mode applies the passing result first.
+            let [Action::Apply { .. }, Action::Learn { model, .. }] = actions.as_slice() else { panic!("{actions:?}") };
             model.clone()
         };
         assert_eq!(learns_with(&[]), None, "memory's own default");
