@@ -17,7 +17,7 @@ use molt::agent::{run_task, Done, Interrupted};
 use molt::{Config, Secrets, TransportKind};
 use molt_api::fs::{ChangeKind, DROP, FORK, MERGE, WRITE};
 use molt_api::model::COMPLETE;
-use molt_api::planner::tools::{RUN, SUBMIT_CHECK, WRITE_FILE};
+use molt_api::planner::tools::{RUN, SUBMIT_CHECK, SUBMIT_REVIEW, WRITE_FILE};
 use molt_api::planner::{AttemptStatus, CheckSpec, Outcome, RunRequest, RunResponse, RUN as PLANNER_RUN};
 use molt_api::progress::Progress;
 use molt_api::shell::RUN as RUN_CHECK;
@@ -88,6 +88,15 @@ impl Respond for FakeApi {
                 json!({ "type": "text", "text": text }),
             ];
             return message(n, model, content, "end_turn", stream);
+        }
+        // The reviewer of a passing result approves it.
+        if body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_REVIEW)) {
+            let input = json!({ "verdict": "approve", "findings": [] });
+            let content = vec![
+                json!({ "type": "thinking", "thinking": "", "signature": signature(n) }),
+                tool_use(n, SUBMIT_REVIEW, input),
+            ];
+            return message(n, model, content, "tool_use", stream);
         }
         let designer = body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_CHECK));
         let last = messages.last().cloned().unwrap_or(Value::Null);

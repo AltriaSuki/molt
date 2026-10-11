@@ -10,6 +10,7 @@ mod ctx;
 mod designer;
 mod memory;
 mod prompts;
+mod review;
 mod runner;
 mod tools;
 

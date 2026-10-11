@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use molt_api::planner::{AttemptStatus, CheckFile, CheckSpec, DesignResponse, Outcome, RunRequest, RunResponse};
+use molt_api::planner::{
+    AttemptStatus, CheckFile, CheckSpec, DesignResponse, Outcome, RunRequest, RunResponse, Verdict,
+};
 use molt_api::progress::Progress;
 use molt_proto::{ErrorCode, RemoteError, TraceId};
 use tokio::task::JoinSet;
@@ -14,6 +16,7 @@ use crate::attempt::{self, Check, Finished};
 use crate::ctx::Ctx;
 use crate::designer::{self, Design};
 use crate::memory;
+use crate::review::{self, Winner};
 use crate::{Bus, Config};
 
 const MAX_ATTEMPTS: u32 = 8;
@@ -206,7 +209,7 @@ async fn race(ctx: &Arc<Ctx>, count: u32, check: Option<Arc<Check>>) -> (Vec<Fin
 
 /// The response, without the run's totals.
 async fn conclude(
-    ctx: &Ctx,
+    ctx: &Arc<Ctx>,
     req: &RunRequest,
     spec: Option<CheckSpec>,
     finished: Vec<Finished>,
@@ -226,6 +229,7 @@ async fn conclude(
         patch_truncated: false,
         applied: false,
         fork: None,
+        review: None,
         attempts: finished.iter().map(|f| f.report.clone()).collect(),
         usage: Default::default(),
         cost_usd: 0.0,
@@ -252,8 +256,25 @@ async fn conclude(
                     resp.changes = diff.changes;
                     resp.patch = diff.patch;
                     resp.patch_truncated = diff.truncated;
+                    if let (true, Some(check), false) = (req.review, spec.as_ref(), resp.changes.is_empty()) {
+                        let winner = Winner {
+                            fork: &fork,
+                            check,
+                            changes: &resp.changes,
+                            patch: &resp.patch,
+                            truncated: resp.patch_truncated,
+                        };
+                        resp.review = Some(review::review(ctx, &winner).await);
+                    }
+                    let held = resp.review.as_ref().filter(|r| r.verdict != Verdict::Approve);
                     // An unverified attempt that changed nothing (it answered a question) has nothing to merge.
-                    if req.apply && (spec.is_some() || !resp.changes.is_empty()) {
+                    if let (true, Some(review)) = (req.apply, held) {
+                        let what = if review.verdict == Verdict::Reject { "rejected" } else { "questioned" };
+                        resp.summary.push_str(&format!(
+                            "\n\nNot applied: the review {what} the changes. They are kept in {fork}."
+                        ));
+                        keep = true;
+                    } else if req.apply && (spec.is_some() || !resp.changes.is_empty()) {
                         match ctx.merge(&fork).await {
                             Ok(_) => resp.applied = true,
                             Err(e) => {
@@ -326,6 +347,7 @@ fn not_designed(ctx: &Ctx, reason: &str) -> RunResponse {
         patch_truncated: false,
         applied: false,
         fork: None,
+        review: None,
         attempts: Vec::new(),
         usage: tally.spend.usage,
         cost_usd: tally.spend.cost_usd,

@@ -128,6 +128,10 @@ struct DoArgs {
     /// model call after the run).
     #[arg(long)]
     no_learn: bool,
+    /// Do not have a reviewer look at a passing result before it is applied
+    /// (the review is more model calls, and holds back what it questions).
+    #[arg(long)]
+    no_review: bool,
 }
 
 #[derive(Args, Default)]
@@ -509,6 +513,7 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     req.budget_usd = args.budget_usd;
     req.apply = !args.no_apply;
     req.stream = args.stream;
+    req.review = !args.no_review;
     let apply = req.apply;
 
     let mut signal = None;

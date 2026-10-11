@@ -1292,6 +1292,7 @@ mod tests {
             patch_truncated: false,
             applied: apply,
             fork: fork.map(str::to_owned),
+            review: None,
             attempts: vec![
                 AttemptReport {
                     index: 0,

@@ -131,7 +131,7 @@ the same project is refused until it closes.
 
 ```
 molt do TASK [--check CMD | --no-check] [--attempts N] [--model M] [--effort E] [--max-turns N]
-        [--budget-usd X] [--no-apply] [--json] [--stream] [--workspace DIR] [--data-dir DIR]
+        [--budget-usd X] [--no-apply] [--no-review] [--json] [--stream] [--workspace DIR] [--data-dir DIR]
         [--pass-env NAME]... [--no-memory] [--no-learn] [--config FILE]
 ```
 
@@ -143,6 +143,7 @@ molt do TASK [--check CMD | --no-check] [--attempts N] [--model M] [--effort E] 
 | `--model`, `--effort` | Model for the attempts (`opus`, `sonnet`, `haiku` or an id) and how hard it thinks. |
 | `--max-turns`, `--budget-usd` | Model turns per attempt, and the spending limit for the whole run. |
 | `--no-apply` | Keep the result in its fork and print its path instead of merging it. |
+| `--no-review` | Skip the review of a passing result (see below). |
 | `--json` | Print the full result (`planner.run`'s reply in `molt-api`) as JSON. |
 | `--stream` | Show model text previews on stderr while the designer and attempts work. The final result still goes to stdout, including with `--json`. |
 | `--workspace DIR` | The project (default: the current directory). |
@@ -154,6 +155,14 @@ molt do TASK [--check CMD | --no-check] [--attempts N] [--model M] [--effort E] 
 
 Progress goes to stderr and the result to stdout. Control characters in text
 from the model or from file names are printed escaped.
+
+A result that passed its check is reviewed before it is applied. Fixed rules
+look for the usual ways of gaming a check: deleted test files, new skip or
+`only` markers, and changed test configuration. A reviewer model then reads
+the task, the check and the diff with read-only tools and answers approve,
+concern or reject. Only an approved result is merged; otherwise it is kept in
+its fork and the findings are printed. Unverified results (`--no-check`) and
+empty changes are not reviewed.
 
 With `--stream`, previews identify the attempt (or check designer), turn and
 model call. These are provisional text, not verified results. Thinking and

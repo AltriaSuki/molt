@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context};
 use molt_api::fs::ChangeKind;
 use molt_api::memory::{self, ConsolidateRequest, ConsolidateResponse};
-use molt_api::planner::{self, AttemptStatus, Outcome, RunRequest, RunResponse};
+use molt_api::planner::{self, AttemptStatus, Outcome, RunRequest, RunResponse, Verdict};
 use molt_api::progress::{self, Progress};
 use molt_kernel::Kernel;
 use molt_proto::{Budget, CapId, Envelope, ErrorCode, Kind, ServiceId, Target, TraceId};
@@ -661,6 +661,15 @@ pub fn report(resp: &RunResponse) -> String {
         lines.push("changes:".to_owned());
         lines.extend(resp.changes.iter().map(|c| format!("  {:<9}{}", change_name(c.kind), c.path)));
     }
+    if let Some(review) = &resp.review {
+        let verdict = match review.verdict {
+            Verdict::Approve => "approve",
+            Verdict::Concern => "concern",
+            Verdict::Reject => "reject",
+        };
+        lines.push(format!("review: {verdict}"));
+        lines.extend(review.findings.iter().map(|f| format!("  - {f}")));
+    }
     if resp.applied {
         lines.push("applied to the workspace".to_owned());
     } else if let Some(fork) = &resp.fork {
@@ -764,7 +773,7 @@ fn change_name(kind: ChangeKind) -> &'static str {
 mod tests {
     use molt_api::fs::Change;
     use molt_api::model::Usage;
-    use molt_api::planner::CheckSpec;
+    use molt_api::planner::{CheckSpec, Review};
     use serde_json::json;
 
     use super::*;
@@ -1031,6 +1040,7 @@ mod tests {
             patch_truncated: false,
             applied: true,
             fork: None,
+            review: None,
             attempts: vec![],
             usage: Usage { input_tokens: 1000, output_tokens: 200, ..Usage::default() },
             cost_usd: 0.012,
@@ -1049,6 +1059,13 @@ mod tests {
             report(&resp).contains("known cost: $0.0120 (1200 tokens), 2 model calls have unknown or unsettled cost\n")
         );
         resp.uncounted_calls = 0;
+        resp.review = Some(Review { verdict: Verdict::Reject, findings: vec!["src/lib.rs:3 returns 42.".into()] });
+        assert!(
+            report(&resp).contains("review: reject\n  - src/lib.rs:3 returns 42.\nnot applied"),
+            "{}",
+            report(&resp)
+        );
+        resp.review = None;
         resp.changes = vec![Change { path: "\x1b[1Aevil".into(), kind: ChangeKind::Added }];
         resp.summary = "Done.\x1b]0;title\x07\n".into();
         let shown = report(&resp);
