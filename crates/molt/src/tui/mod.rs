@@ -6,6 +6,7 @@
 //! comes back, with the keys, to the app.
 
 mod app;
+mod preview;
 mod text;
 mod view;
 

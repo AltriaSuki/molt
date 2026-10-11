@@ -158,6 +158,14 @@ says why. `/help` lists the keys. The services'
 log goes to `tui.log` in the data dir, and colors are left out under
 `NO_COLOR`.
 
+The interface shows model text previews by default, including while designing
+the check. `/stream off` disables previews for subsequent tasks; `/stream on`
+enables them again. Each attempt keeps only the latest 2,048 characters, with
+terminal controls removed, and folds the text into a brief line when the call
+ends. Missing events are labeled as gaps; the interface never reconstructs
+them. Previews are provisional: the complete reply and check determine the
+result, and cancelled or late events cannot make a result appear.
+
 The interface holds the data dir's lock while it is open, so a `molt do` in
 the same project is refused until it closes.
 
@@ -252,8 +260,8 @@ also works in a narrow terminal or when stderr is redirected.
 For `--config`, give the model service a `topic:publish:progress` request capability,
 as in `molt.example.toml`; `--stream` refuses a setup without it. The new
 gateway events use the request's audit trace and are accepted by the CLI only
-from the kernel-authenticated model service. A TUI can consume the same
-events through the existing progress callback.
+from the kernel-authenticated model service. The TUI consumes the same events
+through its progress callback, with previews enabled by default.
 
 | Exit status | Meaning |
 | --- | --- |
@@ -656,7 +664,7 @@ needed. Deleting an unfinished record loses its recovery material.
 ## Known limits
 
 - The default shell requires Linux x86_64 with bubblewrap 0.9+ and usable user namespaces. Unsupported hosts must explicitly choose --no-sandbox; namespace policy never silently falls back.
-- Model text streams only with `--stream`; thinking is not shown and tool calls wait for the complete message. Preview delivery is best effort, and the final reply remains complete.
+- Model text streams with `--stream` in `molt do` and by default in the TUI (`/stream off` disables it); thinking is not shown and tool calls wait for the complete message. Preview delivery is best effort, and the final reply remains complete.
 - The audit log records every message, file contents and model conversations included, and is never rotated; it grows with every run in a data dir.
 - Audit startup, verification and nonempty tail reads still scan the whole log, but memory is bounded by one record plus the requested tail. A record is limited to 16 MiB including its newline; oversized, malformed or unterminated records are refused, including on restart. The writer stops before persisting an oversized entry. `tail -n 0` opens the file without scanning; `read_all` intentionally retains every returned entry. Tail validates record syntax throughout the file, but only verification and startup check the hash chain.
 - Reading one trace back from the audit log scans the log from the start: there is no index yet. One read looks through at most 256 MiB and keeps to its deadline, and two run at once.
