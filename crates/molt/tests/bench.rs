@@ -4,7 +4,8 @@
 //! The fake model always writes "hi" into hello.txt. Asked to design a
 //! check, it designs one that only looks for the file. So it solves the
 //! task that wants "hi" and fails the one that wants "bye", where Molt's
-//! check passes and the hidden tests do not.
+//! check passes and the hidden tests do not. Its check can also run a
+//! toolchain, to show the agent's commands reach it.
 
 use std::path::Path;
 use std::process::Output;
@@ -16,7 +17,10 @@ use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-struct FakeApi;
+/// `check` is the script the model designs as its check.
+struct FakeApi {
+    check: String,
+}
 
 impl Respond for FakeApi {
     fn respond(&self, req: &Request) -> ResponseTemplate {
@@ -28,9 +32,7 @@ impl Respond for FakeApi {
         let after_tools = last["content"].as_array().is_some_and(|c| c.iter().any(|b| b["type"] == "tool_result"));
         let tool = |name: &str, input: Value| json!({ "type": "tool_use", "id": format!("toolu_{n:03}"), "name": name, "input": input });
         let (content, stop) = match (designer, n == 1, after_tools) {
-            (true, true, _) => {
-                (tool(WRITE_FILE, json!({ "path": "check.sh", "content": "test -f hello.txt\n" })), "tool_use")
-            }
+            (true, true, _) => (tool(WRITE_FILE, json!({ "path": "check.sh", "content": self.check })), "tool_use"),
             (true, false, _) => {
                 let input = json!({ "command": "sh check.sh", "files": ["check.sh"], "rationale": "The file exists." });
                 (tool(SUBMIT_CHECK, input), "tool_use")
@@ -56,13 +58,17 @@ fn write(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
-/// A task asking for `word` in hello.txt.
+/// A Python task asking for `word` in hello.txt.
 fn task(tasks: &Path, id: &str, word: &str) {
+    task_in(tasks, id, word, "python");
+}
+
+fn task_in(tasks: &Path, id: &str, word: &str, language: &str) {
     let dir = tasks.join(id);
     write(
         &dir.join("task.toml"),
         &format!(
-            "title = \"Say {word}\"\nlanguage = \"python\"\nkind = \"feature\"\ndifficulty = \"easy\"\nsplit = \"dev\"\n\
+            "title = \"Say {word}\"\nlanguage = \"{language}\"\nkind = \"feature\"\ndifficulty = \"easy\"\nsplit = \"dev\"\n\
              tests = \"true\"\ncheck = \"sh test_bench_hidden.sh\"\nprompt = \"Write {word} into hello.txt.\"\n"
         ),
     );
@@ -94,7 +100,8 @@ fn text(out: &[u8]) -> String {
 #[tokio::test]
 async fn both_arms_run_every_task_and_the_report_compares_them() {
     let server = MockServer::start().await;
-    Mock::given(method("POST")).and(path("/v1/messages")).respond_with(FakeApi).mount(&server).await;
+    let api = FakeApi { check: "test -f hello.txt\n".into() };
+    Mock::given(method("POST")).and(path("/v1/messages")).respond_with(api).mount(&server).await;
     let root = tempfile::tempdir().unwrap();
     let tasks = root.path().join("tasks");
     task(&tasks, "py-hi", "hi");
@@ -144,7 +151,8 @@ async fn both_arms_run_every_task_and_the_report_compares_them() {
     }
     // The key is left out of the results; the rest of the setup is kept.
     assert!(records.iter().all(|r| r.setup.env == [format!("ANTHROPIC_BASE_URL={}", server.uri())]));
-    assert!(records.iter().all(|r| r.setup.molt_build.len() == 16));
+    assert!(records.iter().all(|r| r.setup.molt_build.len() == 16 && r.setup.sandboxed));
+    assert!(root.path().join("out/results.logs/sandbox-policy.json").exists());
     let logs = root.path().join("out/results.logs/py-hi/molt-0");
     assert!(std::fs::read_to_string(logs.join("changes.diff")).unwrap().contains("+hi"));
     assert!(logs.join("molt.json").exists() && logs.join("stderr.log").exists());
@@ -194,5 +202,55 @@ async fn a_run_without_a_spending_limit_or_api_key_is_refused() {
     assert!(out.status.success(), "{}", text(&out.stderr));
     let stdout = text(&out.stdout);
     assert!(stdout.contains("6 runs (1 task × 2 arms × 3 trials)") && stdout.contains("up to $30.00"), "{stdout}");
+    assert!(
+        stdout.contains("--sandbox-policy") && stdout.contains("run in Molt's sandbox, which works here"),
+        "{stdout}"
+    );
     assert!(!results.exists());
+    let out = bench().args(["--dry-run", "--no-sandbox"]).output().unwrap();
+    assert!(text(&out.stdout).contains("--no-sandbox"), "{}", text(&out.stdout));
+}
+
+/// The agent's commands find the tasks' toolchains, cargo here, both in
+/// Molt's sandbox and outside it, with the empty home every run gets. In
+/// the sandbox they do not see the tasks, with their hidden tests.
+#[tokio::test]
+async fn the_agents_commands_reach_the_toolchain_in_and_out_of_the_sandbox() {
+    let root = tempfile::tempdir().unwrap();
+    let tasks = root.path().join("tasks");
+    task_in(&tasks, "rs-hi", "hi", "rust");
+    let scratch = tempfile::tempdir().unwrap();
+    for (name, sandboxed) in [("sandboxed", true), ("unconfined", false)] {
+        let seen = if sandboxed { "! test -e" } else { "test -e" };
+        let check = format!("cargo --version && test -f hello.txt && {seen} '{}'\n", tasks.display());
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/v1/messages")).respond_with(FakeApi { check }).mount(&server).await;
+        let results = root.path().join(format!("{name}.jsonl"));
+        let mut run = vec![
+            "run",
+            "--tasks",
+            tasks.to_str().unwrap(),
+            "--results",
+            results.to_str().unwrap(),
+            "--arm",
+            "molt",
+            "--max-usd",
+            "5",
+            "--task-usd",
+            "1",
+            "--timeout-s",
+            "120",
+            "--scratch",
+            scratch.path().to_str().unwrap(),
+        ];
+        if !sandboxed {
+            run.push("--no-sandbox");
+        }
+        let out = molt_bench(&server, &run);
+        assert!(out.status.success(), "{name}: {}", text(&out.stderr));
+        let records = record::load(&results).unwrap();
+        let r = &records[0];
+        // Molt's check ran it all; had any of it failed, Molt would not have passed the attempt.
+        assert_eq!((r.outcome, r.passed, r.setup.sandboxed), (Some(Outcome::Passed), true, sandboxed), "{r:#?}");
+    }
 }

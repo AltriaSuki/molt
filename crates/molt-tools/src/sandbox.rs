@@ -271,6 +271,7 @@ mod linux {
         let instruction = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
         let load = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
         let equal = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+        let and = (libc::BPF_ALU | libc::BPF_AND | libc::BPF_K) as u16;
         let ret = (libc::BPF_RET | libc::BPF_K) as u16;
         vec![
             instruction(load, 0, 0, 4),           // seccomp_data.arch
@@ -288,10 +289,23 @@ mod linux {
             instruction(ret, 0, 0, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
             instruction(equal, 0, 1, libc::SYS_io_uring_register as u32),
             instruction(ret, 0, 0, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
-            instruction(equal, 1, 0, libc::SYS_socket as u32),
-            instruction(equal, 0, 3, libc::SYS_socketpair as u32),
-            instruction(load, 0, 0, 16), // first socket argument
+            // No AF_UNIX socket of its own, so no host socket is reachable by
+            // a mounted path or, with host networking, an abstract name.
+            instruction(equal, 0, 4, libc::SYS_socket as u32),
+            instruction(load, 0, 0, 16), // domain
             instruction(equal, 0, 1, libc::AF_UNIX as u32),
+            instruction(ret, 0, 0, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
+            instruction(ret, 0, 0, libc::SECCOMP_RET_ALLOW),
+            // Stream and seqpacket pairs reach only each other, and Rust's
+            // and libuv's child processes need them. A datagram pair could
+            // still send to any socket by address.
+            instruction(equal, 0, 7, libc::SYS_socketpair as u32),
+            instruction(load, 0, 0, 16), // domain
+            instruction(equal, 0, 5, libc::AF_UNIX as u32),
+            instruction(load, 0, 0, 24), // type
+            instruction(and, 0, 0, 0xf), // without SOCK_NONBLOCK and SOCK_CLOEXEC
+            instruction(equal, 2, 0, libc::SOCK_STREAM as u32),
+            instruction(equal, 1, 0, libc::SOCK_SEQPACKET as u32),
             instruction(ret, 0, 0, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
             instruction(ret, 0, 0, libc::SECCOMP_RET_ALLOW),
         ]
@@ -468,9 +482,9 @@ mod tests {
     }
 
     #[test]
-    fn seccomp_blocks_host_socket_access_and_preserves_files_and_ip_sockets() {
+    fn seccomp_blocks_host_socket_access_and_preserves_files_ip_sockets_and_socket_pairs() {
         let mut command = std::process::Command::new("/usr/bin/python3");
-        command.args(["-c", "import socket, errno, ctypes\nfor call in [lambda: socket.socket(socket.AF_UNIX), socket.socketpair]:\n try: call(); raise AssertionError('unix socket allowed')\n except OSError as e: assert e.errno == errno.EPERM\nlibc = ctypes.CDLL(None, use_errno=True)\nfor number in [425, 426, 427]:\n assert libc.syscall(number, 0, 0, 0, 0, 0, 0) == -1\n assert ctypes.get_errno() == errno.EPERM, 'io_uring was not blocked'\nsocket.socket(socket.AF_INET).close()\nprint('ordinary stdout still works')"]);
+        command.args(["-c", "import socket, errno, ctypes\nfor call in [lambda: socket.socket(socket.AF_UNIX), lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)]:\n try: call(); raise AssertionError('unix socket allowed')\n except OSError as e: assert e.errno == errno.EPERM\nsocket.socketpair()\nsocket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC | socket.SOCK_NONBLOCK)\nlibc = ctypes.CDLL(None, use_errno=True)\nfor number in [425, 426, 427]:\n assert libc.syscall(number, 0, 0, 0, 0, 0, 0) == -1\n assert ctypes.get_errno() == errno.EPERM, 'io_uring was not blocked'\nsocket.socket(socket.AF_INET).close()\nprint('ordinary stdout still works')"]);
         unsafe {
             command.pre_exec(|| {
                 if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {

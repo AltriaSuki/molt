@@ -24,8 +24,18 @@ use crate::task::Task;
 const STOP_GRACE: Duration = Duration::from_secs(30);
 
 /// Options the harness sets for every run, which an arm may not set.
-const HARNESS_OPTIONS: &[&str] =
-    &["--workspace", "--data-dir", "--json", "--budget-usd", "--no-apply", "--no-learn", "--config", "-c"];
+const HARNESS_OPTIONS: &[&str] = &[
+    "--workspace",
+    "--data-dir",
+    "--json",
+    "--budget-usd",
+    "--no-apply",
+    "--no-learn",
+    "--config",
+    "-c",
+    "--sandbox-policy",
+    "--no-sandbox",
+];
 
 /// One way of running the agent: a name and the `molt do` options that make it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

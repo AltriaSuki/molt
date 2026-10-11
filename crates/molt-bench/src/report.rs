@@ -301,19 +301,20 @@ pub fn markdown(r: &Report) -> String {
     if let [s] = &r.setups[..] {
         let _ = write!(
             out,
-            "; model {}, effort {}, max turns {}, ${} and {} per run",
+            "; model {}, effort {}, max turns {}, ${} and {} per run, commands {}",
             s.model.as_deref().unwrap_or("default"),
             s.effort.as_deref().unwrap_or("default"),
             s.max_turns.map_or("default".to_owned(), |t| t.to_string()),
             s.task_usd,
-            duration(s.timeout_s as f64)
+            duration(s.timeout_s as f64),
+            if s.sandboxed { "sandboxed" } else { "not sandboxed" }
         );
     }
     let _ = writeln!(out, ".");
     if r.setups.len() > 1 {
         let _ = writeln!(
             out,
-            "**These runs were made {} different ways** (build of molt, model, limits or variables), so they \
+            "**These runs were made {} different ways** (build of molt, model, limits, variables or sandbox), so they \
              do not compare as one experiment. Give each setup its own results file.",
             r.setups.len()
         );
