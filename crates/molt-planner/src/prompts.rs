@@ -6,7 +6,7 @@
 
 use molt_api::memory::Recalled;
 use molt_api::model::{text_block, user_blocks};
-use molt_api::planner::tools as t;
+use molt_api::planner::{tools as t, Earlier, Outcome, Requirement};
 use molt_api::shell::RunResponse;
 use serde_json::{json, Value};
 
@@ -112,10 +112,15 @@ pub(crate) fn reviewer_first_message(
     rules: &[String],
     patch: &str,
     truncated: bool,
+    requirements: &[Requirement],
 ) -> Value {
     // The diff is the attempt's text: it must not close its block early.
     let quoted = |s: &str| s.replace("</diff", "<\\/diff");
-    let mut text = format!("<task>\n{task}\n</task>\n\nThe done-check is `{command}`.");
+    let mut text = format!("<task>\n{task}\n</task>");
+    if !requirements.is_empty() {
+        text.push_str(&format!("\n\n{}", requirement_lines(requirements)));
+    }
+    text.push_str(&format!("\n\nThe done-check is `{command}`."));
     if !files.is_empty() {
         text.push_str(&format!(
             " It uses these files, which the check's designer wrote and which are restored before every check run, \
@@ -192,6 +197,7 @@ pub(crate) fn attempt_first_message(
     check: Option<(&str, &[String])>,
     index: u32,
     preamble: &[&str],
+    requirements: &[Requirement],
 ) -> Value {
     let check = match check {
         Some((command, files)) => {
@@ -209,7 +215,11 @@ pub(crate) fn attempt_first_message(
             .to_owned(),
     };
     let mut blocks: Vec<Value> = preamble.iter().map(|b| text_block(*b)).collect();
-    blocks.push(text_block(format!("<task>\n{task}\n</task>\n\n{check}")));
+    let mut first = format!("<task>\n{task}\n</task>");
+    if !requirements.is_empty() {
+        first.push_str(&format!("\n\n{}", requirement_lines(requirements)));
+    }
+    blocks.push(text_block(format!("{first}\n\n{check}")));
     if let Some(hint) = hint(index) {
         blocks.push(text_block(hint));
     }
@@ -221,6 +231,92 @@ pub(crate) fn designer_first_message(task: &str, preamble: &[&str]) -> Value {
     blocks.push(text_block(format!("<task>\n{task}\n</task>\n\nDesign the done-check for this task.")));
     user_blocks(blocks)
 }
+
+/// Bytes of an earlier task's summary given to the model.
+const EARLIER_SUMMARY: usize = 4_000;
+/// Paths of an earlier task's changes named.
+const EARLIER_PATHS: usize = 50;
+
+/// The earlier tasks of the conversation, oldest first, or `None` without any.
+pub(crate) fn earlier_tasks(earlier: &[Earlier]) -> Option<String> {
+    if earlier.is_empty() {
+        return None;
+    }
+    let mut s = String::from(
+        "<earlier_tasks>\nThe user gave these tasks before this one, in the same conversation. They are done; \
+         use them to understand what the user means, not as work to do again.\n",
+    );
+    for (i, e) in earlier.iter().enumerate() {
+        let outcome = match e.outcome {
+            Outcome::Passed => "it passed its done-check",
+            Outcome::Unverified => "it finished without a done-check",
+            Outcome::Failed => "it failed",
+        };
+        let applied = if e.applied { "its changes are in the workspace" } else { "its changes were not applied" };
+        s.push_str(&format!("\n{}. <task>{}</task>\n{outcome}; ", i + 1, e.task.trim()));
+        if e.changes.is_empty() {
+            s.push_str("it changed no file.\n");
+        } else {
+            let mut paths: Vec<&str> = e.changes.iter().take(EARLIER_PATHS).map(String::as_str).collect();
+            if e.changes.len() > EARLIER_PATHS {
+                paths.push("…");
+            }
+            s.push_str(&format!("{applied}: {}.\n", paths.join(", ")));
+        }
+        if !e.summary.trim().is_empty() {
+            s.push_str(&format!("What it said: {}\n", head(e.summary.trim(), EARLIER_SUMMARY)));
+        }
+    }
+    s.push_str("</earlier_tasks>");
+    Some(s)
+}
+
+/// What the user added to the task while it ran, for the model.
+fn requirement_lines(requirements: &[Requirement]) -> String {
+    let mut s = String::from("The user has added to the task since it started; these come before anything above:");
+    for r in requirements {
+        let c = &r.constraint;
+        if !c.text.is_empty() {
+            s.push_str(&format!("\n- {}", c.text));
+        }
+        if !c.protect.is_empty() {
+            s.push_str(&format!(
+                "\n- Leave these unchanged; a result that changes them is not accepted: {}",
+                c.protect.join(", ")
+            ));
+        }
+        if let Some(check) = &c.check {
+            s.push_str(&format!("\n- The done-check is now `{check}`."));
+        }
+    }
+    s
+}
+
+/// The user turn telling an attempt what was added to its task since it
+/// last looked. `changed` are the protected paths its fork has changed.
+pub(crate) fn new_requirements(requirements: &[Requirement], changed: &[String]) -> String {
+    let mut s = format!(
+        "{}\n\nGo over what you have done so far in this light, change what no longer fits, then carry on.",
+        requirement_lines(requirements)
+    );
+    if !changed.is_empty() {
+        s.push_str(&format!(" You have already changed {}: put them back as they were.", changed.join(", ")));
+    }
+    s
+}
+
+/// The user turn for a result that changed what it must leave alone.
+pub(crate) fn protected_changed(changed: &[String]) -> String {
+    format!(
+        "Your result changes {}, which the user asked to leave unchanged, so it is not accepted. \
+         Put them back as they were, then give your final reply again.",
+        changed.join(", ")
+    )
+}
+
+/// The user turn for a result checked under requirements that have changed since.
+pub(crate) const RECHECK: &str = "Your work was checked against the task as it was. \
+Make sure it also meets what was added above, then give your final reply again; it will be checked again.";
 
 pub(crate) const CONTINUE: &str = "Your reply was cut off at the output length limit. Continue where you left off. \
 Write big files in smaller pieces: several smaller files, or a first part followed by edit_file.";
@@ -501,6 +597,8 @@ pub(crate) fn designer_tools(memory: bool) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+    use molt_api::planner::Constraint;
+
     use super::*;
 
     #[test]
@@ -599,7 +697,7 @@ mod tests {
         assert!(!project_context(&[], Some("m")).unwrap().contains("Notes from"));
 
         // It goes first, before the task, for the designer and every attempt alike.
-        let first = attempt_first_message("t", None, 1, &[&text]);
+        let first = attempt_first_message("t", None, 1, &[&text], &[]);
         assert_eq!(first["content"][0]["text"], text.as_str());
         assert_eq!(first["content"].as_array().unwrap().len(), 3);
         assert_eq!(designer_first_message("t", &[&text])["content"][0]["text"], text.as_str());
@@ -607,13 +705,28 @@ mod tests {
     }
 
     #[test]
+    fn the_reviewer_reviews_against_what_the_user_added() {
+        let added = Requirement {
+            version: 1,
+            constraint: Constraint { text: "Keep the short -v too.".into(), ..Constraint::default() },
+            at_ms: 0,
+        };
+        let first = reviewer_first_message("t", "make test", &[], &[], "diff", false, &[added]);
+        let text = first["content"][0]["text"].as_str().unwrap();
+        let (added_at, check_at) = (text.find("- Keep the short -v too.").unwrap(), text.find("make test").unwrap());
+        assert!(text.find("<task>").unwrap() < added_at && added_at < check_at, "{text}");
+        let first = reviewer_first_message("t", "make test", &[], &[], "diff", false, &[]);
+        assert!(!first["content"][0]["text"].as_str().unwrap().contains("has added"));
+    }
+
+    #[test]
     fn hints_vary_by_attempt() {
         let blocks =
-            |i| attempt_first_message("t", Some(("make test", &[])), i, &[])["content"].as_array().unwrap().len();
+            |i| attempt_first_message("t", Some(("make test", &[])), i, &[], &[])["content"].as_array().unwrap().len();
         assert_eq!((blocks(0), blocks(1), blocks(2), blocks(3)), (1, 2, 2, 1));
         assert_ne!(hint(1), hint(2));
         // The shared first block is identical across attempts, so it caches.
-        let first = |i| attempt_first_message("t", Some(("make test", &[])), i, &[])["content"][0].clone();
+        let first = |i| attempt_first_message("t", Some(("make test", &[])), i, &[], &[])["content"][0].clone();
         assert_eq!(first(0), first(1));
     }
 }

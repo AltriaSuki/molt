@@ -40,7 +40,7 @@ that starts with milestone 5.
 | Agent payloads | The request and reply types of every agent service | `molt-api` |
 | Model gateway | `model.*`: the Anthropic Messages API; the only holder of the API key | `molt-gateway` |
 | File and shell services | `fs.*` and `shell.*`: files, forks, diffs, merges and commands, confined to a root | `molt-tools` |
-| Planner | `planner.run`: check first, parallel attempts, verify, apply | `molt-planner` |
+| Planner | `planner.run`: check first, parallel attempts, verify, apply; `planner.control` steers a run that is going | `molt-planner` |
 | Memory | `memory.*`: notes with provenance, learned from finished runs; the project model (definitions, references, repo map) | `molt-memory` |
 
 The kernel never trusts the sender named in a message. The transport
@@ -140,6 +140,24 @@ forks of attempts that had changed files are kept (`kept 2 · interrupted`),
 and with a check known in full `r` starts the task again with it. Ctrl+C
 on an empty input, or Ctrl+D, quits only when pressed twice within about a
 second; the first press says what quitting keeps.
+While the attempts run, you can steer them without stopping them. Whatever
+you type and send is added to the task (`+ keep the short -v too`) and
+becomes the next version of its requirements; each attempt takes it up at its
+next step, and its box says so (`now follows v1`). `/protect PATH...` names
+files or directories the result must leave as they are, and `/check CMD`
+replaces the running task's check. A result found under older requirements is
+never applied as it is: its attempt is told what changed, puts back any
+protected file it had touched, and is checked again. Once an attempt has
+passed and its result is being applied, it is too late, and the addition is
+refused. `/pause` starts no new model call, command or check until `/resume`;
+the status bar says what is still finishing (`pausing; waiting for attempt 1:
+a model call`) and then `paused`.
+
+The tasks you give one after another make a conversation: each new task is
+told what the last five asked, how they ended, what they said and which
+files they changed, and whether those changes are in the workspace. Every
+task still has its own check and budget. `/new` starts a new conversation.
+
 The log keeps everything a task reports, in full; PgUp and PgDn scroll it,
 and Ctrl+Home and Ctrl+End (or Home and End with an empty input) jump to its
 start and end.
@@ -148,7 +166,8 @@ start and end.
 where each came from: the run, the service version that wrote it and the
 messages in the audit log it rests on. `f` forgets one, with a reason, as
 `molt memory forget` does. `/attempts`, `/model`, `/effort`, `/budget` and
-`/check` set the next tasks' options; `/memory-model NAME` sets the model
+`/check` set the next tasks' options (`/check` while a task runs changes only
+that task); `/memory-model NAME` sets the model
 memory learns with (`same` for the attempts' model, `default` for
 `MOLT_MEMORY_MODEL` or `sonnet`), and when learning finds nothing the log
 says why. `/help` lists the keys. The services'

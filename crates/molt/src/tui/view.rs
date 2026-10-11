@@ -1,5 +1,6 @@
 //! Drawing [`App`] into a frame.
 
+use molt_api::planner::RunState;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -397,6 +398,24 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         if !app.learning.is_empty() {
             right.push(span(format!("{} learning  ", SPINNER[spin(app.tick)]), Tone::Mem));
+        }
+        if let Some(task) = app.task.as_ref().filter(|t| t.phase == Phase::Running) {
+            match task.state {
+                RunState::Paused => right.push(span("paused · /resume  ", Tone::Warn)),
+                RunState::Pausing => {
+                    let waiting = text::fit(&clean_line(&task.waiting.join(", ")), usize::from(area.width) / 3);
+                    right.push(span(format!("pausing; waiting for {waiting}  "), Tone::Warn));
+                }
+                RunState::Running if task.version > 0 => {
+                    right.push(span(format!("requirements v{}  ", task.version), Tone::Dim));
+                }
+                RunState::Running => {}
+            }
+        }
+        if !app.earlier.is_empty() && app.task.is_none() {
+            let n = app.earlier.len();
+            let tasks = if n == 1 { "1 earlier task".to_owned() } else { format!("{n} earlier tasks") };
+            right.push(span(format!("{tasks} · /new  "), Tone::Dim));
         }
         if let SessionState::Down(e) = &app.session {
             right.push(span(format!("{} ", text::fit(e, usize::from(area.width) / 3)), Tone::Bad));

@@ -8,7 +8,10 @@ use std::collections::HashSet;
 use molt_api::fs::ChangeKind;
 use molt_api::memory::{ConsolidateResponse, Recalled};
 use molt_api::model::Effort;
-use molt_api::planner::{AttemptReport, AttemptStatus, DesignResponse, Outcome, RunRequest, RunResponse, Verdict};
+use molt_api::planner::{
+    AttemptReport, AttemptStatus, Constraint, Control, ControlResponse, DesignResponse, Earlier, Outcome, RunRequest,
+    RunResponse, RunState, Verdict,
+};
 use molt_api::progress::Progress;
 use molt_proto::TraceId;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -30,6 +33,10 @@ const QUIT_TICKS: u64 = 7;
 const NOTE_LINES: usize = 6;
 /// Lines of a failed check's output shown in its lane.
 const CHECK_TAIL_LINES: usize = 2;
+/// Finished tasks of the conversation each new task is told about.
+const EARLIER_TASKS: usize = 5;
+/// Bytes of an earlier task's summary kept for the tasks after it.
+const EARLIER_SUMMARY_BYTES: usize = 4000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -89,6 +96,11 @@ pub enum Action {
         trace: TraceId,
         /// `None`: memory's default model.
         model: Option<String>,
+    },
+    /// Change the running run `trace`; the answer comes back as [`Msg::Controlled`].
+    Control {
+        trace: TraceId,
+        action: Control,
     },
     Apply {
         fork: String,
@@ -153,6 +165,11 @@ pub enum Msg {
         trace: TraceId,
         result: Result<ConsolidateResponse, String>,
     },
+    Controlled {
+        trace: TraceId,
+        action: Control,
+        result: Result<ControlResponse, String>,
+    },
     Applied(Result<(), String>),
     Discarded(Result<(), String>),
     Notes(Result<Vec<Recalled>, String>),
@@ -203,6 +220,29 @@ pub struct Task {
     notes_seen: HashSet<String>,
     /// Why confirm mode stopped for the user, in short labels.
     pub stops: Vec<String>,
+    /// The latest version of the run's requirements; 0 is the task alone.
+    pub version: u32,
+    pub state: RunState,
+    /// What a pausing run waits for before it is paused.
+    pub waiting: Vec<String>,
+}
+
+impl Task {
+    fn new(trace: TraceId, req: RunRequest, phase: Phase) -> Self {
+        Self {
+            trace,
+            req,
+            phase,
+            lanes: Vec::new(),
+            check_shown: false,
+            recalled_shown: false,
+            notes_seen: HashSet::new(),
+            stops: Vec::new(),
+            version: 0,
+            state: RunState::Running,
+            waiting: Vec::new(),
+        }
+    }
 }
 
 pub enum Prompt {
@@ -472,6 +512,9 @@ pub struct App {
     last: Option<LastDiff>,
     /// The attempts of the last task that finished, for `/lanes`.
     last_lanes: Vec<Lane>,
+    /// The conversation so far: the latest finished tasks, oldest first,
+    /// which each new task is told about. `/new` empties it.
+    pub earlier: Vec<Earlier>,
     /// Values never to show, such as API keys: replaced wherever text from
     /// commands is shown.
     pub secrets: Vec<String>,
@@ -521,6 +564,7 @@ impl App {
             kept: Vec::new(),
             last: None,
             last_lanes: Vec::new(),
+            earlier: Vec::new(),
             secrets: Vec::new(),
             rules: ConfirmSection::default(),
             zoom: None,
@@ -632,9 +676,20 @@ impl App {
                 self.learned(result);
                 Vec::new()
             }
+            Msg::Controlled { trace, action, result } => {
+                self.controlled(&trace, &action, result);
+                Vec::new()
+            }
             Msg::Applied(result) => {
                 match result {
-                    Ok(()) => self.push(Line::from(span("  applied", Tone::Ok))),
+                    Ok(()) => {
+                        self.push(Line::from(span("  applied", Tone::Ok)));
+                        if let (Some(task), Some(last)) = (&self.task, self.earlier.last_mut()) {
+                            if last.task == task.req.task {
+                                last.applied = true;
+                            }
+                        }
+                    }
                     Err(e) => self.error("could not apply", &e),
                 }
                 self.task = None;
@@ -891,8 +946,13 @@ impl App {
         if let Some(command) = line.strip_prefix('/') {
             return self.command(command);
         }
+        if self.task.as_ref().is_some_and(|t| t.phase == Phase::Running) {
+            // Typed while the attempts run: more of what the task asks.
+            self.echo_constraint(&line);
+            return self.steer(Control::Constrain(Constraint { text: line, ..Default::default() }));
+        }
         if self.task.is_some() {
-            self.flash = Some("a task is running; Esc stops it".into());
+            self.flash = Some("a task is waiting; Esc stops it".into());
             self.input = Input::with(&line);
             return Vec::new();
         }
@@ -910,19 +970,11 @@ impl App {
         req.effort = self.settings.effort;
         req.budget_usd = self.settings.budget_usd;
         req.apply = self.mode == Mode::Auto;
+        req.earlier = self.earlier.clone();
 
         self.gap();
         self.echo(&line);
-        let mut task = Task {
-            trace: trace.clone(),
-            req,
-            phase: Phase::Running,
-            lanes: Vec::new(),
-            check_shown: false,
-            recalled_shown: false,
-            notes_seen: HashSet::new(),
-            stops: Vec::new(),
-        };
+        let mut task = Task::new(trace.clone(), req, Phase::Running);
         let action = if let Some(check) = &self.settings.check {
             task.req.check = Some(check.clone());
             Action::Run { req: task.req.clone(), trace }
@@ -959,6 +1011,34 @@ impl App {
                     edit: None,
                 });
                 return vec![Action::LoadNotes { query }];
+            }
+            "check" if self.running() => {
+                if arg.is_empty() {
+                    self.flash = Some("the running task keeps a check; give the command to use instead".into());
+                    return Vec::new();
+                }
+                self.echo_constraint(&format!("check: {arg}"));
+                return self
+                    .steer(Control::Constrain(Constraint { check: Some(arg.to_owned()), ..Default::default() }));
+            }
+            "protect" => {
+                let paths: Vec<String> = arg.split_whitespace().map(str::to_owned).collect();
+                if paths.is_empty() {
+                    self.flash = Some("protect: the files or directories to leave as they are".into());
+                    return Vec::new();
+                }
+                if !self.running() {
+                    self.flash = Some("no task is running; say what to leave alone in the task".into());
+                    return Vec::new();
+                }
+                self.echo_constraint(&format!("leave {} unchanged", paths.join(", ")));
+                return self.steer(Control::Constrain(Constraint { protect: paths, ..Default::default() }));
+            }
+            "pause" => return self.steer(Control::Pause),
+            "resume" => return self.steer(Control::Resume),
+            "new" => {
+                self.earlier.clear();
+                self.flash = Some("a new conversation: the next task starts without the earlier ones".into());
             }
             "check" => {
                 self.settings.check = (!arg.is_empty()).then(|| arg.to_owned());
@@ -1036,6 +1116,66 @@ impl App {
             other => self.flash = Some(format!("no command /{}; /help lists them", clean_line(other))),
         }
         Vec::new()
+    }
+
+    /// The attempts of a task are running.
+    fn running(&self) -> bool {
+        self.task.as_ref().is_some_and(|t| t.phase == Phase::Running)
+    }
+
+    /// What the user added to a running task, in the log.
+    fn echo_constraint(&mut self, text: &str) {
+        for (i, l) in text::clean(text).into_iter().enumerate() {
+            let mark = if i == 0 { span("+ ", Tone::Shell) } else { span("  ", Tone::Plain) };
+            self.push(Line::from(vec![mark, span(l, Tone::Plain)]));
+        }
+    }
+
+    /// Send `action` to the running task.
+    fn steer(&mut self, action: Control) -> Vec<Action> {
+        let Some(task) = self.task.as_ref().filter(|t| t.phase == Phase::Running) else {
+            self.flash = Some("no task is running".into());
+            return Vec::new();
+        };
+        vec![Action::Control { trace: task.trace.clone(), action }]
+    }
+
+    fn controlled(&mut self, trace: &TraceId, action: &Control, result: Result<ControlResponse, String>) {
+        let Some(task) = self.task.as_mut().filter(|t| &t.trace == trace) else { return };
+        match result {
+            Ok(r) => {
+                task.state = r.state;
+                task.waiting = r.waiting;
+                if matches!(action, Control::Constrain(_)) {
+                    task.version = task.version.max(r.version);
+                    let line = format!("  requirements v{}; the attempts take it up at their next step", r.version);
+                    self.push(Line::from(span(line, Tone::Dim)));
+                }
+            }
+            Err(e) => {
+                let what = match action {
+                    Control::Constrain(_) => "not added",
+                    Control::Pause => "not paused",
+                    Control::Resume => "not resumed",
+                };
+                self.error(what, &e);
+            }
+        }
+    }
+
+    /// What a finished run leaves for the next tasks of the conversation.
+    fn remember(&mut self, task: &str, resp: &RunResponse) {
+        let summary = scrub(&resp.summary, &self.secrets);
+        let (summary, _) = bounded(summary.trim(), EARLIER_SUMMARY_BYTES);
+        self.earlier.push(Earlier {
+            task: task.to_owned(),
+            outcome: resp.outcome,
+            summary: summary.to_owned(),
+            changes: resp.changes.iter().map(|c| c.path.clone()).collect(),
+            applied: resp.applied,
+        });
+        let over = self.earlier.len().saturating_sub(EARLIER_TASKS);
+        self.earlier.drain(..over);
     }
 
     fn progress(&mut self, event: Progress) {
@@ -1126,6 +1266,16 @@ impl App {
                 if let Some(lane) = lane(task, attempt) {
                     lane.status = Some(status);
                 }
+            }
+            Progress::Required { requirement, .. } => task.version = task.version.max(requirement.version),
+            Progress::Adopted { attempt, version, .. } => {
+                if let Some(lane) = lane(task, attempt) {
+                    lane.push(Line::from(span(format!("   now follows v{version}"), Tone::Warn)));
+                }
+            }
+            Progress::State { state, waiting, .. } => {
+                task.state = state;
+                task.waiting = waiting;
             }
         }
     }
@@ -1240,6 +1390,7 @@ impl App {
             }
         };
         self.spent_usd += resp.cost_usd;
+        self.remember(&task.req.task, &resp);
         let mut actions = Vec::new();
         let memory_model = agent::memory_model(self.settings.memory_model.as_deref(), task.req.model.as_deref());
 
@@ -1463,16 +1614,7 @@ impl App {
         self.log.extend(lines);
         self.scroll = 0;
         self.zoom = None;
-        self.task = Some(Task {
-            trace: trace.clone(),
-            req: req.clone(),
-            phase: Phase::Running,
-            lanes: Vec::new(),
-            check_shown: true,
-            recalled_shown: false,
-            notes_seen: HashSet::new(),
-            stops: Vec::new(),
-        });
+        self.task = Some(Task { check_shown: true, ..Task::new(trace.clone(), req.clone(), Phase::Running) });
         vec![Action::Run { req, trace }]
     }
 
@@ -1720,6 +1862,7 @@ fn help() -> Vec<Line<'static>> {
         row("shift+tab", "mode: plan only, confirm, auto"),
         row("tab", "show one attempt large; again for the next"),
         row("esc", "stop the task"),
+        row("enter (running)", "add what you typed to the running task"),
         row("pgup / pgdn", "scroll the log"),
         row("ctrl+home / end", "the start or end of the log"),
         row("shift+enter", "a new line in the task; also ctrl+j, or \\ then enter"),
@@ -1730,6 +1873,10 @@ fn help() -> Vec<Line<'static>> {
         head("commands"),
         row("/memory [words]", "notes about this project"),
         row("/check [command]", "use this check for every task; empty: design one"),
+        row("", "while a task runs: check its result with this instead"),
+        row("/protect PATH...", "the running task must leave these as they are"),
+        row("/pause, /resume", "start nothing new in the running task, then go on"),
+        row("/new", "a new conversation: later tasks forget the earlier ones"),
         row("/attempts N", "attempts at once, 1 to 8"),
         row("/model NAME", "opus, sonnet, haiku or a model id"),
         row("/memory-model NAME", "model memory learns with; same: the attempts'"),
@@ -1757,7 +1904,7 @@ pub fn plain(lines: &[Line<'static>]) -> Vec<String> {
 mod tests {
     use molt_api::fs::Change;
     use molt_api::model::Usage;
-    use molt_api::planner::{AttemptReport, Baseline, CheckFile, CheckSpec};
+    use molt_api::planner::{AttemptReport, Baseline, CheckFile, CheckSpec, Requirement};
     use molt_api::progress::RecalledNote;
     use ratatui::crossterm::event::KeyEventState;
 
@@ -1826,6 +1973,7 @@ mod tests {
                     usage: Usage::default(),
                     cost_usd: 0.1,
                     note: String::new(),
+                    requirements: 0,
                 },
                 AttemptReport {
                     index: 1,
@@ -1835,12 +1983,14 @@ mod tests {
                     usage: Usage::default(),
                     cost_usd: 0.2,
                     note: String::new(),
+                    requirements: 0,
                 },
             ],
             usage: Usage::default(),
             cost_usd: 0.3,
             uncounted_calls: 0,
             checkpoint: None,
+            requirements: vec![],
         }
     }
 
@@ -1942,6 +2092,137 @@ mod tests {
         app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-2"))) });
         assert!(app.prompt.is_none());
         assert_eq!(app.kept, ["/d/work/fork-2"]);
+    }
+
+    fn control(actions: &[Action]) -> (TraceId, Control) {
+        let [Action::Control { trace, action }] = actions else { panic!("{actions:?}") };
+        (trace.clone(), action.clone())
+    }
+
+    fn answer(state: RunState, version: u32, waiting: &[&str]) -> Result<ControlResponse, String> {
+        Ok(ControlResponse { state, version, waiting: waiting.iter().map(|w| w.to_string()).collect() })
+    }
+
+    #[test]
+    fn what_is_typed_while_a_task_runs_steers_it() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.settings.check = Some("make test".into());
+        let actions = type_in(&mut app, "fix it");
+        let [Action::Run { trace: run, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let run = run.clone();
+        app.update(Msg::Progress(Progress::AttemptStarted { run: run.to_string(), attempt: 0, fork: None }));
+
+        let (trace, action) = control(&type_in(&mut app, "keep the short -v too"));
+        assert_eq!(trace, run);
+        assert_eq!(
+            action,
+            Control::Constrain(Constraint { text: "keep the short -v too".into(), ..Default::default() })
+        );
+        assert!(log(&app).contains("+ keep the short -v too"), "{}", log(&app));
+        app.update(Msg::Controlled { trace: run.clone(), action, result: answer(RunState::Running, 1, &[]) });
+        assert_eq!(app.task.as_ref().unwrap().version, 1);
+        assert!(log(&app).contains("requirements v1"), "{}", log(&app));
+
+        let (_, action) = control(&type_in(&mut app, "/protect Cargo.lock src/api"));
+        assert_eq!(
+            action,
+            Control::Constrain(Constraint {
+                protect: vec!["Cargo.lock".into(), "src/api".into()],
+                ..Default::default()
+            })
+        );
+        app.update(Msg::Controlled { trace: run.clone(), action, result: Err("too late to change the run".into()) });
+        assert!(log(&app).contains("✗ not added: too late to change the run"), "{}", log(&app));
+
+        // A check given while the task runs replaces its check, not the one for later tasks.
+        let (_, action) = control(&type_in(&mut app, "/check cargo test -q"));
+        assert_eq!(
+            action,
+            Control::Constrain(Constraint { check: Some("cargo test -q".into()), ..Default::default() })
+        );
+        assert_eq!(app.settings.check.as_deref(), Some("make test"));
+
+        let (_, action) = control(&type_in(&mut app, "/pause"));
+        assert_eq!(action, Control::Pause);
+        let waiting = ["attempt 0: a model call"];
+        app.update(Msg::Controlled { trace: run.clone(), action, result: answer(RunState::Pausing, 1, &waiting) });
+        let task = app.task.as_ref().unwrap();
+        assert_eq!(
+            (task.state, task.waiting.as_slice()),
+            (RunState::Pausing, &["attempt 0: a model call".to_owned()][..])
+        );
+        let state = |state| Progress::State { run: run.to_string(), state, waiting: vec![] };
+        app.update(Msg::Progress(state(RunState::Paused)));
+        assert_eq!(app.task.as_ref().unwrap().state, RunState::Paused);
+        assert_eq!(control(&type_in(&mut app, "/resume")).1, Control::Resume);
+        app.update(Msg::Progress(state(RunState::Running)));
+        assert_eq!(app.task.as_ref().unwrap().state, RunState::Running);
+
+        app.update(Msg::Progress(Progress::Required {
+            run: run.to_string(),
+            requirement: Requirement { version: 2, constraint: Constraint::default(), at_ms: 0 },
+        }));
+        app.update(Msg::Progress(Progress::Adopted { run: run.to_string(), attempt: 0, version: 2, turn: 3 }));
+        let task = app.task.as_ref().unwrap();
+        assert_eq!(task.version, 2);
+        assert!(plain(&task.lanes[0].lines).iter().any(|l| l.contains("now follows v2")));
+
+        // Once the task is done, there is nothing to steer.
+        app.update(Msg::Ran { trace: run, result: Ok(passed(true, None)) });
+        assert!(type_in(&mut app, "/pause").is_empty());
+        assert_eq!(app.flash.as_deref(), Some("no task is running"));
+    }
+
+    #[test]
+    fn each_task_is_told_what_the_tasks_before_it_did_until_a_new_conversation() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.settings.check = Some("make test".into());
+        let actions = type_in(&mut app, "add a --verbose flag");
+        let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert!(req.earlier.is_empty());
+        let trace = trace.clone();
+        app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/d/work/fork-1"))) });
+        if let Some(Prompt::Apply { .. }) = app.prompt {
+            app.update(key(KeyCode::Enter));
+        }
+        assert_eq!(app.earlier.len(), 1);
+        assert!(!app.earlier[0].applied);
+        app.update(Msg::Applied(Ok(())));
+        assert!(app.earlier[0].applied, "applying the result is part of what the next task knows");
+
+        let actions = type_in(&mut app, "now document it");
+        let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        let [earlier] = req.earlier.as_slice() else { panic!("{:?}", req.earlier) };
+        assert_eq!(earlier.task, "add a --verbose flag");
+        assert_eq!(earlier.outcome, Outcome::Passed);
+        assert_eq!(earlier.summary, "Trailing commas parse.");
+        assert_eq!(earlier.changes, ["src/parser.rs"]);
+        let trace = trace.clone();
+        app.update(Msg::Ran { trace, result: Ok(passed(true, None)) });
+        assert_eq!(app.earlier.len(), 2);
+
+        type_in(&mut app, "/new");
+        assert!(app.earlier.is_empty());
+        let actions = type_in(&mut app, "something else");
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert!(req.earlier.is_empty());
+    }
+
+    #[test]
+    fn a_conversation_keeps_its_latest_tasks() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.mode = Mode::Auto;
+        for i in 0..EARLIER_TASKS + 2 {
+            let actions = type_in(&mut app, &format!("task {i}"));
+            let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+            let trace = trace.clone();
+            app.update(Msg::Ran { trace, result: Ok(passed(true, None)) });
+        }
+        assert_eq!(app.earlier.len(), EARLIER_TASKS);
+        assert_eq!(app.earlier[0].task, "task 2");
     }
 
     #[test]
@@ -2073,11 +2354,9 @@ mod tests {
         let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
         assert_eq!((req.attempts, req.model.as_deref(), req.budget_usd), (4, Some("sonnet"), Some(2.5)));
         assert_eq!(req.check.as_deref(), Some("make test"));
-        assert!(type_in(&mut app, "another").is_empty());
-        assert_eq!(app.flash.as_deref(), Some("a task is running; Esc stops it"));
-        // What was typed stays in the input.
-        assert_eq!(app.input.text, "another");
-        app.update(ctrl_key('u'));
+        // While it runs, what is typed goes to it.
+        assert!(matches!(type_in(&mut app, "another").as_slice(), [Action::Control { .. }]));
+        assert!(app.input.text.is_empty());
         assert_eq!(type_in(&mut app, "/quit"), [Action::Quit { keep: vec![] }]);
     }
 
@@ -2255,6 +2534,7 @@ mod tests {
             usage: Usage::default(),
             cost_usd: 0.1,
             note: note.into(),
+            requirements: 0,
         }
     }
 

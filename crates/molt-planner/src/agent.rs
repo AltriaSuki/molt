@@ -39,7 +39,8 @@ pub(crate) async fn turn(
     meter: &mut Meter,
     cancel: &CancellationToken,
 ) -> Result<CompleteResponse, Stop> {
-    if cancel.is_cancelled() {
+    // A paused run starts no new call.
+    if cancel.is_cancelled() || !ctx.control.wait_go(cancel, &ctx.cancel).await {
         return Err(if ctx.over_budget() { Stop::Budget } else { Stop::Cancelled });
     }
     if meter.turns >= max_turns {

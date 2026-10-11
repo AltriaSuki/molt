@@ -16,6 +16,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::checkpoint::{Saved, SavedSpend, Store};
+use crate::control::Control;
 use crate::fit::Limits;
 use crate::memory::Memory;
 use crate::{Bus, Config};
@@ -82,6 +83,10 @@ pub(crate) struct Ctx {
     /// Calls not counted before this resume of the run: they do not stop
     /// it, as calls of its own with an unknown cost do, but are reported.
     pub carried_uncounted: u32,
+    /// The run's requirements and whether it is paused.
+    pub control: Arc<Control>,
+    /// Earlier tasks of the conversation, for the model, or `None`.
+    pub earlier: Option<String>,
 }
 
 /// A conversation that grows until it no longer fits a model call (see
@@ -104,6 +109,18 @@ impl Conversation {
 
     pub fn push(&mut self, message: Value) {
         self.messages.push(message);
+    }
+
+    /// Tell the model `text`: after a reply, as a message of its own; after
+    /// tool results, with them, so the user's messages never come two in a row.
+    pub fn tell(&mut self, text: String) {
+        if let Some(last) = self.messages.last_mut().filter(|m| m["role"] == "user") {
+            if let Some(content) = last["content"].as_array_mut() {
+                content.push(model::text_block(text));
+                return;
+            }
+        }
+        self.messages.push(model::user_text(text));
     }
 }
 
@@ -131,6 +148,8 @@ impl Ctx {
             run_cancel: CancellationToken::new(),
             checkpoint: None,
             carried_uncounted: 0,
+            control: Control::new(Vec::new()),
+            earlier: crate::prompts::earlier_tasks(&req.earlier),
         }
     }
 
@@ -170,10 +189,11 @@ impl Ctx {
     }
 
     /// What the first message of every conversation starts with: the
-    /// project's instruction files, then what memory knows. The same in
-    /// every conversation of the run, so the prompt cache can share it.
+    /// project's instruction files, what memory knows, then the tasks before
+    /// this one in the user's conversation. The same in every conversation of
+    /// the run, so the prompt cache can share it.
     pub fn preamble(&self) -> Vec<&str> {
-        self.instructions.iter().chain(&self.memory.context).map(String::as_str).collect()
+        self.instructions.iter().chain(&self.memory.context).chain(&self.earlier).map(String::as_str).collect()
     }
 
     pub fn scoped(&self, cancel: CancellationToken) -> Arc<Self> {
@@ -262,9 +282,16 @@ impl Ctx {
         let budget = Budget::new(self.cfg.max_tokens.into(), ms, 0);
         self.tally.send_modify(|t| t.pending += 1);
         self.save(|s| s.open_calls += 1);
+        let who = match conv.attempt {
+            Some(n) => format!("attempt {n}"),
+            None if conv.system == crate::prompts::REVIEWER_SYSTEM => "the reviewer".to_owned(),
+            None => "the check's designer".to_owned(),
+        };
+        let busy = self.control.busy(format!("{who}: a model call"));
         let ctx = self.clone();
         let call = tokio::spawn(async move {
             let resp = ctx.call::<CompleteResponse>(model::COMPLETE, req, budget).await;
+            drop(busy);
             ctx.tally.send_modify(|t| {
                 t.pending -= 1;
                 match &resp {

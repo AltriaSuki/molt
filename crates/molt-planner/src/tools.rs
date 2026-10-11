@@ -193,6 +193,7 @@ pub(crate) async fn run_command(
         command: command.to_owned(),
         timeout_ms: Some(timeout_ms),
     };
+    let _busy = ctx.control.busy(format!("the command `{}`", prompts::head(command.lines().next().unwrap_or(""), 80)));
     ctx.call(shell::RUN, req, Budget::new(0, timeout_ms.saturating_add(SHELL_GRACE_MS), 0)).await
 }
 

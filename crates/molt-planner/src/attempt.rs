@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::{self, Meter, Stop};
 use crate::checkpoint::{SavedAttempt, SavedEnd};
+use crate::control;
 use crate::ctx::{Conversation, Ctx, Spend};
 use crate::prompts;
 use crate::tools::{self, Actor};
@@ -55,6 +56,7 @@ impl Finished {
             usage: saved.usage,
             cost_usd: saved.cost_usd,
             note: end.note.clone(),
+            requirements: saved.requirements,
         };
         Self { report, fork: saved.fork.clone(), summary: end.summary.clone() }
     }
@@ -69,6 +71,7 @@ impl Finished {
             usage: Default::default(),
             cost_usd: 0.0,
             note,
+            requirements: 0,
         };
         Self { report, fork: None, summary: String::new() }
     }
@@ -123,6 +126,7 @@ pub(crate) async fn run(
         check_runs: 0,
         fork: None,
         memory_tools: ctx.memory.up,
+        version: ctx.control.version(),
     };
     if let Some(saved) = &resume {
         attempt.meter = Meter {
@@ -132,16 +136,19 @@ pub(crate) async fn run(
         attempt.check_runs = saved.check_runs;
         attempt.fork = saved.fork.clone();
         attempt.memory_tools = saved.memory_tools;
+        attempt.version = saved.requirements;
     }
+    attempt.check = attempt.check_at(attempt.version);
     let (status, note, summary) = match attempt.work(resume).await {
         Ok(summary) => (AttemptStatus::Passed, String::new(), summary),
         Err(end) => (end.status, end.note, String::new()),
     };
     // Stopped with the run, it can go on when the run is resumed.
     let resumable = status == AttemptStatus::Cancelled && ctx.run_cancel.is_cancelled();
-    let (meter, check_runs) = (attempt.meter, attempt.check_runs);
+    let (meter, check_runs, version) = (attempt.meter, attempt.check_runs, attempt.version);
     ctx.save(|s| {
         let saved = s.attempt(index);
+        saved.requirements = version;
         saved.turns = meter.turns;
         saved.check_runs = check_runs;
         saved.usage = meter.spend.usage;
@@ -160,6 +167,7 @@ pub(crate) async fn run(
         usage: attempt.meter.spend.usage,
         cost_usd: attempt.meter.spend.cost_usd,
         note,
+        requirements: attempt.version,
     };
     Finished { report, fork: attempt.fork, summary }
 }
@@ -174,9 +182,73 @@ struct Attempt {
     fork: Option<String>,
     /// It is offered memory's tools.
     memory_tools: bool,
+    /// The version of the run's requirements it works to.
+    version: u32,
 }
 
 impl Attempt {
+    /// The run's check as of requirements `version`.
+    fn check_at(&self, version: u32) -> Option<Arc<Check>> {
+        let check = self.check.clone()?;
+        match self.ctx.control.check(version) {
+            Some(command) if command != check.command => Some(Arc::new(Check { command, files: check.files.clone() })),
+            _ => Some(check),
+        }
+    }
+
+    /// Take up the requirements added since the attempt last looked, if
+    /// any: tell the model, and say so. `checked`: its work was found done
+    /// under the old ones, and must be checked again.
+    async fn adopt(&mut self, fork: &str, conv: &mut Conversation, checked: bool) -> bool {
+        let ctx = self.ctx.clone();
+        let latest = ctx.control.version();
+        if latest <= self.version {
+            return false;
+        }
+        let added = ctx.control.since(self.version);
+        let changed = self.changed_protected(fork, latest).await;
+        self.version = latest;
+        self.check = self.check_at(latest);
+        let mut text = prompts::new_requirements(&added, &changed);
+        if checked {
+            text.push_str(&format!("\n\n{}", prompts::RECHECK));
+        }
+        conv.tell(text);
+        self.save(conv);
+        let turn = self.meter.turns + 1;
+        ctx.progress(Progress::Adopted { run: ctx.run_id(), attempt: self.index, version: latest, turn }).await;
+        true
+    }
+
+    /// The protected paths, as of requirements `version`, that the fork has changed.
+    async fn changed_protected(&self, fork: &str, version: u32) -> Vec<String> {
+        let protected = self.ctx.control.protected(version);
+        if protected.is_empty() {
+            return Vec::new();
+        }
+        match self.ctx.diff(fork).await {
+            Ok(diff) => diff
+                .changes
+                .into_iter()
+                .map(|c| c.path)
+                .filter(|path| protected.iter().any(|p| control::covered(path, p)))
+                .collect(),
+            Err(e) => {
+                tracing::warn!(run = %self.ctx.trace, attempt = self.index, error = %e, "could not list the fork's changes");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Wait while the run is paused; an error when it stopped meanwhile.
+    async fn go(&self) -> Result<(), End> {
+        if self.ctx.control.wait_go(&self.cancel, &self.ctx.cancel).await {
+            Ok(())
+        } else {
+            Err(if self.ctx.over_budget() { End::from(Stop::Budget) } else { End::cancelled() })
+        }
+    }
+
     /// The final reply once the attempt is done (and, when there is a check, passed it).
     async fn work(&mut self, resume: Option<SavedAttempt>) -> Result<String, End> {
         let ctx = self.ctx.clone();
@@ -222,6 +294,7 @@ impl Attempt {
                     self.check.as_ref().map(|c| (c.command.as_str(), paths.as_slice())),
                     self.index,
                     &ctx.preamble(),
+                    &ctx.control.upto(self.version),
                 );
                 (fork, Conversation::new(system, tools, first, Some(self.index)))
             }
@@ -235,6 +308,8 @@ impl Attempt {
             let summary = match given.take() {
                 Some(text) => text,
                 None => {
+                    // A clear step: what the user added since takes effect here.
+                    self.adopt(&fork, &mut conv, false).await;
                     let resp = agent::turn(&ctx, &mut conv, ctx.max_turns, &mut self.meter, &self.cancel).await?;
                     let calls = resp.tool_uses();
                     if !calls.is_empty() {
@@ -242,6 +317,7 @@ impl Attempt {
                         asked = false;
                         // Saved before they run: a run stopped now does not know what they did.
                         self.save(&conv);
+                        self.go().await?;
                         let actor = Actor::Attempt { index: self.index, turn: self.meter.turns };
                         let results =
                             self.or_cancel(tools::execute(&ctx, &fork, &calls, agent::cut_off(&resp), actor)).await?;
@@ -269,7 +345,33 @@ impl Attempt {
                     std::mem::take(&mut reply).join("\n\n")
                 }
             };
-            let Some(check) = self.check.clone() else { return Ok(summary) };
+            // Added to while the model worked: it goes over its work first.
+            if self.adopt(&fork, &mut conv, true).await {
+                asked = false;
+                continue;
+            }
+            self.go().await?;
+            let changed = self.changed_protected(&fork, self.version).await;
+            if !changed.is_empty() {
+                ctx.note(format!(
+                    "attempt {}: its result changes {}, which must stay as they are",
+                    self.index,
+                    changed.join(", ")
+                ))
+                .await;
+                asked = false;
+                conv.push(user_text(prompts::protected_changed(&changed)));
+                self.save(&conv);
+                continue;
+            }
+            let Some(check) = self.check.clone() else {
+                if ctx.control.claim(self.version) {
+                    return Ok(summary);
+                }
+                self.adopt(&fork, &mut conv, true).await;
+                asked = false;
+                continue;
+            };
             let ran = self.or_cancel(self.run_check(&fork, &check)).await??;
             self.check_runs += 1;
             let passed = ran.success();
@@ -282,7 +384,13 @@ impl Attempt {
             })
             .await;
             if passed {
-                return Ok(summary);
+                // Only a result found under the latest requirements can be the run's.
+                if ctx.control.claim(self.version) {
+                    return Ok(summary);
+                }
+                self.adopt(&fork, &mut conv, true).await;
+                asked = false;
+                continue;
             }
             if self.check_runs >= ctx.max_check_rounds {
                 let note = format!(
@@ -332,10 +440,11 @@ impl Attempt {
 
     /// Save the attempt as it stands in the run's checkpoint.
     fn save(&self, conv: &Conversation) {
-        let (fork, memory_tools, meter, check_runs) =
-            (self.fork.clone(), self.memory_tools, self.meter, self.check_runs);
+        let (fork, memory_tools, meter, check_runs, version) =
+            (self.fork.clone(), self.memory_tools, self.meter, self.check_runs, self.version);
         self.ctx.save(|s| {
             let saved = s.attempt(self.index);
+            saved.requirements = version;
             saved.fork = fork;
             saved.memory_tools = memory_tools;
             saved.messages = conv.messages.clone();

@@ -7,6 +7,7 @@
 mod agent;
 mod attempt;
 pub mod checkpoint;
+mod control;
 mod ctx;
 mod designer;
 mod fit;
@@ -22,7 +23,8 @@ use std::time::Duration;
 
 use anyhow::{ensure, Context};
 use async_trait::async_trait;
-use molt_api::planner::{DesignResponse, RunRequest, RunResponse};
+use molt_api::planner::{Control, ControlRequest, ControlResponse, DesignResponse, RunRequest, RunResponse};
+use molt_api::progress::{self, Progress};
 use molt_proto::{Budget, Envelope, ErrorCode, RemoteError, Target, TraceId};
 use molt_sdk::{CallOpts, SdkError, Service};
 use serde_json::Value;
@@ -267,21 +269,50 @@ pub async fn design(
     runner::design(bus, cfg, req, trace).await
 }
 
-/// Serve `planner.run` and `planner.design` on `svc` until its link closes.
+/// Steer the run `req.run`, going on in this process (`planner.control`).
+/// A new requirement is announced on the run's progress.
+pub async fn control(bus: &dyn Bus, req: ControlRequest) -> Result<ControlResponse, RemoteError> {
+    let invalid = |message: String| RemoteError { code: ErrorCode::Invalid, message };
+    let Some(control) = control::find(&req.run) else {
+        return Err(invalid(format!("no run {} is going on here (it finished, or never started)", req.run)));
+    };
+    match req.action {
+        Control::Constrain(constraint) => {
+            let requirement = control.add(constraint).map_err(invalid)?;
+            tracing::info!(run = %req.run, version = requirement.version, "requirements changed");
+            let event = Progress::Required { run: req.run.clone(), requirement };
+            if let Ok(v) = serde_json::to_value(&event) {
+                bus.publish(progress::TOPIC, v).await;
+            }
+        }
+        Control::Pause => control.set_paused(true),
+        Control::Resume => control.set_paused(false),
+    }
+    Ok(control.response())
+}
+
+/// Calls to `planner.control` handled at once, besides the runs: steering a
+/// run must not wait for a free run slot.
+const CONTROL_SLOTS: usize = 16;
+
+/// Serve `planner.run`, `planner.design` and `planner.control` on `svc`
+/// until its link closes.
 pub async fn serve(svc: Arc<Service>, cfg: Config) {
-    let max_in_flight = cfg.max_concurrent_runs;
+    let runs = Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_runs.max(1)));
+    let max_in_flight = cfg.max_concurrent_runs.max(1) + CONTROL_SLOTS;
     let cfg = Arc::new(cfg);
     let bus: Arc<dyn Bus> = Arc::new(ServiceBus(svc.clone()));
     svc.serve_cancellable(max_in_flight, move |req, cancel| {
-        let (bus, cfg) = (bus.clone(), cfg.clone());
-        async move { handle_cancellable(bus, cfg, req, cancel).await }
+        let (bus, cfg, runs) = (bus.clone(), cfg.clone(), runs.clone());
+        async move { handle_cancellable(bus, cfg, req, cancel, runs).await }
     })
     .await;
 }
 
 #[cfg(test)]
 async fn handle(bus: Arc<dyn Bus>, cfg: Arc<Config>, req: Envelope) -> Result<Value, RemoteError> {
-    handle_cancellable(bus, cfg, req, CancellationToken::new()).await
+    let runs = Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_runs));
+    handle_cancellable(bus, cfg, req, CancellationToken::new(), runs).await
 }
 
 async fn handle_cancellable(
@@ -289,6 +320,7 @@ async fn handle_cancellable(
     cfg: Arc<Config>,
     req: Envelope,
     cancel: CancellationToken,
+    runs: Arc<tokio::sync::Semaphore>,
 ) -> Result<Value, RemoteError> {
     let method = match &req.to {
         Target::Method { method, .. } => method.as_str(),
@@ -302,6 +334,18 @@ async fn handle_cancellable(
     };
     let encode = |response: Result<Value, serde_json::Error>| {
         response.map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("encoding the response: {e}") })
+    };
+    if method == "control" {
+        let asked: ControlRequest = serde_json::from_value(req.payload).map_err(|e| RemoteError {
+            code: ErrorCode::Invalid,
+            message: format!("bad planner.control request: {e}"),
+        })?;
+        return encode(serde_json::to_value(control(bus.as_ref(), asked).await?));
+    }
+    // A run or a design waits for a free slot.
+    let _slot = tokio::select! {
+        slot = runs.acquire_owned() => slot.map_err(|_| RemoteError { code: ErrorCode::Unavailable, message: "the planner is stopping".into() })?,
+        _ = cancel.cancelled() => return Err(cancelled()),
     };
     match method {
         "run" => {

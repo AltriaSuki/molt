@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context};
 use molt_api::fs::ChangeKind;
 use molt_api::memory::{self, ConsolidateRequest, ConsolidateResponse};
-use molt_api::planner::{self, AttemptStatus, Outcome, RunRequest, RunResponse, Verdict};
+use molt_api::planner::{self, AttemptStatus, Outcome, Requirement, RunRequest, RunResponse, RunState, Verdict};
 use molt_api::progress::{self, Progress};
 use molt_kernel::Kernel;
 use molt_proto::{Budget, CapId, Envelope, ErrorCode, Kind, ServiceId, Target, TraceId};
@@ -667,6 +667,15 @@ pub fn describe(event: &Progress) -> String {
         }
         Progress::AttemptFinished { attempt, status, .. } => format!("attempt {attempt}: {}", status_name(*status)),
         Progress::Note { message, .. } => message.clone(),
+        Progress::Required { requirement, .. } => requirement_line(requirement),
+        Progress::Adopted { attempt, version, turn, .. } => {
+            format!("attempt {attempt}: follows requirements v{version} from turn {turn}")
+        }
+        Progress::State { state: RunState::Running, .. } => "going on".to_owned(),
+        Progress::State { state: RunState::Paused, .. } => "paused".to_owned(),
+        Progress::State { state: RunState::Pausing, waiting, .. } => {
+            format!("pausing; waiting for {}", waiting.join(", "))
+        }
         Progress::Recalled { run, notes, map_tokens } => {
             let mut parts = Vec::new();
             if let Some(tokens) = map_tokens {
@@ -684,6 +693,22 @@ pub fn describe(event: &Progress) -> String {
             line
         }
     })
+}
+
+/// A new version of a run's requirements as one line.
+pub fn requirement_line(requirement: &Requirement) -> String {
+    let c = &requirement.constraint;
+    let mut parts = Vec::new();
+    if !c.text.is_empty() {
+        parts.push(c.text.clone());
+    }
+    if !c.protect.is_empty() {
+        parts.push(format!("leave {} unchanged", c.protect.join(", ")));
+    }
+    if let Some(check) = &c.check {
+        parts.push(format!("check: {check}"));
+    }
+    format!("requirements v{}: {}", requirement.version, parts.join("; "))
 }
 
 fn model_label(context: &molt_api::progress::ModelCall) -> String {
@@ -1104,6 +1129,7 @@ mod tests {
             cost_usd: 0.012,
             uncounted_calls: 0,
             checkpoint: None,
+            requirements: vec![],
         };
         assert_eq!(
             report(&resp),

@@ -26,6 +26,10 @@ pub const RUN: &str = "planner.run";
 /// model, effort and budget matter) and answers a [`DesignResponse`]; a
 /// `planner.run` with its command and files then skips the design.
 pub const DESIGN: &str = "planner.design";
+/// Steer a run while it goes: add to what it must do, pause it, or let it go
+/// on. Takes a [`ControlRequest`] and answers a [`ControlResponse`]. Only a
+/// run still going on the planner that answers can be steered.
+pub const CONTROL: &str = "planner.control";
 
 fn two() -> u32 {
     2
@@ -101,6 +105,26 @@ pub struct RunRequest {
     /// workspace must be its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<Resume>,
+    /// Earlier tasks of the same conversation, oldest first, given to the
+    /// model as context. The run still has its own check and budget.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub earlier: Vec<Earlier>,
+}
+
+/// A task done before this one in the same conversation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Earlier {
+    pub task: String,
+    pub outcome: Outcome,
+    /// What the run said it did, or why it failed.
+    #[serde(default)]
+    pub summary: String,
+    /// The paths its result changed.
+    #[serde(default)]
+    pub changes: Vec<String>,
+    /// Its changes are in the workspace.
+    #[serde(default)]
+    pub applied: bool,
 }
 
 /// Which checkpointed run to go on with, and how.
@@ -133,8 +157,79 @@ impl RunRequest {
             checkpoint: false,
             resume: None,
             review: true,
+            earlier: Vec::new(),
         }
     }
+}
+
+/// A change to a running run (see [`CONTROL`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlRequest {
+    /// The run's id: the trace of its `planner.run` request.
+    pub run: String,
+    #[serde(flatten)]
+    pub action: Control,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum Control {
+    /// Add to what the run must do. It becomes the next version of the
+    /// run's requirements: each attempt takes it at its next step (before
+    /// its next model call), and a result found under an earlier version is
+    /// not applied until the attempt has gone over it again.
+    Constrain(Constraint),
+    /// Start no new model call, command or check until [`Control::Resume`].
+    /// What is already running finishes; the response says what that is.
+    Pause,
+    /// Go on after [`Control::Pause`].
+    Resume,
+}
+
+/// What a [`Control::Constrain`] adds. At least one of its parts is set.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Constraint {
+    /// In the user's words, for the model.
+    #[serde(default)]
+    pub text: String,
+    /// Workspace-relative files or directories the result must leave as
+    /// they are. A result that changes one is not accepted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protect: Vec<String>,
+    /// A new done-check command, in place of the one the run had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
+}
+
+/// One version of a run's requirements after the task itself, which is
+/// version 0.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Requirement {
+    pub version: u32,
+    #[serde(flatten)]
+    pub constraint: Constraint,
+    /// When it was added, in milliseconds since the Unix epoch.
+    pub at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunState {
+    Running,
+    /// Paused, while calls already running finish.
+    Pausing,
+    /// Paused, and nothing is running.
+    Paused,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlResponse {
+    pub state: RunState,
+    /// The run's requirements version now.
+    pub version: u32,
+    /// What is running and cannot be stopped at once, as short descriptions.
+    #[serde(default)]
+    pub waiting: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,6 +341,13 @@ pub struct AttemptReport {
     /// Why it ended: the tail of the last failed check, an error, or empty.
     #[serde(default)]
     pub note: String,
+    /// The version of the run's requirements it last worked to.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub requirements: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -286,6 +388,10 @@ pub struct RunResponse {
     /// run id to resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// What was added to the run while it went, in order. `check` above is
+    /// the one the result was checked with.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requirements: Vec<Requirement>,
 }
 
 /// Names and inputs of the tools the planner offers the model. Each maps to

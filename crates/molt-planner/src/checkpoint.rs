@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use molt_api::model::Usage;
-use molt_api::planner::{AttemptStatus, CheckFile, RunRequest};
+use molt_api::planner::{AttemptStatus, CheckFile, Requirement, RunRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -50,6 +50,9 @@ pub struct Saved {
     pub open_calls: u32,
     #[serde(default)]
     pub attempts: Vec<SavedAttempt>,
+    /// What was added to the run while it went.
+    #[serde(default)]
+    pub requirements: Vec<Requirement>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,6 +99,9 @@ pub struct SavedAttempt {
     /// How it ended; `None` while it can go on.
     #[serde(default)]
     pub end: Option<SavedEnd>,
+    /// The version of the run's requirements it works to.
+    #[serde(default)]
+    pub requirements: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -120,6 +126,7 @@ impl Saved {
             spend: SavedSpend::default(),
             open_calls: 0,
             attempts: Vec::new(),
+            requirements: Vec::new(),
         }
     }
 
@@ -139,6 +146,7 @@ impl Saved {
                     usage: Usage::default(),
                     cost_usd: 0.0,
                     end: None,
+                    requirements: 0,
                 });
                 self.attempts.len() - 1
             }
