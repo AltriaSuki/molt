@@ -1813,6 +1813,7 @@ mod tests {
             usage: Usage::default(),
             cost_usd: 0.3,
             uncounted_calls: 0,
+            checkpoint: None,
         }
     }
 

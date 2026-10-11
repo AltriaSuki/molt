@@ -1147,3 +1147,33 @@ async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
     assert_requests_valid(&server).await;
     setup.assert_forks_dropped();
 }
+
+#[tokio::test]
+async fn a_checkpointed_run_that_runs_out_of_budget_is_resumed_with_its_fork() {
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let mut req = setup.request(Some(CHECK), 1);
+    req.checkpoint = true;
+    // The first model call spends it all.
+    req.budget_usd = Some(0.000_001);
+    let trace = molt_proto::TraceId::random();
+    let stopped = molt::agent::run_task_as(&setup.cfg, req, trace.clone(), false, |_| {}, std::future::pending());
+    let stopped = tokio::time::timeout(RUN_LIMIT, stopped).await.expect("the run hung").unwrap().run;
+    assert_eq!(stopped.checkpoint.as_deref(), Some(trace.as_str()), "{stopped:#?}");
+    let runs = setup.data.path().join(molt::config::RUNS);
+    let saved = molt_planner::checkpoint::load(&runs, trace.as_str()).unwrap();
+    let fork = saved.attempts[0].fork.clone().expect("the attempt had a fork");
+    assert!(std::path::Path::new(&fork).is_dir(), "the fork is kept for the resume");
+    assert_eq!(setup.file("greeting.txt"), None);
+
+    let mut req = saved.request.clone();
+    req.resume = Some(molt_api::planner::Resume { run: trace.to_string(), retry: false });
+    req.budget_usd = Some(10.0);
+    let resumed = molt::agent::run_task_as(&setup.cfg, req, trace.clone(), false, |_| {}, std::future::pending());
+    let resumed = tokio::time::timeout(RUN_LIMIT, resumed).await.expect("the run hung").unwrap().run;
+    assert_eq!(resumed.outcome, Outcome::Passed, "{resumed:#?}");
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    assert!(resumed.cost_usd > stopped.cost_usd, "the cost goes on: {} then {}", stopped.cost_usd, resumed.cost_usd);
+    assert!(molt_planner::checkpoint::load(&runs, trace.as_str()).is_err(), "a finished run keeps no checkpoint");
+    assert!(!std::path::Path::new(&fork).exists());
+}
