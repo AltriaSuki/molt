@@ -295,6 +295,8 @@ impl Config {
             text(&data_dir.join(MEMORY_DB))?,
             "--skip".into(),
             text(data_dir)?,
+            "--forks".into(),
+            text(&data_dir.join("work"))?,
         ];
         let mut memory = service("memory", Tier::Mutable, memory_exec)?;
         memory.pass_env = names(MEMORY_ENV);
@@ -304,6 +306,7 @@ impl Config {
             request(molt_api::model::COMPLETE, Budget::new(1_000_000_000, 0, 1_000_000))?,
             request(molt_proto::audit::READ, Budget::new(0, 0, 10_000_000))?,
             request(&format!("topic:subscribe:{}", molt_api::fs::CHANGED), Budget::new(0, 0, 10))?,
+            request(molt_api::fs::VIEW, Budget::new(0, 0, 100_000_000))?,
         ];
         let mut planner_exec = bin("molt-planner")?;
         // Checkpoints of runs, to resume one that stopped.
@@ -319,9 +322,13 @@ impl Config {
             request(&format!("topic:publish:{}", molt_api::progress::TOPIC), Budget::new(0, 0, 10_000_000))?,
         ];
         // What memory knows about the workspace; not remember, forget or consolidate.
-        for method in
-            [molt_api::memory::INDEX, molt_api::memory::MAP, molt_api::memory::RECALL, molt_api::memory::SYMBOLS]
-        {
+        for method in [
+            molt_api::memory::INDEX,
+            molt_api::memory::MAP,
+            molt_api::memory::RECALL,
+            molt_api::memory::SYMBOLS,
+            molt_api::memory::FORK_SYMBOLS,
+        ] {
             planner.requests.push(request(method, Budget::new(0, 0, 10_000_000))?);
         }
         Ok(Self {
@@ -517,10 +524,19 @@ mod tests {
         assert_eq!(exec.command, "/opt/molt/bin/molt-memory");
         assert_eq!(
             exec.args,
-            ["--root", "/home/u/proj", "--db", "/cache/molt/proj/memory.db", "--skip", "/cache/molt/proj"]
+            [
+                "--root",
+                "/home/u/proj",
+                "--db",
+                "/cache/molt/proj/memory.db",
+                "--skip",
+                "/cache/molt/proj",
+                "--forks",
+                "/cache/molt/proj/work"
+            ]
         );
         assert_eq!(memory.tier, Tier::Mutable);
-        assert_eq!(targets("memory"), ["model.complete", "kernel.audit.read", "topic:subscribe:fs.changed"]);
+        assert_eq!(targets("memory"), ["model.complete", "kernel.audit.read", "topic:subscribe:fs.changed", "fs.view"]);
         assert!(memory.pass_env.iter().all(|v| v.starts_with("MOLT_MEMORY_")));
 
         let planner = cfg.service("planner").unwrap();
@@ -539,7 +555,8 @@ mod tests {
                 "memory.index",
                 "memory.map",
                 "memory.recall",
-                "memory.symbols"
+                "memory.symbols",
+                "memory.fork_symbols"
             ]
         );
         for req in &planner.requests {
