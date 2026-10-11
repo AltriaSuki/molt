@@ -15,6 +15,8 @@ use serde_json::Value;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::checkpoint::{Saved, SavedSpend, Store};
+use crate::fit::Limits;
 use crate::memory::Memory;
 use crate::{Bus, Config};
 
@@ -75,21 +77,29 @@ pub(crate) struct Ctx {
     forks: Arc<Mutex<Vec<String>>>,
     pub cancel: CancellationToken,
     pub run_cancel: CancellationToken,
+    /// Where the run's checkpoint is saved, when it keeps one.
+    pub checkpoint: Option<Arc<Store>>,
+    /// Calls not counted before this resume of the run: they do not stop
+    /// it, as calls of its own with an unknown cost do, but are reported.
+    pub carried_uncounted: u32,
 }
 
-/// A conversation that only ever grows. `system` and `tools` stay the same
-/// for its whole life: thinking blocks are bound to the exact prefix, and an
-/// unchanged prefix keeps the prompt cache warm.
+/// A conversation that grows until it no longer fits a model call (see
+/// [`crate::fit`]). `system` and `tools` stay the same for its whole life:
+/// an unchanged prefix keeps the prompt cache warm.
 pub(crate) struct Conversation {
-    system: &'static str,
-    tools: Arc<Vec<Value>>,
-    messages: Vec<Value>,
-    attempt: Option<u32>,
+    pub(crate) system: &'static str,
+    pub(crate) tools: Arc<Vec<Value>>,
+    pub(crate) messages: Vec<Value>,
+    pub(crate) attempt: Option<u32>,
+    /// How many messages the model last measured, and the tokens it counted
+    /// for them, its reply included.
+    pub(crate) known: Option<(usize, u64)>,
 }
 
 impl Conversation {
     pub fn new(system: &'static str, tools: Arc<Vec<Value>>, first: Value, attempt: Option<u32>) -> Self {
-        Self { system, tools, messages: vec![first], attempt }
+        Self { system, tools, messages: vec![first], attempt, known: None }
     }
 
     pub fn push(&mut self, message: Value) {
@@ -119,7 +129,44 @@ impl Ctx {
             forks: Arc::default(),
             cancel: CancellationToken::new(),
             run_cancel: CancellationToken::new(),
+            checkpoint: None,
+            carried_uncounted: 0,
         }
+    }
+
+    /// Change the run's checkpoint and save it, when it keeps one. A save
+    /// that fails is logged: the run goes on without it.
+    pub fn save(&self, change: impl FnOnce(&mut Saved)) {
+        if let Some(store) = &self.checkpoint {
+            if let Err(e) = store.update(change) {
+                tracing::warn!(run = %self.trace, error = %e, "could not save the checkpoint");
+            }
+        }
+    }
+
+    /// Start counting from what a checkpoint says the run spent before.
+    pub fn restore(&mut self, spend: &SavedSpend, open_calls: u32) {
+        self.tally.send_modify(|t| {
+            t.spend.usage = spend.usage;
+            t.spend.cost_usd = spend.cost_usd;
+        });
+        self.carried_uncounted = spend.uncounted_calls + open_calls;
+    }
+
+    /// The spend to save: everything so far, earlier resumes included.
+    fn saved_spend(&self) -> SavedSpend {
+        let t = self.tally();
+        SavedSpend {
+            usage: t.spend.usage,
+            cost_usd: t.spend.cost_usd,
+            uncounted_calls: self.carried_uncounted + t.unsettled + t.spend.unknown_calls,
+        }
+    }
+
+    /// What one model call of this run can take.
+    pub fn limits(&self) -> Limits {
+        let context = self.cfg.context_tokens.unwrap_or_else(|| Limits::context_of(self.model.as_deref()));
+        Limits::new(context, self.cfg.max_tokens, self.cfg.frame_bytes)
     }
 
     /// What the first message of every conversation starts with: the
@@ -214,6 +261,7 @@ impl Ctx {
         let ms = u64::try_from(self.cfg.model_timeout.as_millis()).unwrap_or(u64::MAX);
         let budget = Budget::new(self.cfg.max_tokens.into(), ms, 0);
         self.tally.send_modify(|t| t.pending += 1);
+        self.save(|s| s.open_calls += 1);
         let ctx = self.clone();
         let call = tokio::spawn(async move {
             let resp = ctx.call::<CompleteResponse>(model::COMPLETE, req, budget).await;
@@ -223,6 +271,11 @@ impl Ctx {
                     Ok(resp) => t.spend.add(resp),
                     Err(_) => t.unsettled += 1,
                 }
+            });
+            let spend = ctx.saved_spend();
+            ctx.save(|s| {
+                s.open_calls = s.open_calls.saturating_sub(1);
+                s.spend = spend;
             });
             if ctx.over_budget() && !ctx.cancel.is_cancelled() {
                 ctx.run_cancel.cancel();
@@ -255,6 +308,14 @@ impl Ctx {
         let alive = self.forks.lock().unwrap_or_else(PoisonError::into_inner).clone();
         for fork in alive.iter().filter(|f| Some(f.as_str()) != keep) {
             self.drop_fork(fork).await;
+        }
+    }
+
+    /// A fork made by an earlier resume of the run: the run owns it now.
+    pub fn track_fork(&self, fork: &str) {
+        let mut forks = self.forks.lock().unwrap_or_else(PoisonError::into_inner);
+        if !forks.iter().any(|f| f == fork) {
+            forks.push(fork.to_owned());
         }
     }
 

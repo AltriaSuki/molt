@@ -6,11 +6,14 @@
 
 mod agent;
 mod attempt;
+pub mod checkpoint;
 mod ctx;
 mod designer;
+mod fit;
 mod instructions;
 mod memory;
 mod prompts;
+mod review;
 mod runner;
 mod tools;
 
@@ -47,6 +50,14 @@ pub struct Config {
     /// replies to model calls that cancelled attempts left running, so their
     /// cost is counted. Calls still unanswered are reported as uncounted.
     pub late_reply_wait: Duration,
+    /// The model's context window in tokens, the reply included. `None`
+    /// takes 200,000 for Claude models and 128,000 for any other.
+    pub context_tokens: Option<u32>,
+    /// The largest model request the bus carries, in bytes.
+    pub frame_bytes: usize,
+    /// Where checkpoints are kept; `None` keeps none, and a run asking for
+    /// one is refused.
+    pub state_dir: Option<std::path::PathBuf>,
     /// Names of the project's instruction files, looked for in the
     /// workspace root and the directories the task names.
     pub instruction_files: Vec<String>,
@@ -65,6 +76,9 @@ impl Default for Config {
             max_concurrent_runs: 4,
             map_tokens: 3_000,
             late_reply_wait: Duration::from_secs(2),
+            context_tokens: None,
+            frame_bytes: molt_transport::MAX_FRAME,
+            state_dir: None,
             instruction_files: vec!["AGENTS.md".into(), "CLAUDE.md".into()],
         }
     }
@@ -74,7 +88,7 @@ impl Config {
     /// [`Config::default`] overridden by `MOLT_PLANNER_MODEL`,
     /// `MOLT_MAX_TURNS`, `MOLT_MAX_CHECK_ROUNDS`, `MOLT_BUDGET_USD`,
     /// `MOLT_MAX_TOKENS`, `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
-    /// `MOLT_MAP_TOKENS` and `MOLT_INSTRUCTION_FILES`.
+    /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS` and `MOLT_INSTRUCTION_FILES`.
     ///
     /// | Variable | Default |
     /// |---|---|
@@ -86,6 +100,7 @@ impl Config {
     /// | `MOLT_MODEL_TIMEOUT_S` | `1200` |
     /// | `MOLT_CHECK_TIMEOUT_S` | `900` |
     /// | `MOLT_MAP_TOKENS` | `3000` (at most 32000) |
+    /// | `MOLT_CONTEXT_TOKENS` | unset: 200000 for Claude models, 128000 for others |
     /// | `MOLT_INSTRUCTION_FILES` | `AGENTS.md,CLAUDE.md`; `none` reads none |
     ///
     /// An empty variable counts as unset. A value that does not parse is an
@@ -125,6 +140,9 @@ impl Config {
             map_tokens: small("MOLT_MAP_TOKENS", d.map_tokens)?.min(32_000),
             max_concurrent_runs: d.max_concurrent_runs,
             late_reply_wait: d.late_reply_wait,
+            context_tokens: get("MOLT_CONTEXT_TOKENS").map(|_| small("MOLT_CONTEXT_TOKENS", 0)).transpose()?,
+            frame_bytes: d.frame_bytes,
+            state_dir: d.state_dir,
             instruction_files: match get("MOLT_INSTRUCTION_FILES") {
                 None => d.instruction_files,
                 Some(v) if v == "none" => Vec::new(),
