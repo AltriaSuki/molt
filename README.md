@@ -147,7 +147,10 @@ start and end.
 where each came from: the run, the service version that wrote it and the
 messages in the audit log it rests on. `f` forgets one, with a reason, as
 `molt memory forget` does. `/attempts`, `/model`, `/effort`, `/budget` and
-`/check` set the next tasks' options; `/help` lists the keys. The services'
+`/check` set the next tasks' options; `/memory-model NAME` sets the model
+memory learns with (`same` for the attempts' model, `default` for
+`MOLT_MEMORY_MODEL` or `sonnet`), and when learning finds nothing the log
+says why. `/help` lists the keys. The services'
 log goes to `tui.log` in the data dir, and colors are left out under
 `NO_COLOR`.
 
@@ -159,7 +162,7 @@ the same project is refused until it closes.
 ```
 molt do TASK [--check CMD | --no-check] [--attempts N] [--model M] [--effort E] [--max-turns N]
         [--budget-usd X] [--no-apply] [--no-review] [--json] [--stream] [--workspace DIR] [--data-dir DIR]
-        [--pass-env NAME]... [--no-memory] [--no-learn] [--checkpoint] [--config FILE]
+        [--pass-env NAME]... [--no-memory] [--no-learn] [--memory-model MODEL] [--checkpoint] [--config FILE]
 molt resume [RUN] [--retry] [--list] [--budget-usd X] [--no-apply] [--json] [--workspace DIR] ...
 ```
 
@@ -179,6 +182,7 @@ molt resume [RUN] [--retry] [--list] [--budget-usd X] [--no-apply] [--json] [--w
 | `--pass-env NAME` | Pass a variable from your environment to the commands the agent runs, the check included. Repeatable. |
 | `--no-memory` | Run without memory: no map or notes for the model, nothing learned. |
 | `--no-learn` | Use memory, but do not learn from this run (learning is one more model call after it). |
+| `--memory-model MODEL` | The model memory learns from this run with; `same` uses the attempts' model. Default: `MOLT_MEMORY_MODEL`, else `sonnet`. Useful when that model is not on your endpoint. |
 | `--checkpoint` | Save a checkpoint as the run goes, so a run that stops before it finishes can go on with `molt resume` (below). |
 | `--config FILE` | Run your own service setup (see `molt.example.toml`) instead of the default one. |
 

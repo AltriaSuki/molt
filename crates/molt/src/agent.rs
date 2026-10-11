@@ -226,6 +226,26 @@ pub fn require_services(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How memory learns from a run.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Learn {
+    /// The model memory learns with; `None` for memory's own default
+    /// (`MOLT_MEMORY_MODEL`, else sonnet).
+    pub model: Option<String>,
+}
+
+/// The model memory learns with, from what the user asked for: a model,
+/// [`SAME_MODEL`] for the attempts' model, or nothing for memory's default.
+pub fn memory_model(asked: Option<&str>, attempts: Option<&str>) -> Option<String> {
+    match asked.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(SAME_MODEL) => attempts.map(str::to_owned),
+        other => other.map(str::to_owned),
+    }
+}
+
+/// Asks memory to learn with the model the attempts used.
+pub const SAME_MODEL: &str = "same";
+
 /// What a run produced.
 #[derive(Debug)]
 pub struct Done {
@@ -248,7 +268,7 @@ pub struct Done {
 pub async fn run_task(
     cfg: &Config,
     req: RunRequest,
-    learn: bool,
+    learn: Option<Learn>,
     on_progress: impl FnMut(&Progress),
     stop: impl Future<Output = ()>,
 ) -> anyhow::Result<Done> {
@@ -262,7 +282,7 @@ pub async fn run_task_as(
     cfg: &Config,
     req: RunRequest,
     trace: TraceId,
-    learn: bool,
+    learn: Option<Learn>,
     mut on_progress: impl FnMut(&Progress),
     stop: impl Future<Output = ()>,
 ) -> anyhow::Result<Done> {
@@ -292,15 +312,15 @@ pub async fn run_task_as(
     let done = match result {
         Ok(ran) => {
             let learned = match (learn, ran.memory) {
-                (false, _) | (true, None) => None,
-                (true, Some(Err(e))) => Some(Err(e)),
+                (None, _) | (Some(_), None) => None,
+                (Some(_), Some(Err(e))) => Some(Err(e)),
                 // Learning is a model call too: the run's budget covers it.
-                (true, Some(Ok(())))
+                (Some(_), Some(Ok(())))
                     if (ran.resp.uncounted_calls > 0 || budget_usd.is_some_and(|b| ran.resp.cost_usd >= b)) =>
                 {
                     Some(Err("skipped: the budget is exhausted or model settlement is incomplete".to_owned()))
                 }
-                (true, Some(Ok(()))) => {
+                (Some(learn), Some(Ok(()))) => {
                     on_progress(&Progress::Note {
                         run: ran.trace.to_string(),
                         message: "learning from the run".into(),
@@ -311,7 +331,7 @@ pub async fn run_task_as(
                         wait_until_up(kernel, &ran.cli, MEMORY, Instant::now() + LEARN_PROBE)
                             .await
                             .map_err(|e| format!("{e:#}"))?;
-                        consolidate(kernel, &ran.cli, &ran.trace, &workspace).await
+                        consolidate(kernel, &ran.cli, &ran.trace, &workspace, learn.model).await
                     };
                     tokio::select! {
                         biased;
@@ -458,9 +478,10 @@ async fn consolidate(
     cli: &Service,
     episode: &TraceId,
     workspace: &str,
+    model: Option<String>,
 ) -> Result<ConsolidateResponse, String> {
     grant(kernel, cli, memory::CONSOLIDATE, Budget::new(0, 0, 10)).await.map_err(|e| format!("{e:#}"))?;
-    let req = ConsolidateRequest { episode: episode.to_string(), workspace: workspace.to_owned(), model: None };
+    let req = ConsolidateRequest { episode: episode.to_string(), workspace: workspace.to_owned(), model };
     let payload = serde_json::to_value(req).map_err(|e| e.to_string())?;
     let opts = CallOpts { cap: None, budget: Budget::new(0, LEARN_MS, 0), trace: None };
     let reply = cli.call(memory::CONSOLIDATE, payload, opts).await.map_err(|e| e.to_string())?;
@@ -801,6 +822,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn memory_learns_with_the_model_asked_for_or_the_attempts_one() {
+        assert_eq!(memory_model(None, Some("opus")), None);
+        assert_eq!(memory_model(Some(" "), Some("opus")), None);
+        assert_eq!(memory_model(Some("haiku"), Some("opus")).as_deref(), Some("haiku"));
+        assert_eq!(memory_model(Some("same"), Some("opus")).as_deref(), Some("opus"));
+        assert_eq!(memory_model(Some("same"), None), None);
+    }
+
+    #[test]
     fn data_dir_names_are_short_plain_and_tied_to_the_path() {
         let name = |path: &str| data_dir_name(Path::new(path), 32);
         let a = name("/home/u/my project");
@@ -912,7 +942,7 @@ mod tests {
         let mut cfg = Config::agent(Path::new("/w"), &data, Path::new("/b")).unwrap();
         cfg.service_mut("model").unwrap().requests.clear();
         let request = RunRequest { stream: true, ..RunRequest::new("task", "/w") };
-        let error = run_task(&cfg, request, false, |_| {}, std::future::pending()).await.unwrap_err();
+        let error = run_task(&cfg, request, None, |_| {}, std::future::pending()).await.unwrap_err();
         assert!(error.to_string().contains("topic:progress"));
         assert!(!data.exists());
     }

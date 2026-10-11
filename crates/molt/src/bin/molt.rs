@@ -150,6 +150,11 @@ struct RunArgs {
     /// (the review is more model calls, and holds back what it questions).
     #[arg(long)]
     no_review: bool,
+    /// Model memory learns from the run with: opus, sonnet, haiku, a model
+    /// id, or `same` for the attempts' model. Default: MOLT_MEMORY_MODEL,
+    /// else sonnet.
+    #[arg(long, value_name = "MODEL", conflicts_with_all = ["no_learn", "no_memory"])]
+    memory_model: Option<String>,
 }
 
 #[derive(Args)]
@@ -643,7 +648,9 @@ async fn execute(
     let mut signal = None;
     let stopped = async { signal = Some(stop.await) };
     let progress = |event: &_| eprintln!("{}", agent::describe(event));
-    let result = agent::run_task_as(cfg, req, trace, !args.no_learn, progress, stopped).await;
+    let learn = (!args.no_learn)
+        .then(|| agent::Learn { model: agent::memory_model(args.memory_model.as_deref(), req.model.as_deref()) });
+    let result = agent::run_task_as(cfg, req, trace, learn, progress, stopped).await;
     let done = match result {
         Ok(done) => done,
         Err(e) if e.is::<Interrupted>() => {
