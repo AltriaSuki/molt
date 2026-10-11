@@ -338,16 +338,26 @@ impl Fake {
                     }]
                 })
             }
-            memory::SYMBOLS => json!(memory::SymbolsResponse {
-                definitions: vec![memory::Definition {
-                    path: "src/greet.rs".into(),
-                    line: 3,
-                    kind: "function".into(),
-                    name: "greet".into(),
-                    signature: "pub fn greet(name: &str) -> String".into(),
-                }],
-                references: vec![],
-                truncated: false,
+            memory::FORK_SYMBOLS => json!(memory::ForkSymbolsResponse {
+                view: fs::ViewResponse {
+                    workspace: "workspace".into(),
+                    fork: "fork-a".into(),
+                    baseline: "baseline".into(),
+                    version: "current".into()
+                },
+                parsed: 0,
+                skipped: 0,
+                symbols: memory::SymbolsResponse {
+                    definitions: vec![memory::Definition {
+                        path: "src/greet.rs".into(),
+                        line: 3,
+                        kind: "function".into(),
+                        name: "greet".into(),
+                        signature: "pub fn greet(name: &str) -> String".into(),
+                    }],
+                    references: vec![],
+                    truncated: false,
+                }
             }),
             other => return Err(invalid(format!("no {other}"))),
         })
@@ -1335,7 +1345,11 @@ async fn memory_gives_every_conversation_the_project_context_and_its_tools() {
     let results = last_text(second);
     assert!(results.contains("Defined at:\nsrc/greet.rs:3: function pub fn greet(name: &str) -> String"), "{results}");
     assert!(results.contains("- [lesson 0.70] hello.txt must end"), "{results}");
-    assert_eq!(fake.calls_to("memory.symbols")[0].payload["name"], "greet");
+    let symbols = &fake.calls_to(memory::FORK_SYMBOLS)[0].payload;
+    assert_eq!(symbols["name"], "greet");
+    assert_eq!(symbols["workspace"], WORKSPACE);
+    assert!(symbols["fork"].as_str().unwrap().starts_with("/scratch/fork-"));
+    assert!(results.contains("baseline baseline, current current"));
     assert!(fake.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
         if message == "project model: 3 files, 7 definitions (3 parsed again, 0 ms)")));
 

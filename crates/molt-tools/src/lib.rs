@@ -128,6 +128,7 @@ impl Fs {
             "search" => blocking(method, payload, move |req| files::search(&roots, req).map(quiet)).await,
             "fork" => blocking(method, payload, move |req| fork::fork(&roots, req).map(quiet)).await,
             "diff" => blocking(method, payload, move |req| fork::diff(&roots, req).map(quiet)).await,
+            "view" => blocking(method, payload, move |req| fork::view(&roots, &forks, req).map(quiet)).await,
             "drop" => blocking(method, payload, move |req| fork::drop_fork(&roots, &forks, req).map(quiet)).await,
             _ => Err(invalid(format!("unknown method fs.{method}"))),
         }

@@ -63,6 +63,7 @@ sender from that.
 | Every learned note cites the messages behind it, and a run is learned from once | `crates/molt/tests/agent.rs` (`a_second_run_starts_with_what_the_first_learned…`), `crates/molt-memory/src/consolidate.rs` |
 | A benchmark run is graded by tests the agent is not given, which its own edits cannot replace | `crates/molt-bench/src/grade.rs` (`grading_overwrites_the_agents_copy_of_a_hidden_file`), `crates/molt-bench/src/task.rs` (`overlay_replaces_files_links_and_directories_and_stays_inside`) |
 | Every benchmark task fails its check as given and passes it with the reference solution | `crates/molt-bench/tests/tasks.rs` |
+| Attempt symbol queries verify fork ownership and content freshness, isolate parallel views, and never update the durable project model | `crates/molt-memory/tests/forks.rs` (`rename_add_move_delete_and_shell_edits_stay_inside_the_attempt`, `unverified_wrong_workspace_and_symlink_forks_are_refused_without_widening_roots`, `an_edit_during_refresh_returns_no_stale_symbols`) |
 | A benchmark starts a run only while what it spent, plus the whole `--task-usd` of that run and of each run in flight, fits in `--max-usd`; it refuses models it has no price for | `crates/molt-bench/src/run.rs` (`runs_stop_before_they_could_pass_the_budget`, `a_run_of_unknown_cost_stops_the_benchmark`), `crates/molt-bench/src/cli.rs` (`a_model_without_a_price_is_refused`) |
 | A model with no price stays of unknown cost and stops the run; prices come only from the user's environment or data directory, never from a project, and a download that does not validate replaces nothing | `crates/molt-gateway/src/prices.rs` (`the_data_directory_holds_the_snapshot_and_nothing_else_is_read`, `a_download_that_does_not_validate_is_refused`, `malformed_declared_prices_stop_startup_and_name_the_item`), `crates/molt-gateway/tests/gateway.rs` (`a_snapshot_prices_a_third_party_model…`) |
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
@@ -241,6 +242,23 @@ progress. It follows the files the `fs` service changes as they change. From it,
 the code most relevant to its task, ranked the way Aider ranks it (PageRank
 over references, weighted toward what the task mentions), and attempts can
 ask where a name is defined and used (`find_symbol`).
+
+`find_symbol` uses a disposable symbol view of its own attempt fork, including
+file-tool and shell changes. Memory asks `fs.view` to verify the fork's original
+workspace and content version before and after refreshing. Every source file
+is re-hashed, while only changed contents are parsed again, so a script that
+preserves size and mtime cannot leave stale symbols. Replies identify the
+baseline and current version; a concurrent edit or failed refresh returns an
+explicit instruction to use `search`/`read_file`. Each view has an independent
+in-memory database, with at most eight cached views; fork symbols never enter
+the persistent project/notes database. The default setup grants only `fs.view`
+to memory for this purpose. Custom configs must set `molt-memory --forks` to
+the same trusted absolute scratch directory used by fs, and grant the planner
+`memory.fork_symbols`; ordinary memory workspace access remains confined to
+`--root`. Cold views index the whole fork; eviction or service restart rebuilds
+them on the next query. Oversized, binary and unsupported files remain outside
+the symbol model, and responses expose skipped/truncated results.
+
 
 **Notes** are one-sentence facts, conventions, decisions, preferences and
 lessons. After a run, memory reads it back from the audit log, boils it down

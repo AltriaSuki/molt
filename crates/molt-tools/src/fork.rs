@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use molt_api::fs::{
     Change, ChangeKind, DiffRequest, DiffResponse, DropRequest, DropResponse, ForkRequest, ForkResponse, MergeRequest,
-    MergeResponse,
+    MergeResponse, ViewRequest, ViewResponse,
 };
 use molt_proto::RemoteError;
 use serde::{Deserialize, Serialize};
@@ -311,6 +311,23 @@ pub(crate) fn diff(roots: &Roots, req: DiffRequest) -> Result<DiffResponse, Remo
         patch.push_str(&section);
     }
     Ok(DiffResponse { changes, patch, truncated })
+}
+
+pub(crate) fn view(roots: &Roots, lock: &Mutex<()>, req: ViewRequest) -> Result<ViewResponse, RemoteError> {
+    // A drop or merge must not replace the fork while its identity is checked.
+    let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let fork = open(roots, &req.fork)?;
+    let now = current(&fork, &roots.scratch)?;
+    let fingerprint = |files: &BTreeMap<String, String>| -> Result<String, RemoteError> {
+        let bytes = serde_json::to_vec(files).map_err(|e| failed(e.to_string()))?;
+        Ok(hex::encode(Sha256::digest(bytes)))
+    };
+    Ok(ViewResponse {
+        workspace: fork.meta.base.to_string_lossy().into_owned(),
+        fork: fork.dir.to_string_lossy().into_owned(),
+        baseline: fingerprint(&fork.meta.files)?,
+        version: fingerprint(&now)?,
+    })
 }
 
 /// The patch for one changed path. The old side is the original as it is

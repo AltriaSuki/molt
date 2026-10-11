@@ -67,13 +67,14 @@ provides = ["shell.*"]
 [[service]]
 name = "memory"
 tier = "mutable"
-exec = { command = "molt-memory", args = ["--root", ".", "--db", ".molt/memory.db"] }
+exec = { command = "molt-memory", args = ["--root", ".", "--db", ".molt/memory.db", "--forks", "/home/you/.cache/molt/work"] }
 provides = ["memory.*"]
 pass_env = ["MOLT_MEMORY_MODEL", "MOLT_MEMORY_EFFORT", "MOLT_MEMORY_MAX_TOKENS", "MOLT_MEMORY_MODEL_TIMEOUT_S"]
 requests = [
   { target = "model.complete", budget = { tokens = 1000000000, calls = 1000000 } },
   { target = "kernel.audit.read", budget = { calls = 10000000 } },
   { target = "topic:fs.changed", budget = { calls = 10 } },
+  { target = "fs.view", budget = { calls = 100000000 } },
 ]
 
 # Calls 0 would refuse every call; ms 0 leaves deadlines to each request.
@@ -96,4 +97,5 @@ requests = [
   { target = "memory.map", budget = { calls = 10000000 } },
   { target = "memory.recall", budget = { calls = 10000000 } },
   { target = "memory.symbols", budget = { calls = 10000000 } },
+  { target = "memory.fork_symbols", budget = { calls = 10000000 } },
 ]
