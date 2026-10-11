@@ -561,7 +561,7 @@ async fn an_explicit_check_passes_and_the_winner_is_merged() {
                 tool: "write_file".into(),
                 detail: "write hello.txt".into()
             },
-            Progress::CheckRan { run: run.clone(), attempt: 0, passed: true, exit_code: Some(0) },
+            Progress::CheckRan { run: run.clone(), attempt: 0, passed: true, exit_code: Some(0), tail: String::new() },
             Progress::AttemptFinished { run, attempt: 0, status: AttemptStatus::Passed },
         ]
     );

@@ -112,7 +112,11 @@ In the default mode, **confirm**, a task stops twice for you:
    check runs as they happen (Tab shows one large). When one passes, you see
    its message, the files it changed and, with `d`, the diff. Enter applies
    it; `k` keeps it in its fork, `n` discards it. `/last` opens the diff of
-   the last finished task again, whatever was done with it.
+   the last finished task again, whatever was done with it. When no attempt
+   passes, each one shows the end of why it stopped, and a failed check shows
+   its last lines in its box; `v` opens the whole story and `r` runs the task
+   again with the same check, without designing it anew. `/lanes` shows the
+   last task's tool calls after it has ended.
 
 Shift+Tab switches to **auto** (design the check and apply what passes) or
 **plan only** (results stay in their forks). Esc stops a task: the services
@@ -424,18 +428,8 @@ cargo test --workspace
 
 The NATS conformance and end-to-end tests need a `nats-server` binary. Set
 `MOLT_NATS_SERVER=/path/to/nats-server` or put it on `PATH`
-(`go install github.com/nats-io/nats-server/v2@v2.15.1`, using the Go version
-in `.github/ci-versions.toml`). Without it they print
+(`go install github.com/nats-io/nats-server/v2@latest`). Without it they print
 a notice and pass; CI always runs them.
-
-The Rust release and components are pinned in `rust-toolchain.toml`, and CI
-reads that file too. Go and nats-server are pinned in `.github/ci-versions.toml`;
-Go cannot fetch a newer toolchain automatically. NATS binaries use an exact
-version/OS/architecture/Go cache key and are version-checked on every run,
-including cache hits. Actions are pinned to commit SHAs. Toolchain upgrades
-belong in a separate PR so ordinary changes keep the same tool versions when
-rerun. The runner image and apt's isolation backend still receive OS updates;
-these pins do not claim a bit-for-bit identical machine image.
 
 `crates/molt-bench/tests/tasks.rs` validates every benchmark task, which takes
 `python3`, `node` (20 or newer), `go` and `cargo`. A missing toolchain skips

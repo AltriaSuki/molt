@@ -17,6 +17,8 @@ use crate::tools::{self, Actor};
 
 /// Bytes of check output kept in a failed attempt's note.
 const NOTE_TAIL: usize = 2000;
+/// Bytes of a failed check's output in its progress event.
+const PROGRESS_TAIL: usize = 400;
 
 /// A done-check as the attempts run it.
 pub(crate) struct Check {
@@ -187,6 +189,7 @@ impl Attempt {
                 attempt: self.index,
                 passed,
                 exit_code: ran.exit_code,
+                tail: if passed { String::new() } else { prompts::output_tail(&ran, PROGRESS_TAIL) },
             })
             .await;
             if passed {
