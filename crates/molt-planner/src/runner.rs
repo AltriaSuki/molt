@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::attempt::{self, Check, Finished};
 use crate::checkpoint::{self, Saved, SavedAttempt, SavedCheck, SavedEnd, SavedSpend, Store};
+use crate::control::{self, Control, Registered};
 use crate::ctx::Ctx;
 use crate::designer::{self, Design};
 use crate::review::{self, Winner};
@@ -57,6 +58,7 @@ pub(crate) async fn run_cancellable(
     }
     ctx.instructions = instructions::gather(&ctx).await;
     let ctx = Arc::new(ctx);
+    let _steer = steer(&ctx);
     if let Some(dir) = &state {
         prune(&ctx, dir).await;
     }
@@ -104,6 +106,7 @@ async fn resume_run(
     ctx.memory = memory::prepare(&ctx).await;
     ctx.instructions = instructions::gather(&ctx).await;
     ctx.restore(&saved.spend, saved.open_calls);
+    ctx.control = Control::new(saved.requirements.clone());
     let mut next = saved.clone();
     next.request = run_req.clone();
     next.spend.uncounted_calls = ctx.carried_uncounted;
@@ -111,6 +114,7 @@ async fn resume_run(
     next.planner = env!("CARGO_PKG_VERSION").to_owned();
     ctx.checkpoint = Some(Arc::new(Store::create(&dir, next).map_err(failed)?));
     let ctx = Arc::new(ctx);
+    let _steer = steer(&ctx);
     ctx.note(format!(
         "resuming run {}: ${:.2} spent before{}",
         resume.run,
@@ -175,6 +179,20 @@ async fn resume_run(
     Ok(finish(&ctx, &run_req, check, designed, slots).await)
 }
 
+/// Make the run steerable with `planner.control` and report its state, until
+/// the guards drop.
+fn steer(ctx: &Arc<Ctx>) -> (Registered, tokio_util::sync::DropGuard) {
+    ctx.control.keep_in(ctx.checkpoint.clone());
+    let stop = CancellationToken::new();
+    let publisher = ctx.clone();
+    let publish = move |event| {
+        let ctx = publisher.clone();
+        tokio::spawn(async move { ctx.progress(event).await });
+    };
+    ctx.control.report(ctx.run_id(), publish, stop.clone());
+    (control::register(ctx.trace.as_str(), ctx.control.clone()), stop.drop_guard())
+}
+
 fn invalid(message: impl Into<String>) -> RemoteError {
     RemoteError { code: ErrorCode::Invalid, message: message.into() }
 }
@@ -220,6 +238,7 @@ fn save_check(ctx: &Ctx, check: Option<&Check>, designed: bool) {
         s.settled = true;
         s.check = saved;
     });
+    ctx.control.settle(check.is_some(), check.map(Check::paths).unwrap_or_default());
 }
 
 /// Remove the checkpoints beyond the newest [`checkpoint::KEEP`], with the
@@ -260,6 +279,7 @@ async fn finish(
     })
     .await;
     let (finished, winner) = race(ctx, slots, check.map(Arc::new)).await;
+    ctx.control.freeze("the run is finishing");
     let stopped = ctx.checkpoint.is_some() && ctx.run_cancel.is_cancelled();
     // Cancelled attempts may have left model calls running, which are billed: give their replies a moment
     // to land and be counted, while the winner is applied.
@@ -476,6 +496,7 @@ async fn conclude(
         cost_usd: 0.0,
         uncounted_calls: 0,
         checkpoint: None,
+        requirements: ctx.control.all(),
     };
 
     match won {
@@ -489,6 +510,10 @@ async fn conclude(
         Some((done, fork)) => {
             ctx.drop_forks_except(Some(&fork)).await;
             resp.winner = Some(done.report.index);
+            // The check the result passed: a constraint may have replaced the run's own.
+            if let (Some(check), Some(command)) = (&mut resp.check, ctx.control.check(done.report.requirements)) {
+                check.command = command;
+            }
             resp.outcome = if spec.is_some() { Outcome::Passed } else { Outcome::Unverified };
             resp.summary = if done.summary.is_empty() {
                 "The attempt finished without a summary.".to_owned()
@@ -501,13 +526,17 @@ async fn conclude(
                     resp.changes = diff.changes;
                     resp.patch = diff.patch;
                     resp.patch_truncated = diff.truncated;
-                    if let (true, Some(check), false) = (req.review, spec.as_ref(), resp.changes.is_empty()) {
+                    // Reviewed against the check it passed and the requirements it followed.
+                    let passed = resp.check.clone();
+                    let requirements = ctx.control.upto(done.report.requirements);
+                    if let (true, Some(check), false) = (req.review, passed.as_ref(), resp.changes.is_empty()) {
                         let winner = Winner {
                             fork: &fork,
                             check,
                             changes: &resp.changes,
                             patch: &resp.patch,
                             truncated: resp.patch_truncated,
+                            requirements: &requirements,
                         };
                         resp.review = Some(review::review(ctx, &winner).await);
                     }
@@ -598,6 +627,7 @@ fn not_designed(ctx: &Ctx, reason: &str) -> RunResponse {
         cost_usd: tally.spend.cost_usd,
         uncounted_calls: tally.uncounted_calls() + ctx.carried_uncounted,
         checkpoint: None,
+        requirements: ctx.control.all(),
     }
 }
 

@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::Usage;
-use crate::planner::AttemptStatus;
+use crate::planner::{AttemptStatus, Requirement, RunState};
 
 /// Identity and ordering of one model call's preview events. Sequence 0 is
 /// its start; gaps mean best-effort progress was omitted, not missing model
@@ -84,6 +84,26 @@ pub enum Progress {
         run: String,
         message: String,
     },
+    /// A new version of the run's requirements was accepted.
+    Required {
+        run: String,
+        #[serde(flatten)]
+        requirement: Requirement,
+    },
+    /// An attempt took up `version` of the requirements before its turn `turn`.
+    Adopted {
+        run: String,
+        attempt: u32,
+        version: u32,
+        turn: u32,
+    },
+    /// The run was paused or let go on, or what a pausing run waits for changed.
+    State {
+        run: String,
+        state: RunState,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        waiting: Vec<String>,
+    },
     /// What memory gave the run to start with: the notes recalled, best
     /// first, and the size of the project map.
     Recalled {
@@ -113,6 +133,9 @@ impl Progress {
             | Self::CheckRan { run, .. }
             | Self::AttemptFinished { run, .. }
             | Self::Note { run, .. }
+            | Self::Required { run, .. }
+            | Self::Adopted { run, .. }
+            | Self::State { run, .. }
             | Self::Recalled { run, .. } => run,
         }
     }
