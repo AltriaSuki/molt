@@ -19,7 +19,7 @@ use molt_api::memory::{
 };
 use molt_api::planner::{self, DesignResponse, RunRequest, RunResponse};
 use molt_api::progress::{self, Progress};
-use molt_proto::{Budget, Kind, ServiceId, Target, TraceId};
+use molt_proto::{Budget, ServiceId, TraceId};
 use molt_sdk::{CallOpts, Service};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -105,11 +105,9 @@ impl Session {
         let pump = cli.clone();
         tokio::spawn(async move {
             while let Some(msg) = pump.next().await {
-                let on_topic = matches!(&msg.to, Target::Topic { name } if name == progress::TOPIC);
-                if msg.kind != Kind::Event || !on_topic {
-                    continue;
-                }
-                if let Ok(event) = serde_json::from_value::<Progress>(msg.payload) {
+                // Share the CLI's gateway-origin and trace checks. Topic
+                // access alone must not let a peer impersonate a model call.
+                if let Some(event) = agent::progress_event(&msg) {
                     if events.send(event).is_err() {
                         break;
                     }
