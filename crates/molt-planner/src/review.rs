@@ -10,7 +10,7 @@ use std::sync::Arc;
 use molt_api::fs::{Change, ChangeKind};
 use molt_api::model::{tool_result, user_blocks, user_text, ToolUse, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{SubmitReview, SUBMIT_REVIEW};
-use molt_api::planner::{CheckSpec, Review, Verdict};
+use molt_api::planner::{CheckSpec, Requirement, Review, Verdict};
 use serde_json::Value;
 
 use crate::agent::{self, Meter, Stop};
@@ -30,6 +30,8 @@ pub(crate) struct Winner<'a> {
     pub changes: &'a [Change],
     pub patch: &'a str,
     pub truncated: bool,
+    /// What the user added to the task while the run went on.
+    pub requirements: &'a [Requirement],
 }
 
 pub(crate) async fn review(ctx: &Arc<Ctx>, winner: &Winner<'_>) -> Review {
@@ -163,6 +165,7 @@ async fn model(ctx: &Arc<Ctx>, winner: &Winner<'_>, rules: &[String]) -> Result<
         rules,
         &patch,
         truncated,
+        winner.requirements,
     );
     let mut conv = Conversation::new(prompts::REVIEWER_SYSTEM, Arc::new(prompts::reviewer_tools()), first, None);
     let mut meter = Meter::default();

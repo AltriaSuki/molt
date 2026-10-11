@@ -13,7 +13,7 @@ use std::path::Path;
 use molt_api::fs::{self, ChangeKind};
 use molt_api::memory::{self, RecallRequest, SymbolsRequest};
 use molt_api::model::{self, CompleteResponse};
-use molt_api::planner::{self, AttemptStatus, Outcome, RunRequest, RunResponse};
+use molt_api::planner::{self, AttemptStatus, Control, ControlRequest, Outcome, RunRequest, RunResponse};
 use molt_api::shell;
 use molt_proto::audit::Logged;
 use molt_proto::Kind;
@@ -181,6 +181,8 @@ pub(crate) fn build(entries: &[Logged], workspace: &Path, cut_short: bool) -> Di
     let mut steps: Vec<Step> = Vec::new();
     // Requests waiting for their reply: the step they made, if any, and their target.
     let mut open: HashMap<String, (Option<usize>, String)> = HashMap::new();
+    // What the user added to the run while it went on, by request, until the planner accepts it.
+    let mut added: HashMap<String, String> = HashMap::new();
 
     for entry in entries {
         let msg = &entry.envelope;
@@ -218,6 +220,22 @@ pub(crate) fn build(entries: &[Logged], workspace: &Path, cut_short: bool) -> Di
                                         None => head.push("No done-check: the user had the run go unverified".into()),
                                     }
                                 }
+                            }
+                            None
+                        }
+                        planner::CONTROL => {
+                            if let Some(Control::Constrain(c)) = parse::<ControlRequest>(p).map(|r| r.action) {
+                                let mut parts = Vec::new();
+                                if !c.text.trim().is_empty() {
+                                    parts.push(format!("«{}»", cut(c.text.trim(), MAX_TASK)));
+                                }
+                                if !c.protect.is_empty() {
+                                    parts.push(format!("leave {} unchanged", clip(&c.protect.join(", "), 1_000)));
+                                }
+                                if let Some(check) = &c.check {
+                                    parts.push(format!("done-check now `{}`", clip(check, 1_000)));
+                                }
+                                added.insert(msg.id.to_string(), parts.join("; "));
                             }
                             None
                         }
@@ -299,6 +317,10 @@ pub(crate) fn build(entries: &[Logged], workspace: &Path, cut_short: bool) -> Di
                 let Some((index, asked)) = msg.reply_to.as_ref().and_then(|id| open.remove(id.as_str())) else {
                     continue;
                 };
+                let constraint = msg.reply_to.as_ref().and_then(|id| added.remove(id.as_str()));
+                if let (Some(c), None) = (constraint, msg.error()) {
+                    head.push(format!("Added by the user while the run went on: {c}"));
+                }
                 if let Some(e) = msg.error() {
                     if let Some(i) = index {
                         steps[i].text.push_str(&format!(" → failed: {}", clip(&e.message, 300)));
@@ -473,7 +495,7 @@ mod tests {
     use molt_api::fs::Change;
     use molt_api::model::Usage;
     use molt_api::planner::{AttemptReport, CheckSpec};
-    use molt_proto::{CapId, Envelope, TraceId};
+    use molt_proto::{CapId, Envelope, ErrorCode, TraceId};
     use serde_json::json;
 
     use super::*;
@@ -552,11 +574,13 @@ mod tests {
                 usage: Usage::default(),
                 cost_usd: 0.1,
                 note: String::new(),
+                requirements: 0,
             }],
             usage: Usage::default(),
             cost_usd: 0.2,
             uncounted_calls: 0,
             checkpoint: None,
+            requirements: vec![],
         }
     }
 
@@ -709,6 +733,31 @@ mod tests {
         assert!(!t.contains("check designer's"), "{t}");
         assert!(t.contains("Outcome: failed: no attempt passed the done-check"), "{t}");
         assert!(t.contains("Attempt 1: failed after 7 turns (the done-check still failed (exit code 2))"), "{t}");
+    }
+
+    #[test]
+    fn what_the_user_added_mid_run_is_part_of_the_task() {
+        let mut log = Log::new();
+        let req = RunRequest::new("Add a --verbose flag", WS);
+        log.call(planner::RUN, serde_json::to_value(&req).unwrap(), json!({}));
+        let constrain = |run: &str, text: &str, protect: &[&str]| json!({ "run": run, "action": "constrain", "text": text, "protect": protect });
+        let trace = log.trace.to_string();
+        log.call(planner::CONTROL, constrain(&trace, "Keep the short -v too", &["Cargo.lock"]), json!({}));
+        log.call(planner::CONTROL, json!({ "run": trace, "action": "pause" }), json!({}));
+        let refused = log.push(Envelope::request(
+            log.trace.clone(),
+            planner::CONTROL.parse().unwrap(),
+            CapId::random(),
+            constrain(&trace, "Never mind", &[]),
+        ));
+        log.push(refused.error_reply(ErrorCode::Invalid, "too late to change the run"));
+        let t = build(&log.entries, Path::new(WS), false).text;
+        assert!(
+            t.contains("Added by the user while the run went on: «Keep the short -v too»; leave Cargo.lock unchanged"),
+            "{t}"
+        );
+        assert!(!t.contains("Never mind"), "{t}");
+        assert!(!t.contains("planner.control"), "{t}");
     }
 
     #[test]

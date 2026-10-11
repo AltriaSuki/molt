@@ -4,10 +4,11 @@
 //! `molt do` starts everything for one task and stops it after; a session
 //! starts once and serves every task the user gives it. The CLI holds the
 //! same capabilities as in `molt do`, plus `planner.design` to show the
-//! check before the attempts start, `fs.merge` and `fs.drop` to apply or
-//! discard a result the user has looked at, `memory.recall`,
-//! `memory.forget`, `memory.review`, `memory.correct` and `memory.promote`
-//! for the memory screen, and `memory.remember` for notes the user writes down.
+//! check before the attempts start, `planner.control` to steer a run that is
+//! going, `fs.merge` and `fs.drop` to apply or discard a result the user has
+//! looked at, `memory.recall`, `memory.forget`, `memory.review`,
+//! `memory.correct` and `memory.promote` for the memory screen, and
+//! `memory.remember` for notes the user writes down.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -20,7 +21,7 @@ use molt_api::memory::{
     PromoteRequest, PromoteResponse, RecallRequest, RecallResponse, RecallSnapshot, Recalled, RememberRequest,
     RememberResponse, ReviewRequest, ReviewResponse,
 };
-use molt_api::planner::{self, DesignResponse, RunRequest, RunResponse};
+use molt_api::planner::{self, Control, ControlRequest, ControlResponse, DesignResponse, RunRequest, RunResponse};
 use molt_api::progress::{self, Progress};
 use molt_proto::{Budget, ServiceId, TraceId};
 use molt_sdk::{CallOpts, Service};
@@ -41,6 +42,8 @@ const TREE_MS: u64 = 600_000;
 const LEARN_MS: u64 = 600_000;
 /// Reply deadline for listing a fork's changes while the session stops.
 const DIFF_MS: u64 = 10_000;
+/// Reply deadline for a change to a running run, which the planner answers at once.
+const CONTROL_MS: u64 = 10_000;
 /// Reply deadline for memory's notes.
 const NOTES_MS: u64 = 60_000;
 
@@ -97,7 +100,7 @@ impl Session {
             Some(_) => Some(agent::wait_until_up(kernel, &cli, MEMORY, deadline).await.map_err(|e| format!("{e:#}"))),
         };
         let budget = Budget::new(0, 0, CALLS);
-        let mut targets = vec![planner::RUN, planner::DESIGN, fs::DIFF, fs::MERGE, fs::DROP];
+        let mut targets = vec![planner::RUN, planner::DESIGN, planner::CONTROL, fs::DIFF, fs::MERGE, fs::DROP];
         if memory.is_some() {
             targets.extend([
                 memory::CONSOLIDATE,
@@ -154,6 +157,13 @@ impl Session {
 
     pub async fn run(&self, req: &RunRequest, trace: &TraceId) -> anyhow::Result<RunResponse> {
         self.call(planner::RUN, req, RUN_MS, Some(trace)).await
+    }
+
+    /// Change the running run `run`: add to its requirements, pause it or let it go on.
+    pub async fn control(&self, run: &TraceId, action: Control) -> anyhow::Result<ControlResponse> {
+        // Under the run's trace, so the change is part of the run's episode.
+        let req = ControlRequest { run: run.to_string(), action };
+        self.call(planner::CONTROL, req, CONTROL_MS, Some(run)).await
     }
 
     /// Have memory learn from the run `trace`, as `molt do` does after a
