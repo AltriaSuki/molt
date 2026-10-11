@@ -53,6 +53,8 @@ sender from that.
 | Guarantee | Test |
 | --- | --- |
 | No service can grant itself a capability or raise its own budget | `crates/molt-kernel/tests/invariants.rs` (`a_service_cannot_use…`, `delegation_can_split…`, `budgets_are_enforced…`) |
+| Topic subscriptions cannot publish or delegate broader rights; denied events are audited, and revoked subscription leases stop future events on both transports | `crates/molt-kernel/tests/topic_rights.rs` (`unix_topic_subscribers_cannot_publish_or_widen_their_rights`, `nats_topic_subscribers_cannot_publish_or_widen_their_rights`), `crates/molt-kernel/src/caps.rs` (`topic_delegation_cannot_upgrade_subscription_to_publication`) |
+| Check design retains unknown and cancelled model settlement; attempts cannot receive a fabricated remaining budget | `crates/molt-planner/src/runner.rs` (`design_preserves_missing_usage_unknown_prices_and_failed_call_settlement`, `cancelled_designs_return_pending_or_late_settlement_and_drop_their_fork`), `crates/molt/src/tui/app.rs` (`incomplete_design_cost_is_shown_and_cannot_be_spent_as_free`, `attempts_use_the_remaining_effective_budget_without_a_minimum_top_up`) |
 | No service can promote a kernel or protected component, change a tier, or add capabilities without a human | `only_humans_promote_protected_and_kernel_components` |
 | No service can delete or rewrite audit entries; every message is on the record before delivery | `every_message_is_logged_before_it_is_delivered`, `the_audit_log_has_no_write_path_and_detects_tampering` |
 | Audit verification and startup retain one bounded record; tail retains only the requested entries, independent of total log size | `audit_readers_keep_memory_bounded_as_the_log_grows`, `malformed_oversized_and_unterminated_records_are_never_discarded` |
@@ -65,6 +67,7 @@ sender from that.
 | A benchmark run is graded by tests the agent is not given, which its own edits cannot replace | `crates/molt-bench/src/grade.rs` (`grading_overwrites_the_agents_copy_of_a_hidden_file`), `crates/molt-bench/src/task.rs` (`overlay_replaces_files_links_and_directories_and_stays_inside`) |
 | Every benchmark task fails its check as given and passes it with the reference solution | `crates/molt-bench/tests/tasks.rs` |
 | A workspace apply persists preimages before writing, identifies actual post-crash file states, and refuses recovery over later edits | `crates/molt-tools/src/apply.rs` (`first_middle_and_last_write_failures_can_resume_or_undo_idempotently`, `restarting_after_each_durable_stage_observes_disk_truth_and_recovers`, `later_edits_and_candidate_changes_are_preserved_and_reported_by_path`), `crates/molt-tools/tests/fs.rs` (`a_durable_merge_retains_preimages_for_files_links_modes_and_dropped_forks`), `crates/molt/tests/apply.rs` |
+| Attempt symbol queries verify fork ownership and content freshness, isolate parallel views, and never update the durable project model | `crates/molt-memory/tests/forks.rs` (`rename_add_move_delete_and_shell_edits_stay_inside_the_attempt`, `unverified_wrong_workspace_and_symlink_forks_are_refused_without_widening_roots`, `an_edit_during_refresh_returns_no_stale_symbols`) |
 | A benchmark starts a run only while what it spent, plus the whole `--task-usd` of that run and of each run in flight, fits in `--max-usd`; it refuses models it has no price for | `crates/molt-bench/src/run.rs` (`runs_stop_before_they_could_pass_the_budget`, `a_run_of_unknown_cost_stops_the_benchmark`), `crates/molt-bench/src/cli.rs` (`a_model_without_a_price_is_refused`) |
 | A model with no price stays of unknown cost and stops the run; prices come only from the user's environment or data directory, never from a project, and a download that does not validate replaces nothing | `crates/molt-gateway/src/prices.rs` (`the_data_directory_holds_the_snapshot_and_nothing_else_is_read`, `a_download_that_does_not_validate_is_refused`, `malformed_declared_prices_stop_startup_and_name_the_item`), `crates/molt-gateway/tests/gateway.rs` (`a_snapshot_prices_a_third_party_model…`) |
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
@@ -165,7 +168,20 @@ start and end.
 `/memory [words]` lists the notes about the project, strongest first, with
 where each came from: the run, the service version that wrote it and the
 messages in the audit log it rests on. `f` forgets one, with a reason, as
-`molt memory forget` does. `/attempts`, `/model`, `/effort`, `/budget` and
+`molt memory forget` does. The screen includes quarantined notes for inspection,
+marked `[review]`, and temporary experience marked `[temporary]`. The detail
+pane shows recall scores, keywords, revision, dependencies and source evidence;
+`v` opens the full scrollable record. `a` reviews a note and `c` corrects it:
+enter the text (for correction), a reason, and dependency paths separated by
+`;`. At the confirmation step, `t` toggles temporary experience, Enter saves,
+Shift+Tab returns to an earlier field, and Esc cancels. Saving uses the displayed
+revision; concurrent modifications are refused and shown without retrying.
+Ordinary planner recall still excludes notes awaiting review.
+
+`/memory-used [run]` opens the immutable recall snapshots for that run in this
+project, defaulting to the latest task. The task's memory log shows this command;
+`u` in the memory screen opens the latest task's context. Later corrections do
+not alter those recorded notes. `/attempts`, `/model`, `/effort`, `/budget` and
 `/check` set the next tasks' options (`/check` while a task runs changes only
 that task); `/memory-model NAME` sets the model
 memory learns with (`same` for the attempts' model, `default` for
@@ -173,6 +189,14 @@ memory learns with (`same` for the attempts' model, `default` for
 says why. `/help` lists the keys. The services'
 log goes to `tui.log` in the data dir, and colors are left out under
 `NO_COLOR`.
+
+The interface shows model text previews by default, including while designing
+the check. `/stream off` disables previews for subsequent tasks; `/stream on`
+enables them again. Each attempt keeps only the latest 2,048 characters, with
+terminal controls removed, and folds the text into a brief line when the call
+ends. Missing events are labeled as gaps; the interface never reconstructs
+them. Previews are provisional: the complete reply and check determine the
+result, and cancelled or late events cannot make a result appear.
 
 The interface holds the data dir's lock while it is open, so a `molt do` in
 the same project is refused until it closes.
@@ -265,11 +289,11 @@ their remote calls can still run and incur charges (see the limits below).
 This line-oriented mode uses no alternate screen or cursor controls, so it
 also works in a narrow terminal or when stderr is redirected.
 
-For `--config`, give the model service a `topic:progress` request capability,
+For `--config`, give the model service a `topic:publish:progress` request capability,
 as in `molt.example.toml`; `--stream` refuses a setup without it. The new
 gateway events use the request's audit trace and are accepted by the CLI only
-from the kernel-authenticated model service. A TUI can consume the same
-events through the existing progress callback.
+from the kernel-authenticated model service. The TUI consumes the same events
+through its progress callback, with previews enabled by default.
 
 | Exit status | Meaning |
 | --- | --- |
@@ -300,6 +324,23 @@ A fork directory set with `--scratch` in a config must be private: the
 another user's directory or one that group or others may write to (`chmod
 700` it). A service that cannot start ends `molt do` with the reason, such as
 a missing binary, as soon as the supervisor gives up on it.
+
+Topic permissions use `topic:publish:<name>` or `topic:subscribe:<name>` in a
+service's `requests`. The kernel checks publication separately from subscription;
+the SDK chooses the corresponding capability. Event destinations remain
+`topic:<name>`, so event payloads and subscriptions' topic names do not change.
+A subscription's recorded capability and its ancestors must still be live at
+delivery; revocation and expiry end access to subsequent events. A denied
+publication is recorded in the audit log before the denial is delivered.
+
+Existing `topic:<name>` grants remain compatible and authorize both operations.
+They can be delegated as a narrower publish or subscribe grant, but a narrow
+grant cannot become the combined grant or the other right. To migrate, upgrade
+the kernel and SDK-backed services together, then replace each combined grant
+with the operations that service actually uses. The default and example setups
+give model/planner publication on progress, fs publication on fs.changed, memory
+subscription on fs.changed, and CLI/TUI subscription on progress. Older kernels
+and SDKs do not recognize the new permission spellings.
 
 Defaults come from the environment:
 
@@ -368,6 +409,23 @@ the code most relevant to its task, ranked the way Aider ranks it (PageRank
 over references, weighted toward what the task mentions), and attempts can
 ask where a name is defined and used (`find_symbol`).
 
+`find_symbol` uses a disposable symbol view of its own attempt fork, including
+file-tool and shell changes. Memory asks `fs.view` to verify the fork's original
+workspace and content version before and after refreshing. Every source file
+is re-hashed, while only changed contents are parsed again, so a script that
+preserves size and mtime cannot leave stale symbols. Replies identify the
+baseline and current version; a concurrent edit or failed refresh returns an
+explicit instruction to use `search`/`read_file`. Each view has an independent
+in-memory database, with at most eight cached views; fork symbols never enter
+the persistent project/notes database. The default setup grants only `fs.view`
+to memory for this purpose. Custom configs must set `molt-memory --forks` to
+the same trusted absolute scratch directory used by fs, and grant the planner
+`memory.fork_symbols`; ordinary memory workspace access remains confined to
+`--root`. Cold views index the whole fork; eviction or service restart rebuilds
+them on the next query. Oversized, binary and unsupported files remain outside
+the symbol model, and responses expose skipped/truncated results.
+
+
 **Notes** are one-sentence facts, conventions, decisions, preferences and
 lessons. After a run, memory reads it back from the audit log, boils it down
 to numbered steps, and has the model write what would help a later task, each
@@ -423,7 +481,49 @@ and `--data-dir`; `show` and `used` also accept `--json`. The database upgrades
 from schema 1 to schema 2 without rewriting existing notes; older binaries
 refuse the newer schema.
 
-### Model prices
+### Model providers
+
+The gateway keeps the existing Anthropic Messages adapter and also supports
+OpenAI Chat Completions. Provider choice belongs to the gateway, not the
+planner. With `OPENAI_API_KEY` set, use `molt do "task" --model openai/gpt-4.1`;
+`MOLT_PROVIDER=openai` sets the default provider and default model to GPT-4.1.
+`anthropic/opus`, `anthropic/sonnet` and `anthropic/haiku` explicitly choose
+Anthropic. Existing unprefixed aliases and Anthropic configuration are unchanged.
+Both keys may be configured together; only the model service receives them.
+Shell commands and sandbox environment policies exclude `OPENAI_*` too.
+
+`OPENAI_BASE_URL` defaults to `https://api.openai.com` and is an origin, without
+`/v1`. HTTPS is required except for loopback test servers. Redirects are refused.
+Changing an endpoint does not imply support for another provider's protocol.
+The optional `MOLT_MODEL_ALIASES` JSON object maps a plain alias to exactly one
+provider/model, for example `{"fast":"openai/gpt-4.1-mini"}`. It is trusted
+configuration, never loaded from project files.
+
+GPT-4.1, mini and nano (including their 2025-04-14 snapshots) have built-in
+capabilities for text, function tools, streaming and structured output, with a
+32,768 output cap and no effort parameter. Other OpenAI models require an
+explicit `MOLT_OPENAI_MODELS` JSON declaration, for example
+`{"my-model":{"tools":true,"streaming":true,"output_schema":false,"efforts":["low","medium","high"],"max_output":16000}}`.
+A declaration must describe a model that actually implements Chat Completions;
+it does not adapt other wire protocols. Unsupported requested capabilities fail
+before HTTP, including effort on Haiku rather than silently dropping it.
+
+The adapter converts unsigned text and function tool histories, preserving
+call IDs, tool errors and tool results. Signed thinking, native citations,
+media and other provider-native blocks cannot cross providers; start a new
+conversation instead. OpenAI text/tool replies use the same planner blocks,
+with provider and native finish reason in `stop_details`. Streaming buffers tool
+JSON until completion, requires `[DONE]` and final usage, and never retries a
+partial response. Cached prompt tokens are separated from uncached tokens for
+pricing; an unknown returned model or missing usage is never charged as zero.
+The spending limit remains a best-effort pre-call limit, not a guaranteed hard
+remote billing cap. Cancellation stops local HTTP and leaves remote billing
+unknown, as on the Anthropic path.
+
+The implementation follows the [Chat Completions reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+and [streaming contract](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events).
+
+## Model prices
 
 The run budget (`--budget-usd`) holds only when molt knows what each model
 call cost, so a call to a model with no price stops the run after it: an
@@ -530,8 +630,18 @@ cargo test --workspace
 
 The NATS conformance and end-to-end tests need a `nats-server` binary. Set
 `MOLT_NATS_SERVER=/path/to/nats-server` or put it on `PATH`
-(`go install github.com/nats-io/nats-server/v2@latest`). Without it they print
+(`go install github.com/nats-io/nats-server/v2@v2.15.1`, using the Go version
+in `.github/ci-versions.toml`). Without it they print
 a notice and pass; CI always runs them.
+
+The Rust release and components are pinned in `rust-toolchain.toml`, and CI
+reads that file too. Go and nats-server are pinned in `.github/ci-versions.toml`;
+Go cannot fetch a newer toolchain automatically. NATS binaries use an exact
+version/OS/architecture/Go cache key and are version-checked on every run,
+including cache hits. Actions are pinned to commit SHAs. Toolchain upgrades
+belong in a separate PR so ordinary changes keep the same tool versions when
+rerun. The runner image and apt's isolation backend still receive OS updates;
+these pins do not claim a bit-for-bit identical machine image.
 
 `crates/molt-bench/tests/tasks.rs` validates every benchmark task, which takes
 `python3`, `node` (20 or newer), `go` and `cargo`. A missing toolchain skips
@@ -596,7 +706,7 @@ needed. Deleting an unfinished record loses its recovery material.
 ## Known limits
 
 - The default shell requires Linux x86_64 with bubblewrap 0.9+ and usable user namespaces. Unsupported hosts must explicitly choose --no-sandbox; namespace policy never silently falls back.
-- Model text streams only with `--stream`; thinking is not shown and tool calls wait for the complete message. Preview delivery is best effort, and the final reply remains complete.
+- Model text streams with `--stream` in `molt do` and by default in the TUI (`/stream off` disables it); thinking is not shown and tool calls wait for the complete message. Preview delivery is best effort, and the final reply remains complete.
 - The audit log records every message, file contents and model conversations included, and is never rotated; it grows with every run in a data dir.
 - Audit startup, verification and nonempty tail reads still scan the whole log, but memory is bounded by one record plus the requested tail. A record is limited to 16 MiB including its newline; oversized, malformed or unterminated records are refused, including on restart. The writer stops before persisting an oversized entry. `tail -n 0` opens the file without scanning; `read_all` intentionally retains every returned entry. Tail validates record syntax throughout the file, but only verification and startup check the hash chain.
 - Reading one trace back from the audit log scans the log from the start: there is no index yet. One read looks through at most 256 MiB and keeps to its deadline, and two run at once.
@@ -608,7 +718,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - Recall matches keywords (with stemming), not meaning: there is no vector index, since the Anthropic API has no embeddings endpoint. A note worded differently from the task can be missed; the strongest notes about the project are always shown.
 - Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. With the default setup, memory lives in the project's data dir, so nothing is shared between projects yet.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
-- A topic capability currently allows both publishing and subscribing.
+- Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.
 - Model prices are as current as the last `molt prices update` (or the release's snapshot) and as right as the community list they came from; a price that changes mid-run is not picked up until the next run. Models that LiteLLM lists only with tiered or regional prices, such as some Qwen models, have no price until declared in `MOLT_MODEL_PRICES`.
 - No license has been chosen yet.
 
@@ -625,6 +735,23 @@ The planner gives each attempt its own cancellation token. A winner stops compet
 The gateway closes its local HTTP request on cancellation and audits a correlated settlement record with `local_stopped`, `remote_cancel_confirmed`, `usage` and `cost_usd`. Anthropic Messages has no remote cancellation acknowledgement here, so remote cancellation and missing usage remain unknown. A completion already received wins the race and is counted once. After a kernel timeout, one authenticated late model reply can still be audited for up to one hour, without delivering a second run result; the late-settlement registry is bounded and temporary, while accepted records persist in the audit log. `molt audit --help` describes querying the log.
 
 Run `cost_usd` is the known subtotal. `uncounted_calls` now includes pending calls, errors without usage, and replies without a known price. The terminal explicitly labels the known cost and incomplete settlement; automatic memory learning is skipped when settlement is incomplete. This is an estimated spending limit, not a provider-enforced dollar ceiling.
+
+`planner.design` uses the same settlement rule, including failed and cancelled
+designs. A missing or incomplete canonical usage record is refused before
+serde defaults can turn it into zero tokens. `DesignResponse.cost_usd` is a
+known subtotal; `uncounted_calls` marks the unknown part. Its optional `error`
+reports a failed design while preserving settlement, and `cancelled` means
+local work stopped, without claiming the provider stopped billing. Invalid
+requests still return protocol errors. Consumers must inspect `error` and
+`cancelled` before treating a missing command as an unverified task.
+
+With complete settlement, `remaining_budget_usd` carries the task's effective
+limit minus the design cost, including the planner's configured default. The
+TUI forwards exactly that remainder to attempts, shows incomplete costs on
+the confirmation screen and session total, and starts no attempts when design
+cost is unknown or the remainder is exhausted. The new fields have serde
+defaults for reading older replies; older consumers should be updated to
+handle failed design replies explicitly and honor the remaining limit.
 
 ### Linux command isolation
 

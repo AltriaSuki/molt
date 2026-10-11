@@ -11,6 +11,7 @@ const MAX_BLOCKS: usize = 1024;
 
 #[derive(Default)]
 pub(crate) struct Decoder {
+    openai: bool,
     line: Vec<u8>,
     data: String,
     event: String,
@@ -19,6 +20,9 @@ pub(crate) struct Decoder {
 }
 
 impl Decoder {
+    pub fn for_provider(provider: crate::provider::Provider) -> Self {
+        Self { openai: provider == crate::provider::Provider::Openai, ..Self::default() }
+    }
     /// Accept arbitrary byte boundaries, including in UTF-8 and CRLF.
     pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<Value>, String> {
         let mut events = Vec::new();
@@ -39,8 +43,12 @@ impl Decoder {
             let line = std::str::from_utf8(&self.line).map_err(|_| "SSE contains invalid UTF-8")?;
             if line.is_empty() {
                 if !self.data.is_empty() {
-                    let value: Value = serde_json::from_str(self.data.trim_end_matches('\n'))
-                        .map_err(|e| format!("invalid SSE JSON: {e}"))?;
+                    let data = self.data.trim_end_matches('\n');
+                    let value: Value = if self.openai && data == "[DONE]" {
+                        json!({"type":"openai_done"})
+                    } else {
+                        serde_json::from_str(data).map_err(|e| format!("invalid SSE JSON: {e}"))?
+                    };
                     if !self.event.is_empty() && value["type"].as_str() != Some(self.event.as_str()) {
                         return Err("SSE event name does not match its data type".into());
                     }

@@ -205,6 +205,11 @@ impl Default for ConfirmSection {
 
 /// What the gateway reads from its environment (see `molt_gateway::Config::from_env`).
 const GATEWAY_ENV: &[&str] = &[
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "MOLT_PROVIDER",
+    "MOLT_MODEL_ALIASES",
+    "MOLT_OPENAI_MODELS",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "MOLT_MODEL",
@@ -280,8 +285,9 @@ impl Config {
         // The gateway is the only holder of the API key, so only a human may change it.
         let mut model = service("model", Tier::Protected, bin("molt-gateway")?)?;
         model.pass_env = names(GATEWAY_ENV);
-        model.requests = vec![request(&format!("topic:{}", molt_api::progress::TOPIC), Budget::new(0, 0, 10_000_000))?];
-        let changed = format!("topic:{}", molt_api::fs::CHANGED);
+        model.requests =
+            vec![request(&format!("topic:publish:{}", molt_api::progress::TOPIC), Budget::new(0, 0, 10_000_000))?];
+        let changed = format!("topic:publish:{}", molt_api::fs::CHANGED);
         let mut fs = service("fs", Tier::Mutable, tools("fs")?)?;
         fs.requests = vec![request(&changed, Budget::new(0, 0, 100_000_000))?];
         let shell = service("shell", Tier::Protected, tools("shell")?)?;
@@ -294,6 +300,8 @@ impl Config {
             text(&data_dir.join(MEMORY_DB))?,
             "--skip".into(),
             text(data_dir)?,
+            "--forks".into(),
+            text(&data_dir.join("work"))?,
         ];
         let mut memory = service("memory", Tier::Mutable, memory_exec)?;
         memory.pass_env = names(MEMORY_ENV);
@@ -302,7 +310,8 @@ impl Config {
         memory.requests = vec![
             request(molt_api::model::COMPLETE, Budget::new(1_000_000_000, 0, 1_000_000))?,
             request(molt_proto::audit::READ, Budget::new(0, 0, 10_000_000))?,
-            request(&changed, Budget::new(0, 0, 10))?,
+            request(&format!("topic:subscribe:{}", molt_api::fs::CHANGED), Budget::new(0, 0, 10))?,
+            request(molt_api::fs::VIEW, Budget::new(0, 0, 100_000_000))?,
         ];
         let mut planner_exec = bin("molt-planner")?;
         // Checkpoints of runs, to resume one that stopped.
@@ -315,12 +324,16 @@ impl Config {
             request(molt_api::model::COMPLETE, Budget::new(4_000_000_000, 0, 1_000_000))?,
             request("fs.*", Budget::new(0, 0, 10_000_000))?,
             request(molt_api::shell::RUN, Budget::new(0, 0, 1_000_000))?,
-            request(&format!("topic:{}", molt_api::progress::TOPIC), Budget::new(0, 0, 10_000_000))?,
+            request(&format!("topic:publish:{}", molt_api::progress::TOPIC), Budget::new(0, 0, 10_000_000))?,
         ];
         // What memory knows about the workspace; not remember, forget or consolidate.
-        for method in
-            [molt_api::memory::INDEX, molt_api::memory::MAP, molt_api::memory::RECALL, molt_api::memory::SYMBOLS]
-        {
+        for method in [
+            molt_api::memory::INDEX,
+            molt_api::memory::MAP,
+            molt_api::memory::RECALL,
+            molt_api::memory::SYMBOLS,
+            molt_api::memory::FORK_SYMBOLS,
+        ] {
             planner.requests.push(request(method, Budget::new(0, 0, 10_000_000))?);
         }
         Ok(Self {
@@ -496,8 +509,12 @@ mod tests {
         let model = cfg.service("model").unwrap();
         assert_eq!(model.exec.as_ref().unwrap().command, "/opt/molt/bin/molt-gateway");
         assert_eq!(model.tier, Tier::Protected);
-        assert_eq!(model.requests.iter().map(|r| r.target.to_string()).collect::<Vec<_>>(), ["topic:progress"]);
+        assert_eq!(model.requests.iter().map(|r| r.target.to_string()).collect::<Vec<_>>(), ["topic:publish:progress"]);
         assert!(model.pass_env.iter().any(|v| v == "ANTHROPIC_API_KEY"));
+        assert!(model.pass_env.iter().any(|v| v == "OPENAI_API_KEY"));
+        for service in cfg.services.iter().filter(|s| s.name.as_str() != "model") {
+            assert!(!service.pass_env.iter().any(|v| v.starts_with("OPENAI_")));
+        }
         assert!(model.pass_env.iter().any(|v| v == "ANTHROPIC_BASE_URL"));
 
         for kind in ["fs", "shell"] {
@@ -508,7 +525,7 @@ mod tests {
         let targets = |name: &str| -> Vec<String> {
             cfg.service(name).unwrap().requests.iter().map(|r| r.target.to_string()).collect()
         };
-        assert_eq!(targets("fs"), ["topic:fs.changed"], "fs reports the files it changes");
+        assert_eq!(targets("fs"), ["topic:publish:fs.changed"], "fs reports the files it changes");
         assert!(targets("shell").is_empty());
 
         let memory = cfg.service("memory").unwrap();
@@ -516,10 +533,19 @@ mod tests {
         assert_eq!(exec.command, "/opt/molt/bin/molt-memory");
         assert_eq!(
             exec.args,
-            ["--root", "/home/u/proj", "--db", "/cache/molt/proj/memory.db", "--skip", "/cache/molt/proj"]
+            [
+                "--root",
+                "/home/u/proj",
+                "--db",
+                "/cache/molt/proj/memory.db",
+                "--skip",
+                "/cache/molt/proj",
+                "--forks",
+                "/cache/molt/proj/work"
+            ]
         );
         assert_eq!(memory.tier, Tier::Mutable);
-        assert_eq!(targets("memory"), ["model.complete", "kernel.audit.read", "topic:fs.changed"]);
+        assert_eq!(targets("memory"), ["model.complete", "kernel.audit.read", "topic:subscribe:fs.changed", "fs.view"]);
         assert!(memory.pass_env.iter().all(|v| v.starts_with("MOLT_MEMORY_")));
 
         let planner = cfg.service("planner").unwrap();
@@ -534,11 +560,12 @@ mod tests {
                 "model.complete",
                 "fs.*",
                 "shell.run",
-                "topic:progress",
+                "topic:publish:progress",
                 "memory.index",
                 "memory.map",
                 "memory.recall",
-                "memory.symbols"
+                "memory.symbols",
+                "memory.fork_symbols"
             ]
         );
         for req in &planner.requests {

@@ -287,7 +287,7 @@ async fn finish(
         tokio::join!(conclude(ctx, req, spec, finished, winner, stopped), ctx.settle(ctx.cfg.late_reply_wait));
     resp.usage = tally.spend.usage;
     resp.cost_usd = tally.spend.cost_usd;
-    resp.uncounted_calls = tally.pending + tally.unsettled + tally.spend.unknown_calls + ctx.carried_uncounted;
+    resp.uncounted_calls = tally.uncounted_calls() + ctx.carried_uncounted;
     if stopped {
         let spend = SavedSpend { usage: resp.usage, cost_usd: resp.cost_usd, uncounted_calls: resp.uncounted_calls };
         ctx.save(|s| {
@@ -354,29 +354,46 @@ pub(crate) async fn design_cancellable(
     ctx.memory = memory::prepare(&ctx).await;
     ctx.instructions = instructions::gather(&ctx).await;
     let ctx = Arc::new(ctx);
-    let design = designer::design(&ctx, true).await?;
-    let spend = ctx.settle(ctx.cfg.late_reply_wait).await.spend;
+    let design = designer::design(&ctx, true).await;
+    // A failed or cancelled design still issued billable calls. Settle it
+    // exactly like a run and retain every unanswered/unknown call in the reply.
+    let tally = ctx.settle(ctx.cfg.late_reply_wait).await;
     let mut resp = DesignResponse {
         command: None,
         files: Vec::new(),
         rationale: String::new(),
         baseline: None,
-        usage: spend.usage,
-        cost_usd: spend.cost_usd,
+        usage: tally.spend.usage,
+        cost_usd: tally.spend.cost_usd,
+        uncounted_calls: tally.uncounted_calls(),
+        remaining_budget_usd: (tally.uncounted_calls() == 0).then(|| (ctx.budget_usd - tally.spend.cost_usd).max(0.0)),
+        error: None,
+        cancelled: false,
     };
     match design {
-        Design::Check { command, files, rationale, baseline } => {
+        Ok(Design::Check { command, files, rationale, baseline }) => {
             resp.command = Some(command);
             resp.files = files.into_iter().map(|(path, content)| CheckFile { path, content }).collect();
             resp.rationale = rationale;
             resp.baseline = baseline;
         }
-        Design::Unverified(reason) => resp.rationale = reason,
-        Design::Failed(reason) => {
+        Ok(Design::Unverified(reason)) => resp.rationale = reason,
+        Ok(Design::Failed(reason)) => {
             let message = format!("could not design a done-check: {reason}");
-            return Err(RemoteError { code: ErrorCode::Failed, message });
+            resp.error = Some(message);
         }
+        Err(error) => resp.error = Some(error.to_string()),
     }
+    if ctx.cancel.is_cancelled() && !ctx.over_budget() {
+        resp.command = None;
+        resp.files.clear();
+        resp.cancelled = true;
+        resp.error = Some("design stopped; remote settlement may remain incomplete".into());
+    }
+    if let Some(error) = &resp.error {
+        resp.rationale = error.clone();
+    }
+    tracing::info!(run = %ctx.trace, cost_usd = resp.cost_usd, uncounted_calls = resp.uncounted_calls, "design settled");
     Ok(resp)
 }
 
@@ -608,7 +625,7 @@ fn not_designed(ctx: &Ctx, reason: &str) -> RunResponse {
         attempts: Vec::new(),
         usage: tally.spend.usage,
         cost_usd: tally.spend.cost_usd,
-        uncounted_calls: tally.pending + tally.unsettled + tally.spend.unknown_calls + ctx.carried_uncounted,
+        uncounted_calls: tally.uncounted_calls() + ctx.carried_uncounted,
         checkpoint: None,
         requirements: ctx.control.all(),
     }
@@ -617,6 +634,124 @@ fn not_designed(ctx: &Ctx, reason: &str) -> RunResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use molt_proto::Budget;
+    use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    #[derive(Clone, Copy)]
+    enum Reply {
+        Known,
+        MissingUsage,
+        UnknownPrice,
+        Failed,
+        Late(Duration),
+    }
+
+    struct DesignBus {
+        reply: Reply,
+        started: Notify,
+        dropped: AtomicBool,
+    }
+
+    impl DesignBus {
+        fn new(reply: Reply) -> Arc<Self> {
+            Arc::new(Self { reply, started: Notify::new(), dropped: AtomicBool::new(false) })
+        }
+    }
+
+    #[async_trait]
+    impl Bus for DesignBus {
+        async fn call(&self, target: &str, _: Value, _: Budget, _: &TraceId) -> Result<Value, RemoteError> {
+            match target {
+                "fs.fork" => Ok(json!({"fork":"/scratch/design", "files":0})),
+                "fs.drop" => {
+                    self.dropped.store(true, Ordering::SeqCst);
+                    Ok(json!({"dropped":true}))
+                }
+                "model.complete" => {
+                    self.started.notify_one();
+                    if let Reply::Late(delay) = self.reply {
+                        tokio::time::sleep(delay).await;
+                    }
+                    if matches!(self.reply, Reply::Failed) {
+                        return Err(RemoteError { code: ErrorCode::Unavailable, message: "reply unavailable".into() });
+                    }
+                    let mut value = json!({
+                        "id":"fake", "model":"fake", "stop_reason":"tool_use",
+                        "content":[{"type":"tool_use", "id":"submit", "name":"submit_check", "input":{"command":null, "files":[], "rationale":"a question, without an automated check"}}],
+                        "usage":{"input_tokens":9,"output_tokens":3}, "cost_usd":0.25
+                    });
+                    if matches!(self.reply, Reply::MissingUsage) {
+                        value.as_object_mut().unwrap().remove("usage");
+                    }
+                    if matches!(self.reply, Reply::UnknownPrice) {
+                        value.as_object_mut().unwrap().remove("cost_usd");
+                    }
+                    Ok(value)
+                }
+                _ => Err(RemoteError { code: ErrorCode::Unavailable, message: format!("no {target}") }),
+            }
+        }
+        async fn publish(&self, _: &str, _: Value) {}
+    }
+
+    #[tokio::test]
+    async fn design_preserves_missing_usage_unknown_prices_and_failed_call_settlement() {
+        for reply in [Reply::MissingUsage, Reply::UnknownPrice, Reply::Failed] {
+            let bus = DesignBus::new(reply);
+            let response =
+                design(bus.clone(), Arc::new(Config::default()), RunRequest::new("question", "/w"), TraceId::random())
+                    .await
+                    .unwrap();
+            assert_eq!(response.uncounted_calls, 1);
+            assert_eq!(response.cost_usd, 0.0, "this is an empty known subtotal, never a free unknown call");
+            assert!(response.remaining_budget_usd.is_none());
+            if !matches!(reply, Reply::UnknownPrice) {
+                assert!(response.error.is_some());
+            }
+            assert!(bus.dropped.load(Ordering::SeqCst));
+        }
+        let response = design(
+            DesignBus::new(Reply::Known),
+            Arc::new(Config { budget_usd: 2.0, ..Config::default() }),
+            RunRequest::new("question", "/w"),
+            TraceId::random(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((response.cost_usd, response.uncounted_calls, response.remaining_budget_usd), (0.25, 0, Some(1.75)));
+        assert_eq!((response.usage.input_tokens, response.usage.output_tokens), (9, 3));
+        assert!(response.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_designs_return_pending_or_late_settlement_and_drop_their_fork() {
+        for (delay, wait, cost, uncounted) in [
+            (Duration::from_secs(10), Duration::ZERO, 0.0, 1),
+            (Duration::from_millis(20), Duration::from_millis(100), 0.25, 0),
+        ] {
+            let bus = DesignBus::new(Reply::Late(delay));
+            let cancel = CancellationToken::new();
+            let cfg = Arc::new(Config { late_reply_wait: wait, ..Config::default() });
+            let task = tokio::spawn(design_cancellable(
+                bus.clone(),
+                cfg,
+                RunRequest::new("question", "/w"),
+                TraceId::random(),
+                cancel.clone(),
+            ));
+            bus.started.notified().await;
+            cancel.cancel();
+            let response = tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap().unwrap();
+            assert!(response.cancelled && response.error.as_ref().unwrap().contains("stopped"));
+            assert_eq!((response.cost_usd, response.uncounted_calls), (cost, uncounted));
+            assert!(response.command.is_none() && response.files.is_empty());
+            assert!(bus.dropped.load(Ordering::SeqCst));
+        }
+    }
 
     #[test]
     fn requests_are_validated() {

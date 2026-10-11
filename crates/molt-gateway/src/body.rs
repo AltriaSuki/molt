@@ -56,7 +56,10 @@ pub(crate) fn build(cfg: &Config, model: &str, req: CompleteRequest) -> Result<C
             output.insert("effort".into(), json!(effort));
         }
     } else if let Some(effort) = effort {
-        tracing::debug!(model, ?effort, "dropping effort: this model does not take it");
+        return Err(RemoteError {
+            code: ErrorCode::Invalid,
+            message: format!("{model} does not support effort {effort:?}"),
+        });
     }
     if let Some(schema) = req.output_schema {
         output.insert("format".into(), json!({ "type": "json_schema", "schema": schema }));
@@ -82,6 +85,7 @@ mod tests {
 
     fn cfg() -> Config {
         Config {
+            providers: Default::default(),
             api_key: "k".into(),
             base_url: "http://127.0.0.1:1".into(),
             default_model: "opus".into(),

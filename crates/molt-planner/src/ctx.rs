@@ -56,6 +56,12 @@ pub(crate) struct Tally {
     pub unsettled: u32,
 }
 
+impl Tally {
+    pub fn uncounted_calls(&self) -> u32 {
+        self.pending.saturating_add(self.unsettled).saturating_add(self.spend.unknown_calls)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Ctx {
     bus: Arc<dyn Bus>,
@@ -229,6 +235,20 @@ impl Ctx {
         } else {
             self.bus.call(target, payload, budget, &self.trace).await?
         };
+        // CompleteResponse's legacy serde defaults erase absent usage. Do
+        // this check before decoding so neither front end counts such a call
+        // as free or treats an invented zero-token answer as settled.
+        if target == model::COMPLETE
+            && !reply.get("usage").is_some_and(|usage| {
+                usage.get("input_tokens").and_then(Value::as_u64).is_some()
+                    && usage.get("output_tokens").and_then(Value::as_u64).is_some()
+            })
+        {
+            return Err(RemoteError {
+                code: ErrorCode::Failed,
+                message: "model reply has no complete usage; settlement is unknown".into(),
+            });
+        }
         serde_json::from_value(reply)
             .map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("bad {target} reply: {e}") })
     }

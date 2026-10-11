@@ -6,6 +6,7 @@
 //! comes back, with the keys, to the app.
 
 mod app;
+mod preview;
 mod text;
 mod view;
 
@@ -284,13 +285,20 @@ impl Runtime {
             Action::Discard { fork } => {
                 self.call(move |s| async move { Msg::Discarded(s.discard(&fork).await.map_err(|e| format!("{e:#}"))) })
             }
-            Action::LoadNotes { query } => {
-                self.call(move |s| async move { Msg::Notes(s.notes(&query).await.map_err(|e| format!("{e:#}"))) })
-            }
+            Action::LoadNotes { query } => self
+                .call(move |s| async move { Msg::Notes(s.inspect_notes(&query).await.map_err(|e| format!("{e:#}"))) }),
             Action::Forget { id, reason } => self.call(move |s| async move {
                 let result = s.forget(&id, &reason).await.map_err(|e| format!("{e:#}"));
                 Msg::Forgot { id, result }
             }),
+            Action::ChangeNote { review, text } => self.call(move |s| async move {
+                Msg::ChangedNote(s.change_note(review, text).await.map_err(|e| format!("{e:#}")))
+            }),
+            Action::UsedNotes { run } => self.call(move |s| async move {
+                let result = s.used_notes(&run).await.map_err(|e| format!("{e:#}"));
+                Msg::UsedNotes { run, result }
+            }),
+
             Action::Interrupt { keep, attempts, check_files } => {
                 for work in self.work.drain(..) {
                     work.abort();

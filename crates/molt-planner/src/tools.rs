@@ -5,7 +5,9 @@
 use std::sync::Arc;
 
 use molt_api::fs::{self, EntryKind};
-use molt_api::memory::{self, RecallRequest, RecallResponse, SymbolsRequest, SymbolsResponse};
+use molt_api::memory::{
+    self, ForkSymbolsRequest, ForkSymbolsResponse, RecallRequest, RecallResponse, SymbolsRequest, SymbolsResponse,
+};
 use molt_api::model::{tool_result, ToolUse};
 use molt_api::planner::tools as t;
 use molt_api::progress::Progress;
@@ -155,15 +157,23 @@ impl Tool {
                 let resp = run_command(ctx, fork, &r.command, timeout_s * 1000).await?;
                 Ok(show_run(&resp, timeout_s))
             }
-            // Memory indexes the user's workspace, not the fork: the paths are the same.
             Self::FindSymbol(f) => {
-                let req = SymbolsRequest {
+                let query = SymbolsRequest {
                     workspace: ctx.workspace.clone(),
                     name: f.name,
                     references: f.references.unwrap_or(true),
                     limit: Some(SYMBOL_LIMIT),
                 };
-                Ok(show_symbols(ctx.call(memory::SYMBOLS, req, files).await?))
+                let req = ForkSymbolsRequest { query, fork: workspace };
+                let response: ForkSymbolsResponse = ctx.call(memory::FORK_SYMBOLS, req, files).await?;
+                Ok(format!(
+                    "Fork symbol view {} (baseline {}, current {}, skipped {}):\n{}",
+                    response.view.fork,
+                    response.view.baseline,
+                    response.view.version,
+                    response.skipped,
+                    show_symbols(response.symbols)
+                ))
             }
             Self::Recall(r) => {
                 let req = RecallRequest {

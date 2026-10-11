@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use molt_api::fs::ChangeKind;
-use molt_api::memory::{ConsolidateResponse, Recalled};
+use molt_api::memory::{ConsolidateResponse, RecallSnapshot, Recalled, ReviewRequest, ReviewResponse};
 use molt_api::model::Effort;
 use molt_api::planner::{
     AttemptReport, AttemptStatus, Constraint, Control, ControlResponse, DesignResponse, Earlier, Outcome, RunRequest,
@@ -17,6 +17,7 @@ use molt_proto::TraceId;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::Line;
 
+use super::preview::Preview;
 use super::text::{self, block, clean_line, span, Tone};
 use crate::agent;
 use crate::agent::outcome_name;
@@ -67,7 +68,7 @@ impl Mode {
 }
 
 /// What the next task runs with.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub attempts: Option<u32>,
     pub model: Option<String>,
@@ -78,6 +79,21 @@ pub struct Settings {
     /// The model memory learns with: a model, [`agent::SAME_MODEL`], or
     /// `None` for memory's default.
     pub memory_model: Option<String>,
+    pub stream: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            attempts: None,
+            model: None,
+            effort: None,
+            budget_usd: None,
+            check: None,
+            stream: true,
+            memory_model: None,
+        }
+    }
 }
 
 /// Work for the runtime.
@@ -114,6 +130,13 @@ pub enum Action {
     Forget {
         id: String,
         reason: String,
+    },
+    ChangeNote {
+        review: ReviewRequest,
+        text: Option<String>,
+    },
+    UsedNotes {
+        run: String,
     },
     /// Stop everything in flight: the services are stopped and started again.
     Interrupt {
@@ -179,6 +202,11 @@ pub enum Msg {
         id: String,
         result: Result<bool, String>,
     },
+    ChangedNote(Result<ReviewResponse, String>),
+    UsedNotes {
+        run: String,
+        result: Result<Vec<RecallSnapshot>, String>,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -207,6 +235,7 @@ pub struct Lane {
     pub turn: u32,
     pub status: Option<AttemptStatus>,
     pub lines: Vec<Line<'static>>,
+    pub preview: Preview,
 }
 
 pub struct Task {
@@ -214,6 +243,7 @@ pub struct Task {
     pub req: RunRequest,
     pub phase: Phase,
     pub lanes: Vec<Lane>,
+    pub designer_preview: Preview,
     /// The check is in the log already.
     check_shown: bool,
     recalled_shown: bool,
@@ -238,6 +268,7 @@ impl Task {
             recalled_shown: false,
             notes_seen: HashSet::new(),
             stops: Vec::new(),
+            designer_preview: Preview::default(),
             version: 0,
             state: RunState::Running,
             waiting: Vec::new(),
@@ -295,6 +326,93 @@ pub enum MemoryEdit {
     Filter(Input),
     /// Why the selected note is wrong.
     Reason(Input),
+    Change(Box<NoteChange>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChangeStep {
+    Text,
+    Reason,
+    Dependencies,
+    Confirm,
+}
+
+pub struct NoteChange {
+    pub review: ReviewRequest,
+    pub text: Option<Input>,
+    pub reason: Input,
+    pub dependencies: Input,
+    pub step: ChangeStep,
+}
+
+impl NoteChange {
+    fn new(workspace: &str, note: &Recalled, correct: bool) -> Self {
+        Self {
+            review: ReviewRequest {
+                workspace: workspace.to_owned(),
+                id: note.note.id.clone(),
+                expected_rev: note.note.rev,
+                reason: String::new(),
+                depends_on: Vec::new(),
+                temporary: note.details.temporary,
+            },
+            text: correct.then(|| Input::with(&note.note.text)),
+            reason: Input::default(),
+            dependencies: Input::with(
+                &note.details.dependencies.iter().map(|d| d.path.as_str()).collect::<Vec<_>>().join("; "),
+            ),
+            step: if correct { ChangeStep::Text } else { ChangeStep::Reason },
+        }
+    }
+
+    pub fn input(&self) -> Option<&Input> {
+        match self.step {
+            ChangeStep::Text => self.text.as_ref(),
+            ChangeStep::Reason => Some(&self.reason),
+            ChangeStep::Dependencies => Some(&self.dependencies),
+            ChangeStep::Confirm => None,
+        }
+    }
+
+    fn input_mut(&mut self) -> Option<&mut Input> {
+        match self.step {
+            ChangeStep::Text => self.text.as_mut(),
+            ChangeStep::Reason => Some(&mut self.reason),
+            ChangeStep::Dependencies => Some(&mut self.dependencies),
+            ChangeStep::Confirm => None,
+        }
+    }
+
+    fn advance(&mut self) -> Result<Option<Action>, &'static str> {
+        self.step = match self.step {
+            ChangeStep::Text if self.text.as_ref().is_none_or(|i| i.text.trim().is_empty()) => {
+                return Err("enter the corrected note")
+            }
+            ChangeStep::Text => ChangeStep::Reason,
+            ChangeStep::Reason if self.reason.text.trim().is_empty() => {
+                return Err("say why this review or correction is justified")
+            }
+            ChangeStep::Reason => ChangeStep::Dependencies,
+            ChangeStep::Dependencies => ChangeStep::Confirm,
+            ChangeStep::Confirm => {
+                let mut review = self.review.clone();
+                review.reason = self.reason.text.trim().to_owned();
+                review.depends_on = self
+                    .dependencies
+                    .text
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                return Ok(Some(Action::ChangeNote {
+                    review,
+                    text: self.text.as_ref().map(|i| i.text.trim().to_owned()),
+                }));
+            }
+        };
+        Ok(None)
+    }
 }
 
 /// A text field. The task input holds several lines; the others one.
@@ -502,8 +620,11 @@ pub struct App {
     pub prompt: Option<Prompt>,
     pub viewer: Option<Viewer>,
     pub screen: Screen,
+    pub last_run: Option<String>,
     /// Spent in this session: designs, runs and learning.
     pub spent_usd: f64,
+    /// Calls whose usage or price is still unknown; spending is a subtotal.
+    pub uncounted_calls: u32,
     /// Runs memory is learning from.
     pub learning: HashSet<String>,
     /// Results the user kept in their forks; never removed.
@@ -559,7 +680,9 @@ impl App {
             prompt: None,
             viewer: None,
             screen: Screen::Main,
+            last_run: None,
             spent_usd: 0.0,
+            uncounted_calls: 0,
             learning: HashSet::new(),
             kept: Vec::new(),
             last: None,
@@ -626,6 +749,11 @@ impl App {
                 match &mut self.screen {
                     Screen::Memory(view) => match &mut view.edit {
                         Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input)) => input.insert(&text),
+                        Some(MemoryEdit::Change(change)) => {
+                            if let Some(input) = change.input_mut() {
+                                input.insert(&text);
+                            }
+                        }
                         None => {}
                     },
                     // The check's command is one line; a task can be many.
@@ -735,6 +863,31 @@ impl App {
                     }
                     Screen::Main => Vec::new(),
                 }
+            }
+            Msg::ChangedNote(result) => {
+                let Screen::Memory(view) = &mut self.screen else { return Vec::new() };
+                view.loading = false;
+                match result {
+                    Ok(response) => {
+                        self.flash = Some(format!("{} revision {} saved", response.note.id, response.note.rev));
+                        view.loading = true;
+                        vec![Action::LoadNotes { query: view.query.clone() }]
+                    }
+                    Err(error) => {
+                        view.error = Some(clean_line(&error));
+                        Vec::new()
+                    }
+                }
+            }
+            Msg::UsedNotes { run, result } => {
+                let Some(viewer) = self.viewer.as_mut().filter(|v| v.title == format!("memory used: {run}")) else {
+                    return Vec::new();
+                };
+                viewer.lines = match result {
+                    Ok(snapshots) => snapshot_lines(&snapshots),
+                    Err(error) => block(&error, "", Tone::Bad),
+                };
+                Vec::new()
             }
         }
     }
@@ -971,10 +1124,12 @@ impl App {
         req.budget_usd = self.settings.budget_usd;
         req.apply = self.mode == Mode::Auto;
         req.earlier = self.earlier.clone();
+        req.stream = self.settings.stream;
 
         self.gap();
         self.echo(&line);
         let mut task = Task::new(trace.clone(), req, Phase::Running);
+        self.last_run = Some(trace.to_string());
         let action = if let Some(check) = &self.settings.check {
             task.req.check = Some(check.clone());
             Action::Run { req: task.req.clone(), trace }
@@ -993,6 +1148,10 @@ impl App {
         let (name, arg) = command.split_once(' ').map_or((command, ""), |(n, a)| (n, a.trim()));
         let set = |what: &str, value: &str| format!("{what}: {value}");
         match name {
+            "memory-used" => {
+                let run = if arg.is_empty() { self.last_run.clone() } else { Some(arg.to_owned()) };
+                return self.open_used(run);
+            }
             "help" => {
                 self.viewer = Some(Viewer { title: "help".into(), lines: help(), scroll: 0 });
             }
@@ -1055,6 +1214,17 @@ impl App {
                 }
                 _ => self.flash = Some("attempts: 1 to 8".into()),
             },
+            "stream" => {
+                match arg {
+                    "on" | "default" | "" => self.settings.stream = true,
+                    "off" => self.settings.stream = false,
+                    _ => {
+                        self.flash = Some("stream: on or off".into());
+                        return Vec::new();
+                    }
+                }
+                self.flash = Some(format!("stream: {} (next task)", if self.settings.stream { "on" } else { "off" }));
+            }
             "model" => {
                 self.settings.model = (!arg.is_empty() && arg != "default").then(|| arg.to_owned());
                 self.flash = Some(set("model", self.settings.model.as_deref().unwrap_or("default")));
@@ -1217,6 +1387,10 @@ impl App {
                 });
                 head.push(span(format!("  {}", parts.join(" · ")), Tone::Dim));
                 self.log.push(Line::from(head));
+                self.log.push(Line::from(span(
+                    format!("  /memory-used {} · recorded recall context", task.trace),
+                    Tone::Dim,
+                )));
                 for n in &notes {
                     self.log.push(Line::from(vec![
                         span(format!("  {:.2} ", n.confidence), Tone::Mem),
@@ -1224,8 +1398,37 @@ impl App {
                     ]));
                 }
             }
-            // Model streaming is opt-in and the terminal interface does not ask for it.
-            Progress::ModelStarted { .. } | Progress::ModelText { .. } | Progress::ModelFinished { .. } => {}
+            event @ (Progress::ModelStarted { .. } | Progress::ModelText { .. } | Progress::ModelFinished { .. }) => {
+                if !task.req.stream {
+                    return;
+                }
+                let context = event.model_call().expect("a model event has a context");
+                match context.attempt {
+                    Some(attempt) if attempt < task.req.attempts && attempt < 8 => {
+                        if !task.lanes.iter().any(|l| l.index == attempt) {
+                            task.lanes.push(Lane {
+                                index: attempt,
+                                fork: None,
+                                turn: 0,
+                                status: None,
+                                lines: Vec::new(),
+                                preview: Preview::default(),
+                            });
+                            task.lanes.sort_by_key(|l| l.index);
+                        }
+                        let lane = lane(task, attempt).expect("the lane was created");
+                        if context.turn < lane.turn || lane.status.is_some() {
+                            return;
+                        }
+                        lane.turn = context.turn;
+                        for line in lane.preview.feed(&event) {
+                            lane.push(line);
+                        }
+                    }
+                    None => self.log.extend(task.designer_preview.feed(&event)),
+                    _ => {}
+                }
+            }
             Progress::Note { message, .. } => {
                 if task.notes_seen.insert(message.clone()) {
                     self.log.push(Line::from(span(format!("  {}", clean_line(&message)), Tone::Dim)));
@@ -1235,7 +1438,14 @@ impl App {
                 if let Some(lane) = lane(task, attempt) {
                     lane.fork = lane.fork.take().or(fork);
                 } else {
-                    task.lanes.push(Lane { index: attempt, fork, turn: 0, status: None, lines: Vec::new() });
+                    task.lanes.push(Lane {
+                        index: attempt,
+                        fork,
+                        turn: 0,
+                        status: None,
+                        lines: Vec::new(),
+                        preview: Preview::default(),
+                    });
                     task.lanes.sort_by_key(|l| l.index);
                 }
             }
@@ -1264,6 +1474,9 @@ impl App {
             }
             Progress::AttemptFinished { attempt, status, .. } => {
                 if let Some(lane) = lane(task, attempt) {
+                    if let Some(line) = lane.preview.finish("ended; final preview event unavailable", true) {
+                        lane.push(line);
+                    }
                     lane.status = Some(status);
                 }
             }
@@ -1285,9 +1498,24 @@ impl App {
         if task.trace != trace {
             return Vec::new();
         }
+        self.log.extend(task.designer_preview.finish("ended; final preview event unavailable", true));
         match result {
             Ok(d) => {
                 self.spent_usd += d.cost_usd;
+                self.uncounted_calls = self.uncounted_calls.saturating_add(d.uncounted_calls);
+                if d.cancelled || d.error.is_some() {
+                    self.task = None;
+                    self.error(
+                        "no check",
+                        &format!(
+                            "{} · ${:.2} known · {} calls uncounted",
+                            d.error.as_deref().unwrap_or("design cancelled"),
+                            d.cost_usd,
+                            d.uncounted_calls
+                        ),
+                    );
+                    return Vec::new();
+                }
                 task.stops = check_stops(&d, existing);
                 if task.stops.is_empty() && !self.rules.always_ask {
                     return self.start_after_check(d, true);
@@ -1345,6 +1573,21 @@ impl App {
     /// Start the attempts with the check the user accepted, or with none.
     fn start_after_check(&mut self, d: DesignResponse, verify: bool) -> Vec<Action> {
         let Some(task) = &mut self.task else { return Vec::new() };
+        if d.cancelled || d.error.is_some() || d.uncounted_calls > 0 {
+            self.task = None;
+            self.push(Line::from(span(
+                "  design cost incomplete; attempts cannot start within an unknown remaining budget",
+                Tone::Warn,
+            )));
+            return Vec::new();
+        }
+        let remaining = d.remaining_budget_usd.or_else(|| task.req.budget_usd.map(|b| b - d.cost_usd));
+        if remaining.is_some_and(|r| !r.is_finite() || r <= 0.0) {
+            self.task = None;
+            self.push(Line::from(span("  task budget exhausted by the check design; no attempts started", Tone::Warn)));
+            return Vec::new();
+        }
+        task.req.budget_usd = remaining;
         task.phase = Phase::Running;
         task.check_shown = true;
         let mut lines = Vec::new();
@@ -1365,10 +1608,6 @@ impl App {
                 ]));
                 task.req.verify = false;
             }
-        }
-        // The design was paid out of the task's budget.
-        if let Some(budget) = task.req.budget_usd {
-            task.req.budget_usd = Some((budget - d.cost_usd).max(0.01));
         }
         self.log.extend(lines);
         vec![Action::Run { req: task.req.clone(), trace: task.trace.clone() }]
@@ -1391,6 +1630,7 @@ impl App {
         };
         self.spent_usd += resp.cost_usd;
         self.remember(&task.req.task, &resp);
+        self.uncounted_calls = self.uncounted_calls.saturating_add(resp.uncounted_calls);
         let mut actions = Vec::new();
         let memory_model = agent::memory_model(self.settings.memory_model.as_deref(), task.req.model.as_deref());
 
@@ -1614,6 +1854,7 @@ impl App {
         self.log.extend(lines);
         self.scroll = 0;
         self.zoom = None;
+        self.last_run = Some(trace.to_string());
         self.task = Some(Task { check_shown: true, ..Task::new(trace.clone(), req.clone(), Phase::Running) });
         vec![Action::Run { req, trace }]
     }
@@ -1664,8 +1905,53 @@ impl App {
         }
     }
 
+    fn open_used(&mut self, run: Option<String>) -> Vec<Action> {
+        let Some(run) = run else {
+            self.flash = Some("no task has run yet; use /memory-used RUN".into());
+            return Vec::new();
+        };
+        self.viewer = Some(Viewer {
+            title: format!("memory used: {run}"),
+            lines: block("loading recorded context", "", Tone::Dim),
+            scroll: 0,
+        });
+        vec![Action::UsedNotes { run }]
+    }
+
     fn memory_key(&mut self, key: &KeyEvent) -> Vec<Action> {
         let Screen::Memory(view) = &mut self.screen else { return Vec::new() };
+        if let Some(MemoryEdit::Change(change)) = &mut view.edit {
+            match key.code {
+                KeyCode::Esc => view.edit = None,
+                KeyCode::Enter => match change.advance() {
+                    Ok(Some(action)) => {
+                        view.edit = None;
+                        view.loading = true;
+                        view.error = None;
+                        return vec![action];
+                    }
+                    Ok(None) => {}
+                    Err(error) => self.flash = Some(error.into()),
+                },
+                KeyCode::BackTab => {
+                    change.step = match change.step {
+                        ChangeStep::Confirm => ChangeStep::Dependencies,
+                        ChangeStep::Dependencies => ChangeStep::Reason,
+                        ChangeStep::Reason if change.text.is_some() => ChangeStep::Text,
+                        step => step,
+                    }
+                }
+                KeyCode::Char('t') if change.step == ChangeStep::Confirm => {
+                    change.review.temporary = !change.review.temporary
+                }
+                _ => {
+                    if let Some(input) = change.input_mut() {
+                        input.key(key);
+                    }
+                }
+            }
+            return Vec::new();
+        }
         if let Some(edit) = &mut view.edit {
             match key.code {
                 KeyCode::Esc => view.edit = None,
@@ -1686,13 +1972,17 @@ impl App {
                         }
                         return vec![Action::Forget { id: note.note.id.clone(), reason }];
                     }
-                    None => {}
+                    Some(MemoryEdit::Change(_)) | None => {}
                 },
                 _ => {
-                    let (MemoryEdit::Filter(input) | MemoryEdit::Reason(input)) = edit;
-                    input.key(key);
+                    if let MemoryEdit::Filter(input) | MemoryEdit::Reason(input) = edit {
+                        input.key(key);
+                    }
                 }
             }
+            return Vec::new();
+        }
+        if view.loading && matches!(key.code, KeyCode::Char('a' | 'c' | 'f' | 'v') | KeyCode::Enter) {
             return Vec::new();
         }
         match key.code {
@@ -1703,6 +1993,25 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => view.selected = view.selected.saturating_sub(1),
             KeyCode::Char('/') => view.edit = Some(MemoryEdit::Filter(Input::with(&view.query))),
             KeyCode::Char('f') if !view.notes.is_empty() => view.edit = Some(MemoryEdit::Reason(Input::default())),
+            KeyCode::Char('a') | KeyCode::Char('c') => {
+                if let Some(note) = view.notes.get(view.selected) {
+                    view.edit = Some(MemoryEdit::Change(Box::new(NoteChange::new(
+                        &self.workspace_path,
+                        note,
+                        key.code == KeyCode::Char('c'),
+                    ))));
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('v') => {
+                if let Some(note) = view.notes.get(view.selected) {
+                    self.viewer = Some(Viewer {
+                        title: format!("{} revision {}", clean_line(&note.note.id), note.note.rev),
+                        lines: memory_lines(note),
+                        scroll: 0,
+                    });
+                }
+            }
+            KeyCode::Char('u') => return self.open_used(self.last_run.clone()),
             KeyCode::Char('r') => {
                 view.loading = true;
                 return vec![Action::LoadNotes { query: view.query.clone() }];
@@ -1711,6 +2020,62 @@ impl App {
         }
         Vec::new()
     }
+}
+
+/// Shared by the detail pane and its scrollable full view. Every field is
+/// display data, including evidence IDs, dependency paths, and note text.
+pub fn memory_lines(r: &Recalled) -> Vec<Line<'static>> {
+    let n = &r.note;
+    let mut fields = vec![
+        format!("{} revision {} · {}", n.id, n.rev, n.kind.as_str()),
+        format!("score {:.3} · confidence {:.3} · recency {:.3}", r.score, r.reason.confidence, r.reason.recency),
+        format!("keywords: {}", r.reason.keywords.as_deref().unwrap_or("none (confidence and recency)")),
+        format!("relevance: {}", r.reason.relevance.map_or("unavailable".into(), |v| format!("{v:.3}"))),
+    ];
+    if r.details.temporary {
+        fields.push("temporary experience · verify before reuse".into());
+    }
+    if !r.details.needs_review.is_empty() {
+        fields.push(format!("needs review: {}", r.details.needs_review.join(", ")));
+    }
+    fields.push(format!("review reason: {}", if r.details.reason.is_empty() { "none" } else { &r.details.reason }));
+    for d in &r.details.dependencies {
+        fields.push(format!("depends on: {} · sha256 {}", d.path, d.sha256));
+    }
+    if let Some(id) = &r.details.supersedes {
+        fields.push(format!("supersedes: {id}"));
+    }
+    fields.extend([
+        format!("source: {}@{} · run {}", n.provenance.service, n.provenance.version, n.provenance.trace),
+        format!("learned: {} · confirmed {}× · confidence {:.2}", text::when(n.created_ms), n.reinforced, n.confidence),
+        format!("disputes: {}", n.conflicts.join(", ")),
+        format!("evidence: {}", n.provenance.events.join(", ")),
+        String::new(),
+        n.text.clone(),
+    ]);
+    fields.into_iter().flat_map(|field| block(&field, "", Tone::Plain)).collect()
+}
+
+fn snapshot_lines(snapshots: &[RecallSnapshot]) -> Vec<Line<'static>> {
+    if snapshots.is_empty() {
+        return block("no recorded memory context in this project", "", Tone::Dim);
+    }
+    let mut lines = Vec::new();
+    for s in snapshots {
+        lines.extend(block(
+            &format!("run {} · call {} · {}\nquery: {}", s.run, s.call, s.purpose, s.query),
+            "",
+            Tone::Mem,
+        ));
+        if s.notes.is_empty() {
+            lines.extend(block("no notes returned", "", Tone::Dim));
+        }
+        for r in &s.notes {
+            lines.extend(memory_lines(r));
+            lines.push(Line::default());
+        }
+    }
+    lines
 }
 
 impl Lane {
@@ -1740,6 +2105,9 @@ fn check_stops(d: &DesignResponse, existing: &[String]) -> Vec<String> {
         return vec!["no automated check".into()];
     }
     let mut stops = Vec::new();
+    if d.uncounted_calls > 0 {
+        stops.push("design cost incomplete".into());
+    }
     match &d.baseline {
         Some(b) if b.passed => stops.push("baseline passes".into()),
         Some(_) => {}
@@ -1872,12 +2240,14 @@ fn help() -> Vec<Line<'static>> {
         Line::default(),
         head("commands"),
         row("/memory [words]", "notes about this project"),
+        row("/memory-used [run]", "recorded context for this run (default: latest)"),
         row("/check [command]", "use this check for every task; empty: design one"),
         row("", "while a task runs: check its result with this instead"),
         row("/protect PATH...", "the running task must leave these as they are"),
         row("/pause, /resume", "start nothing new in the running task, then go on"),
         row("/new", "a new conversation: later tasks forget the earlier ones"),
         row("/attempts N", "attempts at once, 1 to 8"),
+        row("/stream on|off", "model text previews for the next task"),
         row("/model NAME", "opus, sonnet, haiku or a model id"),
         row("/memory-model NAME", "model memory learns with; same: the attempts'"),
         row("/effort LEVEL", "low, medium, high, xhigh or max"),
@@ -1941,6 +2311,111 @@ mod tests {
         plain(&app.log).join("\n")
     }
 
+    fn frame_text(app: &mut App) -> String {
+        let backend = ratatui::backend::TestBackend::new(140, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| super::super::view::draw(frame, app)).unwrap();
+        terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    fn model_context(app: &App, attempt: Option<u32>, seq: u64) -> molt_api::progress::ModelCall {
+        molt_api::progress::ModelCall {
+            run: app.task.as_ref().unwrap().trace.to_string(),
+            attempt,
+            turn: 1,
+            call: "fake-stream".into(),
+            seq,
+        }
+    }
+
+    #[test]
+    fn streamed_model_text_updates_the_frame_and_folds_without_becoming_a_result() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        assert!(matches!(&actions[0], Action::Run { req, .. } if req.stream));
+        let context = model_context(&app, Some(0), 0);
+        app.update(Msg::Progress(Progress::ModelStarted { context }));
+        let context = model_context(&app, Some(0), 1);
+        assert!(app
+            .update(Msg::Progress(Progress::ModelText { context, text: "latest streamed text\x1b\x07".into() }))
+            .is_empty());
+        let shown = frame_text(&mut app);
+        assert!(shown.contains("model preview") && shown.contains("latest streamed text"), "{shown}");
+        assert_eq!(app.spent_usd, 0.0, "preview events cannot settle spending");
+        let context = model_context(&app, Some(0), 3);
+        app.update(Msg::Progress(Progress::ModelText { context, text: " after a gap".into() }));
+        assert!(frame_text(&mut app).contains("gaps in preview"));
+        let context = model_context(&app, Some(0), 4);
+        app.update(Msg::Progress(Progress::ModelFinished {
+            context,
+            usage: Some(Usage::default()),
+            cost_usd: Some(0.02),
+            error: None,
+        }));
+        let shown = frame_text(&mut app);
+        assert!(shown.contains("model preview finished · gaps"), "{shown}");
+        assert!(app.task.as_ref().unwrap().lanes[0].preview.lines(100, 4).is_empty());
+        let context = model_context(&app, Some(0), 5);
+        app.update(Msg::Progress(Progress::ModelText { context, text: "late forged result".into() }));
+        assert!(!frame_text(&mut app).contains("forged result"));
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        assert!(app.update(Msg::Ran { trace, result: Err("the model refused".into()) }).is_empty());
+        assert!(app.task.is_none() && app.prompt.is_none());
+        assert!(log(&app).contains("the model refused"));
+    }
+
+    #[test]
+    fn previews_can_be_disabled_and_cancellation_cannot_revive_them() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        type_in(&mut app, "/stream off");
+        let actions = type_in(&mut app, "implement it");
+        assert!(matches!(&actions[0], Action::Run { req, .. } if !req.stream));
+        let context = model_context(&app, Some(0), 1);
+        app.update(Msg::Progress(Progress::ModelText { context, text: "hidden preview".into() }));
+        assert!(app.task.as_ref().unwrap().lanes.is_empty());
+        assert!(!frame_text(&mut app).contains("hidden preview"));
+        app.update(key(KeyCode::Esc));
+        up(&mut app);
+        type_in(&mut app, "/stream on");
+        type_in(&mut app, "implement it again");
+        let context = model_context(&app, Some(0), 1);
+        app.update(Msg::Progress(Progress::ModelText { context: context.clone(), text: "provisional".into() }));
+        assert!(frame_text(&mut app).contains("provisional"));
+        assert!(matches!(app.update(key(KeyCode::Esc))[0], Action::Interrupt { .. }));
+        // Only the offer to start again with the same check is left.
+        assert!(app.task.is_none() && matches!(app.prompt, Some(Prompt::Retry { stopped: true, .. })));
+        app.update(Msg::Progress(Progress::ModelText { context, text: "late result".into() }));
+        assert!(!frame_text(&mut app).contains("late result"));
+    }
+
+    #[test]
+    fn designer_previews_fold_on_errors_without_creating_a_check() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "implement it");
+        assert!(matches!(&actions[0], Action::Design { req, .. } if req.stream));
+        let context = model_context(&app, None, 0);
+        app.update(Msg::Progress(Progress::ModelStarted { context }));
+        let context = model_context(&app, None, 1);
+        app.update(Msg::Progress(Progress::ModelText { context, text: "designing stream".into() }));
+        assert!(frame_text(&mut app).contains("designing stream"));
+        let context = model_context(&app, None, 2);
+        app.update(Msg::Progress(Progress::ModelFinished {
+            context,
+            usage: None,
+            cost_usd: None,
+            error: Some("cancelled".into()),
+        }));
+        assert!(log(&app).contains("model preview stopped (cancelled)"));
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        assert!(app.update(Msg::Designed { trace, result: Err("cancelled".into()), existing: vec![] }).is_empty());
+        assert!(app.task.is_none() && app.prompt.is_none());
+    }
+
     fn design() -> DesignResponse {
         DesignResponse {
             command: Some("cargo test --test commas".into()),
@@ -1949,6 +2424,10 @@ mod tests {
             baseline: Some(Baseline { passed: false, exit_code: Some(101), tail: String::new() }),
             usage: Usage::default(),
             cost_usd: 0.25,
+            uncounted_calls: 0,
+            remaining_budget_usd: None,
+            error: None,
+            cancelled: false,
         }
     }
 
@@ -2283,9 +2762,9 @@ mod tests {
         app.update(Msg::Progress(Progress::Note { run: run.clone(), message: "project model: 3 files".into() }));
         app.update(Msg::Progress(Progress::Note { run, message: "project model: 3 files".into() }));
         assert!(
-            log(&app).ends_with(
-                "◇ memory  map 2800 tokens · 1 note\n  0.78 Tests need --features x\n  project model: 3 files"
-            ),
+            log(&app).ends_with(&format!(
+                "◇ memory  map 2800 tokens · 1 note\n  /memory-used {trace} · recorded recall context\n  0.78 Tests need --features x\n  project model: 3 files"
+            )),
             "{}",
             log(&app)
         );
@@ -2394,6 +2873,221 @@ mod tests {
         assert_eq!(app.update(key(KeyCode::Enter)), [Action::LoadNotes { query: "lexer".into() }]);
         app.update(key(KeyCode::Esc));
         assert!(matches!(app.screen, Screen::Main));
+    }
+
+    fn inspected_note() -> Recalled {
+        serde_json::from_value(serde_json::json!({
+            "note": { "id":"note_config", "rev":7, "kind":"fact", "text":"Build with cargo", "confidence":0.8,
+                "created_ms":0, "updated_ms":0, "provenance":{"trace":"run_source", "service":"memory", "version":"v1", "events":["source_event"]}},
+            "score":0.9, "reason":{"keywords":"cargo", "relevance":0.9, "confidence":0.8, "recency":0.7},
+            "details":{"dependencies":[{"path":"Cargo.toml", "sha256":"old_hash"}], "needs_review":["Cargo.toml"], "temporary":true, "reason":"verified earlier"}
+        })).unwrap()
+    }
+
+    #[test]
+    fn memory_inspection_shows_the_reason_and_reviews_the_revision_the_person_saw() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/memory cargo");
+        app.update(Msg::Notes(Ok(vec![inspected_note()])));
+        let frame = frame_text(&mut app);
+        for expected in [
+            "[review]",
+            "[temporary]",
+            "revision 7",
+            "keywords: cargo",
+            "needs review: Cargo.toml",
+            "old_hash",
+            "source_event",
+        ] {
+            assert!(frame.contains(expected), "missing {expected}: {frame}");
+        }
+        app.update(key(KeyCode::Char('v')));
+        assert!(plain(&app.viewer.as_ref().unwrap().lines).join("\n").contains("relevance: 0.900"));
+        app.update(key(KeyCode::Esc));
+        app.update(key(KeyCode::Char('a')));
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert!(app.flash.as_ref().unwrap().contains("justified"));
+        app.update(Msg::Paste("checked current config".into()));
+        app.update(key(KeyCode::Enter));
+        // A refresh while editing must not silently raise the saved lease.
+        let mut newer = inspected_note();
+        newer.note.rev = 8;
+        app.update(Msg::Notes(Ok(vec![newer.clone()])));
+        app.update(ctrl_key('u'));
+        app.update(Msg::Paste("Cargo.toml; src/lib.rs".into()));
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Char('t')));
+        let actions = app.update(key(KeyCode::Enter));
+        assert_eq!(
+            actions,
+            [Action::ChangeNote {
+                review: ReviewRequest {
+                    workspace: "/w".into(),
+                    id: "note_config".into(),
+                    expected_rev: 7,
+                    reason: "checked current config".into(),
+                    depends_on: vec!["Cargo.toml".into(), "src/lib.rs".into()],
+                    temporary: false,
+                },
+                text: None
+            }]
+        );
+        assert!(app
+            .update(Msg::ChangedNote(Err("note changed: expected revision 7, current 8; inspect it again".into())))
+            .is_empty());
+        let Screen::Memory(view) = &app.screen else { panic!() };
+        assert_eq!(view.notes, [newer]);
+        assert!(!view.loading && view.error.as_ref().unwrap().contains("current 8"));
+        assert!(frame_text(&mut app).contains("current 8"));
+    }
+
+    #[test]
+    fn correcting_a_note_requires_a_reason_and_confirmation_and_refreshes_after_success() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/memory");
+        let note = inspected_note();
+        app.update(Msg::Notes(Ok(vec![note.clone()])));
+        app.update(key(KeyCode::Char('c')));
+        app.update(ctrl_key('u'));
+        app.update(Msg::Paste("Build with make".into()));
+        app.update(key(KeyCode::Enter));
+        app.update(Msg::Paste("verified the migration".into()));
+        app.update(key(KeyCode::Enter));
+        app.update(ctrl_key('u'));
+        app.update(key(KeyCode::Enter));
+        assert!(frame_text(&mut app).contains("Enter save"));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Action::ChangeNote {
+                review: ReviewRequest {
+                    workspace: "/w".into(),
+                    id: note.note.id.clone(),
+                    expected_rev: 7,
+                    reason: "verified the migration".into(),
+                    depends_on: vec![],
+                    temporary: true,
+                },
+                text: Some("Build with make".into())
+            }]
+        );
+        assert_eq!(
+            app.update(Msg::ChangedNote(Ok(ReviewResponse { note: note.note, details: note.details }))),
+            [Action::LoadNotes { query: String::new() }]
+        );
+        // Cancelling a later form never sends a mutation.
+        app.update(Msg::Notes(Ok(vec![inspected_note()])));
+        app.update(key(KeyCode::Char('c')));
+        assert!(app.update(key(KeyCode::Esc)).is_empty());
+        let Screen::Memory(view) = &app.screen else { panic!() };
+        assert!(view.edit.is_none());
+    }
+
+    #[test]
+    fn used_memory_shows_the_immutable_run_context_and_ignores_late_viewer_replies() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "task");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!() };
+        let run = trace.to_string();
+        assert_eq!(type_in(&mut app, "/memory-used"), [Action::UsedNotes { run: run.clone() }]);
+        let record = RecallSnapshot {
+            run: run.clone(),
+            call: "captured_call".into(),
+            workspace: "/w".into(),
+            query: "cargo".into(),
+            purpose: "context".into(),
+            created_ms: 1,
+            notes: vec![inspected_note()],
+        };
+        app.update(Msg::UsedNotes { run: run.clone(), result: Ok(vec![record.clone()]) });
+        let frame = frame_text(&mut app);
+        assert!(frame.contains("captured_call") && frame.contains("revision 7") && frame.contains("Build with cargo"));
+        app.update(key(KeyCode::Esc));
+        app.update(Msg::UsedNotes { run: run.clone(), result: Ok(vec![record]) });
+        assert!(app.viewer.is_none());
+        type_in(&mut app, "/memory");
+        app.update(Msg::Notes(Ok(vec![])));
+        assert_eq!(app.update(key(KeyCode::Char('u'))), [Action::UsedNotes { run }]);
+    }
+
+    #[test]
+    fn incomplete_design_cost_is_shown_and_cannot_be_spent_as_free() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "task");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let d = DesignResponse { uncounted_calls: 2, ..design() };
+        app.update(Msg::Designed { trace, result: Ok(d), existing: vec![] });
+        let frame = frame_text(&mut app);
+        assert!(
+            frame.contains("cost incomplete")
+                && frame.contains("2 calls uncounted")
+                && frame.contains("remaining budget unknown")
+        );
+        assert_eq!((app.spent_usd, app.uncounted_calls), (0.25, 2));
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert!(app.task.is_none() && app.prompt.is_none());
+        assert!(log(&app).contains("attempts cannot start"));
+    }
+
+    #[test]
+    fn attempts_use_the_remaining_effective_budget_without_a_minimum_top_up() {
+        for (requested, remaining, expected) in [
+            (Some(0.25), None, None),
+            (Some(0.2), None, None),
+            (None, Some(0.0), None),
+            (Some(1.0), None, Some(0.75)),
+            (None, Some(9.75), Some(9.75)),
+        ] {
+            let mut app = App::new("/w", None);
+            up(&mut app);
+            app.settings.budget_usd = requested;
+            type_in(&mut app, "task");
+            let trace = app.task.as_ref().unwrap().trace.clone();
+            app.settings.budget_usd = Some(100.0); // Next-task settings cannot raise this task's budget.
+                                                   // Nothing stops confirm mode here, so the attempts start right away.
+            let actions = app.update(Msg::Designed {
+                trace,
+                result: Ok(DesignResponse { remaining_budget_usd: remaining, ..design() }),
+                existing: vec![],
+            });
+            match expected {
+                Some(budget) => {
+                    let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+                    assert_eq!(req.budget_usd, Some(budget));
+                }
+                None => {
+                    assert!(actions.is_empty() && app.task.is_none());
+                    assert!(log(&app).contains("budget exhausted"));
+                }
+            }
+            assert_eq!(app.spent_usd, 0.25);
+        }
+    }
+
+    #[test]
+    fn a_failed_cancelled_design_records_settlement_without_offer_to_run_unverified() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "task");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let d = DesignResponse {
+            command: None,
+            files: vec![],
+            cancelled: true,
+            error: Some("design stopped".into()),
+            uncounted_calls: 1,
+            ..design()
+        };
+        assert!(app.update(Msg::Designed { trace: trace.clone(), result: Ok(d), existing: vec![] }).is_empty());
+        assert!(app.task.is_none() && app.prompt.is_none());
+        assert_eq!((app.spent_usd, app.uncounted_calls), (0.25, 1));
+        assert!(log(&app).contains("$0.25 known · 1 calls uncounted"));
+        assert!(frame_text(&mut app).contains("1 calls uncounted"));
+        app.update(Msg::Designed { trace, result: Ok(design()), existing: vec![] });
+        assert_eq!(app.spent_usd, 0.25, "late replies are not counted twice");
     }
 
     #[test]

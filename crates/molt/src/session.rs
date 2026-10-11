@@ -6,21 +6,22 @@
 //! same capabilities as in `molt do`, plus `planner.design` to show the
 //! check before the attempts start, `planner.control` to steer a run that is
 //! going, `fs.merge` and `fs.drop` to apply or discard a result the user has
-//! looked at, and `memory.recall` and
-//! `memory.forget` for the memory screen.
+//! looked at, and `memory.recall`, `memory.forget`, `memory.review` and
+//! `memory.correct` for the memory screen.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use anyhow::Context;
 use molt_api::fs::{self, DiffRequest, DiffResponse, DropRequest, DropResponse, MergeRequest, MergeResponse};
 use molt_api::memory::{
-    self, ConsolidateRequest, ConsolidateResponse, ForgetRequest, ForgetResponse, RecallRequest, RecallResponse,
-    Recalled,
+    self, ConsolidateRequest, ConsolidateResponse, CorrectRequest, ForgetRequest, ForgetResponse, RecallRequest,
+    RecallResponse, RecallSnapshot, Recalled, ReviewRequest, ReviewResponse,
 };
 use molt_api::planner::{self, Control, ControlRequest, ControlResponse, DesignResponse, RunRequest, RunResponse};
 use molt_api::progress::{self, Progress};
-use molt_proto::{Budget, Kind, ServiceId, Target, TraceId};
+use molt_proto::{Budget, ServiceId, TraceId};
 use molt_sdk::{CallOpts, Service};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -50,6 +51,7 @@ pub struct Session {
     workspace: String,
     /// `None` without a memory service; an error when it did not come up.
     memory: Option<Result<(), String>>,
+    memory_db: Option<PathBuf>,
     forks: Mutex<Option<RunForks>>,
     versions: Vec<(String, String)>,
 }
@@ -68,6 +70,7 @@ impl Session {
                     cli,
                     workspace: workspace.to_owned(),
                     memory,
+                    memory_db: agent::memory_db(cfg),
                     forks: Mutex::new(RunForks::before(cfg)),
                     versions,
                 })
@@ -97,22 +100,20 @@ impl Session {
         let budget = Budget::new(0, 0, CALLS);
         let mut targets = vec![planner::RUN, planner::DESIGN, planner::CONTROL, fs::DIFF, fs::MERGE, fs::DROP];
         if memory.is_some() {
-            targets.extend([memory::CONSOLIDATE, memory::RECALL, memory::FORGET]);
+            targets.extend([memory::CONSOLIDATE, memory::RECALL, memory::FORGET, memory::REVIEW, memory::CORRECT]);
         }
         for target in targets {
             agent::grant(kernel, &cli, target, budget).await?;
         }
-        agent::grant(kernel, &cli, &format!("topic:{}", progress::TOPIC), budget).await?;
+        agent::grant(kernel, &cli, &format!("topic:subscribe:{}", progress::TOPIC), budget).await?;
         cli.subscribe(progress::TOPIC).await?;
         let cli = Arc::new(cli);
         let pump = cli.clone();
         tokio::spawn(async move {
             while let Some(msg) = pump.next().await {
-                let on_topic = matches!(&msg.to, Target::Topic { name } if name == progress::TOPIC);
-                if msg.kind != Kind::Event || !on_topic {
-                    continue;
-                }
-                if let Ok(event) = serde_json::from_value::<Progress>(msg.payload) {
+                // Share the CLI's gateway-origin and trace checks. Topic
+                // access alone must not let a peer impersonate a model call.
+                if let Some(event) = agent::progress_event(&msg) {
                     if events.send(event).is_err() {
                         break;
                     }
@@ -184,14 +185,48 @@ impl Session {
 
     /// The notes about the workspace that match `query`, best first.
     pub async fn notes(&self, query: &str) -> anyhow::Result<Vec<Recalled>> {
+        self.recall_notes(query, false).await
+    }
+
+    /// Inspection, like `molt memory show`, includes quarantined notes.
+    /// Ordinary recall still excludes them until explicitly reviewed.
+    pub async fn inspect_notes(&self, query: &str) -> anyhow::Result<Vec<Recalled>> {
+        self.recall_notes(query, true).await
+    }
+
+    async fn recall_notes(&self, query: &str, include_review: bool) -> anyhow::Result<Vec<Recalled>> {
         let req = RecallRequest {
             query: query.to_owned(),
             workspace: Some(self.workspace.clone()),
             k: Some(50),
+            include_review,
             ..Default::default()
         };
         let resp: RecallResponse = self.call(memory::RECALL, req, NOTES_MS, None).await?;
         Ok(resp.notes)
+    }
+
+    /// Use the CLI's audited service path and the revision the person saw.
+    pub async fn change_note(&self, review: ReviewRequest, text: Option<String>) -> anyhow::Result<ReviewResponse> {
+        anyhow::ensure!(review.workspace == self.workspace, "the note belongs to another project");
+        match text {
+            Some(text) => self.call(memory::CORRECT, CorrectRequest { review, text }, NOTES_MS, None).await,
+            None => self.call(memory::REVIEW, review, NOTES_MS, None).await,
+        }
+    }
+
+    /// The CLI reads these immutable records locally too; no new recall is
+    /// performed and a later correction cannot replace the original context.
+    pub async fn used_notes(&self, run: &str) -> anyhow::Result<Vec<RecallSnapshot>> {
+        let path = self.memory_db.clone().context("memory has no database in this configuration")?;
+        let workspace = self.workspace.clone();
+        let run = run.to_owned();
+        tokio::task::spawn_blocking(move || {
+            anyhow::ensure!(path.is_file(), "memory has no recorded context yet");
+            let db = molt_memory::Db::open(&path)?;
+            molt_memory::recall_snapshots(&db, &workspace, &run).map_err(|e| anyhow::anyhow!(e.message))
+        })
+        .await?
     }
 
     /// Forget note `id`; false when there is none, or it is already forgotten.
