@@ -166,7 +166,26 @@ pub struct DesignResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<Baseline>,
     pub usage: Usage,
+    /// Known subtotal, not a complete price when `uncounted_calls` is nonzero.
     pub cost_usd: f64,
+    /// Pending replies, calls without usage, and replies without a known price.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub uncounted_calls: u32,
+    /// Remaining effective task limit, including the planner's default.
+    /// `None` on incomplete settlement or in a reply from an older planner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_budget_usd: Option<f64>,
+    /// Design failure, with settlement preserved. Callers must not run a
+    /// failed design as an unverified task. Invalid requests still use errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Local design work stopped; this does not confirm remote cancellation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,6 +344,18 @@ pub mod tools {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_design_replies_remain_readable_without_inventing_a_budget() {
+        let wire = serde_json::json!({"usage":{}, "cost_usd":0.25});
+        let response: DesignResponse = serde_json::from_value(wire).unwrap();
+        assert_eq!(response.uncounted_calls, 0);
+        assert!(response.error.is_none() && response.remaining_budget_usd.is_none() && !response.cancelled);
+        let wire = serde_json::to_value(response).unwrap();
+        for key in ["uncounted_calls", "error", "remaining_budget_usd", "cancelled"] {
+            assert!(wire.get(key).is_none());
+        }
+    }
 
     #[test]
     fn minimal_request_gets_defaults() {

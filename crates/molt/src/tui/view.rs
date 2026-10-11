@@ -137,6 +137,17 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 span("◆ check", Tone::Shell),
                 span(format!("  designed · ${:.2}", d.cost_usd), Tone::Dim),
             ])];
+            if d.uncounted_calls > 0 {
+                lines.push(Line::from(span(
+                    format!("  cost incomplete · {} calls uncounted · remaining budget unknown", d.uncounted_calls),
+                    Tone::Warn,
+                )));
+            } else if let Some(remaining) = d.remaining_budget_usd {
+                lines.push(Line::from(span(
+                    format!("  ${remaining:.2} remaining for attempts"),
+                    if remaining <= 0.0 { Tone::Bad } else { Tone::Dim },
+                )));
+            }
             match &d.command {
                 Some(c) => lines.push(Line::from(vec![span("  $ ", Tone::Dim), span(clean_line(c), Tone::Plain)])),
                 None => lines.push(Line::from(span("  no automated check fits this task", Tone::Warn))),
@@ -326,6 +337,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         parts.push(format!("check: {}", text::fit(&clean_line(check), 24)));
     }
     let mut cost = format!("${:.2}", app.spent_usd);
+    if app.uncounted_calls > 0 {
+        cost.push_str(&format!(" known · {} calls uncounted", app.uncounted_calls));
+    }
     if let Some(b) = s.budget_usd {
         cost.push_str(&format!(" · ${b:.2}/task"));
     }

@@ -53,6 +53,7 @@ sender from that.
 | Guarantee | Test |
 | --- | --- |
 | No service can grant itself a capability or raise its own budget | `crates/molt-kernel/tests/invariants.rs` (`a_service_cannot_use…`, `delegation_can_split…`, `budgets_are_enforced…`) |
+| Check design retains unknown and cancelled model settlement; attempts cannot receive a fabricated remaining budget | `crates/molt-planner/src/runner.rs` (`design_preserves_missing_usage_unknown_prices_and_failed_call_settlement`, `cancelled_designs_return_pending_or_late_settlement_and_drop_their_fork`), `crates/molt/src/tui/app.rs` (`incomplete_design_cost_is_shown_and_cannot_be_spent_as_free`, `attempts_use_the_remaining_effective_budget_without_a_minimum_top_up`) |
 | No service can promote a kernel or protected component, change a tier, or add capabilities without a human | `only_humans_promote_protected_and_kernel_components` |
 | No service can delete or rewrite audit entries; every message is on the record before delivery | `every_message_is_logged_before_it_is_delivered`, `the_audit_log_has_no_write_path_and_detects_tampering` |
 | Audit verification and startup retain one bounded record; tail retains only the requested entries, independent of total log size | `audit_readers_keep_memory_bounded_as_the_log_grows`, `malformed_oversized_and_unterminated_records_are_never_discarded` |
@@ -451,6 +452,23 @@ The planner gives each attempt its own cancellation token. A winner stops compet
 The gateway closes its local HTTP request on cancellation and audits a correlated settlement record with `local_stopped`, `remote_cancel_confirmed`, `usage` and `cost_usd`. Anthropic Messages has no remote cancellation acknowledgement here, so remote cancellation and missing usage remain unknown. A completion already received wins the race and is counted once. After a kernel timeout, one authenticated late model reply can still be audited for up to one hour, without delivering a second run result; the late-settlement registry is bounded and temporary, while accepted records persist in the audit log. `molt audit --help` describes querying the log.
 
 Run `cost_usd` is the known subtotal. `uncounted_calls` now includes pending calls, errors without usage, and replies without a known price. The terminal explicitly labels the known cost and incomplete settlement; automatic memory learning is skipped when settlement is incomplete. This is an estimated spending limit, not a provider-enforced dollar ceiling.
+
+`planner.design` uses the same settlement rule, including failed and cancelled
+designs. A missing or incomplete canonical usage record is refused before
+serde defaults can turn it into zero tokens. `DesignResponse.cost_usd` is a
+known subtotal; `uncounted_calls` marks the unknown part. Its optional `error`
+reports a failed design while preserving settlement, and `cancelled` means
+local work stopped, without claiming the provider stopped billing. Invalid
+requests still return protocol errors. Consumers must inspect `error` and
+`cancelled` before treating a missing command as an unverified task.
+
+With complete settlement, `remaining_budget_usd` carries the task's effective
+limit minus the design cost, including the planner's configured default. The
+TUI forwards exactly that remainder to attempts, shows incomplete costs on
+the confirmation screen and session total, and starts no attempts when design
+cost is unknown or the remainder is exhausted. The new fields have serde
+defaults for reading older replies; older consumers should be updated to
+handle failed design replies explicitly and honor the remaining limit.
 
 ### Linux command isolation
 

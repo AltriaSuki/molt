@@ -303,6 +303,8 @@ pub struct App {
     pub screen: Screen,
     /// Spent in this session: designs, runs and learning.
     pub spent_usd: f64,
+    /// Calls whose usage or price is still unknown; spending is a subtotal.
+    pub uncounted_calls: u32,
     /// Runs memory is learning from.
     pub learning: HashSet<String>,
     /// Results the user kept in their forks; never removed.
@@ -345,6 +347,7 @@ impl App {
             viewer: None,
             screen: Screen::Main,
             spent_usd: 0.0,
+            uncounted_calls: 0,
             learning: HashSet::new(),
             kept: Vec::new(),
             zoom: None,
@@ -840,6 +843,20 @@ impl App {
         match result {
             Ok(d) => {
                 self.spent_usd += d.cost_usd;
+                self.uncounted_calls = self.uncounted_calls.saturating_add(d.uncounted_calls);
+                if d.cancelled || d.error.is_some() {
+                    self.task = None;
+                    self.error(
+                        "no check",
+                        &format!(
+                            "{} · ${:.2} known · {} calls uncounted",
+                            d.error.as_deref().unwrap_or("design cancelled"),
+                            d.cost_usd,
+                            d.uncounted_calls
+                        ),
+                    );
+                    return Vec::new();
+                }
                 task.phase = Phase::Confirming;
                 self.prompt = Some(Prompt::Check(d));
             }
@@ -893,6 +910,21 @@ impl App {
     /// Start the attempts with the check the user accepted, or with none.
     fn start_after_check(&mut self, d: DesignResponse, verify: bool) -> Vec<Action> {
         let Some(task) = &mut self.task else { return Vec::new() };
+        if d.cancelled || d.error.is_some() || d.uncounted_calls > 0 {
+            self.task = None;
+            self.push(Line::from(span(
+                "  design cost incomplete; attempts cannot start within an unknown remaining budget",
+                Tone::Warn,
+            )));
+            return Vec::new();
+        }
+        let remaining = d.remaining_budget_usd.or_else(|| task.req.budget_usd.map(|b| b - d.cost_usd));
+        if remaining.is_some_and(|r| !r.is_finite() || r <= 0.0) {
+            self.task = None;
+            self.push(Line::from(span("  task budget exhausted by the check design; no attempts started", Tone::Warn)));
+            return Vec::new();
+        }
+        task.req.budget_usd = remaining;
         task.phase = Phase::Running;
         task.check_shown = true;
         let mut lines = Vec::new();
@@ -914,10 +946,6 @@ impl App {
                 task.req.verify = false;
             }
         }
-        // The design was paid out of the task's budget.
-        if let Some(budget) = task.req.budget_usd {
-            task.req.budget_usd = Some((budget - d.cost_usd).max(0.01));
-        }
         self.log.extend(lines);
         vec![Action::Run { req: task.req.clone(), trace: task.trace.clone() }]
     }
@@ -937,6 +965,7 @@ impl App {
             }
         };
         self.spent_usd += resp.cost_usd;
+        self.uncounted_calls = self.uncounted_calls.saturating_add(resp.uncounted_calls);
         let mut actions = Vec::new();
 
         for a in &resp.attempts {
@@ -1278,6 +1307,10 @@ mod tests {
             baseline: Some(Baseline { passed: false, exit_code: Some(101), tail: String::new() }),
             usage: Usage::default(),
             cost_usd: 0.25,
+            uncounted_calls: 0,
+            remaining_budget_usd: None,
+            error: None,
+            cancelled: false,
         }
     }
 
@@ -1534,6 +1567,89 @@ mod tests {
         assert_eq!(app.update(key(KeyCode::Enter)), [Action::LoadNotes { query: "lexer".into() }]);
         app.update(key(KeyCode::Esc));
         assert!(matches!(app.screen, Screen::Main));
+    }
+
+    fn frame_text(app: &mut App) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|frame| super::super::view::draw(frame, app)).unwrap();
+        terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn incomplete_design_cost_is_shown_and_cannot_be_spent_as_free() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "task");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let d = DesignResponse { uncounted_calls: 2, ..design() };
+        app.update(Msg::Designed { trace, result: Ok(d) });
+        let frame = frame_text(&mut app);
+        assert!(
+            frame.contains("cost incomplete")
+                && frame.contains("2 calls uncounted")
+                && frame.contains("remaining budget unknown")
+        );
+        assert_eq!((app.spent_usd, app.uncounted_calls), (0.25, 2));
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert!(app.task.is_none() && app.prompt.is_none());
+        assert!(log(&app).contains("attempts cannot start"));
+    }
+
+    #[test]
+    fn attempts_use_the_remaining_effective_budget_without_a_minimum_top_up() {
+        for (requested, remaining, expected) in [
+            (Some(0.25), None, None),
+            (Some(0.2), None, None),
+            (None, Some(0.0), None),
+            (Some(1.0), None, Some(0.75)),
+            (None, Some(9.75), Some(9.75)),
+        ] {
+            let mut app = App::new("/w", None);
+            up(&mut app);
+            app.settings.budget_usd = requested;
+            type_in(&mut app, "task");
+            let trace = app.task.as_ref().unwrap().trace.clone();
+            app.settings.budget_usd = Some(100.0); // Next-task settings cannot raise this task's budget.
+            app.update(Msg::Designed {
+                trace,
+                result: Ok(DesignResponse { remaining_budget_usd: remaining, ..design() }),
+            });
+            let actions = app.update(key(KeyCode::Enter));
+            match expected {
+                Some(budget) => {
+                    let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+                    assert_eq!(req.budget_usd, Some(budget));
+                }
+                None => {
+                    assert!(actions.is_empty() && app.task.is_none());
+                    assert!(log(&app).contains("budget exhausted"));
+                }
+            }
+            assert_eq!(app.spent_usd, 0.25);
+        }
+    }
+
+    #[test]
+    fn a_failed_cancelled_design_records_settlement_without_offer_to_run_unverified() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "task");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let d = DesignResponse {
+            command: None,
+            files: vec![],
+            cancelled: true,
+            error: Some("design stopped".into()),
+            uncounted_calls: 1,
+            ..design()
+        };
+        assert!(app.update(Msg::Designed { trace: trace.clone(), result: Ok(d) }).is_empty());
+        assert!(app.task.is_none() && app.prompt.is_none());
+        assert_eq!((app.spent_usd, app.uncounted_calls), (0.25, 1));
+        assert!(log(&app).contains("$0.25 known · 1 calls uncounted"));
+        assert!(frame_text(&mut app).contains("1 calls uncounted"));
+        app.update(Msg::Designed { trace, result: Ok(design()) });
+        assert_eq!(app.spent_usd, 0.25, "late replies are not counted twice");
     }
 
     #[test]

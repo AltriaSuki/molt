@@ -11,7 +11,6 @@ use molt_api::planner::tools::{SubmitCheck, SUBMIT_CHECK};
 use molt_api::planner::Baseline;
 use molt_proto::RemoteError;
 use serde_json::Value;
-use tokio_util::sync::CancellationToken;
 
 use crate::agent::{self, Meter, Stop};
 use crate::ctx::{Conversation, Ctx};
@@ -82,10 +81,9 @@ async fn work(ctx: &Arc<Ctx>, fork: &str) -> Design {
     let first = prompts::designer_first_message(&ctx.task, ctx.memory.context.as_deref());
     let mut conv = Conversation::new(prompts::DESIGNER_SYSTEM, tools, first, None);
     let mut meter = Meter::default();
-    let never = CancellationToken::new();
     let mut nudged = false;
     loop {
-        let resp = match agent::turn(ctx, &mut conv, MAX_TURNS, &mut meter, &never).await {
+        let resp = match agent::turn(ctx, &mut conv, MAX_TURNS, &mut meter, &ctx.cancel).await {
             Ok(resp) => resp,
             Err(Stop::OutOfTurns) => {
                 return Design::Failed("the check designer ran out of turns without submitting a check".into())
