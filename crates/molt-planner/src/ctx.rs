@@ -68,6 +68,8 @@ pub(crate) struct Ctx {
     pub stream: bool,
     /// What memory knows about the workspace; empty when memory is not up.
     pub memory: Memory,
+    /// The `<project_instructions>` block, when the project has instruction files.
+    pub instructions: Option<String>,
     tally: watch::Sender<Tally>,
     /// Forks created and not yet dropped or merged, so none outlives the run by accident.
     forks: Arc<Mutex<Vec<String>>>,
@@ -111,12 +113,20 @@ impl Ctx {
             budget_usd: req.budget_usd.unwrap_or(cfg.budget_usd),
             stream: req.stream,
             memory: Memory::default(),
+            instructions: None,
             cfg,
             tally: watch::Sender::new(Tally::default()),
             forks: Arc::default(),
             cancel: CancellationToken::new(),
             run_cancel: CancellationToken::new(),
         }
+    }
+
+    /// What the first message of every conversation starts with: the
+    /// project's instruction files, then what memory knows. The same in
+    /// every conversation of the run, so the prompt cache can share it.
+    pub fn preamble(&self) -> Vec<&str> {
+        self.instructions.iter().chain(&self.memory.context).map(String::as_str).collect()
     }
 
     pub fn scoped(&self, cancel: CancellationToken) -> Arc<Self> {

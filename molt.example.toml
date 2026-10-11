@@ -85,7 +85,7 @@ exec = { command = "molt-planner" }
 provides = ["planner.*"]
 pass_env = [
   "MOLT_PLANNER_MODEL", "MOLT_MAX_TURNS", "MOLT_MAX_CHECK_ROUNDS", "MOLT_BUDGET_USD", "MOLT_MAX_TOKENS",
-  "MOLT_MODEL_TIMEOUT_S", "MOLT_CHECK_TIMEOUT_S", "MOLT_MAP_TOKENS",
+  "MOLT_MODEL_TIMEOUT_S", "MOLT_CHECK_TIMEOUT_S", "MOLT_MAP_TOKENS", "MOLT_INSTRUCTION_FILES",
 ]
 requests = [
   { target = "model.complete", budget = { tokens = 4000000000, calls = 1000000 } },

@@ -143,7 +143,7 @@ impl Attempt {
             &ctx.task,
             self.check.as_ref().map(|c| (c.command.as_str(), paths.as_slice())),
             self.index,
-            ctx.memory.context.as_deref(),
+            &ctx.preamble(),
         );
         let tools = Arc::new(prompts::attempt_tools(ctx.memory.up));
         let system = if self.check.is_some() { prompts::ATTEMPT_SYSTEM } else { prompts::UNVERIFIED_SYSTEM };

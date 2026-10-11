@@ -8,6 +8,7 @@ mod agent;
 mod attempt;
 mod ctx;
 mod designer;
+mod instructions;
 mod memory;
 mod prompts;
 mod runner;
@@ -46,6 +47,9 @@ pub struct Config {
     /// replies to model calls that cancelled attempts left running, so their
     /// cost is counted. Calls still unanswered are reported as uncounted.
     pub late_reply_wait: Duration,
+    /// Names of the project's instruction files, looked for in the
+    /// workspace root and the directories the task names.
+    pub instruction_files: Vec<String>,
 }
 
 impl Default for Config {
@@ -61,6 +65,7 @@ impl Default for Config {
             max_concurrent_runs: 4,
             map_tokens: 3_000,
             late_reply_wait: Duration::from_secs(2),
+            instruction_files: vec!["AGENTS.md".into(), "CLAUDE.md".into()],
         }
     }
 }
@@ -68,8 +73,8 @@ impl Default for Config {
 impl Config {
     /// [`Config::default`] overridden by `MOLT_PLANNER_MODEL`,
     /// `MOLT_MAX_TURNS`, `MOLT_MAX_CHECK_ROUNDS`, `MOLT_BUDGET_USD`,
-    /// `MOLT_MAX_TOKENS`, `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S` and
-    /// `MOLT_MAP_TOKENS`.
+    /// `MOLT_MAX_TOKENS`, `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
+    /// `MOLT_MAP_TOKENS` and `MOLT_INSTRUCTION_FILES`.
     ///
     /// | Variable | Default |
     /// |---|---|
@@ -81,6 +86,7 @@ impl Config {
     /// | `MOLT_MODEL_TIMEOUT_S` | `1200` |
     /// | `MOLT_CHECK_TIMEOUT_S` | `900` |
     /// | `MOLT_MAP_TOKENS` | `3000` (at most 32000) |
+    /// | `MOLT_INSTRUCTION_FILES` | `AGENTS.md,CLAUDE.md`; `none` reads none |
     ///
     /// An empty variable counts as unset. A value that does not parse is an
     /// error, and so is a zero: none of these limits has a "no limit" value.
@@ -119,6 +125,20 @@ impl Config {
             map_tokens: small("MOLT_MAP_TOKENS", d.map_tokens)?.min(32_000),
             max_concurrent_runs: d.max_concurrent_runs,
             late_reply_wait: d.late_reply_wait,
+            instruction_files: match get("MOLT_INSTRUCTION_FILES") {
+                None => d.instruction_files,
+                Some(v) if v == "none" => Vec::new(),
+                Some(v) => {
+                    let names: Vec<String> =
+                        v.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_owned).collect();
+                    let plain = |n: &String| !n.contains('/') && n != "." && n != "..";
+                    ensure!(
+                        names.iter().all(plain),
+                        "MOLT_INSTRUCTION_FILES={v:?}: give file names, without directories, separated by commas"
+                    );
+                    names
+                }
+            },
         })
     }
 }
@@ -305,6 +325,7 @@ mod tests {
         assert_eq!(cfg.check_timeout, d.check_timeout);
         assert_eq!(cfg.max_concurrent_runs, d.max_concurrent_runs);
         assert_eq!(cfg.map_tokens, 3_000);
+        assert_eq!(cfg.instruction_files, ["AGENTS.md", "CLAUDE.md"]);
     }
 
     #[test]
@@ -328,6 +349,9 @@ mod tests {
         assert_eq!(cfg.max_tokens, 1000);
         assert_eq!(cfg.model_timeout, Duration::from_secs(5));
         assert_eq!(cfg.check_timeout, Duration::from_secs(6));
+        let files = |v: &str| from(&[("MOLT_INSTRUCTION_FILES", v)]).unwrap().instruction_files;
+        assert_eq!(files("AGENTS.md, .cursorrules,"), ["AGENTS.md", ".cursorrules"]);
+        assert!(files("none").is_empty());
     }
 
     #[test]
@@ -350,6 +374,8 @@ mod tests {
         assert!(from(&[("MOLT_BUDGET_USD", "-1")]).is_err());
         assert!(from(&[("MOLT_BUDGET_USD", "NaN")]).is_err());
         assert!(from(&[("MOLT_CHECK_TIMEOUT_S", "1.5")]).is_err());
+        assert!(from(&[("MOLT_INSTRUCTION_FILES", "docs/AGENTS.md")]).is_err());
+        assert!(from(&[("MOLT_INSTRUCTION_FILES", "..")]).is_err());
         // Empty means unset.
         assert_eq!(from(&[("MOLT_PLANNER_MODEL", " ")]).unwrap().default_model, None);
     }

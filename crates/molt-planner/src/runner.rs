@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::attempt::{self, Check, Finished};
 use crate::ctx::Ctx;
 use crate::designer::{self, Design};
-use crate::memory;
+use crate::{instructions, memory};
 use crate::{Bus, Config};
 
 const MAX_ATTEMPTS: u32 = 8;
@@ -39,6 +39,7 @@ pub(crate) async fn run_cancellable(
     ctx.cancel = cancel.clone();
     ctx.run_cancel = cancel;
     ctx.memory = memory::prepare(&ctx).await;
+    ctx.instructions = instructions::gather(&ctx).await;
     let ctx = Arc::new(ctx);
     tracing::info!(run = %ctx.trace, workspace = %ctx.workspace, attempts = req.attempts, "run started");
 
@@ -118,6 +119,7 @@ pub(crate) async fn design_cancellable(
     ctx.cancel = cancel.clone();
     ctx.run_cancel = cancel;
     ctx.memory = memory::prepare(&ctx).await;
+    ctx.instructions = instructions::gather(&ctx).await;
     let ctx = Arc::new(ctx);
     let design = designer::design(&ctx, true).await?;
     let spend = ctx.settle(ctx.cfg.late_reply_wait).await.spend;
