@@ -12,6 +12,67 @@ use molt_tools::{Fs, Roots};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+#[tokio::test]
+async fn a_durable_merge_retains_preimages_for_files_links_modes_and_dropped_forks() {
+    use molt_api::fs::{AppliesResponse, ApplyStatus, RecoverResponse};
+    let env = Env::new();
+    Env::put(&env.ws, &[("modified.txt", "old\n"), ("deleted.txt", "restore me\n"), ("run.sh", "echo hello\n")]);
+    fs::set_permissions(env.ws.join("modified.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+    symlink("modified.txt", env.ws.join("link")).unwrap();
+    let fork = env.fork().await;
+    Env::put(&fork, &[("modified.txt", "new\n"), ("new/added.txt", "added\n")]);
+    fs::remove_file(fork.join("deleted.txt")).unwrap();
+    fs::set_permissions(fork.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_file(fork.join("link")).unwrap();
+    symlink("new/added.txt", fork.join("link")).unwrap();
+    let merged = env.ok("merge", json!({"fork": fork, "drop": true})).await;
+    let id = merged["operation"].as_str().unwrap();
+    assert!(!fork.exists());
+    let operations: AppliesResponse =
+        serde_json::from_value(env.ok("applies", json!({"workspace": "ws"})).await).unwrap();
+    assert_eq!(operations.operations[0].status, ApplyStatus::Applied);
+    assert_eq!(fs::read_to_string(env.ws.join("modified.txt")).unwrap(), "new\n");
+    assert!(!env.ws.join("deleted.txt").exists());
+    assert_eq!(fs::read_link(env.ws.join("link")).unwrap(), Path::new("new/added.txt"));
+    for _ in 0..2 {
+        let (reply, changed) =
+            env.fs.handle_reporting("recover", json!({"workspace": "ws", "operation": id, "action": "undo"})).await;
+        let reply: RecoverResponse = serde_json::from_value(reply.unwrap()).unwrap();
+        assert_eq!(reply.operation.status, ApplyStatus::Undone);
+        if let Some(changed) = changed {
+            assert_eq!(changed.paths.len(), 5);
+        }
+    }
+    assert_eq!(fs::read_to_string(env.ws.join("modified.txt")).unwrap(), "old\n");
+    assert_eq!(fs::read_to_string(env.ws.join("deleted.txt")).unwrap(), "restore me\n");
+    assert!(!env.ws.join("new").exists());
+    assert_eq!(fs::read_link(env.ws.join("link")).unwrap(), Path::new("modified.txt"));
+    assert_eq!(fs::metadata(env.ws.join("modified.txt")).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(fs::metadata(env.ws.join("run.sh")).unwrap().permissions().mode() & 0o111, 0);
+    let record = env.scratch.join(".molt/applies").join(id);
+    assert_eq!(fs::metadata(&record).unwrap().permissions().mode() & 0o777, 0o700);
+    for f in fs::read_dir(record).unwrap() {
+        assert_eq!(f.unwrap().metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    assert!(env
+        .invalid(
+            "write",
+            json!({"workspace": env.scratch, "path": format!(".molt/applies/{id}/journal.json"), "content": "{}"})
+        )
+        .await
+        .contains("Molt's own data"));
+    assert!(env
+        .invalid("read", json!({"workspace": env.scratch.join(".molt/applies").join(id), "path": "journal.json"}))
+        .await
+        .contains("Molt's own data"));
+    let resumed: RecoverResponse = serde_json::from_value(
+        env.ok("recover", json!({"workspace": "ws", "operation": id, "action": "resume"})).await,
+    )
+    .unwrap();
+    assert_eq!(resumed.operation.status, ApplyStatus::Applied);
+    assert_eq!(fs::read_to_string(env.ws.join("modified.txt")).unwrap(), "new\n");
+}
+
 struct Env {
     tmp: TempDir,
     scratch: PathBuf,
@@ -445,7 +506,160 @@ async fn diff_and_merge_carry_changes_back() {
     assert!(env.ws.join("node_modules/pkg/index.js").is_file());
     assert!(env.ws.join(".git/HEAD").is_file());
     assert!(!fork.exists(), "drop: true removes the fork");
-    assert!(fs::read_dir(&env.scratch).unwrap().next().is_none(), "and its metadata");
+    assert!(!fork.with_extension("json").exists(), "drop removes the fork metadata");
+    assert_eq!(fs::read_dir(&env.scratch).unwrap().map(|e| e.unwrap().file_name()).collect::<Vec<_>>(), [".molt"]);
+    assert!(env
+        .scratch
+        .join(".molt/applies")
+        .join(reply["operation"].as_str().unwrap())
+        .join("journal.json")
+        .is_file());
+}
+
+fn mode(path: &Path) -> u32 {
+    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+fn chmod(path: &Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+async fn diff_of(env: &Env, fork: &Path) -> DiffResponse {
+    serde_json::from_value(env.ok("diff", json!({ "fork": fork })).await).unwrap()
+}
+
+#[tokio::test]
+async fn making_a_script_executable_in_a_fork_is_a_change_that_merges() {
+    let env = Env::new();
+    Env::put(&env.ws, &[("check.sh", "#!/bin/sh\nexit 0\n"), ("both.sh", "#!/bin/sh\nexit 1\n")]);
+    chmod(&env.ws.join("check.sh"), 0o644);
+    chmod(&env.ws.join("both.sh"), 0o640);
+    let fork = env.fork().await;
+    chmod(&fork.join("check.sh"), 0o755);
+    fs::write(fork.join("both.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    chmod(&fork.join("both.sh"), 0o750);
+
+    let diff = diff_of(&env, &fork).await;
+    let changes: Vec<_> = diff.changes.iter().map(|c| (c.path.as_str(), c.kind)).collect();
+    assert_eq!(changes, [("both.sh", ChangeKind::Modified), ("check.sh", ChangeKind::Modified)]);
+    assert!(diff.patch.contains("# check.sh: made executable\n"), "{}", diff.patch);
+    assert!(!diff.patch.contains("+++ b/check.sh"), "the content did not change: {}", diff.patch);
+    assert!(diff.patch.contains("# both.sh: made executable\n--- a/both.sh\n+++ b/both.sh\n"), "{}", diff.patch);
+
+    env.ok("merge", json!({ "fork": fork, "drop": true })).await;
+    // Read access gains execute, as chmod +x would give it.
+    assert_eq!(mode(&env.ws.join("check.sh")), 0o755);
+    assert_eq!(mode(&env.ws.join("both.sh")), 0o750);
+    assert_eq!(fs::read_to_string(env.ws.join("both.sh")).unwrap(), "#!/bin/sh\nexit 0\n");
+    for script in ["check.sh", "both.sh"] {
+        let ran = std::process::Command::new(env.ws.join(script)).status().unwrap();
+        assert!(ran.success(), "{script} runs after the merge, as it did in the fork");
+    }
+}
+
+#[tokio::test]
+async fn removing_the_execute_bit_merges_and_other_bits_stay_the_originals() {
+    let env = Env::new();
+    project(&env);
+    Env::put(&env.ws, &[("private.txt", "secret\n")]);
+    chmod(&env.ws.join("private.txt"), 0o600);
+    let fork = env.fork().await;
+    chmod(&fork.join("run.sh"), 0o644);
+    // Only the execute bit is carried back: the fork loosening a file's
+    // read bits while editing it does not reach the original.
+    fs::write(fork.join("private.txt"), "still secret\n").unwrap();
+    chmod(&fork.join("private.txt"), 0o644);
+
+    let diff = diff_of(&env, &fork).await;
+    assert!(diff.patch.contains("# run.sh: no longer executable\n"), "{}", diff.patch);
+    assert!(!diff.patch.contains("private.txt: "), "{}", diff.patch);
+    env.ok("merge", json!({ "fork": fork, "drop": true })).await;
+    assert_eq!(mode(&env.ws.join("run.sh")), 0o644);
+    assert_eq!(mode(&env.ws.join("private.txt")), 0o600);
+    assert_eq!(fs::read_to_string(env.ws.join("private.txt")).unwrap(), "still secret\n");
+}
+
+#[tokio::test]
+async fn a_mode_change_in_the_original_since_the_fork_is_a_conflict() {
+    let env = Env::new();
+    project(&env);
+    let fork = env.fork().await;
+    fs::write(fork.join("run.sh"), "#!/bin/sh\necho fork\n").unwrap();
+    chmod(&env.ws.join("run.sh"), 0o644);
+
+    let diff = diff_of(&env, &fork).await;
+    assert!(diff.patch.contains("# run.sh: the original changed since the fork"), "{}", diff.patch);
+    let err = env.err("merge", json!({ "fork": fork })).await;
+    assert!(err.message.starts_with("conflict:") && err.message.contains("run.sh"), "{}", err.message);
+    assert_eq!(fs::read_to_string(env.ws.join("run.sh")).unwrap(), "#!/bin/sh\necho run\n");
+    assert_eq!(mode(&env.ws.join("run.sh")), 0o644);
+
+    // The same mode on both sides is not a conflict.
+    let fork = env.fork().await;
+    chmod(&fork.join("README.md"), 0o755);
+    chmod(&env.ws.join("README.md"), 0o755);
+    assert!(diff_of(&env, &fork).await.patch.contains("# README.md: the original already has this change"));
+    env.ok("merge", json!({ "fork": fork, "drop": true })).await;
+}
+
+#[tokio::test]
+async fn a_new_file_never_brings_special_bits_from_the_fork() {
+    let env = Env::new();
+    project(&env);
+    let fork = env.fork().await;
+    Env::put(&fork, &[("tool.sh", "#!/bin/sh\n"), ("shared", "")]);
+    chmod(&fork.join("tool.sh"), 0o4755);
+    fs::create_dir(fork.join("dir")).unwrap();
+    symlink("../run.sh", fork.join("dir/link")).unwrap();
+    chmod(&fork.join("shared"), 0o1666);
+    env.ok("merge", json!({ "fork": fork, "drop": true })).await;
+    assert_eq!(mode(&env.ws.join("tool.sh")), 0o755);
+    assert_eq!(mode(&env.ws.join("shared")), 0o666);
+    assert_eq!(fs::read_link(env.ws.join("dir/link")).unwrap(), Path::new("../run.sh"));
+}
+
+#[tokio::test]
+async fn a_fork_made_before_modes_were_recorded_merges_as_it_did_then() {
+    let env = Env::new();
+    project(&env);
+    let fork = env.fork().await;
+    // Rewrite the metadata as the previous version wrote it: no version,
+    // content hashes without the executable mark.
+    let meta_path = env.scratch.join(format!("{}.json", fork.file_name().unwrap().to_str().unwrap()));
+    let mut meta: Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+    let run = meta["files"]["run.sh"].as_str().unwrap().to_owned();
+    assert!(run.ends_with("+x"), "{run}");
+    meta["files"]["run.sh"] = json!(run.trim_end_matches("+x"));
+    meta.as_object_mut().unwrap().remove("version");
+    fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+    // An executable file is not reported as changed, and a mode change is
+    // not seen, as before.
+    assert!(diff_of(&env, &fork).await.changes.is_empty());
+    chmod(&fork.join("README.md"), 0o755);
+    assert!(diff_of(&env, &fork).await.changes.is_empty());
+    fs::write(fork.join("run.sh"), "#!/bin/sh\necho fork\n").unwrap();
+    chmod(&fork.join("run.sh"), 0o644);
+    let diff = diff_of(&env, &fork).await;
+    assert_eq!(diff.changes.len(), 1, "{diff:?}");
+    env.ok("merge", json!({ "fork": fork, "drop": true })).await;
+    assert_eq!(fs::read_to_string(env.ws.join("run.sh")).unwrap(), "#!/bin/sh\necho fork\n");
+    assert_eq!(mode(&env.ws.join("run.sh")), 0o755, "the original keeps its mode");
+}
+
+#[tokio::test]
+async fn a_fork_from_a_newer_version_is_refused() {
+    let env = Env::new();
+    project(&env);
+    let fork = env.fork().await;
+    let meta_path = env.scratch.join(format!("{}.json", fork.file_name().unwrap().to_str().unwrap()));
+    let mut meta: Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+    meta["version"] = json!(99);
+    fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+    for method in ["diff", "merge"] {
+        let err = env.err(method, json!({ "fork": fork })).await;
+        assert!(err.message.contains("newer Molt"), "{}", err.message);
+    }
 }
 
 #[tokio::test]

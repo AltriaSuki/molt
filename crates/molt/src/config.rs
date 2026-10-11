@@ -14,6 +14,12 @@
 //! memory_mb = 512
 //! env = { GREETING = "hi" }           # set for the process
 //! pass_env = ["ECHO_PREFIX"]          # copied from molt's environment when set
+//!
+//! [confirm]                           # when the interface's confirm mode stops
+//! max_lines = 300
+//! max_files = 10
+//! ask_paths = [".github/", "Cargo.toml"]
+//! always_ask = false
 //! ```
 
 use std::collections::BTreeMap;
@@ -150,6 +156,51 @@ pub struct Config {
     pub kernel: KernelSection,
     #[serde(default, rename = "service")]
     pub services: Vec<ServiceSection>,
+    #[serde(default)]
+    pub confirm: ConfirmSection,
+}
+
+/// When the interface's confirm mode stops for the user. It goes on by
+/// itself when nothing here calls for a look.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmSection {
+    /// Stop before applying a result that adds and removes more lines than this.
+    #[serde(default = "default_max_lines")]
+    pub max_lines: usize,
+    /// Stop before applying a result that changes more files than this.
+    #[serde(default = "default_max_files")]
+    pub max_files: usize,
+    /// Stop before applying a result that changes one of these: a path, a
+    /// directory ending in `/`, or a file name matched in any directory.
+    #[serde(default = "default_ask_paths")]
+    pub ask_paths: Vec<String>,
+    /// Stop for every check and every result, as before these rules.
+    #[serde(default)]
+    pub always_ask: bool,
+}
+
+fn default_max_lines() -> usize {
+    300
+}
+
+fn default_max_files() -> usize {
+    10
+}
+
+fn default_ask_paths() -> Vec<String> {
+    [".github/", "Cargo.toml", "Cargo.lock", "package.json", "go.mod", "migrations/"].map(str::to_owned).to_vec()
+}
+
+impl Default for ConfirmSection {
+    fn default() -> Self {
+        Self {
+            max_lines: default_max_lines(),
+            max_files: default_max_files(),
+            ask_paths: default_ask_paths(),
+            always_ask: false,
+        }
+    }
 }
 
 /// What the gateway reads from its environment (see `molt_gateway::Config::from_env`).
@@ -178,6 +229,8 @@ const PLANNER_ENV: &[&str] = &[
     "MOLT_MODEL_TIMEOUT_S",
     "MOLT_CHECK_TIMEOUT_S",
     "MOLT_MAP_TOKENS",
+    "MOLT_CONTEXT_TOKENS",
+    "MOLT_INSTRUCTION_FILES",
 ];
 
 /// What the memory service reads from its environment (see `molt_memory::Config::from_env`).
@@ -186,6 +239,8 @@ const MEMORY_ENV: &[&str] =
 
 /// The memory database in a data dir.
 pub const MEMORY_DB: &str = "memory.db";
+/// The directory in the data dir where the planner keeps run checkpoints.
+pub const RUNS: &str = "runs";
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -250,7 +305,10 @@ impl Config {
             request(molt_proto::audit::READ, Budget::new(0, 0, 10_000_000))?,
             request(&format!("topic:subscribe:{}", molt_api::fs::CHANGED), Budget::new(0, 0, 10))?,
         ];
-        let mut planner = service("planner", Tier::Mutable, bin("molt-planner")?)?;
+        let mut planner_exec = bin("molt-planner")?;
+        // Checkpoints of runs, to resume one that stopped.
+        planner_exec.args = vec!["--state".into(), text(&data_dir.join(RUNS))?];
+        let mut planner = service("planner", Tier::Mutable, planner_exec)?;
         planner.pass_env = names(PLANNER_ENV);
         // A budget of zero calls refuses every call, and `ms` 0 leaves deadlines
         // to each request; the planner enforces the run's own limits.
@@ -269,6 +327,7 @@ impl Config {
         Ok(Self {
             kernel: KernelSection { data_dir: data_dir.to_path_buf(), ..KernelSection::default() },
             services: vec![model, fs, shell, memory, planner],
+            confirm: ConfirmSection::default(),
         })
     }
 
@@ -360,6 +419,15 @@ mod tests {
         assert_eq!(m.tier, Tier::Mutable);
         assert_eq!(m.requests[0].budget.calls, 100);
         assert!(cfg.services[0].env.is_empty() && cfg.services[0].pass_env.is_empty());
+    }
+
+    #[test]
+    fn the_confirm_rules_have_defaults_and_take_what_is_set() {
+        assert_eq!(Config::parse("").unwrap().confirm, ConfirmSection::default());
+        let cfg = Config::parse("[confirm]\nmax_lines = 50\nask_paths = [\"db/\"]\n").unwrap();
+        assert_eq!((cfg.confirm.max_lines, cfg.confirm.max_files), (50, 10));
+        assert_eq!(cfg.confirm.ask_paths, ["db/"]);
+        assert!(Config::parse("[confirm]\nmax_line = 50\n").is_err());
     }
 
     #[test]
@@ -457,6 +525,7 @@ mod tests {
 
         let planner = cfg.service("planner").unwrap();
         assert_eq!(planner.exec.as_ref().unwrap().command, "/opt/molt/bin/molt-planner");
+        assert_eq!(planner.exec.as_ref().unwrap().args, ["--state", "/cache/molt/proj/runs"]);
         assert!(planner.pass_env.iter().any(|v| v == "MOLT_MAX_TURNS"));
         assert!(!planner.pass_env.iter().any(|v| v.starts_with("ANTHROPIC")), "the planner never sees the key");
         let targets: Vec<String> = planner.requests.iter().map(|r| r.target.to_string()).collect();

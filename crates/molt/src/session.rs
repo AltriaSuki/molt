@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use anyhow::Context;
-use molt_api::fs::{self, DropRequest, DropResponse, MergeRequest, MergeResponse};
+use molt_api::fs::{self, DiffRequest, DiffResponse, DropRequest, DropResponse, MergeRequest, MergeResponse};
 use molt_api::memory::{
     self, ConsolidateRequest, ConsolidateResponse, ForgetRequest, ForgetResponse, RecallRequest, RecallResponse,
     Recalled,
@@ -36,6 +36,8 @@ const RUN_MS: u64 = 6 * 3600 * 1000;
 const TREE_MS: u64 = 600_000;
 /// Reply deadline for learning from a run.
 const LEARN_MS: u64 = 600_000;
+/// Reply deadline for listing a fork's changes while the session stops.
+const DIFF_MS: u64 = 10_000;
 /// Reply deadline for memory's notes.
 const NOTES_MS: u64 = 60_000;
 
@@ -90,7 +92,7 @@ impl Session {
             Some(_) => Some(agent::wait_until_up(kernel, &cli, MEMORY, deadline).await.map_err(|e| format!("{e:#}"))),
         };
         let budget = Budget::new(0, 0, CALLS);
-        let mut targets = vec![planner::RUN, planner::DESIGN, fs::MERGE, fs::DROP];
+        let mut targets = vec![planner::RUN, planner::DESIGN, fs::DIFF, fs::MERGE, fs::DROP];
         if memory.is_some() {
             targets.extend([memory::CONSOLIDATE, memory::RECALL, memory::FORGET]);
         }
@@ -143,19 +145,26 @@ impl Session {
         self.call(planner::RUN, req, RUN_MS, Some(trace)).await
     }
 
-    /// Have memory learn from the run `trace`, as `molt do` does after a run.
-    pub async fn learn(&self, trace: &TraceId) -> Result<ConsolidateResponse, String> {
+    /// Have memory learn from the run `trace`, as `molt do` does after a
+    /// run, with `model`, or memory's own default without one.
+    pub async fn learn(&self, trace: &TraceId, model: Option<String>) -> Result<ConsolidateResponse, String> {
         if let Some(problem) = self.memory_problem() {
             return Err(problem);
         }
         // A trace of its own, so the learning does not become part of the episode.
-        let req = ConsolidateRequest { episode: trace.to_string(), workspace: self.workspace.clone(), model: None };
+        let req = ConsolidateRequest { episode: trace.to_string(), workspace: self.workspace.clone(), model };
         self.call(memory::CONSOLIDATE, req, LEARN_MS, None).await.map_err(|e| format!("{e:#}"))
     }
 
     /// Merge a result kept in `fork` into the workspace, and drop the fork.
     pub async fn apply(&self, fork: &str) -> anyhow::Result<MergeResponse> {
         self.call(fs::MERGE, MergeRequest { fork: fork.to_owned(), drop: true }, TREE_MS, None).await
+    }
+
+    /// The paths `fork` changed.
+    pub async fn changes(&self, fork: &str) -> anyhow::Result<Vec<String>> {
+        let resp: DiffResponse = self.call(fs::DIFF, DiffRequest { fork: fork.to_owned() }, DIFF_MS, None).await?;
+        Ok(resp.changes.into_iter().map(|c| c.path).collect())
     }
 
     pub async fn discard(&self, fork: &str) -> anyhow::Result<()> {

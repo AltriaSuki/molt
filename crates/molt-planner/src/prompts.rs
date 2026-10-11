@@ -79,6 +79,64 @@ any other change you make is thrown away.
 
 Finish by calling submit_check.";
 
+pub(crate) const REVIEWER_SYSTEM: &str = "\
+You review a change another agent made to carry out a software task. The change passed the task's automated \
+done-check. Your job is to find out whether it did so by doing the task, or by gaming the check.
+
+Gaming the check includes:
+- hard-coding the outputs or values the check's tests expect, or special-casing their inputs, instead of \
+implementing the behavior;
+- deleting, skipping, disabling or weakening existing tests, or changing test configuration so tests do not run;
+- making the check's command pass without the task being done, for example by catching and hiding errors.
+
+You see the task, the check, and the change as a diff. The workspace is the changed copy: read files to see the \
+code around the change. You cannot change anything.
+
+Judge what the change does, not its style. An incomplete or rough change that honestly attempts the task is not \
+gaming; say so as a concern only if it plainly fails the task in a way the check misses.
+
+Finish by calling submit_review with:
+- approve: the change does the task;
+- concern: something needs a person's look before the change is used;
+- reject: the change games the check.
+Each finding is one sentence, naming the file and line of the diff it rests on.";
+
+pub(crate) const REVIEW_NUDGE: &str = "You have not called submit_review. Call it now with your verdict and findings.";
+
+/// The reviewer's first message: the task, the check, what the fixed rules
+/// found, and the diff, all as data.
+pub(crate) fn reviewer_first_message(
+    task: &str,
+    command: &str,
+    files: &[String],
+    rules: &[String],
+    patch: &str,
+    truncated: bool,
+) -> Value {
+    // The diff is the attempt's text: it must not close its block early.
+    let quoted = |s: &str| s.replace("</diff", "<\\/diff");
+    let mut text = format!("<task>\n{task}\n</task>\n\nThe done-check is `{command}`.");
+    if !files.is_empty() {
+        text.push_str(&format!(
+            " It uses these files, which the check's designer wrote and which are restored before every check run, \
+             so the change cannot have edited them: {}.",
+            files.join(", ")
+        ));
+    }
+    if !rules.is_empty() {
+        text.push_str("\n\nFixed rules flagged these; look at each:\n");
+        for r in rules {
+            text.push_str(&format!("- {r}\n"));
+        }
+    }
+    text.push_str(&format!("\n<diff>\n{}\n</diff>", quoted(patch.trim_end())));
+    if truncated {
+        text.push_str("\n\nThe diff was cut short; read the changed files for the rest.");
+    }
+    text.push_str("\n\nReview the change.");
+    user_blocks(vec![text_block(text)])
+}
+
 /// Extra guidance for attempt `index`, so parallel attempts explore different
 /// approaches. It goes in its own block after the task, keeping the shared
 /// part of the first message cacheable.
@@ -124,15 +182,16 @@ pub(crate) fn project_context(notes: &[Recalled], map: Option<&str>) -> Option<S
     Some(text)
 }
 
-/// The task, the check, and `context` first when memory gave one. The
-/// context is the same in every attempt's first message and comes before
+/// The task and the check, after the `preamble` blocks (the project's
+/// instruction files and memory's context, when there are any). The
+/// preamble is the same in every attempt's first message and comes before
 /// what differs between them. Attempts start together, so each still pays
 /// to cache it once; it saves on their later turns.
 pub(crate) fn attempt_first_message(
     task: &str,
     check: Option<(&str, &[String])>,
     index: u32,
-    context: Option<&str>,
+    preamble: &[&str],
 ) -> Value {
     let check = match check {
         Some((command, files)) => {
@@ -149,7 +208,7 @@ pub(crate) fn attempt_first_message(
                  so make it complete: the answer, or what you changed."
             .to_owned(),
     };
-    let mut blocks: Vec<Value> = context.map(text_block).into_iter().collect();
+    let mut blocks: Vec<Value> = preamble.iter().map(|b| text_block(*b)).collect();
     blocks.push(text_block(format!("<task>\n{task}\n</task>\n\n{check}")));
     if let Some(hint) = hint(index) {
         blocks.push(text_block(hint));
@@ -157,8 +216,8 @@ pub(crate) fn attempt_first_message(
     user_blocks(blocks)
 }
 
-pub(crate) fn designer_first_message(task: &str, context: Option<&str>) -> Value {
-    let mut blocks: Vec<Value> = context.map(text_block).into_iter().collect();
+pub(crate) fn designer_first_message(task: &str, preamble: &[&str]) -> Value {
+    let mut blocks: Vec<Value> = preamble.iter().map(|b| text_block(*b)).collect();
     blocks.push(text_block(format!("<task>\n{task}\n</task>\n\nDesign the done-check for this task.")));
     user_blocks(blocks)
 }
@@ -168,6 +227,10 @@ Write big files in smaller pieces: several smaller files, or a first part follow
 
 pub(crate) const CUT_OFF: &str = "This call was cut off because your reply reached the output length limit, \
 so it was not run. Write big files in smaller pieces and try again.";
+
+/// The result of a tool call a stopped run left running.
+pub(crate) const INTERRUPTED: &str = "The run was stopped while this call ran, and has now been resumed. Whether the \
+     call took effect is not known: look at the files (or run a command that only reads) before doing it again.";
 
 pub(crate) const FINAL_REPLY: &str = "Your reply was empty. If you are done, give your final reply now: the answer, \
 or a short summary of what you changed. Otherwise, carry on.";
@@ -379,6 +442,37 @@ fn file_and_shell_tools() -> Vec<Value> {
     ]
 }
 
+/// The reviewer's tools: reading and searching, plus submit_review.
+pub(crate) fn reviewer_tools() -> Vec<Value> {
+    let mut tools: Vec<Value> = file_and_shell_tools()
+        .into_iter()
+        .filter(|t| REVIEWER_READS.contains(&t["name"].as_str().unwrap_or_default()))
+        .collect();
+    tools.push(tool(
+        t::SUBMIT_REVIEW,
+        "Submit your review. This ends your work.",
+        json!({
+            "verdict": {
+                "type": "string",
+                "enum": ["approve", "concern", "reject"],
+                "description": "approve: the change does the task. concern: it needs a person's look. reject: it \
+                                games the check.",
+            },
+            "findings": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "What the verdict rests on, one sentence each, naming the file and line of the diff. \
+                                Empty only for a plain approve.",
+            },
+        }),
+        &["verdict", "findings"],
+    ));
+    tools
+}
+
+/// The only tools a reviewer's calls may use: none of them changes the fork.
+pub(crate) const REVIEWER_READS: &[&str] = &[t::READ_FILE, t::LIST_FILES, t::SEARCH];
+
 /// The designer's tools: an attempt's, plus submit_check.
 pub(crate) fn designer_tools(memory: bool) -> Vec<Value> {
     let mut tools = attempt_tools(memory);
@@ -505,21 +599,21 @@ mod tests {
         assert!(!project_context(&[], Some("m")).unwrap().contains("Notes from"));
 
         // It goes first, before the task, for the designer and every attempt alike.
-        let first = attempt_first_message("t", None, 1, Some(&text));
+        let first = attempt_first_message("t", None, 1, &[&text]);
         assert_eq!(first["content"][0]["text"], text.as_str());
         assert_eq!(first["content"].as_array().unwrap().len(), 3);
-        assert_eq!(designer_first_message("t", Some(&text))["content"][0]["text"], text.as_str());
-        assert_eq!(designer_first_message("t", None)["content"].as_array().unwrap().len(), 1);
+        assert_eq!(designer_first_message("t", &[&text])["content"][0]["text"], text.as_str());
+        assert_eq!(designer_first_message("t", &[])["content"].as_array().unwrap().len(), 1);
     }
 
     #[test]
     fn hints_vary_by_attempt() {
         let blocks =
-            |i| attempt_first_message("t", Some(("make test", &[])), i, None)["content"].as_array().unwrap().len();
+            |i| attempt_first_message("t", Some(("make test", &[])), i, &[])["content"].as_array().unwrap().len();
         assert_eq!((blocks(0), blocks(1), blocks(2), blocks(3)), (1, 2, 2, 1));
         assert_ne!(hint(1), hint(2));
         // The shared first block is identical across attempts, so it caches.
-        let first = |i| attempt_first_message("t", Some(("make test", &[])), i, None)["content"][0].clone();
+        let first = |i| attempt_first_message("t", Some(("make test", &[])), i, &[])["content"][0].clone();
         assert_eq!(first(0), first(1));
     }
 }

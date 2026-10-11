@@ -33,6 +33,7 @@ const RECALL_K: u32 = 8;
 pub(crate) enum Actor {
     Designer,
     Attempt { index: u32, turn: u32 },
+    Reviewer,
 }
 
 #[derive(Debug)]
@@ -263,6 +264,7 @@ async fn report(ctx: &Ctx, actor: Actor, tool: &str, detail: &str) {
                 .await
         }
         Actor::Designer => ctx.note(format!("check designer: {detail}")).await,
+        Actor::Reviewer => ctx.note(format!("reviewer: {detail}")).await,
     }
 }
 
