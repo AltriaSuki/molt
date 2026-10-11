@@ -14,6 +14,7 @@ use molt_proto::TraceId;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::Line;
 
+use super::preview::Preview;
 use super::text::{self, block, clean_line, span, Tone};
 use crate::agent::outcome_name;
 
@@ -51,7 +52,7 @@ impl Mode {
 }
 
 /// What the next task runs with.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub attempts: Option<u32>,
     pub model: Option<String>,
@@ -59,6 +60,13 @@ pub struct Settings {
     pub budget_usd: Option<f64>,
     /// A check command of the user's, used instead of a designed one.
     pub check: Option<String>,
+    pub stream: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { attempts: None, model: None, effort: None, budget_usd: None, check: None, stream: true }
+    }
 }
 
 /// Work for the runtime.
@@ -159,6 +167,7 @@ pub struct Lane {
     pub turn: u32,
     pub status: Option<AttemptStatus>,
     pub lines: Vec<Line<'static>>,
+    pub preview: Preview,
 }
 
 pub struct Task {
@@ -166,6 +175,7 @@ pub struct Task {
     pub req: RunRequest,
     pub phase: Phase,
     pub lanes: Vec<Lane>,
+    pub designer_preview: Preview,
     /// The check is in the log already.
     check_shown: bool,
     recalled_shown: bool,
@@ -637,6 +647,7 @@ impl App {
         req.effort = self.settings.effort;
         req.budget_usd = self.settings.budget_usd;
         req.apply = self.mode == Mode::Auto;
+        req.stream = self.settings.stream;
 
         self.gap();
         self.push(Line::from(vec![span("› ", Tone::Shell), span(clean_line(&line), Tone::Plain)]));
@@ -645,6 +656,7 @@ impl App {
             req,
             phase: Phase::Running,
             lanes: Vec::new(),
+            designer_preview: Preview::default(),
             check_shown: false,
             recalled_shown: false,
             notes_seen: HashSet::new(),
@@ -701,6 +713,17 @@ impl App {
                 }
                 _ => self.flash = Some("attempts: 1 to 8".into()),
             },
+            "stream" => {
+                match arg {
+                    "on" | "default" | "" => self.settings.stream = true,
+                    "off" => self.settings.stream = false,
+                    _ => {
+                        self.flash = Some("stream: on or off".into());
+                        return Vec::new();
+                    }
+                }
+                self.flash = Some(format!("stream: {} (next task)", if self.settings.stream { "on" } else { "off" }));
+            }
             "model" => {
                 self.settings.model = (!arg.is_empty() && arg != "default").then(|| arg.to_owned());
                 self.flash = Some(set("model", self.settings.model.as_deref().unwrap_or("default")));
@@ -792,8 +815,36 @@ impl App {
                     self.log.push(Line::from(span(format!("  and {} more", notes.len() - 5), Tone::Dim)));
                 }
             }
-            // Model streaming is opt-in and the terminal interface does not ask for it.
-            Progress::ModelStarted { .. } | Progress::ModelText { .. } | Progress::ModelFinished { .. } => {}
+            event @ (Progress::ModelStarted { .. } | Progress::ModelText { .. } | Progress::ModelFinished { .. }) => {
+                if !task.req.stream {
+                    return;
+                }
+                let context = event.model_call().expect("a model event has a context");
+                match context.attempt {
+                    Some(attempt) if attempt < task.req.attempts && attempt < 8 => {
+                        if !task.lanes.iter().any(|l| l.index == attempt) {
+                            task.lanes.push(Lane {
+                                index: attempt,
+                                turn: 0,
+                                status: None,
+                                lines: Vec::new(),
+                                preview: Preview::default(),
+                            });
+                            task.lanes.sort_by_key(|l| l.index);
+                        }
+                        let lane = lane(task, attempt).expect("the lane was created");
+                        if context.turn < lane.turn || lane.status.is_some() {
+                            return;
+                        }
+                        lane.turn = context.turn;
+                        for line in lane.preview.feed(&event) {
+                            lane.push(line);
+                        }
+                    }
+                    None => self.log.extend(task.designer_preview.feed(&event)),
+                    _ => {}
+                }
+            }
             Progress::Note { message, .. } => {
                 if task.notes_seen.insert(message.clone()) {
                     self.log.push(Line::from(span(format!("  {}", clean_line(&message)), Tone::Dim)));
@@ -801,7 +852,13 @@ impl App {
             }
             Progress::AttemptStarted { attempt, .. } => {
                 if !task.lanes.iter().any(|l| l.index == attempt) {
-                    task.lanes.push(Lane { index: attempt, turn: 0, status: None, lines: Vec::new() });
+                    task.lanes.push(Lane {
+                        index: attempt,
+                        turn: 0,
+                        status: None,
+                        lines: Vec::new(),
+                        preview: Preview::default(),
+                    });
                     task.lanes.sort_by_key(|l| l.index);
                 }
             }
@@ -826,6 +883,9 @@ impl App {
             }
             Progress::AttemptFinished { attempt, status, .. } => {
                 if let Some(lane) = lane(task, attempt) {
+                    if let Some(line) = lane.preview.finish("ended; final preview event unavailable", true) {
+                        lane.push(line);
+                    }
                     lane.status = Some(status);
                 }
             }
@@ -837,6 +897,7 @@ impl App {
         if task.trace != trace {
             return Vec::new();
         }
+        self.log.extend(task.designer_preview.finish("ended; final preview event unavailable", true));
         match result {
             Ok(d) => {
                 self.spent_usd += d.cost_usd;
@@ -1210,6 +1271,7 @@ fn help() -> Vec<Line<'static>> {
         row("/memory [words]", "notes about this project"),
         row("/check [command]", "use this check for every task; empty: design one"),
         row("/attempts N", "attempts at once, 1 to 8"),
+        row("/stream on|off", "model text previews for the next task"),
         row("/model NAME", "opus, sonnet, haiku or a model id"),
         row("/effort LEVEL", "low, medium, high, xhigh or max"),
         row("/budget USD", "spending limit per task"),
@@ -1268,6 +1330,110 @@ mod tests {
 
     fn log(app: &App) -> String {
         plain(&app.log).join("\n")
+    }
+
+    fn frame_text(app: &mut App) -> String {
+        let backend = ratatui::backend::TestBackend::new(140, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| super::super::view::draw(frame, app)).unwrap();
+        terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    fn model_context(app: &App, attempt: Option<u32>, seq: u64) -> molt_api::progress::ModelCall {
+        molt_api::progress::ModelCall {
+            run: app.task.as_ref().unwrap().trace.to_string(),
+            attempt,
+            turn: 1,
+            call: "fake-stream".into(),
+            seq,
+        }
+    }
+
+    #[test]
+    fn streamed_model_text_updates_the_frame_and_folds_without_becoming_a_result() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        assert!(matches!(&actions[0], Action::Run { req, .. } if req.stream));
+        let context = model_context(&app, Some(0), 0);
+        app.update(Msg::Progress(Progress::ModelStarted { context }));
+        let context = model_context(&app, Some(0), 1);
+        assert!(app
+            .update(Msg::Progress(Progress::ModelText { context, text: "latest streamed text\x1b\x07".into() }))
+            .is_empty());
+        let shown = frame_text(&mut app);
+        assert!(shown.contains("model preview") && shown.contains("latest streamed text"), "{shown}");
+        assert_eq!(app.spent_usd, 0.0, "preview events cannot settle spending");
+        let context = model_context(&app, Some(0), 3);
+        app.update(Msg::Progress(Progress::ModelText { context, text: " after a gap".into() }));
+        assert!(frame_text(&mut app).contains("gaps in preview"));
+        let context = model_context(&app, Some(0), 4);
+        app.update(Msg::Progress(Progress::ModelFinished {
+            context,
+            usage: Some(Usage::default()),
+            cost_usd: Some(0.02),
+            error: None,
+        }));
+        let shown = frame_text(&mut app);
+        assert!(shown.contains("model preview finished · gaps"), "{shown}");
+        assert!(app.task.as_ref().unwrap().lanes[0].preview.lines(100, 4).is_empty());
+        let context = model_context(&app, Some(0), 5);
+        app.update(Msg::Progress(Progress::ModelText { context, text: "late forged result".into() }));
+        assert!(!frame_text(&mut app).contains("forged result"));
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        assert!(app.update(Msg::Ran { trace, result: Err("the model refused".into()) }).is_empty());
+        assert!(app.task.is_none() && app.prompt.is_none());
+        assert!(log(&app).contains("the model refused"));
+    }
+
+    #[test]
+    fn previews_can_be_disabled_and_cancellation_cannot_revive_them() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        type_in(&mut app, "/stream off");
+        let actions = type_in(&mut app, "implement it");
+        assert!(matches!(&actions[0], Action::Run { req, .. } if !req.stream));
+        let context = model_context(&app, Some(0), 1);
+        app.update(Msg::Progress(Progress::ModelText { context, text: "hidden preview".into() }));
+        assert!(app.task.as_ref().unwrap().lanes.is_empty());
+        assert!(!frame_text(&mut app).contains("hidden preview"));
+        app.update(key(KeyCode::Esc));
+        up(&mut app);
+        type_in(&mut app, "/stream on");
+        type_in(&mut app, "implement it again");
+        let context = model_context(&app, Some(0), 1);
+        app.update(Msg::Progress(Progress::ModelText { context: context.clone(), text: "provisional".into() }));
+        assert!(frame_text(&mut app).contains("provisional"));
+        assert!(matches!(app.update(key(KeyCode::Esc))[0], Action::Interrupt { .. }));
+        assert!(app.task.is_none() && app.prompt.is_none());
+        app.update(Msg::Progress(Progress::ModelText { context, text: "late result".into() }));
+        assert!(!frame_text(&mut app).contains("late result"));
+    }
+
+    #[test]
+    fn designer_previews_fold_on_errors_without_creating_a_check() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "implement it");
+        assert!(matches!(&actions[0], Action::Design { req, .. } if req.stream));
+        let context = model_context(&app, None, 0);
+        app.update(Msg::Progress(Progress::ModelStarted { context }));
+        let context = model_context(&app, None, 1);
+        app.update(Msg::Progress(Progress::ModelText { context, text: "designing stream".into() }));
+        assert!(frame_text(&mut app).contains("designing stream"));
+        let context = model_context(&app, None, 2);
+        app.update(Msg::Progress(Progress::ModelFinished {
+            context,
+            usage: None,
+            cost_usd: None,
+            error: Some("cancelled".into()),
+        }));
+        assert!(log(&app).contains("model preview stopped (cancelled)"));
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        assert!(app.update(Msg::Designed { trace, result: Err("cancelled".into()) }).is_empty());
+        assert!(app.task.is_none() && app.prompt.is_none());
     }
 
     fn design() -> DesignResponse {

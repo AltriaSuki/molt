@@ -539,7 +539,7 @@ async fn call_planner(cli: &Service, req: &RunRequest, trace: &TraceId) -> anyho
 }
 
 /// The progress event `msg` carries, if it is one of run `run`'s.
-fn progress_of(msg: &Envelope, run: &str) -> Option<Progress> {
+pub(crate) fn progress_of(msg: &Envelope, run: &str) -> Option<Progress> {
     let on_topic = matches!(&msg.to, Target::Topic { name } if name == progress::TOPIC);
     if msg.kind != Kind::Event || !on_topic {
         return None;

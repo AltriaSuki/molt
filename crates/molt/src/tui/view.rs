@@ -202,9 +202,16 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             ]
         }
         None => match &app.task {
-            Some(Task { phase: Phase::Designing, .. }) => busy("designing the check"),
+            Some(task @ Task { phase: Phase::Designing, .. }) => {
+                let mut lines = busy("designing the check");
+                lines.extend(task.designer_preview.lines(width, 4));
+                lines
+            }
             Some(task @ Task { phase: Phase::Running, .. }) if task.lanes.is_empty() => {
-                busy(if task.req.check.is_some() || !task.req.verify { "starting" } else { "designing the check" })
+                let mut lines =
+                    busy(if task.req.check.is_some() || !task.req.verify { "starting" } else { "designing the check" });
+                lines.extend(task.designer_preview.lines(width, 4));
+                lines
             }
             Some(Task { phase: Phase::Applying, .. }) => busy("applying"),
             _ => Vec::new(),
@@ -259,9 +266,13 @@ fn draw_lanes(frame: &mut Frame, area: Rect, app: &App) {
                 .title(Line::from(span(format!(" {status} "), tone)).right_aligned());
             let inner = block.inner(cols[c]);
             frame.render_widget(block, cols[c]);
+            let preview = lane.preview.lines(inner.width, usize::from(inner.height).min(4));
+            let history_height = usize::from(inner.height).saturating_sub(preview.len());
             let lines = wrap_all(&lane.lines, inner.width);
-            let skip = lines.len().saturating_sub(usize::from(inner.height));
-            frame.render_widget(Paragraph::new(lines[skip..].to_vec()), inner);
+            let skip = lines.len().saturating_sub(history_height);
+            let mut shown = lines[skip..].to_vec();
+            shown.extend(preview);
+            frame.render_widget(Paragraph::new(shown), inner);
         }
     }
 }
@@ -324,6 +335,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     }
     if let Some(check) = &s.check {
         parts.push(format!("check: {}", text::fit(&clean_line(check), 24)));
+    }
+    if !s.stream {
+        parts.push("previews off".into());
     }
     let mut cost = format!("${:.2}", app.spent_usd);
     if let Some(b) = s.budget_usd {
