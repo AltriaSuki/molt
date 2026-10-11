@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use molt_api::fs::ChangeKind;
-use molt_api::memory::{ConsolidateResponse, Recalled};
+use molt_api::memory::{ConsolidateResponse, RecallSnapshot, Recalled, ReviewRequest, ReviewResponse};
 use molt_api::model::Effort;
 use molt_api::planner::{AttemptStatus, DesignResponse, Outcome, RunRequest, RunResponse};
 use molt_api::progress::Progress;
@@ -89,6 +89,13 @@ pub enum Action {
         id: String,
         reason: String,
     },
+    ChangeNote {
+        review: ReviewRequest,
+        text: Option<String>,
+    },
+    UsedNotes {
+        run: String,
+    },
     /// Stop everything in flight: the services are stopped and started again.
     Interrupt {
         keep: Vec<String>,
@@ -132,6 +139,11 @@ pub enum Msg {
     Forgot {
         id: String,
         result: Result<bool, String>,
+    },
+    ChangedNote(Result<ReviewResponse, String>),
+    UsedNotes {
+        run: String,
+        result: Result<Vec<RecallSnapshot>, String>,
     },
 }
 
@@ -207,6 +219,93 @@ pub enum MemoryEdit {
     Filter(Input),
     /// Why the selected note is wrong.
     Reason(Input),
+    Change(Box<NoteChange>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChangeStep {
+    Text,
+    Reason,
+    Dependencies,
+    Confirm,
+}
+
+pub struct NoteChange {
+    pub review: ReviewRequest,
+    pub text: Option<Input>,
+    pub reason: Input,
+    pub dependencies: Input,
+    pub step: ChangeStep,
+}
+
+impl NoteChange {
+    fn new(workspace: &str, note: &Recalled, correct: bool) -> Self {
+        Self {
+            review: ReviewRequest {
+                workspace: workspace.to_owned(),
+                id: note.note.id.clone(),
+                expected_rev: note.note.rev,
+                reason: String::new(),
+                depends_on: Vec::new(),
+                temporary: note.details.temporary,
+            },
+            text: correct.then(|| Input::with(&note.note.text)),
+            reason: Input::default(),
+            dependencies: Input::with(
+                &note.details.dependencies.iter().map(|d| d.path.as_str()).collect::<Vec<_>>().join("; "),
+            ),
+            step: if correct { ChangeStep::Text } else { ChangeStep::Reason },
+        }
+    }
+
+    pub fn input(&self) -> Option<&Input> {
+        match self.step {
+            ChangeStep::Text => self.text.as_ref(),
+            ChangeStep::Reason => Some(&self.reason),
+            ChangeStep::Dependencies => Some(&self.dependencies),
+            ChangeStep::Confirm => None,
+        }
+    }
+
+    fn input_mut(&mut self) -> Option<&mut Input> {
+        match self.step {
+            ChangeStep::Text => self.text.as_mut(),
+            ChangeStep::Reason => Some(&mut self.reason),
+            ChangeStep::Dependencies => Some(&mut self.dependencies),
+            ChangeStep::Confirm => None,
+        }
+    }
+
+    fn advance(&mut self) -> Result<Option<Action>, &'static str> {
+        self.step = match self.step {
+            ChangeStep::Text if self.text.as_ref().is_none_or(|i| i.text.trim().is_empty()) => {
+                return Err("enter the corrected note")
+            }
+            ChangeStep::Text => ChangeStep::Reason,
+            ChangeStep::Reason if self.reason.text.trim().is_empty() => {
+                return Err("say why this review or correction is justified")
+            }
+            ChangeStep::Reason => ChangeStep::Dependencies,
+            ChangeStep::Dependencies => ChangeStep::Confirm,
+            ChangeStep::Confirm => {
+                let mut review = self.review.clone();
+                review.reason = self.reason.text.trim().to_owned();
+                review.depends_on = self
+                    .dependencies
+                    .text
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                return Ok(Some(Action::ChangeNote {
+                    review,
+                    text: self.text.as_ref().map(|i| i.text.trim().to_owned()),
+                }));
+            }
+        };
+        Ok(None)
+    }
 }
 
 /// A one-line text field.
@@ -301,6 +400,7 @@ pub struct App {
     pub prompt: Option<Prompt>,
     pub viewer: Option<Viewer>,
     pub screen: Screen,
+    pub last_run: Option<String>,
     /// Spent in this session: designs, runs and learning.
     pub spent_usd: f64,
     /// Runs memory is learning from.
@@ -344,6 +444,7 @@ impl App {
             prompt: None,
             viewer: None,
             screen: Screen::Main,
+            last_run: None,
             spent_usd: 0.0,
             learning: HashSet::new(),
             kept: Vec::new(),
@@ -397,6 +498,11 @@ impl App {
                 match &mut self.screen {
                     Screen::Memory(view) => match &mut view.edit {
                         Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input)) => input.insert(&text),
+                        Some(MemoryEdit::Change(change)) => {
+                            if let Some(input) = change.input_mut() {
+                                input.insert(&text);
+                            }
+                        }
                         None => {}
                     },
                     Screen::Main => self.input.insert(&text),
@@ -479,6 +585,31 @@ impl App {
                     }
                     Screen::Main => Vec::new(),
                 }
+            }
+            Msg::ChangedNote(result) => {
+                let Screen::Memory(view) = &mut self.screen else { return Vec::new() };
+                view.loading = false;
+                match result {
+                    Ok(response) => {
+                        self.flash = Some(format!("{} revision {} saved", response.note.id, response.note.rev));
+                        view.loading = true;
+                        vec![Action::LoadNotes { query: view.query.clone() }]
+                    }
+                    Err(error) => {
+                        view.error = Some(clean_line(&error));
+                        Vec::new()
+                    }
+                }
+            }
+            Msg::UsedNotes { run, result } => {
+                let Some(viewer) = self.viewer.as_mut().filter(|v| v.title == format!("memory used: {run}")) else {
+                    return Vec::new();
+                };
+                viewer.lines = match result {
+                    Ok(snapshots) => snapshot_lines(&snapshots),
+                    Err(error) => block(&error, "", Tone::Bad),
+                };
+                Vec::new()
             }
         }
     }
@@ -649,6 +780,7 @@ impl App {
             recalled_shown: false,
             notes_seen: HashSet::new(),
         };
+        self.last_run = Some(trace.to_string());
         let action = if let Some(check) = &self.settings.check {
             task.req.check = Some(check.clone());
             Action::Run { req: task.req.clone(), trace }
@@ -667,6 +799,10 @@ impl App {
         let (name, arg) = command.split_once(' ').map_or((command, ""), |(n, a)| (n, a.trim()));
         let set = |what: &str, value: &str| format!("{what}: {value}");
         match name {
+            "memory-used" => {
+                let run = if arg.is_empty() { self.last_run.clone() } else { Some(arg.to_owned()) };
+                return self.open_used(run);
+            }
             "help" => {
                 self.viewer = Some(Viewer { title: "help".into(), lines: help(), scroll: 0 });
             }
@@ -782,6 +918,10 @@ impl App {
                 });
                 head.push(span(format!("  {}", parts.join(" · ")), Tone::Dim));
                 self.log.push(Line::from(head));
+                self.log.push(Line::from(span(
+                    format!("  /memory-used {} · recorded recall context", task.trace),
+                    Tone::Dim,
+                )));
                 for n in notes.iter().take(5) {
                     self.log.push(Line::from(vec![
                         span(format!("  {:.2} ", n.confidence), Tone::Mem),
@@ -1119,8 +1259,53 @@ impl App {
         }
     }
 
+    fn open_used(&mut self, run: Option<String>) -> Vec<Action> {
+        let Some(run) = run else {
+            self.flash = Some("no task has run yet; use /memory-used RUN".into());
+            return Vec::new();
+        };
+        self.viewer = Some(Viewer {
+            title: format!("memory used: {run}"),
+            lines: block("loading recorded context", "", Tone::Dim),
+            scroll: 0,
+        });
+        vec![Action::UsedNotes { run }]
+    }
+
     fn memory_key(&mut self, key: &KeyEvent) -> Vec<Action> {
         let Screen::Memory(view) = &mut self.screen else { return Vec::new() };
+        if let Some(MemoryEdit::Change(change)) = &mut view.edit {
+            match key.code {
+                KeyCode::Esc => view.edit = None,
+                KeyCode::Enter => match change.advance() {
+                    Ok(Some(action)) => {
+                        view.edit = None;
+                        view.loading = true;
+                        view.error = None;
+                        return vec![action];
+                    }
+                    Ok(None) => {}
+                    Err(error) => self.flash = Some(error.into()),
+                },
+                KeyCode::BackTab => {
+                    change.step = match change.step {
+                        ChangeStep::Confirm => ChangeStep::Dependencies,
+                        ChangeStep::Dependencies => ChangeStep::Reason,
+                        ChangeStep::Reason if change.text.is_some() => ChangeStep::Text,
+                        step => step,
+                    }
+                }
+                KeyCode::Char('t') if change.step == ChangeStep::Confirm => {
+                    change.review.temporary = !change.review.temporary
+                }
+                _ => {
+                    if let Some(input) = change.input_mut() {
+                        input.key(key);
+                    }
+                }
+            }
+            return Vec::new();
+        }
         if let Some(edit) = &mut view.edit {
             match key.code {
                 KeyCode::Esc => view.edit = None,
@@ -1141,13 +1326,17 @@ impl App {
                         }
                         return vec![Action::Forget { id: note.note.id.clone(), reason }];
                     }
-                    None => {}
+                    Some(MemoryEdit::Change(_)) | None => {}
                 },
                 _ => {
-                    let (MemoryEdit::Filter(input) | MemoryEdit::Reason(input)) = edit;
-                    input.key(key);
+                    if let MemoryEdit::Filter(input) | MemoryEdit::Reason(input) = edit {
+                        input.key(key);
+                    }
                 }
             }
+            return Vec::new();
+        }
+        if view.loading && matches!(key.code, KeyCode::Char('a' | 'c' | 'f' | 'v') | KeyCode::Enter) {
             return Vec::new();
         }
         match key.code {
@@ -1158,6 +1347,25 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => view.selected = view.selected.saturating_sub(1),
             KeyCode::Char('/') => view.edit = Some(MemoryEdit::Filter(Input::with(&view.query))),
             KeyCode::Char('f') if !view.notes.is_empty() => view.edit = Some(MemoryEdit::Reason(Input::default())),
+            KeyCode::Char('a') | KeyCode::Char('c') => {
+                if let Some(note) = view.notes.get(view.selected) {
+                    view.edit = Some(MemoryEdit::Change(Box::new(NoteChange::new(
+                        &self.workspace_path,
+                        note,
+                        key.code == KeyCode::Char('c'),
+                    ))));
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('v') => {
+                if let Some(note) = view.notes.get(view.selected) {
+                    self.viewer = Some(Viewer {
+                        title: format!("{} revision {}", clean_line(&note.note.id), note.note.rev),
+                        lines: memory_lines(note),
+                        scroll: 0,
+                    });
+                }
+            }
+            KeyCode::Char('u') => return self.open_used(self.last_run.clone()),
             KeyCode::Char('r') => {
                 view.loading = true;
                 return vec![Action::LoadNotes { query: view.query.clone() }];
@@ -1166,6 +1374,62 @@ impl App {
         }
         Vec::new()
     }
+}
+
+/// Shared by the detail pane and its scrollable full view. Every field is
+/// display data, including evidence IDs, dependency paths, and note text.
+pub fn memory_lines(r: &Recalled) -> Vec<Line<'static>> {
+    let n = &r.note;
+    let mut fields = vec![
+        format!("{} revision {} · {}", n.id, n.rev, n.kind.as_str()),
+        format!("score {:.3} · confidence {:.3} · recency {:.3}", r.score, r.reason.confidence, r.reason.recency),
+        format!("keywords: {}", r.reason.keywords.as_deref().unwrap_or("none (confidence and recency)")),
+        format!("relevance: {}", r.reason.relevance.map_or("unavailable".into(), |v| format!("{v:.3}"))),
+    ];
+    if r.details.temporary {
+        fields.push("temporary experience · verify before reuse".into());
+    }
+    if !r.details.needs_review.is_empty() {
+        fields.push(format!("needs review: {}", r.details.needs_review.join(", ")));
+    }
+    fields.push(format!("review reason: {}", if r.details.reason.is_empty() { "none" } else { &r.details.reason }));
+    for d in &r.details.dependencies {
+        fields.push(format!("depends on: {} · sha256 {}", d.path, d.sha256));
+    }
+    if let Some(id) = &r.details.supersedes {
+        fields.push(format!("supersedes: {id}"));
+    }
+    fields.extend([
+        format!("source: {}@{} · run {}", n.provenance.service, n.provenance.version, n.provenance.trace),
+        format!("learned: {} · confirmed {}× · confidence {:.2}", text::when(n.created_ms), n.reinforced, n.confidence),
+        format!("disputes: {}", n.conflicts.join(", ")),
+        format!("evidence: {}", n.provenance.events.join(", ")),
+        String::new(),
+        n.text.clone(),
+    ]);
+    fields.into_iter().flat_map(|field| block(&field, "", Tone::Plain)).collect()
+}
+
+fn snapshot_lines(snapshots: &[RecallSnapshot]) -> Vec<Line<'static>> {
+    if snapshots.is_empty() {
+        return block("no recorded memory context in this project", "", Tone::Dim);
+    }
+    let mut lines = Vec::new();
+    for s in snapshots {
+        lines.extend(block(
+            &format!("run {} · call {} · {}\nquery: {}", s.run, s.call, s.purpose, s.query),
+            "",
+            Tone::Mem,
+        ));
+        if s.notes.is_empty() {
+            lines.extend(block("no notes returned", "", Tone::Dim));
+        }
+        for r in &s.notes {
+            lines.extend(memory_lines(r));
+            lines.push(Line::default());
+        }
+    }
+    lines
 }
 
 impl Lane {
@@ -1208,6 +1472,7 @@ fn help() -> Vec<Line<'static>> {
         Line::default(),
         head("commands"),
         row("/memory [words]", "notes about this project"),
+        row("/memory-used [run]", "recorded context for this run (default: latest)"),
         row("/check [command]", "use this check for every task; empty: design one"),
         row("/attempts N", "attempts at once, 1 to 8"),
         row("/model NAME", "opus, sonnet, haiku or a model id"),
@@ -1468,9 +1733,9 @@ mod tests {
         app.update(Msg::Progress(Progress::Note { run: run.clone(), message: "project model: 3 files".into() }));
         app.update(Msg::Progress(Progress::Note { run, message: "project model: 3 files".into() }));
         assert!(
-            log(&app).ends_with(
-                "◇ memory  map 2800 tokens · 1 note\n  0.78 Tests need --features x\n  project model: 3 files"
-            ),
+            log(&app).ends_with(&format!(
+                "◇ memory  map 2800 tokens · 1 note\n  /memory-used {trace} · recorded recall context\n  0.78 Tests need --features x\n  project model: 3 files"
+            )),
             "{}",
             log(&app)
         );
@@ -1534,6 +1799,149 @@ mod tests {
         assert_eq!(app.update(key(KeyCode::Enter)), [Action::LoadNotes { query: "lexer".into() }]);
         app.update(key(KeyCode::Esc));
         assert!(matches!(app.screen, Screen::Main));
+    }
+
+    fn inspected_note() -> Recalled {
+        serde_json::from_value(serde_json::json!({
+            "note": { "id":"note_config", "rev":7, "kind":"fact", "text":"Build with cargo", "confidence":0.8,
+                "created_ms":0, "updated_ms":0, "provenance":{"trace":"run_source", "service":"memory", "version":"v1", "events":["source_event"]}},
+            "score":0.9, "reason":{"keywords":"cargo", "relevance":0.9, "confidence":0.8, "recency":0.7},
+            "details":{"dependencies":[{"path":"Cargo.toml", "sha256":"old_hash"}], "needs_review":["Cargo.toml"], "temporary":true, "reason":"verified earlier"}
+        })).unwrap()
+    }
+
+    fn frame_text(app: &mut App) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|frame| super::super::view::draw(frame, app)).unwrap();
+        terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn memory_inspection_shows_the_reason_and_reviews_the_revision_the_person_saw() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/memory cargo");
+        app.update(Msg::Notes(Ok(vec![inspected_note()])));
+        let frame = frame_text(&mut app);
+        for expected in [
+            "[review]",
+            "[temporary]",
+            "revision 7",
+            "keywords: cargo",
+            "needs review: Cargo.toml",
+            "old_hash",
+            "source_event",
+        ] {
+            assert!(frame.contains(expected), "missing {expected}: {frame}");
+        }
+        app.update(key(KeyCode::Char('v')));
+        assert!(plain(&app.viewer.as_ref().unwrap().lines).join("\n").contains("relevance: 0.900"));
+        app.update(key(KeyCode::Esc));
+        app.update(key(KeyCode::Char('a')));
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert!(app.flash.as_ref().unwrap().contains("justified"));
+        app.update(Msg::Paste("checked current config".into()));
+        app.update(key(KeyCode::Enter));
+        // A refresh while editing must not silently raise the saved lease.
+        let mut newer = inspected_note();
+        newer.note.rev = 8;
+        app.update(Msg::Notes(Ok(vec![newer.clone()])));
+        app.update(ctrl_key('u'));
+        app.update(Msg::Paste("Cargo.toml; src/lib.rs".into()));
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Char('t')));
+        let actions = app.update(key(KeyCode::Enter));
+        assert_eq!(
+            actions,
+            [Action::ChangeNote {
+                review: ReviewRequest {
+                    workspace: "/w".into(),
+                    id: "note_config".into(),
+                    expected_rev: 7,
+                    reason: "checked current config".into(),
+                    depends_on: vec!["Cargo.toml".into(), "src/lib.rs".into()],
+                    temporary: false,
+                },
+                text: None
+            }]
+        );
+        assert!(app
+            .update(Msg::ChangedNote(Err("note changed: expected revision 7, current 8; inspect it again".into())))
+            .is_empty());
+        let Screen::Memory(view) = &app.screen else { panic!() };
+        assert_eq!(view.notes, [newer]);
+        assert!(!view.loading && view.error.as_ref().unwrap().contains("current 8"));
+        assert!(frame_text(&mut app).contains("current 8"));
+    }
+
+    #[test]
+    fn correcting_a_note_requires_a_reason_and_confirmation_and_refreshes_after_success() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/memory");
+        let note = inspected_note();
+        app.update(Msg::Notes(Ok(vec![note.clone()])));
+        app.update(key(KeyCode::Char('c')));
+        app.update(ctrl_key('u'));
+        app.update(Msg::Paste("Build with make".into()));
+        app.update(key(KeyCode::Enter));
+        app.update(Msg::Paste("verified the migration".into()));
+        app.update(key(KeyCode::Enter));
+        app.update(ctrl_key('u'));
+        app.update(key(KeyCode::Enter));
+        assert!(frame_text(&mut app).contains("Enter save"));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Action::ChangeNote {
+                review: ReviewRequest {
+                    workspace: "/w".into(),
+                    id: note.note.id.clone(),
+                    expected_rev: 7,
+                    reason: "verified the migration".into(),
+                    depends_on: vec![],
+                    temporary: true,
+                },
+                text: Some("Build with make".into())
+            }]
+        );
+        assert_eq!(
+            app.update(Msg::ChangedNote(Ok(ReviewResponse { note: note.note, details: note.details }))),
+            [Action::LoadNotes { query: String::new() }]
+        );
+        // Cancelling a later form never sends a mutation.
+        app.update(Msg::Notes(Ok(vec![inspected_note()])));
+        app.update(key(KeyCode::Char('c')));
+        assert!(app.update(key(KeyCode::Esc)).is_empty());
+        let Screen::Memory(view) = &app.screen else { panic!() };
+        assert!(view.edit.is_none());
+    }
+
+    #[test]
+    fn used_memory_shows_the_immutable_run_context_and_ignores_late_viewer_replies() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "task");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!() };
+        let run = trace.to_string();
+        assert_eq!(type_in(&mut app, "/memory-used"), [Action::UsedNotes { run: run.clone() }]);
+        let record = RecallSnapshot {
+            run: run.clone(),
+            call: "captured_call".into(),
+            workspace: "/w".into(),
+            query: "cargo".into(),
+            purpose: "context".into(),
+            created_ms: 1,
+            notes: vec![inspected_note()],
+        };
+        app.update(Msg::UsedNotes { run: run.clone(), result: Ok(vec![record.clone()]) });
+        let frame = frame_text(&mut app);
+        assert!(frame.contains("captured_call") && frame.contains("revision 7") && frame.contains("Build with cargo"));
+        app.update(key(KeyCode::Esc));
+        app.update(Msg::UsedNotes { run: run.clone(), result: Ok(vec![record]) });
+        assert!(app.viewer.is_none());
+        type_in(&mut app, "/memory");
+        app.update(Msg::Notes(Ok(vec![])));
+        assert_eq!(app.update(key(KeyCode::Char('u'))), [Action::UsedNotes { run }]);
     }
 
     #[test]

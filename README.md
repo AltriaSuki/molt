@@ -119,7 +119,20 @@ are stopped, with every command the agent started, and started again.
 `/memory [words]` lists the notes about the project, strongest first, with
 where each came from: the run, the service version that wrote it and the
 messages in the audit log it rests on. `f` forgets one, with a reason, as
-`molt memory forget` does. `/attempts`, `/model`, `/effort`, `/budget` and
+`molt memory forget` does. The screen includes quarantined notes for inspection,
+marked `[review]`, and temporary experience marked `[temporary]`. The detail
+pane shows recall scores, keywords, revision, dependencies and source evidence;
+`v` opens the full scrollable record. `a` reviews a note and `c` corrects it:
+enter the text (for correction), a reason, and dependency paths separated by
+`;`. At the confirmation step, `t` toggles temporary experience, Enter saves,
+Shift+Tab returns to an earlier field, and Esc cancels. Saving uses the displayed
+revision; concurrent modifications are refused and shown without retrying.
+Ordinary planner recall still excludes notes awaiting review.
+
+`/memory-used [run]` opens the immutable recall snapshots for that run in this
+project, defaulting to the latest task. The task's memory log shows this command;
+`u` in the memory screen opens the latest task's context. Later corrections do
+not alter those recorded notes. `/attempts`, `/model`, `/effort`, `/budget` and
 `/check` set the next tasks' options; `/help` lists the keys. The services'
 log goes to `tui.log` in the data dir, and colors are left out under
 `NO_COLOR`.
