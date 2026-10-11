@@ -150,7 +150,20 @@ start and end.
 `/memory [words]` lists the notes about the project, strongest first, with
 where each came from: the run, the service version that wrote it and the
 messages in the audit log it rests on. `f` forgets one, with a reason, as
-`molt memory forget` does. `/attempts`, `/model`, `/effort`, `/budget` and
+`molt memory forget` does. The screen includes quarantined notes for inspection,
+marked `[review]`, and temporary experience marked `[temporary]`. The detail
+pane shows recall scores, keywords, revision, dependencies and source evidence;
+`v` opens the full scrollable record. `a` reviews a note and `c` corrects it:
+enter the text (for correction), a reason, and dependency paths separated by
+`;`. At the confirmation step, `t` toggles temporary experience, Enter saves,
+Shift+Tab returns to an earlier field, and Esc cancels. Saving uses the displayed
+revision; concurrent modifications are refused and shown without retrying.
+Ordinary planner recall still excludes notes awaiting review.
+
+`/memory-used [run]` opens the immutable recall snapshots for that run in this
+project, defaulting to the latest task. The task's memory log shows this command;
+`u` in the memory screen opens the latest task's context. Later corrections do
+not alter those recorded notes. `/attempts`, `/model`, `/effort`, `/budget` and
 `/check` set the next tasks' options; `/memory-model NAME` sets the model
 memory learns with (`same` for the attempts' model, `default` for
 `MOLT_MEMORY_MODEL` or `sonnet`), and when learning finds nothing the log
@@ -598,8 +611,18 @@ cargo test --workspace
 
 The NATS conformance and end-to-end tests need a `nats-server` binary. Set
 `MOLT_NATS_SERVER=/path/to/nats-server` or put it on `PATH`
-(`go install github.com/nats-io/nats-server/v2@latest`). Without it they print
+(`go install github.com/nats-io/nats-server/v2@v2.15.1`, using the Go version
+in `.github/ci-versions.toml`). Without it they print
 a notice and pass; CI always runs them.
+
+The Rust release and components are pinned in `rust-toolchain.toml`, and CI
+reads that file too. Go and nats-server are pinned in `.github/ci-versions.toml`;
+Go cannot fetch a newer toolchain automatically. NATS binaries use an exact
+version/OS/architecture/Go cache key and are version-checked on every run,
+including cache hits. Actions are pinned to commit SHAs. Toolchain upgrades
+belong in a separate PR so ordinary changes keep the same tool versions when
+rerun. The runner image and apt's isolation backend still receive OS updates;
+these pins do not claim a bit-for-bit identical machine image.
 
 `crates/molt-bench/tests/tasks.rs` validates every benchmark task, which takes
 `python3`, `node` (20 or newer), `go` and `cargo`. A missing toolchain skips
