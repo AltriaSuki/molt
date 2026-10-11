@@ -25,6 +25,7 @@ use molt_api::fs::{self as fs_api, FilesChanged};
 use molt_api::memory::{
     ConsolidateRequest, CorrectRequest, ForgetRequest, ForgetResponse, IndexRequest, MapRequest, RecallRequest,
     RecallResponse, RememberRequest, RememberResponse, RetractRequest, RetractResponse, ReviewRequest, SymbolsRequest,
+    UndoRequest,
 };
 use molt_api::model::Effort;
 use molt_proto::{Budget, Envelope, ErrorCode, Kind, RemoteError, Target, TraceId};
@@ -362,6 +363,15 @@ impl Memory {
                 let trace = req.trace_id.to_string();
                 let done =
                     self.blocking(move |db| notes::retract(db, &r.service, &r.version, &r.reason, &trace, now)).await?;
+                reply(RetractResponse { retracted: done.retracted, adjusted: done.adjusted })
+            }
+            "undo" => {
+                if req.from.as_ref().map(|s| s.as_str()) != Some("cli") {
+                    return Err(invalid("only the kernel-identified CLI may undo a run"));
+                }
+                let r: UndoRequest = parse(&method, req.payload)?;
+                let trace = req.trace_id.to_string();
+                let done = self.blocking(move |db| notes::undo_run(db, &r.run, &r.reason, &trace, now)).await?;
                 reply(RetractResponse { retracted: done.retracted, adjusted: done.adjusted })
             }
             "consolidate" => {

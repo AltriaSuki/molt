@@ -28,6 +28,7 @@ pub const REMEMBER: &str = "memory.remember";
 pub const RECALL: &str = "memory.recall";
 pub const FORGET: &str = "memory.forget";
 pub const RETRACT: &str = "memory.retract";
+pub const UNDO: &str = "memory.undo";
 pub const CONSOLIDATE: &str = "memory.consolidate";
 pub const INDEX: &str = "memory.index";
 pub const MAP: &str = "memory.map";
@@ -293,6 +294,18 @@ pub struct RetractResponse {
     /// Notes kept, with the version's part in them undone.
     #[serde(default)]
     pub adjusted: u64,
+}
+
+/// Take back what a run's episode did to the notes, because the user undid
+/// its result: the notes only it bore out are forgotten, and the notes it
+/// reinforced or contradicted are worked out again without it. The run is
+/// not learned from again. Only the CLI may ask. Answered with a
+/// [`RetractResponse`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndoRequest {
+    /// The run's trace id.
+    pub run: String,
+    pub reason: String,
 }
 
 /// Learn from a finished episode: read it from the audit log, have the model
