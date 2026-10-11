@@ -182,15 +182,16 @@ pub(crate) fn project_context(notes: &[Recalled], map: Option<&str>) -> Option<S
     Some(text)
 }
 
-/// The task, the check, and `context` first when memory gave one. The
-/// context is the same in every attempt's first message and comes before
+/// The task and the check, after the `preamble` blocks (the project's
+/// instruction files and memory's context, when there are any). The
+/// preamble is the same in every attempt's first message and comes before
 /// what differs between them. Attempts start together, so each still pays
 /// to cache it once; it saves on their later turns.
 pub(crate) fn attempt_first_message(
     task: &str,
     check: Option<(&str, &[String])>,
     index: u32,
-    context: Option<&str>,
+    preamble: &[&str],
 ) -> Value {
     let check = match check {
         Some((command, files)) => {
@@ -207,7 +208,7 @@ pub(crate) fn attempt_first_message(
                  so make it complete: the answer, or what you changed."
             .to_owned(),
     };
-    let mut blocks: Vec<Value> = context.map(text_block).into_iter().collect();
+    let mut blocks: Vec<Value> = preamble.iter().map(|b| text_block(*b)).collect();
     blocks.push(text_block(format!("<task>\n{task}\n</task>\n\n{check}")));
     if let Some(hint) = hint(index) {
         blocks.push(text_block(hint));
@@ -215,8 +216,8 @@ pub(crate) fn attempt_first_message(
     user_blocks(blocks)
 }
 
-pub(crate) fn designer_first_message(task: &str, context: Option<&str>) -> Value {
-    let mut blocks: Vec<Value> = context.map(text_block).into_iter().collect();
+pub(crate) fn designer_first_message(task: &str, preamble: &[&str]) -> Value {
+    let mut blocks: Vec<Value> = preamble.iter().map(|b| text_block(*b)).collect();
     blocks.push(text_block(format!("<task>\n{task}\n</task>\n\nDesign the done-check for this task.")));
     user_blocks(blocks)
 }
@@ -598,21 +599,21 @@ mod tests {
         assert!(!project_context(&[], Some("m")).unwrap().contains("Notes from"));
 
         // It goes first, before the task, for the designer and every attempt alike.
-        let first = attempt_first_message("t", None, 1, Some(&text));
+        let first = attempt_first_message("t", None, 1, &[&text]);
         assert_eq!(first["content"][0]["text"], text.as_str());
         assert_eq!(first["content"].as_array().unwrap().len(), 3);
-        assert_eq!(designer_first_message("t", Some(&text))["content"][0]["text"], text.as_str());
-        assert_eq!(designer_first_message("t", None)["content"].as_array().unwrap().len(), 1);
+        assert_eq!(designer_first_message("t", &[&text])["content"][0]["text"], text.as_str());
+        assert_eq!(designer_first_message("t", &[])["content"].as_array().unwrap().len(), 1);
     }
 
     #[test]
     fn hints_vary_by_attempt() {
         let blocks =
-            |i| attempt_first_message("t", Some(("make test", &[])), i, None)["content"].as_array().unwrap().len();
+            |i| attempt_first_message("t", Some(("make test", &[])), i, &[])["content"].as_array().unwrap().len();
         assert_eq!((blocks(0), blocks(1), blocks(2), blocks(3)), (1, 2, 2, 1));
         assert_ne!(hint(1), hint(2));
         // The shared first block is identical across attempts, so it caches.
-        let first = |i| attempt_first_message("t", Some(("make test", &[])), i, None)["content"][0].clone();
+        let first = |i| attempt_first_message("t", Some(("make test", &[])), i, &[])["content"][0].clone();
         assert_eq!(first(0), first(1));
     }
 }

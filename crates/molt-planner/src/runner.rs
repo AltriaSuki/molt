@@ -16,8 +16,8 @@ use crate::attempt::{self, Check, Finished};
 use crate::checkpoint::{self, Saved, SavedAttempt, SavedCheck, SavedEnd, SavedSpend, Store};
 use crate::ctx::Ctx;
 use crate::designer::{self, Design};
-use crate::memory;
 use crate::review::{self, Winner};
+use crate::{instructions, memory};
 use crate::{Bus, Config};
 
 const MAX_ATTEMPTS: u32 = 8;
@@ -55,6 +55,7 @@ pub(crate) async fn run_cancellable(
         let store = Store::create(dir, Saved::new(ctx.trace.as_str(), req.clone())).map_err(failed)?;
         ctx.checkpoint = Some(Arc::new(store));
     }
+    ctx.instructions = instructions::gather(&ctx).await;
     let ctx = Arc::new(ctx);
     if let Some(dir) = &state {
         prune(&ctx, dir).await;
@@ -101,6 +102,7 @@ async fn resume_run(
     ctx.cancel = cancel.clone();
     ctx.run_cancel = cancel;
     ctx.memory = memory::prepare(&ctx).await;
+    ctx.instructions = instructions::gather(&ctx).await;
     ctx.restore(&saved.spend, saved.open_calls);
     let mut next = saved.clone();
     next.request = run_req.clone();
@@ -330,6 +332,7 @@ pub(crate) async fn design_cancellable(
     ctx.cancel = cancel.clone();
     ctx.run_cancel = cancel;
     ctx.memory = memory::prepare(&ctx).await;
+    ctx.instructions = instructions::gather(&ctx).await;
     let ctx = Arc::new(ctx);
     let design = designer::design(&ctx, true).await?;
     let spend = ctx.settle(ctx.cfg.late_reply_wait).await.spend;
