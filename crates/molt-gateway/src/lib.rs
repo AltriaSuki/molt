@@ -17,7 +17,7 @@ mod stream;
 
 use std::fmt;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, ensure, Context};
@@ -324,7 +324,7 @@ pub async fn serve(svc: Arc<Service>, gateway: Arc<Gateway>) {
     svc.serve_cancellable(max_in_flight, move |req, cancel| {
         let gateway = gateway.clone();
         let events = events.clone();
-        async move { handle_observed(&gateway, req, Some(events), cancel).await }
+        async move { handle_observed(&gateway, req, Some(Events::Bus(events)), cancel).await }
     })
     .await;
 }
@@ -334,10 +334,43 @@ async fn handle(gateway: &Gateway, req: Envelope) -> Result<Value, RemoteError> 
     handle_observed(gateway, req, None, CancellationToken::new()).await
 }
 
+/// Where a streamed call's progress goes: the bus when serving, a list in
+/// tests.
+#[derive(Clone)]
+enum Events {
+    Bus(Arc<Service>),
+    #[cfg(test)]
+    Collect(Arc<Mutex<Vec<Progress>>>),
+}
+
+/// A streamed call that has published `ModelStarted` and not yet
+/// `ModelFinished`, so a cancellation can close it.
+struct Open {
+    context: ModelCall,
+    publisher: Option<Publisher>,
+}
+
+/// The preview publishing task, stopped when dropped so no preview follows
+/// the call's `ModelFinished`.
+struct Publisher(tokio::task::JoinHandle<()>);
+
+impl Publisher {
+    async fn stop(mut self) {
+        self.0.abort();
+        let _ = (&mut self.0).await;
+    }
+}
+
+impl Drop for Publisher {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn handle_observed(
     gateway: &Gateway,
     req: Envelope,
-    events: Option<Arc<Service>>,
+    events: Option<Events>,
     cancel: CancellationToken,
 ) -> Result<Value, RemoteError> {
     let method = match &req.to {
@@ -356,9 +389,11 @@ async fn handle_observed(
                 code: ErrorCode::Invalid,
                 message: format!("bad model.complete request: {e}"),
             })?;
+            let open: Mutex<Option<Open>> = Mutex::new(None);
+            let streamed = request.stream.clone().zip(events.clone());
             let call = async {
-                if let (Some(context), Some(events)) = (request.stream.clone(), events) {
-                    let mut call = ModelCall {
+                if let Some((context, events)) = streamed {
+                    let call = ModelCall {
                         run: req.trace_id.to_string(),
                         attempt: context.attempt,
                         turn: context.turn,
@@ -369,7 +404,7 @@ async fn handle_observed(
                     // A slow event consumer cannot block the model response or
                     // build an unbounded queue. Missing previews produce seq gaps.
                     let (tx, mut rx) = mpsc::channel::<(u64, String)>(32);
-                    let mut publisher = {
+                    let publisher = Publisher({
                         let events = events.clone();
                         let trace = req.trace_id.clone();
                         let context = call.clone();
@@ -380,24 +415,34 @@ async fn handle_observed(
                                 publish(&events, &trace, Progress::ModelText { context, text }).await;
                             }
                         })
-                    };
+                    });
+                    *lock(&open) = Some(Open { context: call, publisher: Some(publisher) });
                     let response = gateway
                         .complete_streamed(
                             request,
                             within.map(|limit| limit.saturating_sub(started.elapsed())),
                             |text| {
-                                call.seq += 1;
-                                let _ = tx.try_send((call.seq, text));
+                                if let Some(open) = lock(&open).as_mut() {
+                                    open.context.seq += 1;
+                                    let _ = tx.try_send((open.context.seq, text));
+                                }
                             },
                         )
                         .await;
                     drop(tx);
                     let drain =
                         within.map_or(Duration::from_millis(400), |limit| limit.saturating_sub(started.elapsed()));
-                    if tokio::time::timeout(drain, &mut publisher).await.is_err() {
-                        publisher.abort();
-                        let _ = publisher.await;
+                    let publisher = lock(&open).as_mut().and_then(|o| o.publisher.take());
+                    if let Some(mut publisher) = publisher {
+                        if tokio::time::timeout(drain, &mut publisher.0).await.is_err() {
+                            publisher.stop().await;
+                        }
                     }
+                    // Taken before publishing, so a cancellation from here on
+                    // cannot send a second `ModelFinished`.
+                    let Some(Open { context: mut call, .. }) = lock(&open).take() else {
+                        return response;
+                    };
                     call.seq += 1;
                     let (usage, cost_usd, error) = match &response {
                         Ok(resp) => (
@@ -416,14 +461,37 @@ async fn handle_observed(
             };
             let response = tokio::select! {
                 biased;
-                response = call => response?,
-                _ = cancel.cancelled() => return Ok(cancelled_settlement(call_id, true)),
+                response = call => Some(response),
+                _ = cancel.cancelled() => None,
             };
-            serde_json::to_value(response)
+            let Some(response) = response else {
+                // A started call needs its end, or subscribers see it running
+                // forever. Usage and cost stay unknown, never zero.
+                let unfinished = lock(&open).take();
+                if let (Some(Open { mut context, publisher }), Some(events)) = (unfinished, events) {
+                    if let Some(publisher) = publisher {
+                        publisher.stop().await;
+                    }
+                    context.seq += 1;
+                    let error = Some("cancelled".into());
+                    publish(
+                        &events,
+                        &req.trace_id,
+                        Progress::ModelFinished { context, usage: None, cost_usd: None, error },
+                    )
+                    .await;
+                }
+                return Ok(cancelled_settlement(call_id, true));
+            };
+            serde_json::to_value(response?)
                 .map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("encoding the response: {e}") })
         }
         other => Err(RemoteError { code: ErrorCode::Invalid, message: format!("no method {other:?}") }),
     }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn cancelled_settlement(call: molt_proto::MsgId, may_have_started: bool) -> Value {
@@ -437,16 +505,22 @@ fn cancelled_settlement(call: molt_proto::MsgId, may_have_started: bool) -> Valu
     })
 }
 
-async fn publish(service: &Service, trace: &molt_proto::TraceId, event: Progress) {
-    if let Ok(payload) = serde_json::to_value(event) {
-        // Progress is best effort, even when the transport's outgoing queue
-        // is full. This bound also keeps draining 32 previews within the
-        // gateway's normal reply margin.
-        let _ = tokio::time::timeout(
-            Duration::from_millis(10),
-            service.publish_traced(progress::TOPIC, payload, trace.clone()),
-        )
-        .await;
+async fn publish(events: &Events, trace: &molt_proto::TraceId, event: Progress) {
+    match events {
+        Events::Bus(service) => {
+            if let Ok(payload) = serde_json::to_value(event) {
+                // Progress is best effort, even when the transport's outgoing queue
+                // is full. This bound also keeps draining 32 previews within the
+                // gateway's normal reply margin.
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(10),
+                    service.publish_traced(progress::TOPIC, payload, trace.clone()),
+                )
+                .await;
+            }
+        }
+        #[cfg(test)]
+        Events::Collect(seen) => lock(seen).push(event),
     }
 }
 
@@ -648,6 +722,120 @@ mod tests {
             assert_eq!(server.received_requests().await.unwrap().len(), 1);
         }
     }
+    #[tokio::test]
+    async fn a_streamed_call_cancelled_midway_still_finishes_with_unknown_usage() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let sse = |value: Value| format!("event: {}\ndata: {value}\n\n", value["type"].as_str().unwrap());
+        let first =
+            sse(json!({"type":"message_start","message":{
+                "id":"msg", "model":"claude-opus-5-5", "role":"assistant", "type":"message", "content":[],
+                "usage":{"input_tokens":10,"output_tokens":1}
+            }})) + &sse(json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}))
+                + &sse(json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                let mut chunk = [0; 2048];
+                let n = socket.read(&mut chunk).await.unwrap();
+                bytes.extend_from_slice(&chunk[..n]);
+            }
+            let header =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n";
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(first.as_bytes()).await.unwrap();
+            // Never finish: only the cancellation ends the call.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let mut cfg = from(&[("ANTHROPIC_API_KEY", "k")]).unwrap();
+        cfg.base_url = url;
+        let gateway = Gateway::new(cfg).unwrap();
+        let request = CompleteRequest {
+            messages: vec![user_text("hi")],
+            stream: Some(molt_api::model::StreamContext { attempt: Some(2), turn: 3 }),
+            ..Default::default()
+        };
+        let request = envelope("model.complete", serde_json::to_value(request).unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let cancel = CancellationToken::new();
+        let work = handle_observed(&gateway, request, Some(Events::Collect(seen.clone())), cancel.clone());
+        tokio::pin!(work);
+        let has_text = || lock(&seen).iter().any(|e| matches!(e, Progress::ModelText { .. }));
+        tokio::select! {
+            result = &mut work => panic!("the call finished early: {result:?}"),
+            _ = async { while !has_text() { tokio::time::sleep(Duration::from_millis(5)).await } } => {}
+        }
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), work).await.unwrap().unwrap();
+        assert_eq!(result["error"]["code"], "cancelled");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        server.abort();
+
+        let seen = lock(&seen).clone();
+        assert!(matches!(seen.first(), Some(Progress::ModelStarted { .. })), "{seen:?}");
+        let Some(Progress::ModelFinished { context, usage, cost_usd, error }) = seen.last() else {
+            panic!("the events do not end with ModelFinished: {seen:?}");
+        };
+        assert_eq!((context.attempt, context.turn), (Some(2), 3));
+        assert_eq!((usage, cost_usd, error.as_deref()), (&None, &None, Some("cancelled")));
+        let finished = seen.iter().filter(|e| matches!(e, Progress::ModelFinished { .. })).count();
+        assert_eq!(finished, 1, "{seen:?}");
+        let seqs: Vec<u64> = seen.iter().filter_map(|e| e.model_call().map(|c| c.seq)).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "seq goes up: {seqs:?}");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_call_that_completes_reports_its_usage_once() {
+        let server = MockServer::start().await;
+        let body = [
+            json!({"type":"message_start","message":{"id":"msg","model":"claude-opus-5-5","role":"assistant",
+                "type":"message","content":[],"usage":{"input_tokens":10,"output_tokens":1}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}),
+            json!({"type":"message_stop"}),
+        ]
+        .iter()
+        .map(|v| format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap()))
+        .collect::<String>();
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .mount(&server)
+            .await;
+        let mut cfg = from(&[("ANTHROPIC_API_KEY", "k")]).unwrap();
+        cfg.base_url = server.uri();
+        let gateway = Gateway::new(cfg).unwrap();
+        let request = CompleteRequest {
+            messages: vec![user_text("hi")],
+            stream: Some(molt_api::model::StreamContext { attempt: Some(0), turn: 1 }),
+            ..Default::default()
+        };
+        let request = envelope("model.complete", serde_json::to_value(request).unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let result = handle_observed(&gateway, request, Some(Events::Collect(seen.clone())), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(result.get("error").is_none(), "{result}");
+        let seen = lock(&seen).clone();
+        let kinds: Vec<&str> = seen
+            .iter()
+            .map(|e| match e {
+                Progress::ModelStarted { .. } => "started",
+                Progress::ModelText { .. } => "text",
+                Progress::ModelFinished { .. } => "finished",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["started", "text", "finished"]);
+        let Some(Progress::ModelFinished { usage, error, .. }) = seen.last() else { unreachable!() };
+        assert_eq!((usage.map(|u| u.output_tokens), error), (Some(4), &None));
+    }
+
     #[tokio::test]
     async fn missing_usage_is_unknown_and_is_not_priced_as_zero() {
         let server = MockServer::start().await;
