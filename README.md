@@ -63,6 +63,7 @@ sender from that.
 | A benchmark run is graded by tests the agent is not given, which its own edits cannot replace | `crates/molt-bench/src/grade.rs` (`grading_overwrites_the_agents_copy_of_a_hidden_file`), `crates/molt-bench/src/task.rs` (`overlay_replaces_files_links_and_directories_and_stays_inside`) |
 | Every benchmark task fails its check as given and passes it with the reference solution | `crates/molt-bench/tests/tasks.rs` |
 | A benchmark starts a run only while what it spent, plus the whole `--task-usd` of that run and of each run in flight, fits in `--max-usd`; it refuses models it has no price for | `crates/molt-bench/src/run.rs` (`runs_stop_before_they_could_pass_the_budget`, `a_run_of_unknown_cost_stops_the_benchmark`), `crates/molt-bench/src/cli.rs` (`a_model_without_a_price_is_refused`) |
+| A model with no price stays of unknown cost and stops the run; prices come only from the user's environment or data directory, never from a project, and a download that does not validate replaces nothing | `crates/molt-gateway/src/prices.rs` (`the_data_directory_holds_the_snapshot_and_nothing_else_is_read`, `a_download_that_does_not_validate_is_refused`, `malformed_declared_prices_stop_startup_and_name_the_item`), `crates/molt-gateway/tests/gateway.rs` (`a_snapshot_prices_a_third_party_model…`) |
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
 
 ## Quick start
@@ -212,6 +213,7 @@ Defaults come from the environment:
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` | gateway | required, `https://api.anthropic.com` |
 | `MOLT_MODEL`, `MOLT_EFFORT`, `MOLT_MAX_TOKENS` | gateway | `opus`, unset, `32000` |
 | `MOLT_MODEL_TIMEOUT_S`, `MOLT_MODEL_RETRIES`, `MOLT_MODEL_CONCURRENCY`, `MOLT_FALLBACKS` | gateway | `1200`, `4`, `16`, `1` |
+| `MOLT_MODEL_PRICES`, `MOLT_PRICES_FILE` | gateway | unset, `~/.local/share/molt/prices.json` (see [Model prices](#model-prices)) |
 | `MOLT_PLANNER_MODEL`, `MOLT_MAX_TURNS`, `MOLT_BUDGET_USD` | planner | the gateway's model, `50`, `10` |
 | `MOLT_MAX_CHECK_ROUNDS`, `MOLT_CHECK_TIMEOUT_S` | planner | `3` check runs per attempt, `900` |
 | `MOLT_MAP_TOKENS` | planner | `3000` (the project map a run starts with; at most `32000`) |
@@ -294,6 +296,44 @@ and `--data-dir`; `show` and `used` also accept `--json`. The database upgrades
 from schema 1 to schema 2 without rewriting existing notes; older binaries
 refuse the newer schema.
 
+### Model prices
+
+The run budget (`--budget-usd`) holds only when molt knows what each model
+call cost, so a call to a model with no price stops the run after it: an
+unknown cost is never counted as free. Molt knows the prices of a few
+thousand models, so third-party APIs reached through `ANTHROPIC_BASE_URL`
+work too. It looks a model up, in order, in:
+
+1. `MOLT_MODEL_PRICES`, prices you declare in US dollars per million tokens:
+   `glm-4.6=0.6,2.2;deepseek-chat=0.28,0.42` (input, output), or four
+   numbers to give cache write and cache read prices as well.
+2. The snapshot `molt prices update` downloaded, in
+   `~/.local/share/molt/prices.json` (`$XDG_DATA_HOME/molt` when set;
+   `MOLT_PRICES_FILE` names another file), or, until there is one, the
+   snapshot built into this release.
+3. The Anthropic prices built into the gateway.
+
+```sh
+molt prices show deepseek-chat         # what a model costs and where that price came from
+molt prices update                     # download LiteLLM's price list, check it, and use it
+molt prices update --source openrouter # or OpenRouter's own prices
+```
+
+`update` refuses a download that is not a price list (not JSON, the wrong
+shape, a negative or non-finite price) and leaves the current snapshot as
+it is; it points out models whose price moved more than twofold. Snapshots
+record their source, URL, SHA-256 and download time, and every model call's
+reply names the entry and snapshot its cost came from. A dated id
+(`-YYYYMMDD`) and a provider prefix (`openrouter/`) fall back to the bare
+model id; a bare id that only several providers list gets the highest of
+their prices. When a source leaves out cache prices they are estimated high:
+a cache write at 1.25 times input and a cache read at the full input price.
+
+Prices are read once when the gateway starts, never from the project
+directory, and never downloaded during a run. The sandbox hides home
+directories from the commands an agent runs, so they cannot change the
+snapshot; with `--no-sandbox` they run as you and could.
+
 ## Benchmark
 
 `molt bench` measures what Molt's design buys. It runs Molt as it ships and
@@ -312,7 +352,8 @@ molt bench report runs/base.jsonl                      # the comparison, in Mark
 molt bench validate                                    # check every task grades correctly
 ```
 
-`run` needs `ANTHROPIC_API_KEY` and a spending limit. Each run gets its own
+`run` needs `ANTHROPIC_API_KEY`, a spending limit, and a [price](#model-prices) for
+every model it uses; runs get the same prices. Each run gets its own
 copy of the task's repo, data dir and empty home directory, `--task-usd`
 (default $5) as its budget and `--timeout-s` (default 30 minutes); a run
 starts only if what was spent, plus that budget for it and for each run in
@@ -384,6 +425,7 @@ its tasks with a notice, except on CI.
 - Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. With the default setup, memory lives in the project's data dir, so nothing is shared between projects yet.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - A topic capability currently allows both publishing and subscribing.
+- Model prices are as current as the last `molt prices update` (or the release's snapshot) and as right as the community list they came from; a price that changes mid-run is not picked up until the next run. Models that LiteLLM lists only with tiered or regional prices, such as some Qwen models, have no price until declared in `MOLT_MODEL_PRICES`.
 - No license has been chosen yet.
 
 ### Cancellation and model settlement

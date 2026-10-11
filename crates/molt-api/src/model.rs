@@ -129,6 +129,27 @@ pub struct CompleteResponse {
     /// Estimated cost in US dollars; `None` when the model's prices are unknown.
     #[serde(default)]
     pub cost_usd: Option<f64>,
+    /// Where the prices behind `cost_usd` came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_source: Option<PriceSource>,
+}
+
+/// Which price a cost was worked out with, so that any charge can be checked later.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PriceSource {
+    /// The price-table entry used: a model id, or `*/<name>` for the highest
+    /// price among several providers' entries for that model.
+    pub entry: String,
+    /// `MOLT_MODEL_PRICES`, `built-in`, or a snapshot's source such as `litellm`.
+    pub source: String,
+    /// Where a snapshot was downloaded from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// SHA-256 of the download a snapshot was made from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at_ms: Option<u64>,
 }
 
 /// One `tool_use` block.

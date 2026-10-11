@@ -1551,6 +1551,7 @@ name = "molt-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "molt-api",
  "molt-proto",
  "molt-sdk",
@@ -1558,6 +1559,8 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

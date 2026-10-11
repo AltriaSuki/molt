@@ -52,6 +52,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: molt_bench::cli::Cmd,
     },
+    /// See and update what each model costs.
+    Prices {
+        #[command(subcommand)]
+        cmd: PricesCmd,
+    },
     /// Work with the audit log.
     Audit {
         #[command(subcommand)]
@@ -244,6 +249,29 @@ fn env_name(name: &str) -> Result<String, String> {
 }
 
 #[derive(Subcommand)]
+enum PricesCmd {
+    /// Download a price list, check it, and make it the snapshot runs use.
+    /// Nothing is replaced when the download does not check out.
+    Update {
+        /// litellm (the widest coverage) or openrouter (OpenRouter's own prices).
+        #[arg(long, default_value = "litellm")]
+        source: molt_gateway::prices::Source,
+        /// Download from here instead of the source's own address.
+        #[arg(long)]
+        url: Option<String>,
+        /// Write the snapshot here. Default: ~/.local/share/molt/prices.json
+        /// (in XDG_DATA_HOME when set), or MOLT_PRICES_FILE.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Show where prices come from, or what MODEL costs and where that price came from.
+    Show {
+        /// opus, sonnet, haiku or a model id.
+        model: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum AuditCmd {
     /// Check the hash chain of an audit log.
     Verify { path: Option<PathBuf> },
@@ -260,11 +288,13 @@ async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let cmd = cli.cmd.unwrap_or_else(|| Cmd::Ui(UiArgs { workspace: ".".into(), ..UiArgs::default() }));
     // `molt do`, `molt memory`, `molt bench` and the interface print their own progress; kernel logs would bury it.
-    molt::init_tracing(if matches!(cmd, Cmd::Do(_) | Cmd::Memory { .. } | Cmd::Bench { .. } | Cmd::Ui(_)) {
-        "warn"
-    } else {
-        "info"
-    });
+    molt::init_tracing(
+        if matches!(cmd, Cmd::Do(_) | Cmd::Memory { .. } | Cmd::Bench { .. } | Cmd::Prices { .. } | Cmd::Ui(_)) {
+            "warn"
+        } else {
+            "info"
+        },
+    );
     let config = || Config::load(cli.config.as_deref().unwrap_or(Path::new(DEFAULT_CONFIG)));
     let audit_path = |p: Option<PathBuf>| -> anyhow::Result<PathBuf> {
         match p {
@@ -296,6 +326,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         Cmd::Do(args) => return do_task(cli.config.as_deref(), args).await,
         Cmd::Memory { cmd } => memory_cmd(cli.config.as_deref(), cmd).await?,
         Cmd::Bench { cmd } => return molt_bench::cli::main(cmd).await,
+        Cmd::Prices { cmd } => return prices_cmd(cmd).await,
         Cmd::Audit { cmd: AuditCmd::Verify { path } } => {
             let path = audit_path(path)?;
             let n =
@@ -326,6 +357,94 @@ async fn main() -> anyhow::Result<ExitCode> {
                 "{}",
                 molt_transport::nats::server_config(molt_transport::nats::DEFAULT_PREFIX, &secrets.kernel, &services)
             );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn prices_cmd(cmd: PricesCmd) -> anyhow::Result<ExitCode> {
+    use molt_gateway::prices::{self, PriceSource, PriceTable, Snapshot};
+
+    let var = |name: &str| std::env::var(name).ok();
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let origin = |s: &PriceSource| {
+        let mut text = s.source.clone();
+        if let Some(url) = &s.url {
+            text.push_str(&format!(" from {url}"));
+        }
+        if let Some(sha) = &s.sha256 {
+            text.push_str(&format!(", sha256 {}", &sha[..sha.len().min(16)]));
+        }
+        if let Some(ms) = s.fetched_at_ms {
+            let days = now_ms.saturating_sub(u128::from(ms)) / 86_400_000;
+            text.push_str(&format!(", fetched {days} days ago"));
+        }
+        text
+    };
+    match cmd {
+        PricesCmd::Update { source, url, output } => {
+            let path = match output {
+                Some(path) => path,
+                None => prices::snapshot_path(var).context("neither XDG_DATA_HOME nor HOME is set; pass --output")?,
+            };
+            let new = prices::download(source, url.as_deref()).await?;
+            let old = std::fs::read_to_string(&path).ok().and_then(|text| Snapshot::parse(&text).ok());
+            let changed = old.unwrap_or_else(Snapshot::bundled).big_changes(&new);
+            if !changed.is_empty() {
+                let shown: Vec<&str> = changed.iter().take(10).map(String::as_str).collect();
+                let more = if changed.len() > shown.len() { ", …" } else { "" };
+                eprintln!(
+                    "note: {} models changed their input or output price more than twofold: {}{more}",
+                    changed.len(),
+                    shown.join(", ")
+                );
+            }
+            new.write(&path)?;
+            let source = PriceSource {
+                source: new.source.clone(),
+                url: Some(new.url.clone()),
+                sha256: Some(new.sha256.clone()),
+                ..Default::default()
+            };
+            println!("{}: {} models, {}", path.display(), new.models.len(), origin(&source));
+            println!(
+                "Runs started from now on use these prices; one already running keeps the prices it started with."
+            );
+        }
+        PricesCmd::Show { model: None } => {
+            let table = PriceTable::from_env()?;
+            if let Some(path) = prices::snapshot_path(var).filter(|p| p.exists()) {
+                println!("snapshot: {}", path.display());
+            } else {
+                println!("snapshot: the one built into this release (`molt prices update` downloads a newer one)");
+            }
+            for (source, models) in table.sources() {
+                println!("{models} models: {}", origin(&source));
+            }
+        }
+        PricesCmd::Show { model: Some(model) } => {
+            let table = PriceTable::from_env()?;
+            let id = molt_gateway::resolve_model(&model);
+            let Some((p, source)) = table.lookup(&id) else {
+                eprintln!(
+                    "no price for {id} (looked for {}): its calls' cost is unknown, so a run with it stops after \
+                     the first call. Run `molt prices update`, or set {}={id}=input,output in US dollars per \
+                     million tokens",
+                    prices::names(&id).join(", "),
+                    prices::OVERRIDE_VAR
+                );
+                return Ok(ExitCode::FAILURE);
+            };
+            // Rounded to a billionth of a dollar, which hides float noise such as 0.35000000000000003.
+            let usd = |v: f64| (v * 1e9).round() / 1e9;
+            println!(
+                "{id}: per million tokens ${} input, ${} output, ${} cache write, ${} cache read",
+                usd(p.input),
+                usd(p.output),
+                usd(p.cache_write),
+                usd(p.cache_read)
+            );
+            println!("entry {} in {}", source.entry, origin(&source));
         }
     }
     Ok(ExitCode::SUCCESS)

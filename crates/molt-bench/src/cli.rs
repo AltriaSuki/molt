@@ -210,7 +210,7 @@ async fn run_cmd(args: RunArgs) -> anyhow::Result<ExitCode> {
         Some(p) => p.canonicalize().with_context(|| format!("the molt executable {}", p.display()))?,
         None => std::env::current_exe().context("finding this executable")?,
     };
-    priced(args.model.as_deref(), &plan.arms)?;
+    priced(&molt_gateway::prices::PriceTable::from_env()?, args.model.as_deref(), &plan.arms)?;
     let mut options = Vec::new();
     if let Some(model) = &args.model {
         options.extend(["--model".to_owned(), model.clone()]);
@@ -431,7 +431,7 @@ fn recorded(name: &str, value: &str) -> Option<String> {
 /// Refuse a model the gateway has no price for, given for every arm or in
 /// an arm's options: its runs would report no cost, and no spending limit
 /// would hold them back.
-fn priced(model: Option<&str>, arms: &[Arm]) -> anyhow::Result<()> {
+fn priced(prices: &molt_gateway::prices::PriceTable, model: Option<&str>, arms: &[Arm]) -> anyhow::Result<()> {
     let mut models: Vec<(String, &str)> = model.map(|m| (m.to_owned(), "--model")).into_iter().collect();
     for arm in arms {
         let mut args = arm.args.iter();
@@ -447,9 +447,10 @@ fn priced(model: Option<&str>, arms: &[Arm]) -> anyhow::Result<()> {
     }
     for (m, from) in models {
         ensure!(
-            molt_gateway::has_price(&m),
+            molt_gateway::has_price(prices, &m),
             "{from}: molt has no price for the model {m:?}, so its runs' cost would be unknown and no spending \
-             limit would hold them back; use opus, sonnet or haiku"
+             limit would hold them back; run `molt prices update`, or declare it in MOLT_MODEL_PRICES \
+             (such as {m}=input,output in US dollars per million tokens)"
         );
     }
     Ok(())
@@ -502,9 +503,12 @@ mod tests {
     #[test]
     fn a_model_without_a_price_is_refused() {
         let arm = |spec: &str| Arm::parse(spec).unwrap();
+        let prices = molt_gateway::prices::PriceTable::default();
+        let priced = |model, arms: &[Arm]| priced(&prices, model, arms);
         assert!(priced(Some("opus"), &[arm("molt"), arm("plain")]).is_ok());
         assert!(priced(Some("claude-sonnet-5-5-20260901"), &[]).is_ok());
-        assert!(priced(Some("gpt-9"), &[]).unwrap_err().to_string().contains("--model"));
+        let err = priced(Some("gpt-9"), &[]).unwrap_err().to_string();
+        assert!(err.contains("--model") && err.contains("molt prices update"), "{err}");
         assert!(priced(None, &[arm("cheap=--model haiku")]).is_ok());
         let err = priced(None, &[arm("odd=--attempts 1 --model=claude-unknown-1")]).unwrap_err();
         assert!(err.to_string().starts_with("odd:"), "{err}");
