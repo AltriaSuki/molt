@@ -916,7 +916,7 @@ mod tests {
         };
         assert_eq!(
             progress_of(&event("trace_a"), "trace_a"),
-            Some(Progress::AttemptStarted { run: "trace_a".into(), attempt: 1 })
+            Some(Progress::AttemptStarted { run: "trace_a".into(), attempt: 1, fork: None })
         );
         assert_eq!(progress_of(&event("trace_b"), "trace_a"), None);
         let mut other = event("trace_a");

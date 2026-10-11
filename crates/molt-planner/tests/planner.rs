@@ -553,7 +553,7 @@ async fn an_explicit_check_passes_and_the_winner_is_merged() {
         fake.events(),
         vec![
             Progress::CheckReady { run: run.clone(), command: Some("check".into()), files: vec![], designed: false },
-            Progress::AttemptStarted { run: run.clone(), attempt: 0 },
+            Progress::AttemptStarted { run: run.clone(), attempt: 0, fork: Some("/scratch/fork-0".into()) },
             Progress::ToolCall {
                 run: run.clone(),
                 attempt: 0,

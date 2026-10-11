@@ -114,7 +114,6 @@ pub(crate) async fn run(
     cancel: CancellationToken,
     resume: Option<SavedAttempt>,
 ) -> Finished {
-    ctx.progress(Progress::AttemptStarted { run: ctx.run_id(), attempt: index }).await;
     let mut attempt = Attempt {
         ctx: ctx.clone(),
         index,
@@ -191,6 +190,8 @@ impl Attempt {
                 // The fork must still be there, as the run left it.
                 ctx.diff(&fork).await.map_err(|e| End::error(format!("its fork {fork} cannot be used: {e}")))?;
                 ctx.track_fork(&fork);
+                let started = Some(fork.clone());
+                ctx.progress(Progress::AttemptStarted { run: ctx.run_id(), attempt: self.index, fork: started }).await;
                 let mut conv = Conversation::new(system, tools, Value::Null, Some(self.index));
                 conv.messages = saved.messages;
                 conv.known = saved.known;
@@ -199,7 +200,11 @@ impl Attempt {
             }
             None => {
                 // Not raced against cancellation: a fork created after we stopped waiting would never be dropped.
-                let fork = ctx.fork().await.map_err(|e| End::error(format!("could not fork the workspace: {e}")))?;
+                let fork = ctx.fork().await;
+                // Started once it has a fork, so a caller that stops the run can keep what the attempt did there.
+                let started = fork.as_ref().ok().cloned();
+                ctx.progress(Progress::AttemptStarted { run: ctx.run_id(), attempt: self.index, fork: started }).await;
+                let fork = fork.map_err(|e| End::error(format!("could not fork the workspace: {e}")))?;
                 self.fork = Some(fork.clone());
                 if self.cancel.is_cancelled() {
                     return Err(if ctx.over_budget() { End::from(Stop::Budget) } else { End::cancelled() });

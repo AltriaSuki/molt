@@ -22,6 +22,8 @@ use crate::agent::outcome_name;
 const SUMMARY_BYTES: usize = 1 << 20;
 /// Lines kept per attempt while it runs.
 const LANE_LINES: usize = 200;
+/// Ticks within which a second Ctrl+C or Ctrl+D quits: about a second.
+const QUIT_TICKS: u64 = 7;
 /// Lines of a failed attempt's note shown under it in the log.
 const NOTE_LINES: usize = 6;
 /// Lines of a failed check's output shown in its lane.
@@ -97,6 +99,10 @@ pub enum Action {
     /// Stop everything in flight: the services are stopped and started again.
     Interrupt {
         keep: Vec<String>,
+        /// Forks of the attempts that were running, kept when they hold
+        /// changes to more than `check_files`.
+        attempts: Vec<String>,
+        check_files: Vec<String>,
     },
     Quit {
         keep: Vec<String>,
@@ -116,8 +122,11 @@ pub enum Msg {
         memory_problem: Option<String>,
     },
     SessionFailed(String),
-    /// The services of an interrupted session have stopped.
-    Stopped,
+    /// The services of an interrupted session have stopped; `kept` are the
+    /// forks of interrupted attempts kept for their changes.
+    Stopped {
+        kept: Vec<String>,
+    },
     Progress(Progress),
     Designed {
         trace: TraceId,
@@ -161,6 +170,8 @@ pub enum Phase {
 
 pub struct Lane {
     pub index: u32,
+    /// The attempt's fork, once the planner has said which.
+    pub fork: Option<String>,
     pub turn: u32,
     pub status: Option<AttemptStatus>,
     pub lines: Vec<Line<'static>>,
@@ -190,6 +201,8 @@ pub enum Prompt {
     Retry {
         req: Box<RunRequest>,
         designed: bool,
+        /// The user stopped the run, rather than every attempt failing.
+        stopped: bool,
         attempts: Vec<AttemptReport>,
     },
 }
@@ -337,6 +350,8 @@ pub struct App {
     /// A short message in the status bar, until the next key.
     pub flash: Option<String>,
     pub tick: u64,
+    /// The tick of a first Ctrl+C or Ctrl+D; a second soon after quits.
+    quit_armed: Option<u64>,
     pub quit: bool,
 }
 
@@ -378,6 +393,7 @@ impl App {
             zoom: None,
             flash: None,
             tick: 0,
+            quit_armed: None,
             quit: false,
         }
     }
@@ -451,7 +467,14 @@ impl App {
                 self.session = SessionState::Down(clean_line(&e));
                 Vec::new()
             }
-            Msg::Stopped => {
+            Msg::Stopped { kept } => {
+                if !kept.is_empty() {
+                    self.push(Line::from(span(format!("  kept {} · interrupted", kept.len()), Tone::Dim)));
+                    for fork in &kept {
+                        self.push(Line::from(span(format!("  kept in {}", clean_line(fork)), Tone::Dim)));
+                    }
+                    self.kept.extend(kept);
+                }
                 self.session = SessionState::Starting;
                 vec![Action::StartSession]
             }
@@ -513,9 +536,15 @@ impl App {
 
     fn key(&mut self, key: KeyEvent) -> Vec<Action> {
         if ctrl(&key, 'd') || (ctrl(&key, 'c') && self.task.is_none() && self.input.text.is_empty()) {
-            self.quit = true;
-            return vec![Action::Quit { keep: self.keep() }];
+            if self.quit_armed.is_some_and(|at| self.tick.wrapping_sub(at) <= QUIT_TICKS) {
+                self.quit = true;
+                return vec![Action::Quit { keep: self.keep() }];
+            }
+            self.quit_armed = Some(self.tick);
+            self.flash = Some(self.quit_warning(if ctrl(&key, 'd') { "ctrl+d" } else { "ctrl+c" }));
+            return Vec::new();
         }
+        self.quit_armed = None;
         if self.viewer.is_some() {
             self.viewer_key(&key);
             return Vec::new();
@@ -615,6 +644,21 @@ impl App {
         self.task.as_ref().is_some_and(|t| matches!(t.phase, Phase::Designing | Phase::Running | Phase::Applying))
     }
 
+    /// What a first Ctrl+C or Ctrl+D says: press again, and what quitting keeps.
+    fn quit_warning(&self, keys: &str) -> String {
+        let mut parts = vec![format!("{keys} again to quit")];
+        if self.busy() {
+            parts.push("the running task stops".into());
+        }
+        let keep = self.keep().len();
+        match keep {
+            0 => {}
+            1 => parts.push("1 result stays in its fork".into()),
+            n => parts.push(format!("{n} results stay in their forks")),
+        }
+        parts.join("; ")
+    }
+
     fn interrupt(&mut self) -> Vec<Action> {
         if self.task.is_none() && self.learning.is_empty() {
             return Vec::new();
@@ -625,12 +669,26 @@ impl App {
             self.push(Line::from(span(format!("  kept in {}", clean_line(&fork)), Tone::Dim)));
         }
         self.prompt = None;
-        self.task = None;
+        let mut attempts = Vec::new();
+        let mut check_files = Vec::new();
+        if let Some(mut task) = self.task.take() {
+            if matches!(task.phase, Phase::Running) {
+                attempts = task.lanes.iter().filter_map(|l| l.fork.clone()).collect();
+                check_files = task.req.check_files.iter().map(|f| f.path.clone()).collect();
+                self.last_lanes = std::mem::take(&mut task.lanes);
+                // Starting again needs the check in full; a designed one is only known once accepted.
+                if task.req.check.is_some() {
+                    let designed = self.settings.check.as_deref() != task.req.check.as_deref();
+                    self.prompt =
+                        Some(Prompt::Retry { req: Box::new(task.req), designed, stopped: true, attempts: Vec::new() });
+                }
+            }
+        }
         self.zoom = None;
         self.learning.clear();
         self.push(Line::from(span("■ stopped; restarting the services", Tone::Warn)));
         self.session = SessionState::Starting;
-        vec![Action::Interrupt { keep }]
+        vec![Action::Interrupt { keep, attempts, check_files }]
     }
 
     fn history_step(&mut self, back: bool) {
@@ -851,9 +909,11 @@ impl App {
                     self.log.push(Line::from(span(format!("  {}", clean_line(&message)), Tone::Dim)));
                 }
             }
-            Progress::AttemptStarted { attempt, .. } => {
-                if !task.lanes.iter().any(|l| l.index == attempt) {
-                    task.lanes.push(Lane { index: attempt, turn: 0, status: None, lines: Vec::new() });
+            Progress::AttemptStarted { attempt, fork, .. } => {
+                if let Some(lane) = lane(task, attempt) {
+                    lane.fork = lane.fork.take().or(fork);
+                } else {
+                    task.lanes.push(Lane { index: attempt, fork, turn: 0, status: None, lines: Vec::new() });
                     task.lanes.sort_by_key(|l| l.index);
                 }
             }
@@ -1101,7 +1161,12 @@ impl App {
             }
             if req.check.is_some() {
                 let designed = resp.check.as_ref().is_some_and(|c| c.designed);
-                self.prompt = Some(Prompt::Retry { req: Box::new(req), designed, attempts: resp.attempts.clone() });
+                self.prompt = Some(Prompt::Retry {
+                    req: Box::new(req),
+                    designed,
+                    stopped: false,
+                    attempts: resp.attempts.clone(),
+                });
             }
         }
 
@@ -1390,7 +1455,7 @@ fn help() -> Vec<Line<'static>> {
         row("pgup / pgdn", "scroll the log"),
         row("ctrl+home / end", "the start or end of the log"),
         row("↑ / ↓", "earlier inputs"),
-        row("ctrl+d", "quit"),
+        row("ctrl+d twice", "quit"),
         Line::default(),
         head("commands"),
         row("/memory [words]", "notes about this project"),
@@ -1534,8 +1599,8 @@ mod tests {
         );
 
         let run = trace.to_string();
-        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 1 }));
-        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 0 }));
+        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 1, fork: None }));
+        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 0, fork: None }));
         app.update(Msg::Progress(Progress::ToolCall {
             run: run.clone(),
             attempt: 1,
@@ -1551,7 +1616,7 @@ mod tests {
             tail: String::new(),
         }));
         // Another run's events are not this task's.
-        app.update(Msg::Progress(Progress::AttemptStarted { run: "other".into(), attempt: 5 }));
+        app.update(Msg::Progress(Progress::AttemptStarted { run: "other".into(), attempt: 5, fork: None }));
         let task = app.task.as_ref().unwrap();
         assert_eq!(task.lanes.iter().map(|l| l.index).collect::<Vec<_>>(), [0, 1]);
         assert_eq!(plain(&task.lanes[1].lines), [" 3 edit src/parser.rs", "   check passed"]);
@@ -1627,10 +1692,10 @@ mod tests {
 
         // Esc while it runs stops everything.
         let actions = app.update(key(KeyCode::Esc));
-        assert_eq!(actions, [Action::Interrupt { keep: vec![] }]);
+        assert_eq!(actions, [Action::Interrupt { keep: vec![], attempts: vec![], check_files: vec![] }]);
         assert!(app.task.is_none());
         assert_eq!(app.session, SessionState::Starting);
-        assert_eq!(app.update(Msg::Stopped), [Action::StartSession]);
+        assert_eq!(app.update(Msg::Stopped { kept: vec![] }), [Action::StartSession]);
 
         // A design that fails ends the task.
         up(&mut app);
@@ -1736,6 +1801,8 @@ mod tests {
         let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
         app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-9"))) });
         assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
+        assert!(app.update(ctrl_key('d')).is_empty());
+        assert_eq!(app.flash.as_deref(), Some("ctrl+d again to quit; 1 result stays in its fork"));
         assert_eq!(app.update(ctrl_key('d')), [Action::Quit { keep: vec!["/d/work/fork-9".into()] }]);
     }
 
@@ -1875,7 +1942,7 @@ mod tests {
         let first = first.clone();
 
         let run = trace.to_string();
-        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 0 }));
+        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 0, fork: None }));
         app.update(Msg::Progress(Progress::CheckRan {
             run: run.clone(),
             attempt: 0,
@@ -1924,7 +1991,7 @@ mod tests {
         let actions = type_in(&mut app, "task");
         let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
         let run = trace.to_string();
-        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 0 }));
+        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 0, fork: None }));
         app.update(Msg::Progress(Progress::ToolCall {
             run,
             attempt: 0,
@@ -1942,5 +2009,71 @@ mod tests {
         type_in(&mut app, "/lanes");
         let viewer = app.viewer.take().expect("the last task's attempts");
         assert_eq!(plain(&viewer.lines)[..2], ["attempt 1 · tool calls", " 1 read Makefile"]);
+    }
+
+    #[test]
+    fn quitting_takes_a_second_press_soon_after_the_first() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        assert!(app.update(ctrl_key('d')).is_empty());
+        assert_eq!(app.flash.as_deref(), Some("ctrl+d again to quit"));
+        assert!(!app.quit);
+        // Too late: the second press only warns again.
+        for _ in 0..=QUIT_TICKS {
+            app.update(Msg::Tick);
+        }
+        assert!(app.update(ctrl_key('c')).is_empty());
+        assert_eq!(app.flash.as_deref(), Some("ctrl+c again to quit"));
+        assert_eq!(app.update(ctrl_key('c')), [Action::Quit { keep: vec![] }]);
+
+        // Another key in between starts over.
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.update(ctrl_key('d'));
+        app.update(key(KeyCode::Left));
+        assert!(app.update(ctrl_key('d')).is_empty());
+        // A signal still quits at once.
+        assert_eq!(app.update(Msg::Signal), [Action::Quit { keep: vec![] }]);
+    }
+
+    #[test]
+    fn an_interrupt_keeps_the_attempts_forks_and_offers_to_start_again() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "task");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()) });
+        let actions = app.update(key(KeyCode::Enter));
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let first = req.clone();
+        let run = trace.to_string();
+        for (attempt, fork) in [(0, Some("/d/work/fork-a")), (1, Some("/d/work/fork-b")), (2, None)] {
+            app.update(Msg::Progress(Progress::AttemptStarted {
+                run: run.clone(),
+                attempt,
+                fork: fork.map(str::to_owned),
+            }));
+        }
+        let actions = app.update(key(KeyCode::Esc));
+        assert_eq!(
+            actions,
+            [Action::Interrupt {
+                keep: vec![],
+                attempts: vec!["/d/work/fork-a".into(), "/d/work/fork-b".into()],
+                check_files: vec!["tests/commas.rs".into()],
+            }]
+        );
+        // The runtime found changes in one of them.
+        assert_eq!(app.update(Msg::Stopped { kept: vec!["/d/work/fork-b".into()] }), [Action::StartSession]);
+        assert_eq!(app.kept, ["/d/work/fork-b"]);
+        assert!(log(&app).ends_with("  kept 1 · interrupted\n  kept in /d/work/fork-b"), "{}", log(&app));
+
+        assert!(matches!(app.prompt, Some(Prompt::Retry { stopped: true, .. })));
+        assert!(app.update(key(KeyCode::Char('r'))).is_empty(), "not while the services restart");
+        up(&mut app);
+        let actions = app.update(key(KeyCode::Char('r')));
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!((&req.check, &req.check_files), (&first.check, &first.check_files));
     }
 }
