@@ -1047,6 +1047,7 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
     let molt_do = |data_dir: &Path, key: Option<&str>, args: &[&str]| {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_molt"));
         cmd.args(["do", "anything", "--data-dir"]).arg(data_dir).args(args).current_dir(workspace.path());
+        cmd.env_remove("OPENAI_API_KEY").env_remove("MOLT_PROVIDER");
         match key {
             Some(key) => cmd.env("ANTHROPIC_API_KEY", key),
             None => cmd.env_remove("ANTHROPIC_API_KEY"),
@@ -1056,7 +1057,7 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
         String::from_utf8_lossy(&out.stderr).into_owned()
     };
     let err = molt_do(data.path(), None, &[]);
-    assert!(err.contains("ANTHROPIC_API_KEY is not set"), "{err}");
+    assert!(err.contains("ANTHROPIC_API_KEY or OPENAI_API_KEY is not set"), "{err}");
     let ws = workspace.path().canonicalize().unwrap();
     let inside = ws.join("state");
     let err = molt_do(&inside, Some("test"), &[]);
