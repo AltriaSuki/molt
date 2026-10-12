@@ -431,6 +431,44 @@ The check files a run writes into forks are never checked. To compare the
 modes, run them as benchmark arms, such as
 `--arm reject="--syntax-check reject" --arm unchecked="--syntax-check off"`.
 
+## Trusted lifecycle hooks
+
+An explicitly selected `--config /outside/project/molt.toml` may contain
+`[[hooks]]` entries. Files inside the workspace never supply hooks, even with
+`--config`; no project file is discovered automatically.
+
+```toml
+[[hooks]]
+event = "before_apply"
+command = "cargo fmt"
+blocking = true
+timeout_ms = 30000
+
+[[hooks]]
+event = "run_finished"
+command = "printf 'Molt finished\\n'"
+```
+
+Supported events are `before_apply`, `after_apply`, `run_finished`, and
+`attempt_failed`. Only `before_apply` may block. Its commands run sequentially
+in each passing candidate's isolated fork after acceptance, before ranking, diff, review
+and application. The authoritative check files are restored, protected paths
+are checked, and acceptance runs again even if a nonblocking formatter failed.
+A failing check or blocking hook keeps the result in its fork and applies
+nothing. Retained results (including the TUI's confirm mode) are prepared the
+same way before they are shown, so the diff/review covers the formatted result.
+
+Notification hooks run in a separate disposable fork and cannot change the
+applied workspace. `after_apply` is also sent when the TUI user applies a kept
+result; `run_finished` means the planner finished, not that the user accepted a
+kept result. All commands use the existing shell sandbox, environment scrubbing,
+process-tree cleanup and bounded output. They do not gain host network or
+notification access. Shell requests/results record output, exit status and
+elapsed time in the audit; planner notes identify the lifecycle event. Timeouts
+are 1–600000 ms, commands at most 8192 bytes, and at most 32 hooks are accepted.
+An interrupted or resumed run may deliver notifications again; use idempotent
+notification commands. Hooks are not part of the model-editable RunRequest.
+
 ## Projects
 
 A project is what molt keeps memory for. Each has a stable id and a name in
@@ -870,44 +908,6 @@ Dependencies mount at their canonical absolute paths. `--pass-env NAME` explicit
 Limits are inherited per process: address space, CPU time, file size, open files and process count, plus the existing command wall timeout. These are not aggregate cgroup quotas; RLIMIT_NPROC has the operating system's per-user semantics and does not limit root. TERM reaches the sandbox session group with 500 ms grace; KILL then tears down its PID namespace, including descendants that called setsid. Normal completion, cancelled handlers and service exit also tear down the namespace. Temporary mounts disappear with the last process. Future executable skills must use this shell path to share the policy.
 
 CI installs bubblewrap and requires namespace tests to run. A constrained local executor may skip only those integration tests after a failed capability probe; production startup still fails closed. Tests cover host paths, symlinks, read-only dependencies, network policy, host sockets, limits, C builds, cancellation and descendants with new sessions.
-
-## Trusted lifecycle hooks
-
-An explicitly selected `--config /outside/project/molt.toml` may contain
-`[[hooks]]` entries. Files inside the workspace never supply hooks, even with
-`--config`; no project file is discovered automatically.
-
-```toml
-[[hooks]]
-event = "before_apply"
-command = "cargo fmt"
-blocking = true
-timeout_ms = 30000
-
-[[hooks]]
-event = "run_finished"
-command = "printf 'Molt finished\\n'"
-```
-
-Supported events are `before_apply`, `after_apply`, `run_finished`, and
-`attempt_failed`. Only `before_apply` may block. Its commands run sequentially
-in each passing candidate's isolated fork after acceptance, before ranking, diff, review
-and application. The authoritative check files are restored, protected paths
-are checked, and acceptance runs again even if a nonblocking formatter failed.
-A failing check or blocking hook keeps the result in its fork and applies
-nothing. Retained results (including the TUI's confirm mode) are prepared the
-same way before they are shown, so the diff/review covers the formatted result.
-
-Notification hooks run in a separate disposable fork and cannot change the
-applied workspace. `after_apply` is also sent when the TUI user applies a kept
-result; `run_finished` means the planner finished, not that the user accepted a
-kept result. All commands use the existing shell sandbox, environment scrubbing,
-process-tree cleanup and bounded output. They do not gain host network or
-notification access. Shell requests/results record output, exit status and
-elapsed time in the audit; planner notes identify the lifecycle event. Timeouts
-are 1–600000 ms, commands at most 8192 bytes, and at most 32 hooks are accepted.
-An interrupted or resumed run may deliver notifications again; use idempotent
-notification commands. Hooks are not part of the model-editable RunRequest.
 
 ## Terminal colors and controls
 
