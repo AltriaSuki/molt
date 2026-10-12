@@ -20,6 +20,8 @@ class Failure(Exception):
 def run(argv, *, cwd=None, env=None, timeout=60, input=None, check=True):
     child_env = dict(os.environ if env is None else env)
     program = Path(argv[0]).name
+    if program == 'git':
+        child_env['GIT_LITERAL_PATHSPECS'] = '1'
     if program != 'molt':
         child_env.pop('ANTHROPIC_API_KEY', None)
         child_env.pop('OPENAI_API_KEY', None)
@@ -133,7 +135,7 @@ def main():
     branch = f'molt/issue-{issue}-{os.environ["GITHUB_RUN_ID"]}-{os.environ.get("GITHUB_RUN_ATTEMPT", "1")}'
     _, names, _ = run(['git', 'config', '--name-only', '--get-regexp', r'^filter\.'], cwd=workspace, check=False)
     filters = {name.rsplit('.', 1)[0] for name in names.decode().splitlines()}
-    git_prefix = ['git', '-c', 'core.hooksPath=/dev/null']
+    git_prefix = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false']
     for name in sorted(filters):
         git_prefix.extend(['-c', name + '.clean=/bin/cat', '-c', name + '.process=', '-c', name + '.required=false'])
     started = time.monotonic()

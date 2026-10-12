@@ -27,6 +27,16 @@ class Tests(unittest.TestCase):
                 ci.safe_path(path)
         self.assertEqual(ci.safe_path('src/a b.rs'), 'src/a b.rs')
 
+    def test_git_paths_are_literal_even_when_they_contain_wildcards(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ci.run(['git', 'init', '-q'], cwd=root)
+            (root / '[ab].txt').write_text('reported')
+            (root / 'a.txt').write_text('unreported')
+            ci.run(['git', 'add', '--', '[ab].txt'], cwd=root)
+            files = ci.run(['git', 'diff', '--cached', '--name-only'], cwd=root)[1]
+            self.assertEqual(files.decode().strip(), '[ab].txt')
+
     def test_unknown_cost_and_baseline_are_never_zero(self):
         result = {'run': 'trace_1', 'check': {'command': 'test\n```'}, 'uncounted_calls': 2}
         body = ci.evidence(result, {'exit_code': None, 'timed_out': True})
