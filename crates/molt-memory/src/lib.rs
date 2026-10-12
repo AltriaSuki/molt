@@ -23,8 +23,9 @@ use anyhow::{ensure, Context};
 use async_trait::async_trait;
 use molt_api::fs::{self as fs_api, FilesChanged};
 use molt_api::memory::{
-    ConsolidateRequest, CorrectRequest, ForgetRequest, ForgetResponse, IndexRequest, MapRequest, RecallRequest,
-    RecallResponse, RememberRequest, RememberResponse, RetractRequest, RetractResponse, ReviewRequest, SymbolsRequest,
+    ConsolidateRequest, CorrectRequest, ForgetRequest, ForgetResponse, IndexRequest, MapRequest, PromoteRequest,
+    PromoteResponse, RecallRequest, RecallResponse, RememberRequest, RememberResponse, RetractRequest, RetractResponse,
+    ReviewRequest, SymbolsRequest,
 };
 use molt_api::model::Effort;
 use molt_proto::{Budget, Envelope, ErrorCode, Kind, RemoteError, Target, TraceId};
@@ -194,6 +195,14 @@ pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// Run `f` on `db` off the async runtime.
+async fn on<R: Send + 'static>(
+    db: Arc<Db>,
+    f: impl FnOnce(&Db) -> Result<R, RemoteError> + Send + 'static,
+) -> Result<R, RemoteError> {
+    tokio::task::spawn_blocking(move || f(&db)).await.map_err(|e| failed(format!("memory failed: {e}")))?
+}
+
 fn parse<T: DeserializeOwned>(method: &str, payload: Value) -> Result<T, RemoteError> {
     serde_json::from_value(payload).map_err(|e| invalid(format!("bad memory.{method} request: {e}")))
 }
@@ -206,12 +215,14 @@ fn reply<T: Serialize>(value: T) -> Result<Value, RemoteError> {
 /// review state in the database; use the service for kernel-audited calls.
 /// `req.workspace` must be the notes' key, and `path` the canonical
 /// directory their dependencies are in. Capturing requires a service request.
+/// `user` is the user's layer of notes for every project, when there is one.
 pub fn recall(
     db: &Db,
     req: &RecallRequest,
     path: Option<&Path>,
+    user: Option<&Db>,
 ) -> Result<Vec<molt_api::memory::Recalled>, RemoteError> {
-    review::recall(db, req, path, None, now_ms())
+    review::recall(db, req, path, user, None, now_ms())
 }
 
 /// Read immutable context/tool records for a canonical project and run.
@@ -226,6 +237,9 @@ pub fn recall_snapshots(
 /// The memory service's state.
 pub struct Memory {
     db: Arc<Db>,
+    /// The user's layer: notes for every project, kept outside any one
+    /// project's data. Notes remembered for no workspace go there.
+    user: Option<Arc<Db>>,
     /// Canonical; every workspace must be inside it.
     root: PathBuf,
     cfg: Config,
@@ -263,6 +277,7 @@ impl Memory {
         }
         Ok(Self {
             db,
+            user: None,
             root,
             cfg,
             writer,
@@ -271,6 +286,12 @@ impl Memory {
             changes: std::sync::Mutex::default(),
             fork_views: tokio::sync::Mutex::default(),
         })
+    }
+
+    /// Keep notes for every project in `user` rather than in this project's database.
+    pub fn with_user(mut self, user: Arc<Db>) -> Self {
+        self.user = Some(user);
+        self
     }
 
     /// The canonical directory a request's `workspace` names: an absolute
@@ -322,8 +343,7 @@ impl Memory {
         &self,
         f: impl FnOnce(&Db) -> Result<R, RemoteError> + Send + 'static,
     ) -> Result<R, RemoteError> {
-        let db = self.db.clone();
-        tokio::task::spawn_blocking(move || f(&db)).await.map_err(|e| failed(format!("memory failed: {e}")))?
+        on(self.db.clone(), f).await
     }
 
     /// Bring the model of the canonical `ws` up to date, one update at a time.
@@ -353,6 +373,9 @@ impl Memory {
                 let r: RememberRequest = parse(&method, req.payload)?;
                 let service = req.from.as_ref().ok_or_else(|| invalid("the request has no sender"))?.to_string();
                 let workspace = r.workspace.as_deref().map(|w| self.workspace_key(w)).transpose()?;
+                if workspace.is_none() && self.user.is_some() && service != "cli" {
+                    return Err(invalid("only the kernel-identified CLI may remember a user-layer note"));
+                }
                 let new = NewNote {
                     kind: r.kind,
                     text: r.text,
@@ -365,7 +388,11 @@ impl Memory {
                         version: r.version,
                     },
                 };
-                let (note, reinforced) = self.blocking(move |db| notes::remember(db, new, now)).await?;
+                let db = match (&new.workspace, &self.user) {
+                    (None, Some(user)) => user.clone(),
+                    _ => self.db.clone(),
+                };
+                let (note, reinforced) = on(db, move |db| notes::remember(db, new, now)).await?;
                 reply(RememberResponse { note, reinforced })
             }
             "recall" => {
@@ -378,8 +405,12 @@ impl Memory {
                 }
                 let run = req.trace_id.to_string();
                 let call = req.id.to_string();
-                let notes =
-                    self.blocking(move |db| review::recall(db, &r, path.as_deref(), Some((&run, &call)), now)).await?;
+                let user = self.user.clone();
+                let notes = self
+                    .blocking(move |db| {
+                        review::recall(db, &r, path.as_deref(), user.as_deref(), Some((&run, &call)), now)
+                    })
+                    .await?;
                 reply(RecallResponse { notes })
             }
             "review" | "correct" => {
@@ -403,23 +434,63 @@ impl Memory {
                     service: "cli".into(),
                     version: "user".into(),
                 };
+                // A note this project does not hold is one of the user's, if anywhere.
+                let id = r.id.clone();
+                let ours = self.blocking(move |db| db.with(|conn| notes::get(conn, &id)).map_err(error::db)).await?;
+                let (db, global) = match (ours, &self.user) {
+                    (None, Some(user)) => (user.clone(), true),
+                    _ => (self.db.clone(), false),
+                };
                 reply(
-                    self.blocking(move |db| review::review(db, &r, &path, correction.as_deref(), provenance, now))
+                    on(db, move |db| review::review(db, &r, &path, global, correction.as_deref(), provenance, now))
                         .await?,
                 )
+            }
+            "promote" => {
+                if req.from.as_ref().map(|s| s.as_str()) != Some("cli") {
+                    return Err(invalid("only the kernel-identified CLI may promote notes"));
+                }
+                let r: PromoteRequest = parse(&method, req.payload)?;
+                let user = self.user.clone().ok_or_else(|| invalid("this memory has no user layer to promote to"))?;
+                let (key, path) = self.scope(&r.workspace)?;
+                let by = molt_api::memory::Provenance {
+                    trace: req.trace_id.to_string(),
+                    events: vec![req.id.to_string()],
+                    service: "cli".into(),
+                    version: "user".into(),
+                };
+                let note = self
+                    .blocking(move |db| {
+                        review::refresh(db, &key, &path, &by.trace, now)?;
+                        review::promote(db, &user, &key, &r, &by, now)
+                    })
+                    .await?;
+                reply(PromoteResponse { note })
             }
             "forget" => {
                 let r: ForgetRequest = parse(&method, req.payload)?;
                 let trace = req.trace_id.to_string();
-                let forgotten = self.blocking(move |db| notes::forget(db, &r.id, &r.reason, &trace, now)).await?;
+                let (id, reason, t) = (r.id.clone(), r.reason.clone(), trace.clone());
+                let mut forgotten = self.blocking(move |db| notes::forget(db, &id, &reason, &t, now)).await?;
+                if let (false, Some(user)) = (forgotten, self.user.clone()) {
+                    forgotten = on(user, move |db| notes::forget(db, &r.id, &r.reason, &trace, now)).await?;
+                }
                 reply(ForgetResponse { forgotten })
             }
             "retract" => {
                 let r: RetractRequest = parse(&method, req.payload)?;
                 let trace = req.trace_id.to_string();
-                let done =
-                    self.blocking(move |db| notes::retract(db, &r.service, &r.version, &r.reason, &trace, now)).await?;
-                reply(RetractResponse { retracted: done.retracted, adjusted: done.adjusted })
+                // What a version learned may have been promoted to the user's layer.
+                let mut retracted = 0;
+                let mut adjusted = 0;
+                for db in std::iter::once(self.db.clone()).chain(self.user.clone()) {
+                    let (r, trace) = (r.clone(), trace.clone());
+                    let done =
+                        on(db, move |db| notes::retract(db, &r.service, &r.version, &r.reason, &trace, now)).await?;
+                    retracted += done.retracted;
+                    adjusted += done.adjusted;
+                }
+                reply(RetractResponse { retracted, adjusted })
             }
             "consolidate" => {
                 let r: ConsolidateRequest = parse(&method, req.payload)?;

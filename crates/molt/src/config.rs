@@ -358,6 +358,15 @@ impl Config {
         Ok(())
     }
 
+    /// Have the memory service keep the user's notes for every project in
+    /// the database at `path`, shared by all of them.
+    pub fn with_user_db(&mut self, path: &Path) -> anyhow::Result<()> {
+        let Some(exec) = self.service_mut("memory").and_then(|s| s.exec.as_mut()) else { return Ok(()) };
+        let path = path.to_str().with_context(|| format!("{} is not UTF-8", path.display()))?;
+        exec.args.extend(["--user-db".into(), path.to_owned()]);
+        Ok(())
+    }
+
     pub fn service(&self, name: &str) -> Option<&ServiceSection> {
         self.services.iter().find(|s| s.name.as_str() == name)
     }

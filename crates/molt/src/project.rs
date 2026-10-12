@@ -64,6 +64,11 @@ impl Registry {
         Self { dir: dir.into() }
     }
 
+    /// The user's notes for every project, next to the registry.
+    pub fn user_db(&self) -> PathBuf {
+        self.dir.join("user.db")
+    }
+
     pub fn list(&self) -> anyhow::Result<Vec<Project>> {
         self.update(|projects| Ok(projects.clone()))
     }

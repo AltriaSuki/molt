@@ -172,7 +172,8 @@ start and end.
 `/memory [words]` lists the notes about the project, strongest first, with
 where each came from: the run, the service version that wrote it and the
 messages in the audit log it rests on. `f` forgets one, with a reason, as
-`molt memory forget` does. The screen includes quarantined notes for inspection,
+`molt memory forget` does, and `p` promotes one to every project, as
+`molt memory promote` does. The screen includes quarantined notes for inspection,
 marked `[review]`, and temporary experience marked `[temporary]`. The detail
 pane shows recall scores, keywords, revision, dependencies and source evidence;
 `v` opens the full scrollable record. `a` reviews a note and `c` corrects it:
@@ -185,7 +186,8 @@ Ordinary planner recall still excludes notes awaiting review.
 `/memory-used [run]` opens the immutable recall snapshots for that run in this
 project, defaulting to the latest task. The task's memory log shows this command;
 `u` in the memory screen opens the latest task's context. Later corrections do
-not alter those recorded notes. `/attempts`, `/model`, `/effort`, `/budget` and
+not alter those recorded notes. `/remember TEXT` keeps a preference of yours
+for every project. `/attempts`, `/model`, `/effort`, `/budget` and
 `/check` set the next tasks' options (`/check` while a task runs changes only
 that task); `/memory-model NAME` sets the model
 memory learns with (`same` for the attempts' model, `default` for
@@ -520,6 +522,29 @@ using its current revision and dependency list. Unrelated changes leave it
 alone. Files are limited to 1 MiB, at most 16 per note; symlinks, paths outside
 the project and Molt's own data are refused.
 
+### Your notes, for every project
+
+Notes about you, such as "Answer in Chinese.", belong to no project. They
+live in your own layer, `user.db` next to the project registry
+(`$XDG_DATA_HOME/molt`, else `~/.local/share/molt`), and every project's
+recall merges them with its own, best first. Each recalled note says which
+layer it came from, in `show`, on the memory screen and in a run's snapshot.
+
+```sh
+molt memory remember --global "Answer in Chinese."    # yours, everywhere
+molt memory remember "Deploy with make release."      # this project's
+molt memory promote NOTE_ID --reason "every project of mine builds with make"
+```
+
+Writing one goes through the kernel and is audited. Learning never writes
+there: a run's record holds text the project chose. When the model thinks a
+learned note holds everywhere, it only proposes it (`proposed for every
+project` in `show`, and in what a run reports learning); `promote` copies it
+once you say why. The project note stays, marked with where it went, and the
+copy keeps its evidence, so rolling back the version that learned it retracts
+the copy too. `forget` and `correct` work on your notes from any project.
+Project databases from before need no migration.
+
 `review --temporary` marks a workaround as temporary experience, and the
 model is explicitly told to verify it before reuse. Review metadata does not
 change the original learning evidence. All these commands accept `--workspace`
@@ -762,7 +787,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.
 - Recall matches keywords (with stemming), not meaning: there is no vector index, since the Anthropic API has no embeddings endpoint. A note worded differently from the task can be missed; the strongest notes about the project are always shown.
-- Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. With the default setup, memory lives in the project's data dir, so nothing is shared between projects yet. Clones of one project share its data dir, so molt runs in one of them at a time.
+- Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. Only notes you write or promote yourself are shared between projects. Clones of one project share its data dir, so molt runs in one of them at a time.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.
 - Model prices are as current as the last `molt prices update` (or the release's snapshot) and as right as the community list they came from; a price that changes mid-run is not picked up until the next run. Models that LiteLLM lists only with tiered or regional prices, such as some Qwen models, have no price until declared in `MOLT_MODEL_PRICES`.

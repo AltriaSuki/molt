@@ -176,7 +176,7 @@ mod tests {
         });
         drop(db);
         let upgraded = Db::open(&path).unwrap();
-        let notes = crate::recall(&upgraded, &Default::default(), None).unwrap();
+        let notes = crate::recall(&upgraded, &Default::default(), None, None).unwrap();
         assert_eq!(notes[0].note.id, "old_note");
         assert_eq!(notes[0].details, Default::default());
         assert!(crate::recall_snapshots(&upgraded, "/w", "source_run").unwrap().is_empty());

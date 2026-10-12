@@ -819,6 +819,57 @@ async fn a_project_keeps_its_notes_without_a_folder_and_after_a_move() {
 }
 
 #[tokio::test]
+async fn a_note_remembered_for_every_project_is_recalled_in_another() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let molt = |args: &[&str], dir: &Path| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+            .args(args)
+            .env("XDG_DATA_HOME", home.path().join("user-data"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env_remove("ANTHROPIC_API_KEY")
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "molt {args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        stdout.into_owned()
+    };
+    // Two projects, each with its own data dir and so its own notes.
+    let mut at = Vec::new();
+    for name in ["a", "b"] {
+        let dir = home.path().join(name);
+        let data = home.path().join(format!("data-{name}"));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        molt(&["project", "new", name, "--path", dir.to_str().unwrap()], home.path());
+        at.push((dir, data.to_str().unwrap().to_owned()));
+    }
+    let memory = |args: &[&str], (dir, data): &(PathBuf, String)| {
+        let mut all = vec!["memory"];
+        all.extend(args);
+        all.extend(["--data-dir", data.as_str()]);
+        molt(&all, dir)
+    };
+
+    let kept = memory(&["remember", "Build with make."], &at[0]);
+    assert!(kept.contains("for this project"), "{kept}");
+    let kept = memory(&["remember", "--global", "Answer in Chinese."], &at[0]);
+    assert!(kept.contains("for every project"), "{kept}");
+    let shown = memory(&["show"], &at[1]);
+    assert!(shown.contains("Answer in Chinese."), "{shown}");
+    assert!(shown.contains("yours, for every project"), "{shown}");
+    assert!(!shown.contains("Build with make."), "{shown}");
+
+    // A project note goes everywhere only when promoted.
+    let id = memory(&["show", "build"], &at[0]).split_whitespace().next().unwrap().to_owned();
+    memory(&["promote", &id, "--reason", "every project here builds with make"], &at[0]);
+    assert!(memory(&["show"], &at[1]).contains("Build with make."));
+    assert!(memory(&["show", "build"], &at[0]).contains("promoted as"));
+}
+
+#[tokio::test]
 async fn the_cli_carries_out_a_task() {
     let server = fake_api(Fake::Greets).await;
     let workspace = tempfile::tempdir().unwrap();
