@@ -721,7 +721,6 @@ needed. Deleting an unfinished record loses its recovery material.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.
 - Model prices are as current as the last `molt prices update` (or the release's snapshot) and as right as the community list they came from; a price that changes mid-run is not picked up until the next run. Models that LiteLLM lists only with tiered or regional prices, such as some Qwen models, have no price until declared in `MOLT_MODEL_PRICES`.
-- No license has been chosen yet.
 
 ### Cancellation and model settlement
 
@@ -811,3 +810,7 @@ win name conflicts. Invalid, oversized and out-of-workspace files are skipped
 with a startup warning; restart the interface after editing templates. Discovery
 is bounded to 128 directory entries and 64 KiB per file. Nested YAML structures
 and multiline frontmatter scalars are not supported.
+
+## License
+
+Molt is dual-licensed under the [MIT license](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option. Contributions are accepted under the same terms; see [CONTRIBUTING.md](CONTRIBUTING.md#license).
