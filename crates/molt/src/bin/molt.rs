@@ -666,6 +666,7 @@ async fn execute(
     let resp = done.run;
     if args.json {
         let mut out = serde_json::to_value(&resp)?;
+        out["run"] = serde_json::json!(run);
         // What learning did and cost, next to the run's own spend.
         out["learning"] = done.learned.as_ref().map_or(serde_json::Value::Null, agent::learning_json);
         println!("{}", serde_json::to_string_pretty(&out)?);
