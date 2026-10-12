@@ -34,6 +34,8 @@ enum Cmd {
     /// Open the interface: tasks one after another in a workspace, the
     /// check shown before the attempts start, and what memory holds.
     Ui(UiArgs),
+    #[command(hide = true)]
+    UiBackend,
     /// Start the kernel and the configured services; stop on Ctrl-C, SIGTERM or SIGHUP.
     Run,
     /// Carry out a task in a workspace with the agent services, verified by a done-check.
@@ -453,6 +455,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                 eprintln!("kept: {}", agent::printable(&fork));
             }
         }
+        Cmd::UiBackend => molt::tui::serve_backend().await?,
         Cmd::Run => {
             let stop = molt::stop_signal()?;
             let cfg = config()?;

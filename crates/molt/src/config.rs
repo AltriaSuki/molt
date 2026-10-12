@@ -30,7 +30,7 @@ use molt_proto::{Budget, CapRequest, Exec, Manifest, ServiceId, Target, Tier};
 use molt_transport::Secret;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportKind {
     #[default]
@@ -54,7 +54,7 @@ fn five() -> u32 {
     5
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelSection {
     #[serde(default = "default_data_dir")]
@@ -73,7 +73,7 @@ impl Default for KernelSection {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceSection {
     pub name: ServiceId,
@@ -149,7 +149,7 @@ impl ServiceSection {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -162,7 +162,7 @@ pub struct Config {
 
 /// When the interface's confirm mode stops for the user. It goes on by
 /// itself when nothing here calls for a look.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfirmSection {
     /// Stop before applying a result that adds and removes more lines than this.

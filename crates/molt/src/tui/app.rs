@@ -98,9 +98,12 @@ impl Default for Settings {
 }
 
 /// Work for the runtime.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     StartSession,
+    Redraw,
+    Suspend,
+    SaveTheme(text::Theme),
     Design {
         req: RunRequest,
         trace: TraceId,
@@ -166,8 +169,9 @@ pub enum Action {
 }
 
 /// What happened.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum Msg {
+    #[serde(skip)]
     Key(KeyEvent),
     Paste(String),
     Tick,
@@ -680,6 +684,7 @@ pub struct App {
     workspace_path: String,
     pub mode: Mode,
     pub settings: Settings,
+    pub theme: text::Theme,
     pub session: SessionState,
     pub log: Vec<Line<'static>>,
     /// Lines scrolled up from the end of the log; 0 follows it.
@@ -741,6 +746,7 @@ impl App {
             workspace_path: workspace_path.to_owned(),
             mode: Mode::Confirm,
             settings: Settings::default(),
+            theme: text::Theme::detect(std::env::var("COLORTERM").ok().as_deref()),
             session: SessionState::Starting,
             log: Vec::new(),
             scroll: 0,
@@ -985,6 +991,12 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if ctrl(&key, 'l') {
+            return vec![Action::Redraw];
+        }
+        if ctrl(&key, 'z') {
+            return vec![Action::Suspend];
+        }
         if ctrl(&key, 'd') || (ctrl(&key, 'c') && self.task.is_none() && self.input.text.is_empty()) {
             if self.quit_armed.is_some_and(|at| self.tick.wrapping_sub(at) <= QUIT_TICKS) {
                 self.quit = true;
@@ -1243,6 +1255,17 @@ impl App {
             "memory-used" => {
                 let run = if arg.is_empty() { self.last_run.clone() } else { Some(arg.to_owned()) };
                 return self.open_used(run);
+            }
+            "theme" => {
+                if arg.is_empty() {
+                    self.flash = Some(format!("theme: {}; /theme dark|light|ansi", self.theme.name()));
+                } else if let Some(theme) = text::Theme::parse(arg) {
+                    self.theme = theme;
+                    self.flash = Some(format!("theme: {}", theme.name()));
+                    return vec![Action::SaveTheme(theme), Action::Redraw];
+                } else {
+                    self.flash = Some("theme: dark, light or ansi".into());
+                }
             }
             "help" => {
                 self.viewer = Some(Viewer { title: "help".into(), lines: help(), scroll: 0 });
@@ -2418,6 +2441,8 @@ fn help() -> Vec<Line<'static>> {
         row("pgup / pgdn", "scroll the log"),
         row("ctrl+home / end", "the start or end of the log"),
         row("shift+enter", "a new line in the task; also ctrl+j, or \\ then enter"),
+        row("ctrl+l", "clear and redraw the screen"),
+        row("ctrl+z", "suspend the interface; fg returns, services keep running"),
         row("ctrl+g", "write the task in $VISUAL or $EDITOR"),
         row("↑ / ↓", "the line above or below, then earlier inputs"),
         row("ctrl+d twice", "quit"),
@@ -2439,6 +2464,7 @@ fn help() -> Vec<Line<'static>> {
         row("/budget USD", "spending limit per task"),
         row("/last", "the diff of the last finished task"),
         row("/lanes", "the tool calls of the last finished task"),
+        row("/theme NAME", "dark, light or terminal ANSI colors; saved for next time"),
         row("/clear", "clear the log"),
         row("/quit", "quit"),
         Line::default(),
@@ -2702,6 +2728,21 @@ mod tests {
         let trace = app.task.as_ref().unwrap().trace.clone();
         assert!(app.update(Msg::Designed { trace, result: Err("cancelled".into()), existing: vec![] }).is_empty());
         assert!(app.task.is_none() && app.prompt.is_none());
+    }
+
+    #[test]
+    fn terminal_controls_work_over_a_viewer_and_leave_the_task_running() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "fix it");
+        type_in(&mut app, "/help");
+        assert_eq!(app.update(ctrl_key('l')), [Action::Redraw]);
+        assert_eq!(app.update(ctrl_key('z')), [Action::Suspend]);
+        assert!(app.task.is_some());
+        app.viewer = None;
+        assert_eq!(type_in(&mut app, "/theme light"), [Action::SaveTheme(text::Theme::Light), Action::Redraw]);
+        assert_eq!(app.theme, text::Theme::Light);
+        assert!(app.task.is_some());
     }
 
     fn design() -> DesignResponse {

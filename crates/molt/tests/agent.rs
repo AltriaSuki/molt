@@ -1363,3 +1363,79 @@ async fn a_comparison_suite_cannot_mutate_the_checked_candidate() {
     assert!(resp.applied);
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
 }
+
+#[tokio::test]
+async fn the_ui_backend_finishes_without_terminal_reads_and_exits_when_the_pipe_closes() {
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    async fn send(out: &mut (impl AsyncWrite + Unpin), value: Value) {
+        let bytes = serde_json::to_vec(&value).unwrap();
+        out.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
+        out.write_all(&bytes).await.unwrap();
+        out.flush().await.unwrap();
+    }
+    async fn recv(input: &mut (impl AsyncRead + Unpin)) -> Value {
+        let mut size = [0; 4];
+        input.read_exact(&mut size).await.unwrap();
+        let mut bytes = vec![0; u32::from_be_bytes(size) as usize];
+        input.read_exact(&mut bytes).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    let mut noise = molt::ServiceSection::new(
+        ServiceId::new("noise").unwrap(),
+        molt_proto::Tier::Mutable,
+        molt_proto::Exec {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf untrusted-service-stdout".into()],
+        },
+        Vec::new(),
+    );
+    noise.max_restarts = 0;
+    setup.cfg.services.push(noise);
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+        .arg("ui-backend")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
+    send(
+        &mut input,
+        json!({"cfg":setup.cfg,"workspace":setup.workspace.path().canonicalize().unwrap().to_str().unwrap()}),
+    )
+    .await;
+    send(&mut input, json!("StartSession")).await;
+    let up = tokio::time::timeout(Duration::from_secs(20), recv(&mut output)).await.unwrap();
+    assert!(up.get("SessionUp").is_some(), "{up}");
+    let req = setup.request(Some(CHECK), 1);
+    send(&mut input, json!({"Run":{"req":req,"trace":molt_proto::TraceId::random()}})).await;
+    // With no frontend reading messages, both model turns and review still run.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if server.received_requests().await.unwrap_or_default().len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let msg = recv(&mut output).await;
+            if msg.get("Ran").is_some() {
+                break msg;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(result["Ran"]["result"]["Ok"]["applied"], true, "{result}");
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    drop(input);
+    assert!(tokio::time::timeout(Duration::from_secs(15), child.wait()).await.unwrap().unwrap().success());
+}

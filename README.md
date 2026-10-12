@@ -870,6 +870,26 @@ Limits are inherited per process: address space, CPU time, file size, open files
 
 CI installs bubblewrap and requires namespace tests to run. A constrained local executor may skip only those integration tests after a failed capability probe; production startup still fails closed. Tests cover host paths, symlinks, read-only dependencies, network policy, host sockets, limits, C builds, cancellation and descendants with new sessions.
 
+## Terminal colors and controls
+
+`/theme dark`, `/theme light`, and `/theme ansi` change all interface colors,
+including earlier log entries. Dark and light set their own background; ANSI
+uses only the terminal's 16 colors and follows its background. Without a saved
+choice, `COLORTERM=truecolor` or `24bit` selects dark and other terminals select
+ANSI. Light's eight text colors meet WCAG AA (4.5:1) against its white background.
+`NO_COLOR` keeps colors disabled. The choice is saved privately in
+`<data dir>/tui-theme.json`; other interface settings are not saved yet.
+
+Ctrl+L clears and redraws the interface. On Unix, Ctrl+Z restores the terminal
+and suspends just the interface process; use the shell's `fg` to return. Its
+kernel and services run in an independent backend process group, so bus
+dispatch and later tool/model turns continue while the interface is stopped.
+Private pipes carry bounded frames; service stdout goes to the log, and output
+backpressure can drop progress previews while preserving final RPC settlement.
+Queued results are shown after resuming. This requires a shell with job control and a foreground
+process group (an orphaned process group can ignore SIGTSTP). Background color
+probing with OSC 11 is not implemented.
+
 ## License
 
 Molt is dual-licensed under the [MIT license](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option. Contributions are accepted under the same terms; see [CONTRIBUTING.md](CONTRIBUTING.md#license).
