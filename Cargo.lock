@@ -1601,6 +1601,7 @@ dependencies = [
  "molt-api",
  "molt-proto",
  "molt-sdk",
+ "molt-syntax",
  "molt-tools",
  "rand 0.9.5",
  "rayon",
@@ -1666,6 +1667,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "molt-syntax"
+version = "0.1.0"
+dependencies = [
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-cpp",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+]
+
+[[package]]
 name = "molt-tools"
 version = "0.1.0"
 dependencies = [
@@ -1677,6 +1693,7 @@ dependencies = [
  "molt-api",
  "molt-proto",
  "molt-sdk",
+ "molt-syntax",
  "rand 0.9.5",
  "regex",
  "serde",

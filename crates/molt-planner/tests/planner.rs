@@ -86,6 +86,19 @@ fn files<'a>(st: &'a mut State, workspace: &str) -> Result<&'a mut Files, Remote
     st.forks.get_mut(workspace).map(|(_, now)| now).ok_or_else(|| invalid(format!("no workspace {workspace}")))
 }
 
+/// What the fake `fs` finds wrong with `content`: an unclosed `((`, on its first line.
+fn syntax_errors(check: fs::SyntaxCheck, content: &str) -> Option<fs::SyntaxReport> {
+    (!check.is_off() && content.contains("((")).then(|| fs::SyntaxReport {
+        errors: vec![fs::SyntaxError {
+            line: 1,
+            message: "missing `)`".into(),
+            context: format!("1 | {}", content.lines().next().unwrap_or("")),
+        }],
+        more: 2,
+        rejected: check == fs::SyntaxCheck::Reject,
+    })
+}
+
 fn changes(base: &Files, now: &Files) -> Vec<Change> {
     let mut out = Vec::new();
     for (path, content) in now {
@@ -180,8 +193,13 @@ impl Fake {
             fs::WRITE => {
                 let w: fs::WriteRequest = parse(payload);
                 let bytes = w.content.len() as u64;
-                let created = files(st, &w.workspace)?.insert(w.path, w.content).is_none();
-                json!(fs::WriteResponse { bytes, created })
+                let syntax = syntax_errors(w.syntax, &w.content);
+                let files = files(st, &w.workspace)?;
+                let created = !files.contains_key(&w.path);
+                if !syntax.as_ref().is_some_and(|s| s.rejected) {
+                    files.insert(w.path, w.content);
+                }
+                json!(fs::WriteResponse { bytes, created, syntax })
             }
             fs::EDIT => {
                 let e: fs::EditRequest = parse(payload);
@@ -192,8 +210,12 @@ impl Fake {
                 if found == 0 || (found > 1 && !e.replace_all) {
                     return Err(invalid(format!("old text occurs {found} times in {}", e.path)));
                 }
-                *file = file.replace(&e.old, &e.new);
-                json!(fs::EditResponse { replacements: found })
+                let new = file.replace(&e.old, &e.new);
+                let syntax = syntax_errors(e.syntax, &new);
+                if !syntax.as_ref().is_some_and(|s| s.rejected) {
+                    *file = new;
+                }
+                json!(fs::EditResponse { replacements: found, syntax })
             }
             fs::LIST => {
                 let l: fs::ListRequest = parse(payload);
@@ -1044,6 +1066,38 @@ async fn tool_results_go_back_together_and_assistant_turns_verbatim() {
     // The read after the write in the same turn sees the write.
     assert_eq!(text(5), "new\n");
     assert_eq!(text(6), "README.md:1: # project");
+}
+
+#[tokio::test]
+async fn syntax_errors_a_change_introduces_go_back_with_its_result_and_reject_mode_keeps_the_file() {
+    for (mode, kept) in [(None, true), (Some(fs::SyntaxCheck::Reject), false)] {
+        let fake = Fake::new(
+            |req| match turn(req) {
+                1 => use_tools(req, &[("write_file", json!({ "path": "a.rs", "content": "fn f(( {}\n" }))]),
+                2 => write_hello(req, "hi\n"),
+                _ => done("Done."),
+            },
+            hello_check,
+        );
+        let resp = run(&fake, RunRequest { syntax_check: mode, ..request(Some("check"), 1) }).await;
+        assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+
+        let second = &fake.requests()[1];
+        let result = &second.messages[2]["content"][0];
+        let text = result["content"].as_str().unwrap();
+        assert!(text.contains("line 1: missing `)`\n1 | fn f(( {}") && text.contains("[2 more not shown]"), "{text}");
+        if kept {
+            assert_ne!(result["is_error"], json!(true));
+            assert!(text.starts_with("Wrote 10 bytes to a.rs (created). It introduced syntax errors"), "{text}");
+        } else {
+            assert_eq!(result["is_error"], json!(true));
+            assert!(text.starts_with("Not changed: this would introduce syntax errors in a.rs"), "{text}");
+        }
+        assert_eq!(fake.workspace().contains_key("a.rs"), kept);
+        let modes: Vec<Value> = fake.calls_to(fs::WRITE).iter().map(|c| c.payload["syntax"].clone()).collect();
+        let asked = if kept { "report" } else { "reject" };
+        assert_eq!(modes, [json!(asked), json!(asked)]);
+    }
 }
 
 #[tokio::test]

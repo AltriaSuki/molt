@@ -375,6 +375,7 @@ Defaults come from the environment:
 | `MOLT_MAP_TOKENS` | planner | `3000` (the project map a run starts with; at most `32000`) |
 | `MOLT_CONTEXT_TOKENS` | planner | the model's context window: `200000` for Claude models, `128000` for others |
 | `MOLT_INSTRUCTION_FILES` | planner | `AGENTS.md,CLAUDE.md` (the project's instruction files; `none` reads none) |
+| `MOLT_SYNTAX_CHECK` | planner | `report` (see [Syntax errors after an edit](#syntax-errors-after-an-edit)); `reject` or `off` |
 | `MOLT_MEMORY_MODEL`, `MOLT_MEMORY_EFFORT`, `MOLT_MEMORY_MAX_TOKENS`, `MOLT_MEMORY_MODEL_TIMEOUT_S` | memory | `sonnet`, `low`, `8000`, `300` |
 
 The planner reads `MOLT_MAX_TOKENS` and `MOLT_MODEL_TIMEOUT_S` too: a model
@@ -411,6 +412,23 @@ that they win over notes. They are read with `fs.read`, so the audit log
 records what each run saw, and the run's progress lists the files.
 `--no-memory` does not turn them off; `MOLT_INSTRUCTION_FILES` names other
 files, or `none`.
+
+### Syntax errors after an edit
+
+When an attempt writes or edits a file in a language the project model
+parses (below), the `fs` service parses the file before and after the change
+with the same tree-sitter grammars and returns the syntax errors the change
+added, with the lines around each, in the tool's result. An error the file
+already had is not reported again, wherever the edit moved it, so a project
+that was broken before, or a construct a grammar does not know, does not get
+in the way. Nothing outside the service runs and nothing is fetched; a
+version that takes over 2 seconds to parse is not checked. By default the
+change is still made (`report`); `--syntax-check reject` (or
+`MOLT_SYNTAX_CHECK=reject`) leaves the file as it was and returns the errors
+as a failed call, as SWE-agent's edit guard does, and `off` does not look.
+The check files a run writes into forks are never checked. To compare the
+modes, run them as benchmark arms, such as
+`--arm reject="--syntax-check reject" --arm unchecked="--syntax-check off"`.
 
 ## Projects
 

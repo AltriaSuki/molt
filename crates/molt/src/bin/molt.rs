@@ -5,6 +5,7 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use molt::agent::{self, Interrupted};
 use molt::{Config, Secrets};
+use molt_api::fs::SyntaxCheck;
 use molt_api::memory::{
     self, CorrectRequest, ForgetRequest, ForgetResponse, Layer, MapRequest, NoteKind, PromoteRequest, PromoteResponse,
     RecallRequest, RecallResponse, RememberRequest, RememberResponse, ReviewRequest, ReviewResponse,
@@ -107,6 +108,11 @@ struct DoArgs {
     /// Model turns per attempt.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     max_turns: Option<u32>,
+    /// What the model's file writes and edits do about syntax errors they
+    /// introduce: report them with the result, reject the change, or off.
+    /// Default: the planner's (report).
+    #[arg(long, value_name = "MODE", value_parser = syntax_check)]
+    syntax_check: Option<SyntaxCheck>,
     /// Save a checkpoint as the run goes, so that a run stopped before it
     /// finishes (interrupted, out of budget, killed) can go on with `molt resume`.
     #[arg(long)]
@@ -322,6 +328,15 @@ fn usd(text: &str) -> Result<f64, String> {
     match text.parse::<f64>() {
         Ok(usd) if usd.is_finite() && usd > 0.0 => Ok(usd),
         _ => Err(format!("{text:?} is not a positive amount")),
+    }
+}
+
+fn syntax_check(text: &str) -> Result<SyntaxCheck, String> {
+    match text {
+        "report" => Ok(SyntaxCheck::Report),
+        "reject" => Ok(SyntaxCheck::Reject),
+        "off" => Ok(SyntaxCheck::Off),
+        _ => Err(format!("{text:?} is not a mode: use report, reject or off")),
     }
 }
 
@@ -639,6 +654,7 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     req.model = args.model;
     req.effort = args.effort;
     req.max_turns = args.max_turns;
+    req.syntax_check = args.syntax_check;
     req.budget_usd = args.common.budget_usd;
     req.apply = !args.common.no_apply;
     req.stream = args.common.stream;
