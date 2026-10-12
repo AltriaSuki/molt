@@ -11,6 +11,7 @@ mod control;
 mod ctx;
 mod designer;
 mod fit;
+pub mod hooks;
 mod instructions;
 mod memory;
 mod prompts;
@@ -33,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 /// Planner settings. [`Config::from_env`] documents the variables.
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub hooks: Vec<hooks::Hook>,
     /// Model for runs that name none; `None` leaves the choice to the gateway.
     pub default_model: Option<String>,
     pub max_turns: u32,
@@ -68,6 +70,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            hooks: Vec::new(),
             default_model: None,
             max_turns: 50,
             max_check_rounds: 3,
@@ -131,7 +134,13 @@ impl Config {
             }
             None => d.budget_usd,
         };
+        let hooks = get("MOLT_HOOKS_JSON")
+            .map(|s| serde_json::from_str::<Vec<hooks::Hook>>(&s))
+            .transpose()?
+            .unwrap_or_default();
+        hooks::validate(&hooks)?;
         Ok(Self {
+            hooks,
             default_model: get("MOLT_PLANNER_MODEL"),
             max_turns: small("MOLT_MAX_TURNS", d.max_turns)?,
             max_check_rounds: small("MOLT_MAX_CHECK_ROUNDS", d.max_check_rounds)?,

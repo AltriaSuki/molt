@@ -54,6 +54,7 @@ pub struct Session {
     memory_db: Option<PathBuf>,
     forks: Mutex<Option<RunForks>>,
     versions: Vec<(String, String)>,
+    hooks: Vec<molt_planner::hooks::Hook>,
 }
 
 impl Session {
@@ -73,6 +74,7 @@ impl Session {
                     memory_db: agent::memory_db(cfg),
                     forks: Mutex::new(RunForks::before(cfg)),
                     versions,
+                    hooks: cfg.hooks.clone(),
                 })
             }
             Err(e) => {
@@ -99,6 +101,9 @@ impl Session {
         };
         let budget = Budget::new(0, 0, CALLS);
         let mut targets = vec![planner::RUN, planner::DESIGN, planner::CONTROL, fs::DIFF, fs::MERGE, fs::DROP];
+        if !cfg.hooks.is_empty() {
+            targets.extend([fs::FORK, molt_api::shell::RUN]);
+        }
         if memory.is_some() {
             targets.extend([memory::CONSOLIDATE, memory::RECALL, memory::FORGET, memory::REVIEW, memory::CORRECT]);
         }
@@ -169,7 +174,36 @@ impl Session {
 
     /// Merge a result kept in `fork` into the workspace, and drop the fork.
     pub async fn apply(&self, fork: &str) -> anyhow::Result<MergeResponse> {
-        self.call(fs::MERGE, MergeRequest { fork: fork.to_owned(), drop: true }, TREE_MS, None).await
+        let result = self.call(fs::MERGE, MergeRequest { fork: fork.to_owned(), drop: true }, TREE_MS, None).await?;
+        self.notify_applied().await;
+        Ok(result)
+    }
+
+    async fn notify_applied(&self) {
+        let hooks: Vec<_> = self.hooks.iter().filter(|h| h.event == molt_planner::hooks::Event::AfterApply).collect();
+        if hooks.is_empty() {
+            return;
+        }
+        let fork: anyhow::Result<fs::ForkResponse> =
+            self.call(fs::FORK, fs::ForkRequest { workspace: self.workspace.clone() }, TREE_MS, None).await;
+        let Ok(fork) = fork else {
+            tracing::warn!("after_apply hooks could not get a private fork");
+            return;
+        };
+        for hook in hooks {
+            let req = molt_api::shell::RunRequest {
+                workspace: fork.fork.clone(),
+                command: hook.command.clone(),
+                timeout_ms: Some(hook.timeout_ms),
+            };
+            let result: anyhow::Result<molt_api::shell::RunResponse> =
+                self.call(molt_api::shell::RUN, req, hook.timeout_ms.saturating_add(5000), None).await;
+            if let Err(error) = result {
+                tracing::warn!(error = %error, "after_apply notification failed");
+            }
+        }
+        let _: anyhow::Result<fs::DropResponse> =
+            self.call(fs::DROP, fs::DropRequest { fork: fork.fork }, TREE_MS, None).await;
     }
 
     /// The paths `fork` changed.

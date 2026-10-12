@@ -1233,3 +1233,54 @@ async fn a_checkpointed_run_that_runs_out_of_budget_is_resumed_with_its_fork() {
     assert!(molt_planner::checkpoint::load(&runs, trace.as_str()).is_err(), "a finished run keeps no checkpoint");
     assert!(!std::path::Path::new(&fork).exists());
 }
+
+#[tokio::test]
+async fn lifecycle_formatting_is_rechecked_and_cannot_weaken_the_protected_check() {
+    use molt_planner::hooks::{Event, Hook};
+    for (command, should_apply) in [
+        ("printf '\\n' >> greeting.txt", true),
+        ("printf goodbye > greeting.txt", false),
+        ("printf 'exit 0\\n' > check.sh; printf goodbye > greeting.txt", false),
+        ("sleep 10", false),
+    ] {
+        let server = fake_api(Fake::DesignsThenGreets).await;
+        let mut setup = Setup::new(&server);
+        let hooks = vec![
+            Hook {
+                event: Event::BeforeApply,
+                command: command.into(),
+                blocking: true,
+                timeout_ms: if command == "sleep 10" { 20 } else { 5000 },
+            },
+            Hook {
+                event: Event::AfterApply,
+                command: "printf notification > notification.txt".into(),
+                blocking: false,
+                timeout_ms: 5000,
+            },
+        ];
+        setup
+            .cfg
+            .service_mut("planner")
+            .unwrap()
+            .env
+            .insert("MOLT_HOOKS_JSON".into(), serde_json::to_string(&hooks).unwrap());
+        let (response, events) = setup.run(setup.request(None, 1)).await;
+        assert_eq!(response.applied, should_apply, "{command}: {}", response.summary);
+        if should_apply {
+            assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n\n"));
+            assert_eq!(setup.file("check.sh").as_deref(), Some(&format!("{CHECK}\n")[..]));
+        } else {
+            assert_eq!(response.outcome, Outcome::Failed);
+            assert!(response.fork.is_some());
+            assert!(setup.file("greeting.txt").is_none());
+            assert!(response.summary.contains("Not applied"));
+        }
+        assert!(setup.file("notification.txt").is_none(), "notifications only write in a disposable fork");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Progress::Note { message, .. } if message.contains("hook BeforeApply"))));
+        let audit = std::fs::read_to_string(setup.data.path().join("audit.jsonl")).unwrap();
+        assert!(audit.contains("duration_ms") && audit.contains("shell.run"));
+    }
+}

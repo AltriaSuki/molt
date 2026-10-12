@@ -68,7 +68,7 @@ pub(crate) async fn run_cancellable(
     let designed = req.verify && (req.check.is_none() || !req.check_files.is_empty());
     let check = match settle_check(&ctx, &req).await? {
         Ok(check) => check,
-        Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason))),
+        Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason)).await),
     };
     save_check(&ctx, check.as_ref(), designed);
     // Without a check there is nothing to pick a winner by, so one attempt is enough.
@@ -143,7 +143,7 @@ async fn resume_run(
                 save_check(&ctx, check.as_ref(), designed);
                 (check, designed)
             }
-            Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason))),
+            Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason)).await),
         }
     };
 
@@ -278,16 +278,18 @@ async fn finish(
         designed,
     })
     .await;
-    let (finished, winner) = race(ctx, slots, check.map(Arc::new)).await;
+    let check = check.map(Arc::new);
+    let (finished, winner) = race(ctx, slots, check.clone()).await;
     ctx.control.freeze("the run is finishing");
     let stopped = ctx.checkpoint.is_some() && ctx.run_cancel.is_cancelled();
     // Cancelled attempts may have left model calls running, which are billed: give their replies a moment
     // to land and be counted, while the winner is applied.
     let (mut resp, tally) =
-        tokio::join!(conclude(ctx, req, spec, finished, winner, stopped), ctx.settle(ctx.cfg.late_reply_wait));
+        tokio::join!(conclude(ctx, req, (spec, check), finished, winner, stopped), ctx.settle(ctx.cfg.late_reply_wait));
     resp.usage = tally.spend.usage;
     resp.cost_usd = tally.spend.cost_usd;
     resp.uncounted_calls = tally.uncounted_calls() + ctx.carried_uncounted;
+    crate::hooks::notify(ctx, crate::hooks::Event::RunFinished).await;
     if stopped {
         let spend = SavedSpend { usage: resp.usage, cost_usd: resp.cost_usd, uncounted_calls: resp.uncounted_calls };
         ctx.save(|s| {
@@ -314,7 +316,7 @@ async fn finish(
 
 /// A run that ended before any attempt: a stopped one keeps its checkpoint,
 /// to design the check again when resumed; otherwise nothing is left.
-fn finish_early(ctx: &Ctx, mut resp: RunResponse) -> RunResponse {
+async fn finish_early(ctx: &Arc<Ctx>, mut resp: RunResponse) -> RunResponse {
     if let Some(store) = &ctx.checkpoint {
         if ctx.run_cancel.is_cancelled() {
             resp.checkpoint = Some(ctx.run_id());
@@ -322,6 +324,7 @@ fn finish_early(ctx: &Ctx, mut resp: RunResponse) -> RunResponse {
             store.remove();
         }
     }
+    crate::hooks::notify(ctx, crate::hooks::Event::RunFinished).await;
     resp
 }
 
@@ -461,6 +464,9 @@ async fn race(ctx: &Arc<Ctx>, slots: Vec<Slot>, check: Option<Arc<Check>>) -> (V
             winner = Some(done.report.index);
             cancel.cancel();
         }
+        if matches!(done.report.status, AttemptStatus::Failed | AttemptStatus::Error) {
+            crate::hooks::notify(ctx, crate::hooks::Event::AttemptFailed).await;
+        }
         finished.push(done);
     }
     finished.sort_by_key(|f| f.report.index);
@@ -471,11 +477,12 @@ async fn race(ctx: &Arc<Ctx>, slots: Vec<Slot>, check: Option<Arc<Check>>) -> (V
 async fn conclude(
     ctx: &Arc<Ctx>,
     req: &RunRequest,
-    spec: Option<CheckSpec>,
+    checks: (Option<CheckSpec>, Option<Arc<Check>>),
     finished: Vec<Finished>,
     winner: Option<u32>,
     stopped: bool,
 ) -> RunResponse {
+    let (spec, check) = checks;
     let won = winner
         .filter(|_| !ctx.run_cancel.is_cancelled())
         .and_then(|w| finished.iter().find(|f| f.report.index == w))
@@ -520,6 +527,13 @@ async fn conclude(
             } else {
                 done.summary.clone()
             };
+            if let Err(error) = crate::hooks::prepare(ctx, &fork, check.as_deref(), done.report.requirements).await {
+                resp.outcome = Outcome::Failed;
+                resp.summary.push_str(&format!("\n\nNot applied: {error}. The result is kept in {fork}."));
+                ctx.forget_fork(&fork);
+                resp.fork = Some(fork);
+                return resp;
+            }
             let mut keep = false;
             match ctx.diff(&fork).await {
                 Ok(diff) => {
@@ -550,7 +564,10 @@ async fn conclude(
                         keep = true;
                     } else if req.apply && (spec.is_some() || !resp.changes.is_empty()) {
                         match ctx.merge(&fork).await {
-                            Ok(_) => resp.applied = true,
+                            Ok(_) => {
+                                resp.applied = true;
+                                crate::hooks::notify(ctx, crate::hooks::Event::AfterApply).await;
+                            }
                             Err(e) => {
                                 let what = if e.message.starts_with("partial:") {
                                     "The apply needs recovery; the workspace may contain changes"

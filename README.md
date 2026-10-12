@@ -71,6 +71,7 @@ sender from that.
 | A benchmark starts a run only while what it spent, plus the whole `--task-usd` of that run and of each run in flight, fits in `--max-usd`; it refuses models it has no price for | `crates/molt-bench/src/run.rs` (`runs_stop_before_they_could_pass_the_budget`, `a_run_of_unknown_cost_stops_the_benchmark`), `crates/molt-bench/src/cli.rs` (`a_model_without_a_price_is_refused`) |
 | A model with no price stays of unknown cost and stops the run; prices come only from the user's environment or data directory, never from a project, and a download that does not validate replaces nothing | `crates/molt-gateway/src/prices.rs` (`the_data_directory_holds_the_snapshot_and_nothing_else_is_read`, `a_download_that_does_not_validate_is_refused`, `malformed_declared_prices_stop_startup_and_name_the_item`), `crates/molt-gateway/tests/gateway.rs` (`a_snapshot_prices_a_third_party_model…`) |
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
+| Only trusted external configuration installs hooks; formatting cannot bypass a protected done-check | `agent::tests::only_configuration_outside_the_project_can_install_hooks`, `tests/agent.rs::lifecycle_formatting_is_rechecked_and_cannot_weaken_the_protected_check` |
 
 ## Quick start
 
@@ -781,3 +782,41 @@ Dependencies mount at their canonical absolute paths. `--pass-env NAME` explicit
 Limits are inherited per process: address space, CPU time, file size, open files and process count, plus the existing command wall timeout. These are not aggregate cgroup quotas; RLIMIT_NPROC has the operating system's per-user semantics and does not limit root. TERM reaches the sandbox session group with 500 ms grace; KILL then tears down its PID namespace, including descendants that called setsid. Normal completion, cancelled handlers and service exit also tear down the namespace. Temporary mounts disappear with the last process. Future executable skills must use this shell path to share the policy.
 
 CI installs bubblewrap and requires namespace tests to run. A constrained local executor may skip only those integration tests after a failed capability probe; production startup still fails closed. Tests cover host paths, symlinks, read-only dependencies, network policy, host sockets, limits, C builds, cancellation and descendants with new sessions.
+
+## Trusted lifecycle hooks
+
+An explicitly selected `--config /outside/project/molt.toml` may contain
+`[[hooks]]` entries. Files inside the workspace never supply hooks, even with
+`--config`; no project file is discovered automatically.
+
+```toml
+[[hooks]]
+event = "before_apply"
+command = "cargo fmt"
+blocking = true
+timeout_ms = 30000
+
+[[hooks]]
+event = "run_finished"
+command = "printf 'Molt finished\\n'"
+```
+
+Supported events are `before_apply`, `after_apply`, `run_finished`, and
+`attempt_failed`. Only `before_apply` may block. Its commands run sequentially
+in the winner's existing isolated fork after acceptance, before diff, review
+and application. The authoritative check files are restored, protected paths
+are checked, and acceptance runs again even if a nonblocking formatter failed.
+A failing check or blocking hook keeps the result in its fork and applies
+nothing. Retained results (including the TUI's confirm mode) are prepared the
+same way before they are shown, so the diff/review covers the formatted result.
+
+Notification hooks run in a separate disposable fork and cannot change the
+applied workspace. `after_apply` is also sent when the TUI user applies a kept
+result; `run_finished` means the planner finished, not that the user accepted a
+kept result. All commands use the existing shell sandbox, environment scrubbing,
+process-tree cleanup and bounded output. They do not gain host network or
+notification access. Shell requests/results record output, exit status and
+elapsed time in the audit; planner notes identify the lifecycle event. Timeouts
+are 1–600000 ms, commands at most 8192 bytes, and at most 32 hooks are accepted.
+An interrupted or resumed run may deliver notifications again; use idempotent
+notification commands. Hooks are not part of the model-editable RunRequest.
