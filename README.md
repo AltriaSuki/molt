@@ -71,6 +71,7 @@ sender from that.
 | A benchmark starts a run only while what it spent, plus the whole `--task-usd` of that run and of each run in flight, fits in `--max-usd`; it refuses models it has no price for | `crates/molt-bench/src/run.rs` (`runs_stop_before_they_could_pass_the_budget`, `a_run_of_unknown_cost_stops_the_benchmark`), `crates/molt-bench/src/cli.rs` (`a_model_without_a_price_is_refused`) |
 | A model with no price stays of unknown cost and stops the run; prices come only from the user's environment or data directory, never from a project, and a download that does not validate replaces nothing | `crates/molt-gateway/src/prices.rs` (`the_data_directory_holds_the_snapshot_and_nothing_else_is_read`, `a_download_that_does_not_validate_is_refused`, `malformed_declared_prices_stop_startup_and_name_the_item`), `crates/molt-gateway/tests/gateway.rs` (`a_snapshot_prices_a_third_party_model…`) |
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
+| Offline embedding models are hash-pinned and cannot reintroduce forgotten or cross-project notes | `semantic::tests::pinned_models_retrieve_synonyms_and_reject_changed_files`, `semantic::tests::synonyms_are_recalled_with_scores_and_snapshots_survive_forgetting` |
 
 ## Quick start
 
@@ -715,7 +716,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.
-- Recall matches keywords (with stemming), not meaning: there is no vector index, since the Anthropic API has no embeddings endpoint. A note worded differently from the task can be missed; the strongest notes about the project are always shown.
+- Default recall matches keywords with stemming, so differently worded notes can be missed. Optional offline word-vector recall needs a reviewed hash-pinned local model; its mean-pooling backend does not understand word order or supply a pretrained vocabulary.
 - Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. With the default setup, memory lives in the project's data dir, so nothing is shared between projects yet.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.
@@ -781,3 +782,32 @@ Dependencies mount at their canonical absolute paths. `--pass-env NAME` explicit
 Limits are inherited per process: address space, CPU time, file size, open files and process count, plus the existing command wall timeout. These are not aggregate cgroup quotas; RLIMIT_NPROC has the operating system's per-user semantics and does not limit root. TERM reaches the sandbox session group with 500 ms grace; KILL then tears down its PID namespace, including descendants that called setsid. Normal completion, cancelled handlers and service exit also tear down the namespace. Temporary mounts disappear with the last process. Future executable skills must use this shell path to share the policy.
 
 CI installs bubblewrap and requires namespace tests to run. A constrained local executor may skip only those integration tests after a failed capability probe; production startup still fails closed. Tests cover host paths, symlinks, read-only dependencies, network policy, host sockets, limits, C builds, cancellation and descendants with new sessions.
+
+## Offline semantic notes (optional)
+
+Build with `cargo build --workspace --features molt/semantic`. In a trusted
+memory-service configuration, add `--embedding-model /outside/project/model.json`
+and `--embedding-sha256 HASH` to `molt-memory`'s arguments. No model is downloaded;
+its SHA-256 is required and checked before parsing. The model is a data-only JSON
+export of pretrained word vectors, with `format: "mean-word-vectors-v1"`,
+`dimensions` (1–1024), and a `vectors` map of lowercase words to finite arrays.
+Mean pooling and cosine similarity run locally on CPU. This first backend does
+not run MiniLM/ONNX, understand word order or supply a pretrained vocabulary.
+Use a licensed, reviewed vocabulary suitable for the project's languages.
+
+`--semantic-weight` (default 0.5) mixes normalized FTS5 relevance and cosine
+similarity; `--semantic-min-similarity` (default 0.4) admits non-keyword matches.
+Confidence and recency retain their weights. Empty/OOV queries keep lexical
+behavior. Without the feature/configuration, recall is unchanged. Snapshot
+reasons record lexical relevance, similarity, weight and model SHA-256, so old
+snapshots retain the exact evidence even after correction or forgetting.
+
+SQLite caches note vectors by model and text hashes. Writes/corrections refresh
+the derived cache, and recall retries invalid or stale entries. Forgotten,
+retracted and review-pending notes stay excluded before semantic selection.
+Model input is bounded to 64 MiB, 200000 vocabulary words and 1024 dimensions;
+semantic databases are limited to 10000 live notes. Changing the model hash
+keeps old snapshot evidence and reindexes the new model. No additional key or
+network access is used. The lightweight backend should be compared against
+keyword-only recall on real tasks before claiming a success-rate improvement;
+fixture synonym recall demonstrates functionality, not production quality.

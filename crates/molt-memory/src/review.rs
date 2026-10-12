@@ -178,7 +178,7 @@ pub(crate) fn recall(
     db.with(|conn| -> rusqlite::Result<_> {
         let tx = conn.transaction()?;
         apply(&tx, changes, identity.map_or("inspection", |i| i.0), now)?;
-        let found = notes::select(&tx, req, Scope::WithGlobal, now)?;
+        let found = notes::select(&tx, req, Scope::WithGlobal, now, db.semantic())?;
         if let (Some(purpose), Some((run, call))) = (&req.capture, identity) {
             let snapshot = RecallSnapshot {
                 run: run.into(),

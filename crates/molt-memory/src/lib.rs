@@ -13,6 +13,7 @@ mod forks;
 mod notes;
 pub mod project;
 mod review;
+pub mod semantic;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};

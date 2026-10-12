@@ -25,6 +25,15 @@ struct Cli {
     /// The fs service's trusted scratch directory, for disposable fork symbols.
     #[arg(long)]
     forks: Option<PathBuf>,
+    /// Trusted local word-vector JSON model. No file is downloaded automatically.
+    #[arg(long, requires = "embedding_sha256")]
+    embedding_model: Option<PathBuf>,
+    #[arg(long, requires = "embedding_model")]
+    embedding_sha256: Option<String>,
+    #[arg(long, default_value_t = 0.5)]
+    semantic_weight: f64,
+    #[arg(long, default_value_t = 0.4)]
+    semantic_min_similarity: f64,
 }
 
 #[tokio::main]
@@ -32,7 +41,21 @@ async fn main() -> anyhow::Result<()> {
     molt::init_tracing("info");
     let cli = Cli::parse();
     let cfg = Config { skip: cli.skip, fork_root: cli.forks, ..Config::from_env()? };
-    let db = Arc::new(Db::open(&cli.db)?);
+    let mut db = Db::open(&cli.db)?;
+    if let Some(path) = cli.embedding_model {
+        anyhow::ensure!(
+            !path.canonicalize()?.starts_with(cli.root.canonicalize()?),
+            "embedding model must be outside the workspace"
+        );
+        let model = molt_memory::semantic::Model::load(
+            &path,
+            cli.embedding_sha256.as_deref().expect("clap requires hash"),
+            cli.semantic_weight,
+            cli.semantic_min_similarity,
+        )?;
+        db.enable_semantic(model)?;
+    }
+    let db = Arc::new(db);
     let svc = Arc::new(Service::connect_from_env().await?);
     let bus = Arc::new(ServiceBus(svc.clone()));
     let memory = Arc::new(Memory::new(db, &cli.root, cfg, Writer::of(&svc), bus)?);
