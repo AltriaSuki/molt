@@ -111,6 +111,15 @@ async fn event_loop(
     let mut app = App::new(&workspace, home);
     app.secrets = secrets_in_env();
     app.rules = cfg.confirm.clone();
+    let theme_file = cfg.kernel.data_dir.join("tui-theme.json");
+    match std::fs::read(&theme_file) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(theme) => app.theme = theme,
+            Err(e) => app.flash = Some(format!("saved theme ignored: {e}")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => app.flash = Some(format!("could not load saved theme: {e}")),
+    }
     let mut rt =
         Runtime { cfg: Arc::new(cfg), workspace, tx, sessions, session: None, starting: false, work: Vec::new() };
     rt.exec(Action::StartSession);
@@ -128,6 +137,13 @@ async fn event_loop(
         for action in actions {
             match action {
                 Action::Quit { keep: k } => keep = k,
+                Action::Redraw => redraw(terminal)?,
+                Action::Suspend => suspend(terminal, &pause)?,
+                Action::SaveTheme(theme) => {
+                    if let Err(e) = save_theme(&rt.cfg.kernel.data_dir, theme) {
+                        app.flash = Some(format!("theme changed but could not be saved: {e}"));
+                    }
+                }
                 Action::Edit { text } => {
                     let edited = edit_outside(terminal, &pause, &rt.cfg.kernel.data_dir, &text);
                     let _ = rt.tx.send(Msg::Edited(edited));
@@ -328,7 +344,7 @@ impl Runtime {
                 }
             }
             // The loop handles these: they need the terminal.
-            Action::Quit { .. } | Action::Edit { .. } => {}
+            Action::Quit { .. } | Action::Edit { .. } | Action::Redraw | Action::Suspend | Action::SaveTheme(_) => {}
         }
     }
 
@@ -395,6 +411,47 @@ fn edit_outside(terminal: &mut DefaultTerminal, pause: &Pause, dir: &Path, text:
     }
 }
 
+fn redraw(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+    execute!(std::io::stdout(), Clear(ClearType::All))?;
+    terminal.draw(|_| {}).map(|_| ())
+}
+
+fn save_theme(dir: &Path, theme: text::Theme) -> anyhow::Result<()> {
+    use std::io::Write;
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let temporary = dir.join(format!("tui-theme-{}-{nonce}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+    let result = (|| -> anyhow::Result<()> {
+        file.write_all(&serde_json::to_vec(&theme)?)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, dir.join("tui-theme.json"))?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(temporary);
+    result
+}
+
+fn suspend(terminal: &mut DefaultTerminal, pause: &Pause) -> anyhow::Result<()> {
+    pause.paused.store(true, Ordering::SeqCst);
+    let reading = pause.reading.lock().unwrap_or_else(PoisonError::into_inner);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    ratatui::restore();
+    // Stop only the interface process. Its service children continue working.
+    // SIGCONT resumes this call, before the terminal reader is unpaused.
+    let stopped = tokio::task::block_in_place(|| {
+        // SAFETY: raise sends a standard signal to the current process.
+        unsafe { libc::raise(libc::SIGTSTP) }
+    });
+    let restored = terminal::enable_raw_mode()
+        .and_then(|()| execute!(std::io::stdout(), EnterAlternateScreen, EnableBracketedPaste))
+        .and_then(|()| redraw(terminal));
+    drop(reading);
+    pause.paused.store(false, Ordering::SeqCst);
+    restored.context("could not restore the terminal after suspension")?;
+    anyhow::ensure!(stopped == 0, "could not suspend the interface");
+    Ok(())
+}
+
 /// Standard error sent to a file until dropped.
 struct Redirect {
     saved: libc::c_int,
@@ -427,5 +484,21 @@ impl Drop for Redirect {
             libc::dup2(self.saved, libc::STDERR_FILENO);
             libc::close(self.saved);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn themes_are_saved_privately_and_replaced_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        save_theme(dir.path(), text::Theme::Light).unwrap();
+        save_theme(dir.path(), text::Theme::Ansi).unwrap();
+        let path = dir.path().join("tui-theme.json");
+        assert_eq!(serde_json::from_slice::<text::Theme>(&std::fs::read(&path).unwrap()).unwrap(), text::Theme::Ansi);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

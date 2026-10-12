@@ -40,6 +40,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let shown: Vec<Line> = lines.into_iter().skip(viewer.scroll).take(usize::from(inner.height)).collect();
         frame.render_widget(Paragraph::new(shown), inner);
     }
+    app.theme.paint(frame.buffer_mut());
 }
 
 fn centered(area: Rect, w_pct: u16, h_pct: u16) -> Rect {
