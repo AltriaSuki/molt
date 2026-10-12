@@ -557,6 +557,7 @@ mod tests {
                 command: "cargo test --test flags".into(),
                 files: vec!["tests/flags.rs".into()],
                 designed: true,
+                suite: None,
             }),
             winner: Some(1),
             summary: "Added the --verbose flag.".into(),
@@ -581,6 +582,7 @@ mod tests {
             uncounted_calls: 0,
             checkpoint: None,
             requirements: vec![],
+            selection: None,
         }
     }
 

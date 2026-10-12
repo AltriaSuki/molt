@@ -9,7 +9,7 @@ use molt_api::fs::{FilesChanged, CHANGED};
 use molt_api::memory::{
     ForgetResponse, IndexResponse, MapResponse, RecallResponse, RememberResponse, RetractResponse, SymbolsResponse,
 };
-use molt_memory::{Bus, Config, Db, Memory, Writer};
+use molt_memory::{Bus, Config, Db, Memory, Project, Writer};
 use molt_proto::{Budget, CapId, Envelope, ErrorCode, RemoteError, ServiceId, TraceId};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -63,6 +63,13 @@ impl Setup {
         assert_eq!(err.code, ErrorCode::Invalid, "{err:?}");
         err.message
     }
+}
+
+/// `payload` to `memory` from the planner, which must answer.
+async fn ask(memory: &Memory, to: &str, payload: Value) -> Value {
+    let mut msg = Envelope::request(TraceId::random(), to.parse().unwrap(), CapId::random(), payload);
+    msg.from = Some(ServiceId::new("planner").unwrap());
+    memory.handle(msg).await.unwrap()
 }
 
 fn remember(workspace: &str, text: &str) -> Value {
@@ -147,6 +154,51 @@ async fn notes_are_recalled_forgotten_and_retracted() {
     assert_eq!(r.retracted, 1, "the parser note; the forgotten one is already gone");
     let all: RecallResponse = s.call("memory.recall", json!({ "workspace": "app" })).await;
     assert!(all.notes.is_empty());
+}
+
+#[tokio::test]
+async fn notes_about_a_project_follow_it_across_its_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    for d in ["app", "clone", "other"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    let db_path = root.join("memory.db");
+    let open = |project: Option<Project>| {
+        let db = Arc::new(Db::open(&db_path).unwrap());
+        let writer = Writer { service: "memory".into(), version: "v1".into() };
+        Memory::new(db, &root, Config { project, ..Config::default() }, writer, Arc::new(NoBus)).unwrap()
+    };
+    let texts = |found: Value| -> Vec<String> {
+        let found: RecallResponse = serde_json::from_value(found).unwrap();
+        found.notes.into_iter().map(|r| r.note.text).collect()
+    };
+
+    // Before projects, notes were kept by path.
+    let before = open(None);
+    ask(&before, "memory.remember", remember("app", "Build with make.")).await;
+    drop(before);
+
+    let project = |paths: &[&str]| Project { id: "proj_1".into(), paths: paths.iter().map(|p| root.join(p)).collect() };
+    let now = open(Some(project(&["app", "clone"])));
+    let r: RememberResponse =
+        serde_json::from_value(ask(&now, "memory.remember", remember("clone", "Tests run with make check.")).await)
+            .unwrap();
+    assert_eq!(r.note.workspace.as_deref(), Some("proj_1"));
+    // Both clones see both notes, the one kept by path before included.
+    for ws in ["app", "clone"] {
+        let mut found = texts(ask(&now, "memory.recall", json!({ "workspace": ws })).await);
+        found.sort();
+        assert_eq!(found, ["Build with make.", "Tests run with make check."], "{ws}");
+    }
+    // Another directory is another project.
+    assert!(texts(ask(&now, "memory.recall", json!({ "workspace": "other" })).await).is_empty());
+    drop(now);
+
+    // The directory moves, and the registry says so.
+    std::fs::rename(root.join("app"), root.join("moved")).unwrap();
+    let moved = open(Some(project(&["moved", "clone"])));
+    assert_eq!(texts(ask(&moved, "memory.recall", json!({ "workspace": "moved" })).await).len(), 2);
 }
 
 #[tokio::test]
