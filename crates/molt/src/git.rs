@@ -34,6 +34,7 @@ pub struct Repo {
     top: PathBuf,
     /// Where the workspace is under `top`, as git writes it: empty or ending in `/`.
     prefix: String,
+    filters: BTreeSet<String>,
 }
 
 /// What a commit of a run holds and says.
@@ -98,16 +99,36 @@ impl Repo {
         }
         let top = PathBuf::from(lines.next().context("git did not name the top of the work tree")?);
         let prefix = lines.next().unwrap_or_default().to_owned();
-        Ok(Self { top, prefix })
+        let mut repo = Self { top, prefix, filters: BTreeSet::new() };
+        let out = repo.command().args(["config", "--name-only", "--get-regexp", r"^filter\."]).output()?;
+        ensure!(out.status.success() || out.status.code() == Some(1), "could not inspect Git filters");
+        repo.filters = String::from_utf8(out.stdout)?
+            .lines()
+            .filter_map(|name| name.rsplit_once('.').map(|(prefix, _)| prefix.to_owned()))
+            .collect();
+        Ok(repo)
     }
 
     fn command(&self) -> Command {
         let mut cmd = Command::new("git");
         // Paths are file names, never patterns; `-c` keeps paths with unusual characters unquoted.
-        cmd.current_dir(&self.top)
-            .env("GIT_LITERAL_PATHSPECS", "1")
-            .env_remove("GIT_INDEX_FILE")
-            .args(["-c", "core.quotePath=false"]);
+        cmd.current_dir(&self.top).env("GIT_LITERAL_PATHSPECS", "1").env_remove("GIT_INDEX_FILE").args([
+            "-c",
+            "core.quotePath=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ]);
+        // Candidate attributes can select a configured executable filter. Host
+        // plumbing must not execute candidate code outside the shell sandbox.
+        for name in &self.filters {
+            for (setting, value) in
+                [("clean", "/bin/cat"), ("smudge", "/bin/cat"), ("process", ""), ("required", "false")]
+            {
+                cmd.arg("-c").arg(format!("{name}.{setting}={value}"));
+            }
+        }
         cmd
     }
 
@@ -497,6 +518,28 @@ mod tests {
             paths: paths.iter().map(|p| (*p).to_owned()).collect(),
             branch: None,
         }
+    }
+
+    #[test]
+    fn committing_and_undoing_do_not_execute_candidate_selected_git_programs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = repo();
+        let d = dir.path();
+        git(d, &["config", "filter.candidate.clean", "touch filter-ran; cat"]);
+        git(d, &["config", "filter.candidate.smudge", "touch filter-ran; cat"]);
+        git(d, &["config", "core.hooksPath", "hooks"]);
+        std::fs::create_dir(d.join("hooks")).unwrap();
+        let hook = d.join("hooks/reference-transaction");
+        std::fs::write(&hook, "#!/bin/sh\ntouch hook-ran\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let repo = Repo::open(d).unwrap();
+        std::fs::write(d.join(".gitattributes"), "*.txt filter=candidate\n").unwrap();
+        std::fs::write(d.join("a.txt"), "changed\n").unwrap();
+        repo.commit_run(&commit("guarded", &["a.txt", ".gitattributes"])).unwrap().unwrap();
+        repo.undo(Some("guarded")).unwrap();
+        assert!(!d.join("filter-ran").exists());
+        assert!(!d.join("hook-ran").exists());
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "a\n");
     }
 
     #[test]
