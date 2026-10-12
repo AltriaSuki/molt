@@ -4,6 +4,7 @@ description = "Request and reply shapes for the Molt agent services: model gatew
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 serde.workspace = true
