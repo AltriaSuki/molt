@@ -4,6 +4,7 @@ description = "Molt: a self-improving agent on a microkernel. The kernel daemon,
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 molt-api.workspace = true
