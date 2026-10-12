@@ -373,6 +373,9 @@ impl Memory {
                 let r: RememberRequest = parse(&method, req.payload)?;
                 let service = req.from.as_ref().ok_or_else(|| invalid("the request has no sender"))?.to_string();
                 let workspace = r.workspace.as_deref().map(|w| self.workspace_key(w)).transpose()?;
+                if workspace.is_none() && self.user.is_some() && service != "cli" {
+                    return Err(invalid("only the kernel-identified CLI may remember a user-layer note"));
+                }
                 let new = NewNote {
                     kind: r.kind,
                     text: r.text,
@@ -449,14 +452,19 @@ impl Memory {
                 }
                 let r: PromoteRequest = parse(&method, req.payload)?;
                 let user = self.user.clone().ok_or_else(|| invalid("this memory has no user layer to promote to"))?;
-                let (key, _) = self.scope(&r.workspace)?;
+                let (key, path) = self.scope(&r.workspace)?;
                 let by = molt_api::memory::Provenance {
                     trace: req.trace_id.to_string(),
                     events: vec![req.id.to_string()],
                     service: "cli".into(),
                     version: "user".into(),
                 };
-                let note = self.blocking(move |db| review::promote(db, &user, &key, &r, &by, now)).await?;
+                let note = self
+                    .blocking(move |db| {
+                        review::refresh(db, &key, &path, &by.trace, now)?;
+                        review::promote(db, &user, &key, &r, &by, now)
+                    })
+                    .await?;
                 reply(PromoteResponse { note })
             }
             "forget" => {

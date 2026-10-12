@@ -329,6 +329,8 @@ async fn the_user_layer_is_shared_by_every_project_and_only_a_person_promotes() 
     let b = open("b.db", Some(&user));
     let trace = TraceId::random();
     let mine = json!({ "kind": "preference", "text": "Answer in Chinese.", "trace": "trace_9", "version": "user" });
+    let refused = ask_in(&a, "planner", &trace, "memory.remember", mine.clone()).await.unwrap_err();
+    assert!(refused.message.contains("CLI"));
     let mine: RememberResponse =
         serde_json::from_value(ask_in(&a, "cli", &trace, "memory.remember", mine).await.unwrap()).unwrap();
     assert_eq!(mine.note.workspace, None);
@@ -387,4 +389,25 @@ async fn the_user_layer_is_shared_by_every_project_and_only_a_person_promotes() 
     let left: RecallResponse =
         serde_json::from_value(ask(&a, "memory.recall", json!({ "workspace": "a" })).await).unwrap();
     assert!(left.notes.is_empty(), "{left:?}");
+}
+
+#[tokio::test]
+async fn promotion_rechecks_dependencies_changed_outside_molt() {
+    let mut setup = Setup::new();
+    setup.memory = setup.memory.with_user(Arc::new(Db::in_memory().unwrap()));
+    let remembered: RememberResponse = setup.call("memory.remember", remember("app", "The parser uses lengths.")).await;
+    let review = json!({"workspace":"app", "id":remembered.note.id, "expected_rev":remembered.note.rev,
+        "reason":"checked source", "depends_on":["src/lib.rs"]});
+    setup.ask("cli", "memory.review", review).await.unwrap();
+    std::fs::write(setup.root.join("app/src/lib.rs"), "changed externally").unwrap();
+    let error = setup
+        .ask(
+            "cli",
+            "memory.promote",
+            json!({"workspace":"app", "id":remembered.note.id,
+        "reason":"applies everywhere"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("awaits review"), "{error:?}");
 }
