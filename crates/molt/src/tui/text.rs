@@ -26,8 +26,106 @@ pub enum Tone {
     Plain,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+    Ansi,
+}
+
+impl Theme {
+    pub fn detect(colorterm: Option<&str>) -> Self {
+        if colorterm.is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "truecolor" | "24bit")) {
+            Self::Dark
+        } else {
+            Self::Ansi
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            "ansi" => Some(Self::Ansi),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Ansi => "ansi",
+        }
+    }
+
+    pub fn background(self) -> Color {
+        match self {
+            Self::Dark => Color::Rgb(16, 30, 33),
+            Self::Light => Color::Rgb(255, 255, 255),
+            Self::Ansi => Color::Reset,
+        }
+    }
+
+    pub fn color(self, tone: Tone) -> Color {
+        match self {
+            Self::Dark => match tone {
+                Tone::Shell => Color::Rgb(235, 154, 82),
+                Tone::Sea => Color::Rgb(95, 189, 176),
+                Tone::Mem => Color::Rgb(185, 162, 230),
+                Tone::Ok => Color::Rgb(147, 207, 110),
+                Tone::Bad => Color::Rgb(236, 111, 106),
+                Tone::Warn => Color::Rgb(230, 199, 90),
+                Tone::Dim => Color::Rgb(108, 127, 131),
+                Tone::Plain => Color::Rgb(230, 236, 238),
+            },
+            Self::Light => match tone {
+                Tone::Shell => Color::Rgb(145, 65, 12),
+                Tone::Sea => Color::Rgb(0, 101, 92),
+                Tone::Mem => Color::Rgb(105, 66, 145),
+                Tone::Ok => Color::Rgb(45, 105, 29),
+                Tone::Bad => Color::Rgb(175, 35, 35),
+                Tone::Warn => Color::Rgb(120, 88, 0),
+                Tone::Dim => Color::Rgb(90, 100, 105),
+                Tone::Plain => Color::Rgb(25, 35, 40),
+            },
+            Self::Ansi => match tone {
+                Tone::Shell => Color::Yellow,
+                Tone::Sea => Color::Cyan,
+                Tone::Mem => Color::Magenta,
+                Tone::Ok => Color::Green,
+                Tone::Bad => Color::Red,
+                Tone::Warn => Color::LightYellow,
+                Tone::Dim => Color::DarkGray,
+                Tone::Plain => Color::Reset,
+            },
+        }
+    }
+
+    /// Remap canonical colors at draw time, so old logs change with the theme too.
+    pub fn paint(self, buffer: &mut ratatui::buffer::Buffer) {
+        if colorless() {
+            return;
+        }
+        const TONES: [Tone; 8] =
+            [Tone::Shell, Tone::Sea, Tone::Mem, Tone::Ok, Tone::Bad, Tone::Warn, Tone::Dim, Tone::Plain];
+        for cell in &mut buffer.content {
+            if let Some(tone) = TONES.into_iter().find(|&t| Self::Dark.color(t) == cell.fg) {
+                cell.fg = self.color(tone);
+            } else if cell.fg == Color::Reset {
+                cell.fg = self.color(Tone::Plain);
+            }
+            if cell.bg == Color::Reset {
+                cell.bg = self.background();
+            }
+        }
+    }
+}
+
 /// Colors are left out when `NO_COLOR` is set; the glyphs still tell states apart.
-fn colorless() -> bool {
+pub fn colorless() -> bool {
     static NO_COLOR: OnceLock<bool> = OnceLock::new();
     *NO_COLOR.get_or_init(|| std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()))
 }
@@ -40,17 +138,7 @@ pub fn style(tone: Tone) -> Style {
             _ => Style::new(),
         };
     }
-    let color = match tone {
-        Tone::Shell => Color::Rgb(235, 154, 82),
-        Tone::Sea => Color::Rgb(95, 189, 176),
-        Tone::Mem => Color::Rgb(185, 162, 230),
-        Tone::Ok => Color::Rgb(147, 207, 110),
-        Tone::Bad => Color::Rgb(236, 111, 106),
-        Tone::Warn => Color::Rgb(230, 199, 90),
-        Tone::Dim => Color::Rgb(108, 127, 131),
-        Tone::Plain => return Style::new(),
-    };
-    Style::new().fg(color)
+    Style::new().fg(Theme::Dark.color(tone))
 }
 
 pub fn span(text: impl Into<String>, tone: Tone) -> Span<'static> {
@@ -132,6 +220,16 @@ pub fn fit(text: &str, max: usize) -> String {
     out
 }
 
+/// A running time to the second: `45s`, `2m14s`, `1h02m`.
+pub fn duration(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+    }
+}
+
 /// A confidence from 0 to 1 as a bar ten cells wide, in eighths.
 pub fn bar(value: f64) -> String {
     const PARTS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
@@ -203,6 +301,32 @@ mod tests {
 
     fn texts(lines: &[Line<'static>]) -> Vec<String> {
         lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
+    }
+
+    #[test]
+    fn light_text_meets_aa_and_ansi_uses_only_terminal_colors() {
+        fn luminance(c: Color) -> f64 {
+            let Color::Rgb(r, g, b) = c else { panic!("expected RGB") };
+            let linear = |v: u8| {
+                let v = f64::from(v) / 255.0;
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+        }
+        for tone in [Tone::Shell, Tone::Sea, Tone::Mem, Tone::Ok, Tone::Bad, Tone::Warn, Tone::Dim, Tone::Plain] {
+            assert!(
+                (luminance(Theme::Light.background()) + 0.05) / (luminance(Theme::Light.color(tone)) + 0.05) >= 4.5
+            );
+            assert!(matches!(Theme::Dark.color(tone), Color::Rgb(..)));
+            assert!(!matches!(Theme::Ansi.color(tone), Color::Rgb(..) | Color::Indexed(..)));
+        }
+        assert_eq!(Theme::detect(Some("24bit")), Theme::Dark);
+        assert_eq!(Theme::detect(None), Theme::Ansi);
+        assert_eq!(Theme::parse("bad"), None);
     }
 
     #[test]

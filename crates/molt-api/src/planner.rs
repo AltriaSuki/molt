@@ -87,6 +87,10 @@ pub struct RunRequest {
     /// Default set by the planner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_check_rounds: Option<u32>,
+    /// What the attempts' file writes and edits do about syntax errors they
+    /// introduce (see [`crate::fs::SyntaxCheck`]). Default set by the planner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syntax_check: Option<crate::fs::SyntaxCheck>,
     /// Spending limit for the whole run in US dollars. Default set by the
     /// planner. Calls to a model whose prices the gateway does not know are
     /// not counted.
@@ -211,6 +215,7 @@ impl RunRequest {
             effort: None,
             max_turns: None,
             max_check_rounds: None,
+            syntax_check: None,
             budget_usd: None,
             apply: true,
             stream: false,

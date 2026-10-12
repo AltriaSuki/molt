@@ -462,6 +462,7 @@ fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) ->
         "MOLT_MAP_TOKENS",
         "MOLT_CONTEXT_TOKENS",
         "MOLT_INSTRUCTION_FILES",
+        "MOLT_SYNTAX_CHECK",
         "MOLT_MEMORY_MODEL",
         "MOLT_MEMORY_EFFORT",
         "MOLT_MEMORY_MAX_TOKENS",
@@ -816,6 +817,57 @@ async fn a_project_keeps_its_notes_without_a_folder_and_after_a_move() {
     assert!(show(&[], &new).contains(LEARNED_TEXT));
     // Nothing in a project's directory says which project it is.
     assert_eq!(std::fs::read_dir(&new).unwrap().count(), 1, "only the greeting");
+}
+
+#[tokio::test]
+async fn a_note_remembered_for_every_project_is_recalled_in_another() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let molt = |args: &[&str], dir: &Path| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+            .args(args)
+            .env("XDG_DATA_HOME", home.path().join("user-data"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env_remove("ANTHROPIC_API_KEY")
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "molt {args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        stdout.into_owned()
+    };
+    // Two projects, each with its own data dir and so its own notes.
+    let mut at = Vec::new();
+    for name in ["a", "b"] {
+        let dir = home.path().join(name);
+        let data = home.path().join(format!("data-{name}"));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        molt(&["project", "new", name, "--path", dir.to_str().unwrap()], home.path());
+        at.push((dir, data.to_str().unwrap().to_owned()));
+    }
+    let memory = |args: &[&str], (dir, data): &(PathBuf, String)| {
+        let mut all = vec!["memory"];
+        all.extend(args);
+        all.extend(["--data-dir", data.as_str()]);
+        molt(&all, dir)
+    };
+
+    let kept = memory(&["remember", "Build with make."], &at[0]);
+    assert!(kept.contains("for this project"), "{kept}");
+    let kept = memory(&["remember", "--global", "Answer in Chinese."], &at[0]);
+    assert!(kept.contains("for every project"), "{kept}");
+    let shown = memory(&["show"], &at[1]);
+    assert!(shown.contains("Answer in Chinese."), "{shown}");
+    assert!(shown.contains("yours, for every project"), "{shown}");
+    assert!(!shown.contains("Build with make."), "{shown}");
+
+    // A project note goes everywhere only when promoted.
+    let id = memory(&["show", "build"], &at[0]).split_whitespace().next().unwrap().to_owned();
+    memory(&["promote", &id, "--reason", "every project here builds with make"], &at[0]);
+    assert!(memory(&["show"], &at[1]).contains("Build with make."));
+    assert!(memory(&["show", "build"], &at[0]).contains("promoted as"));
 }
 
 #[tokio::test]
@@ -1375,4 +1427,80 @@ async fn all_candidates_are_formatted_and_rechecked_before_selection() {
     assert!(resp.applied, "{resp:#?}");
     assert_eq!(resp.selection.as_ref().unwrap().candidates.len(), 2);
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n\n"));
+}
+
+#[tokio::test]
+async fn the_ui_backend_finishes_without_terminal_reads_and_exits_when_the_pipe_closes() {
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    async fn send(out: &mut (impl AsyncWrite + Unpin), value: Value) {
+        let bytes = serde_json::to_vec(&value).unwrap();
+        out.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
+        out.write_all(&bytes).await.unwrap();
+        out.flush().await.unwrap();
+    }
+    async fn recv(input: &mut (impl AsyncRead + Unpin)) -> Value {
+        let mut size = [0; 4];
+        input.read_exact(&mut size).await.unwrap();
+        let mut bytes = vec![0; u32::from_be_bytes(size) as usize];
+        input.read_exact(&mut bytes).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    let mut noise = molt::ServiceSection::new(
+        ServiceId::new("noise").unwrap(),
+        molt_proto::Tier::Mutable,
+        molt_proto::Exec {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf untrusted-service-stdout".into()],
+        },
+        Vec::new(),
+    );
+    noise.max_restarts = 0;
+    setup.cfg.services.push(noise);
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+        .arg("ui-backend")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
+    send(
+        &mut input,
+        json!({"cfg":setup.cfg,"workspace":setup.workspace.path().canonicalize().unwrap().to_str().unwrap()}),
+    )
+    .await;
+    send(&mut input, json!("StartSession")).await;
+    let up = tokio::time::timeout(Duration::from_secs(20), recv(&mut output)).await.unwrap();
+    assert!(up.get("SessionUp").is_some(), "{up}");
+    let req = setup.request(Some(CHECK), 1);
+    send(&mut input, json!({"Run":{"req":req,"trace":molt_proto::TraceId::random()}})).await;
+    // With no frontend reading messages, both model turns and review still run.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if server.received_requests().await.unwrap_or_default().len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let msg = recv(&mut output).await;
+            if msg.get("Ran").is_some() {
+                break msg;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(result["Ran"]["result"]["Ok"]["applied"], true, "{result}");
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    drop(input);
+    assert!(tokio::time::timeout(Duration::from_secs(15), child.wait()).await.unwrap().unwrap().success());
 }

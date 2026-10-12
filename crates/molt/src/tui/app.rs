@@ -4,9 +4,10 @@
 //! tested with plain values.
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use molt_api::fs::ChangeKind;
-use molt_api::memory::{ConsolidateResponse, RecallSnapshot, Recalled, ReviewRequest, ReviewResponse};
+use molt_api::memory::{ConsolidateResponse, Layer, RecallSnapshot, Recalled, ReviewRequest, ReviewResponse};
 use molt_api::model::Effort;
 use molt_api::planner::{
     AttemptReport, AttemptStatus, Constraint, Control, ControlResponse, DesignResponse, Earlier, Outcome, RunRequest,
@@ -97,9 +98,12 @@ impl Default for Settings {
 }
 
 /// Work for the runtime.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     StartSession,
+    Redraw,
+    Suspend,
+    SaveTheme(text::Theme),
     Design {
         req: RunRequest,
         trace: TraceId,
@@ -131,6 +135,15 @@ pub enum Action {
         id: String,
         reason: String,
     },
+    /// Keep a preference of the user's for every project.
+    Remember {
+        text: String,
+    },
+    /// Copy a project note to the user's layer, for every project.
+    Promote {
+        id: String,
+        reason: String,
+    },
     ChangeNote {
         review: ReviewRequest,
         text: Option<String>,
@@ -156,8 +169,9 @@ pub enum Action {
 }
 
 /// What happened.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum Msg {
+    #[serde(skip)]
     Key(KeyEvent),
     Paste(String),
     Tick,
@@ -202,6 +216,13 @@ pub enum Msg {
         id: String,
         result: Result<bool, String>,
     },
+    /// The id of the note `/remember` kept.
+    Remembered(Result<String, String>),
+    /// The id of the user-layer copy of note `id`.
+    Promoted {
+        id: String,
+        result: Result<String, String>,
+    },
     ChangedNote(Result<ReviewResponse, String>),
     UsedNotes {
         run: String,
@@ -228,6 +249,36 @@ pub enum Phase {
     Applying,
 }
 
+/// What settled model calls cost so far. A call whose cost is unknown makes
+/// the sum a lower bound; it is never counted as free.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Spend {
+    pub usd: f64,
+    pub unknown: bool,
+}
+
+impl Spend {
+    fn add(&mut self, cost: Option<f64>) {
+        match cost {
+            Some(c) if c.is_finite() && c >= 0.0 => self.usd += c,
+            _ => self.unknown = true,
+        }
+    }
+
+    /// `$0.18`, or `≥ $0.18` when some cost is unknown.
+    pub fn label(&self) -> String {
+        let at_least = if self.unknown { "≥ " } else { "" };
+        format!("{at_least}${:.2}", self.usd)
+    }
+}
+
+impl std::ops::Add for Spend {
+    type Output = Spend;
+    fn add(self, other: Spend) -> Spend {
+        Spend { usd: self.usd + other.usd, unknown: self.unknown || other.unknown }
+    }
+}
+
 pub struct Lane {
     pub index: u32,
     /// The attempt's fork, once the planner has said which.
@@ -236,6 +287,11 @@ pub struct Lane {
     pub status: Option<AttemptStatus>,
     pub lines: Vec<Line<'static>>,
     pub preview: Preview,
+    /// The attempt's model calls that have finished.
+    pub spend: Spend,
+    /// When the TUI first heard of the attempt, and when it ended.
+    pub started: Instant,
+    pub ended: Option<Instant>,
 }
 
 pub struct Task {
@@ -244,6 +300,14 @@ pub struct Task {
     pub phase: Phase,
     pub lanes: Vec<Lane>,
     pub designer_preview: Preview,
+    /// The whole task's budget, as the user set it; `req.budget_usd` is
+    /// what is left for the attempts once the check is designed.
+    pub budget_usd: Option<f64>,
+    /// The check design: its finished calls while it runs, then its settled
+    /// cost.
+    pub design_spend: Spend,
+    /// Model calls already counted, so a repeated event is not counted twice.
+    counted: HashSet<String>,
     /// The check is in the log already.
     check_shown: bool,
     recalled_shown: bool,
@@ -261,9 +325,12 @@ impl Task {
     fn new(trace: TraceId, req: RunRequest, phase: Phase) -> Self {
         Self {
             trace,
+            budget_usd: req.budget_usd,
             req,
             phase,
             lanes: Vec::new(),
+            design_spend: Spend::default(),
+            counted: HashSet::new(),
             check_shown: false,
             recalled_shown: false,
             notes_seen: HashSet::new(),
@@ -273,6 +340,12 @@ impl Task {
             state: RunState::Running,
             waiting: Vec::new(),
         }
+    }
+
+    /// What this task has cost so far, by finished model calls; the run's
+    /// reply settles it.
+    pub fn spend(&self) -> Spend {
+        self.lanes.iter().fold(self.design_spend, |sum, lane| sum + lane.spend)
     }
 }
 
@@ -326,6 +399,8 @@ pub enum MemoryEdit {
     Filter(Input),
     /// Why the selected note is wrong.
     Reason(Input),
+    /// Why the selected note holds in every project.
+    Promote(Input),
     Change(Box<NoteChange>),
 }
 
@@ -609,6 +684,7 @@ pub struct App {
     workspace_path: String,
     pub mode: Mode,
     pub settings: Settings,
+    pub theme: text::Theme,
     pub session: SessionState,
     pub log: Vec<Line<'static>>,
     /// Lines scrolled up from the end of the log; 0 follows it.
@@ -670,6 +746,7 @@ impl App {
             workspace_path: workspace_path.to_owned(),
             mode: Mode::Confirm,
             settings: Settings::default(),
+            theme: text::Theme::detect(std::env::var("COLORTERM").ok().as_deref()),
             session: SessionState::Starting,
             log: Vec::new(),
             scroll: 0,
@@ -748,7 +825,9 @@ impl App {
             Msg::Paste(text) => {
                 match &mut self.screen {
                     Screen::Memory(view) => match &mut view.edit {
-                        Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input)) => input.insert(&text),
+                        Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input) | MemoryEdit::Promote(input)) => {
+                            input.insert(&text)
+                        }
                         Some(MemoryEdit::Change(change)) => {
                             if let Some(input) = change.input_mut() {
                                 input.insert(&text);
@@ -856,13 +935,7 @@ impl App {
                     Ok(false) => self.flash = Some(format!("{id} was already forgotten")),
                     Err(e) => self.flash = Some(format!("could not forget {id}: {}", clean_line(&e))),
                 }
-                match &mut self.screen {
-                    Screen::Memory(view) => {
-                        view.loading = true;
-                        vec![Action::LoadNotes { query: view.query.clone() }]
-                    }
-                    Screen::Main => Vec::new(),
-                }
+                self.reload_notes()
             }
             Msg::ChangedNote(result) => {
                 let Screen::Memory(view) = &mut self.screen else { return Vec::new() };
@@ -889,10 +962,41 @@ impl App {
                 };
                 Vec::new()
             }
+            Msg::Remembered(result) => {
+                self.flash = Some(match result {
+                    Ok(id) => format!("remembered {id} for every project"),
+                    Err(e) => format!("could not remember that: {}", clean_line(&e)),
+                });
+                self.reload_notes()
+            }
+            Msg::Promoted { id, result } => {
+                self.flash = Some(match result {
+                    Ok(copy) => format!("{id} now holds in every project as {copy}"),
+                    Err(e) => format!("could not promote {id}: {}", clean_line(&e)),
+                });
+                self.reload_notes()
+            }
+        }
+    }
+
+    /// Load the notes again when the memory screen is open.
+    fn reload_notes(&mut self) -> Vec<Action> {
+        match &mut self.screen {
+            Screen::Memory(view) => {
+                view.loading = true;
+                vec![Action::LoadNotes { query: view.query.clone() }]
+            }
+            Screen::Main => Vec::new(),
         }
     }
 
     fn key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if ctrl(&key, 'l') {
+            return vec![Action::Redraw];
+        }
+        if ctrl(&key, 'z') {
+            return vec![Action::Suspend];
+        }
         if ctrl(&key, 'd') || (ctrl(&key, 'c') && self.task.is_none() && self.input.text.is_empty()) {
             if self.quit_armed.is_some_and(|at| self.tick.wrapping_sub(at) <= QUIT_TICKS) {
                 self.quit = true;
@@ -1152,6 +1256,17 @@ impl App {
                 let run = if arg.is_empty() { self.last_run.clone() } else { Some(arg.to_owned()) };
                 return self.open_used(run);
             }
+            "theme" => {
+                if arg.is_empty() {
+                    self.flash = Some(format!("theme: {}; /theme dark|light|ansi", self.theme.name()));
+                } else if let Some(theme) = text::Theme::parse(arg) {
+                    self.theme = theme;
+                    self.flash = Some(format!("theme: {}", theme.name()));
+                    return vec![Action::SaveTheme(theme), Action::Redraw];
+                } else {
+                    self.flash = Some("theme: dark, light or ansi".into());
+                }
+            }
             "help" => {
                 self.viewer = Some(Viewer { title: "help".into(), lines: help(), scroll: 0 });
             }
@@ -1170,6 +1285,17 @@ impl App {
                     edit: None,
                 });
                 return vec![Action::LoadNotes { query }];
+            }
+            "remember" => {
+                if !self.memory_up() {
+                    self.flash = Some("memory is not running".into());
+                    return Vec::new();
+                }
+                if arg.is_empty() {
+                    self.flash = Some("/remember TEXT: a preference of yours, for every project".into());
+                    return Vec::new();
+                }
+                return vec![Action::Remember { text: arg.to_owned() }];
             }
             "check" if self.running() => {
                 if arg.is_empty() {
@@ -1399,23 +1525,33 @@ impl App {
                 }
             }
             event @ (Progress::ModelStarted { .. } | Progress::ModelText { .. } | Progress::ModelFinished { .. }) => {
+                let context = event.model_call().expect("a model event has a context");
+                let attempt = context.attempt.filter(|&a| a < task.req.attempts && a < 8);
+                let settles = matches!(event, Progress::ModelFinished { .. });
+                if let Some(attempt) = attempt.filter(|_| task.req.stream || settles) {
+                    if !task.lanes.iter().any(|l| l.index == attempt) {
+                        task.lanes.push(Lane::new(attempt, None));
+                        task.lanes.sort_by_key(|l| l.index);
+                    }
+                }
+                // Counted even when previews are off or the lane has ended:
+                // a cancelled attempt's last call settles after it stops.
+                if let Progress::ModelFinished { cost_usd, .. } = &event {
+                    if task.counted.insert(context.call.clone()) {
+                        match (context.attempt, attempt) {
+                            (None, _) => task.design_spend.add(*cost_usd),
+                            (_, Some(attempt)) => {
+                                lane(task, attempt).expect("the lane was created").spend.add(*cost_usd)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 if !task.req.stream {
                     return;
                 }
-                let context = event.model_call().expect("a model event has a context");
                 match context.attempt {
                     Some(attempt) if attempt < task.req.attempts && attempt < 8 => {
-                        if !task.lanes.iter().any(|l| l.index == attempt) {
-                            task.lanes.push(Lane {
-                                index: attempt,
-                                fork: None,
-                                turn: 0,
-                                status: None,
-                                lines: Vec::new(),
-                                preview: Preview::default(),
-                            });
-                            task.lanes.sort_by_key(|l| l.index);
-                        }
                         let lane = lane(task, attempt).expect("the lane was created");
                         if context.turn < lane.turn || lane.status.is_some() {
                             return;
@@ -1438,14 +1574,7 @@ impl App {
                 if let Some(lane) = lane(task, attempt) {
                     lane.fork = lane.fork.take().or(fork);
                 } else {
-                    task.lanes.push(Lane {
-                        index: attempt,
-                        fork,
-                        turn: 0,
-                        status: None,
-                        lines: Vec::new(),
-                        preview: Preview::default(),
-                    });
+                    task.lanes.push(Lane::new(attempt, fork));
                     task.lanes.sort_by_key(|l| l.index);
                 }
             }
@@ -1478,6 +1607,7 @@ impl App {
                         lane.push(line);
                     }
                     lane.status = Some(status);
+                    lane.ended.get_or_insert_with(Instant::now);
                 }
             }
             Progress::Required { requirement, .. } => task.version = task.version.max(requirement.version),
@@ -1501,6 +1631,7 @@ impl App {
         self.log.extend(task.designer_preview.finish("ended; final preview event unavailable", true));
         match result {
             Ok(d) => {
+                task.design_spend = Spend { usd: d.cost_usd, unknown: d.uncounted_calls > 0 };
                 self.spent_usd += d.cost_usd;
                 self.uncounted_calls = self.uncounted_calls.saturating_add(d.uncounted_calls);
                 if d.cancelled || d.error.is_some() {
@@ -1621,6 +1752,10 @@ impl App {
         }
         let mut task = self.task.take().expect("checked above");
         self.zoom = None;
+        let now = Instant::now();
+        for lane in &mut task.lanes {
+            lane.ended.get_or_insert(now);
+        }
         self.last_lanes = std::mem::take(&mut task.lanes);
         let resp = match result {
             Ok(resp) => resp,
@@ -1629,6 +1764,16 @@ impl App {
                 return Vec::new();
             }
         };
+        // Progress can be dropped by a busy transport or suspended interface.
+        // The final attempt reports settle the archived lane totals as well.
+        for lane in &mut self.last_lanes {
+            if let Some(attempt) = resp.attempts.iter().find(|a| a.index == lane.index) {
+                lane.spend.usd = attempt.cost_usd;
+                lane.spend.unknown |= resp.uncounted_calls > 0;
+                lane.status = Some(attempt.status);
+                lane.turn = attempt.turns;
+            }
+        }
         self.spent_usd += resp.cost_usd;
         self.remember(&task.req.task, &resp);
         self.uncounted_calls = self.uncounted_calls.saturating_add(resp.uncounted_calls);
@@ -1889,6 +2034,9 @@ impl App {
                 if !r.contradicted.is_empty() {
                     parts.push(format!("disputed {}", count(r.contradicted.len())));
                 }
+                if !r.proposed.is_empty() {
+                    parts.push(format!("proposed {} for every project (/memory, p)", count(r.proposed.len())));
+                }
                 if parts.is_empty() {
                     parts.push(match &r.skipped {
                         Some(why) => format!("nothing new: {}", clean_line(why)),
@@ -1985,10 +2133,20 @@ impl App {
                         }
                         return vec![Action::Forget { id: note.note.id.clone(), reason }];
                     }
+                    Some(MemoryEdit::Promote(mut input)) => {
+                        let reason = input.take().trim().to_owned();
+                        let Some(note) = view.notes.get(view.selected) else { return Vec::new() };
+                        if reason.is_empty() {
+                            view.edit = Some(MemoryEdit::Promote(input));
+                            self.flash = Some("say why the note holds in every project".into());
+                            return Vec::new();
+                        }
+                        return vec![Action::Promote { id: note.note.id.clone(), reason }];
+                    }
                     Some(MemoryEdit::Change(_)) | None => {}
                 },
                 _ => {
-                    if let MemoryEdit::Filter(input) | MemoryEdit::Reason(input) = edit {
+                    if let MemoryEdit::Filter(input) | MemoryEdit::Reason(input) | MemoryEdit::Promote(input) = edit {
                         input.key(key);
                     }
                 }
@@ -2006,6 +2164,13 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => view.selected = view.selected.saturating_sub(1),
             KeyCode::Char('/') => view.edit = Some(MemoryEdit::Filter(Input::with(&view.query))),
             KeyCode::Char('f') if !view.notes.is_empty() => view.edit = Some(MemoryEdit::Reason(Input::default())),
+            KeyCode::Char('p') => match view.notes.get(view.selected) {
+                Some(note) if note.layer == Layer::User => {
+                    self.flash = Some("that note holds everywhere already".into())
+                }
+                Some(_) => view.edit = Some(MemoryEdit::Promote(Input::default())),
+                None => {}
+            },
             KeyCode::Char('a') | KeyCode::Char('c') => {
                 if let Some(note) = view.notes.get(view.selected) {
                     view.edit = Some(MemoryEdit::Change(Box::new(NoteChange::new(
@@ -2045,6 +2210,13 @@ pub fn memory_lines(r: &Recalled) -> Vec<Line<'static>> {
         format!("keywords: {}", r.reason.keywords.as_deref().unwrap_or("none (confidence and recency)")),
         format!("relevance: {}", r.reason.relevance.map_or("unavailable".into(), |v| format!("{v:.3}"))),
     ];
+    if r.layer == Layer::User {
+        fields.push("layer: yours, for every project".into());
+    } else if r.details.everywhere {
+        fields.push("layer: this project · proposed for every project (p to promote)".into());
+    } else if let Some(to) = &r.details.promoted_to {
+        fields.push(format!("layer: this project · promoted as {to}"));
+    }
     if r.details.temporary {
         fields.push("temporary experience · verify before reuse".into());
     }
@@ -2092,6 +2264,25 @@ fn snapshot_lines(snapshots: &[RecallSnapshot]) -> Vec<Line<'static>> {
 }
 
 impl Lane {
+    fn new(index: u32, fork: Option<String>) -> Self {
+        Self {
+            index,
+            fork,
+            turn: 0,
+            status: None,
+            lines: Vec::new(),
+            preview: Preview::default(),
+            spend: Spend::default(),
+            started: Instant::now(),
+            ended: None,
+        }
+    }
+
+    /// How long the attempt has run, or ran.
+    pub fn elapsed(&self) -> Duration {
+        self.ended.unwrap_or_else(Instant::now).saturating_duration_since(self.started)
+    }
+
     fn push(&mut self, line: Line<'static>) {
         self.lines.push(line);
         if self.lines.len() > LANE_LINES {
@@ -2186,7 +2377,10 @@ fn covers(rule: &str, path: &str) -> bool {
 fn lane_lines(lanes: &[Lane]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for lane in lanes {
-        lines.push(Line::from(span(format!("attempt {} · tool calls", lane.index + 1), Tone::Shell)));
+        lines.push(Line::from(vec![
+            span(format!("attempt {} · tool calls", lane.index + 1), Tone::Shell),
+            span(format!(" · {} · {}", text::duration(lane.elapsed()), lane.spend.label()), Tone::Dim),
+        ]));
         lines.extend(lane.lines.iter().cloned());
         lines.push(Line::default());
     }
@@ -2247,6 +2441,8 @@ fn help() -> Vec<Line<'static>> {
         row("pgup / pgdn", "scroll the log"),
         row("ctrl+home / end", "the start or end of the log"),
         row("shift+enter", "a new line in the task; also ctrl+j, or \\ then enter"),
+        row("ctrl+l", "clear and redraw the screen"),
+        row("ctrl+z", "suspend the interface; fg returns, services keep running"),
         row("ctrl+g", "write the task in $VISUAL or $EDITOR"),
         row("↑ / ↓", "the line above or below, then earlier inputs"),
         row("ctrl+d twice", "quit"),
@@ -2254,6 +2450,7 @@ fn help() -> Vec<Line<'static>> {
         head("commands"),
         row("/memory [words]", "notes about this project"),
         row("/memory-used [run]", "recorded context for this run (default: latest)"),
+        row("/remember TEXT", "a preference of yours, for every project"),
         row("/check [command]", "use this check for every task; empty: design one"),
         row("", "while a task runs: check its result with this instead"),
         row("/protect PATH...", "the running task must leave these as they are"),
@@ -2267,6 +2464,7 @@ fn help() -> Vec<Line<'static>> {
         row("/budget USD", "spending limit per task"),
         row("/last", "the diff of the last finished task"),
         row("/lanes", "the tool calls of the last finished task"),
+        row("/theme NAME", "dark, light or terminal ANSI colors; saved for next time"),
         row("/clear", "clear the log"),
         row("/quit", "quit"),
         Line::default(),
@@ -2325,10 +2523,15 @@ mod tests {
     }
 
     fn frame_text(app: &mut App) -> String {
-        let backend = ratatui::backend::TestBackend::new(140, 40);
+        frame_rows(app, 140).concat()
+    }
+
+    fn frame_rows(app: &mut App, width: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, 40);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| super::super::view::draw(frame, app)).unwrap();
-        terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect()
+        let cells: Vec<String> = terminal.backend().buffer().content.iter().map(|c| c.symbol().to_owned()).collect();
+        cells.chunks(usize::from(width)).map(|row| row.concat()).collect()
     }
 
     fn model_context(app: &App, attempt: Option<u32>, seq: u64) -> molt_api::progress::ModelCall {
@@ -2379,6 +2582,104 @@ mod tests {
         assert!(log(&app).contains("the model refused"));
     }
 
+    fn finished(app: &App, attempt: Option<u32>, call: &str, cost_usd: Option<f64>) -> Msg {
+        let context = molt_api::progress::ModelCall { call: call.into(), ..model_context(app, attempt, 9) };
+        Msg::Progress(Progress::ModelFinished { context, usage: None, cost_usd, error: None })
+    }
+
+    #[test]
+    fn each_lane_shows_what_its_finished_calls_cost_and_unknown_cost_is_a_lower_bound() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        app.settings.budget_usd = Some(1.0);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        // Each call counts once.
+        app.update(finished(&app, Some(0), "a", Some(0.3)));
+        app.update(finished(&app, Some(0), "a", Some(0.3)));
+        app.update(finished(&app, Some(1), "b", None));
+        let task = app.task.as_ref().unwrap();
+        assert_eq!(task.lanes[0].spend.label(), "$0.30");
+        assert_eq!(task.lanes[1].spend.label(), "≥ $0.00");
+        assert_eq!(task.spend().label(), "≥ $0.30");
+        let shown = frame_text(&mut app);
+        assert!(shown.contains("turn 1 · 0s · $0.30"), "{shown}");
+        assert!(shown.contains("task ≥ $0.30 / $1.00"), "{shown}");
+        assert_eq!(app.spent_usd, 0.0, "progress events do not settle spending");
+
+        // An attempt stopped by the winner still settles its last call.
+        app.update(Msg::Progress(Progress::AttemptFinished {
+            run: trace.to_string(),
+            attempt: 1,
+            status: AttemptStatus::Cancelled,
+        }));
+        app.update(finished(&app, Some(1), "c", Some(0.05)));
+        assert_eq!(app.task.as_ref().unwrap().lanes[1].spend.label(), "≥ $0.05");
+
+        app.update(Msg::Ran { trace, result: Ok(passed(false, Some("fork"))) });
+        assert!((app.spent_usd - 0.3).abs() < 1e-9, "the reply settles the run once: {}", app.spent_usd);
+    }
+
+    #[test]
+    fn final_reports_settle_lane_cost_when_progress_was_lost() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        app.update(Msg::Progress(Progress::AttemptStarted { run: trace.to_string(), attempt: 1, fork: None }));
+        let resp = passed(false, Some("fork"));
+        let cost = resp.attempts.iter().find(|a| a.index == 1).unwrap().cost_usd;
+        app.update(Msg::Ran { trace, result: Ok(resp) });
+        assert_eq!(app.last_lanes.iter().find(|a| a.index == 1).unwrap().spend.usd, cost);
+        assert!(cost > 0.0);
+    }
+
+    #[test]
+    fn the_check_designs_calls_count_until_its_reply_settles_them() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        app.update(finished(&app, None, "d", Some(0.04)));
+        assert_eq!(app.task.as_ref().unwrap().spend().label(), "$0.04");
+        app.update(Msg::Designed { trace, result: Ok(design()), existing: vec![] });
+        let task = app.task.as_ref().unwrap();
+        assert_eq!(task.spend().label(), format!("${:.2}", design().cost_usd));
+    }
+
+    #[test]
+    fn narrow_lanes_keep_their_status_on_one_row() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        app.settings.attempts = Some(4);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        for attempt in 0..4 {
+            app.update(Msg::Progress(Progress::AttemptStarted { run: trace.to_string(), attempt, fork: None }));
+            app.update(Msg::Progress(Progress::ToolCall {
+                run: trace.to_string(),
+                attempt,
+                turn: 12,
+                tool: "read_file".into(),
+                detail: "read".into(),
+            }));
+            app.update(finished(&app, Some(attempt), &format!("call {attempt}"), Some(0.25)));
+        }
+        let rows = frame_rows(&mut app, 79);
+        let titles = rows.iter().find(|r| r.contains("turn 12")).expect("the lane titles");
+        assert_eq!(titles.matches("turn 12").count(), 4, "{titles}");
+        let wide = frame_rows(&mut app, 200);
+        let titles = wide.iter().find(|r| r.contains("turn 12")).expect("the lane titles");
+        assert_eq!(titles.matches("turn 12 · 0s · $0.25").count(), 4, "{titles}");
+        assert_eq!(titles.matches("attempt").count(), 4, "{titles}");
+    }
+
     #[test]
     fn previews_can_be_disabled_and_cancellation_cannot_revive_them() {
         let mut app = App::new("/work/project", None);
@@ -2427,6 +2728,21 @@ mod tests {
         let trace = app.task.as_ref().unwrap().trace.clone();
         assert!(app.update(Msg::Designed { trace, result: Err("cancelled".into()), existing: vec![] }).is_empty());
         assert!(app.task.is_none() && app.prompt.is_none());
+    }
+
+    #[test]
+    fn terminal_controls_work_over_a_viewer_and_leave_the_task_running() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "fix it");
+        type_in(&mut app, "/help");
+        assert_eq!(app.update(ctrl_key('l')), [Action::Redraw]);
+        assert_eq!(app.update(ctrl_key('z')), [Action::Suspend]);
+        assert!(app.task.is_some());
+        app.viewer = None;
+        assert_eq!(type_in(&mut app, "/theme light"), [Action::SaveTheme(text::Theme::Light), Action::Redraw]);
+        assert_eq!(app.theme, text::Theme::Light);
+        assert!(app.task.is_some());
     }
 
     fn design() -> DesignResponse {
@@ -2825,6 +3141,7 @@ mod tests {
             reinforced: vec![],
             contradicted: vec![],
             skipped: Some("the episode held nothing worth keeping".into()),
+            proposed: vec![],
             usage: Usage::default(),
             cost_usd: 0.01,
         };
@@ -2855,6 +3172,48 @@ mod tests {
     }
 
     #[test]
+    fn notes_for_every_project_are_remembered_and_promoted_by_hand() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        assert_eq!(
+            type_in(&mut app, "/remember Answer in Chinese."),
+            [Action::Remember { text: "Answer in Chinese.".into() }]
+        );
+        assert!(type_in(&mut app, "/remember").is_empty(), "nothing to remember");
+        app.update(Msg::Remembered(Ok("note_u".into())));
+        assert_eq!(app.flash.as_deref(), Some("remembered note_u for every project"));
+
+        type_in(&mut app, "/memory");
+        let note = |id: &str, layer: Layer| Recalled {
+            note: serde_json::from_value(serde_json::json!({
+                "id": id, "kind": "fact", "text": "t", "confidence": 0.5, "created_ms": 0, "updated_ms": 0,
+                "provenance": { "trace": "tr", "service": "memory", "version": "v" }, "rev": 1
+            }))
+            .unwrap(),
+            score: 1.0,
+            reason: Default::default(),
+            details: Default::default(),
+            layer,
+        };
+        app.update(Msg::Notes(Ok(vec![note("note_u", Layer::User), note("note_p", Layer::Project)])));
+        app.update(key(KeyCode::Char('p')));
+        assert_eq!(app.flash.as_deref(), Some("that note holds everywhere already"));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Char('p')));
+        assert!(app.update(key(KeyCode::Enter)).is_empty(), "a reason is required");
+        app.update(Msg::Paste("all my projects use make".into()));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Action::Promote { id: "note_p".into(), reason: "all my projects use make".into() }]
+        );
+        assert_eq!(
+            app.update(Msg::Promoted { id: "note_p".into(), result: Ok("note_c".into()) }),
+            [Action::LoadNotes { query: String::new() }]
+        );
+        assert_eq!(app.flash.as_deref(), Some("note_p now holds in every project as note_c"));
+    }
+
+    #[test]
     fn the_memory_screen_lists_filters_and_forgets() {
         let mut app = App::new("/w", None);
         up(&mut app);
@@ -2868,6 +3227,7 @@ mod tests {
             score: 1.0,
             reason: Default::default(),
             details: Default::default(),
+            layer: Default::default(),
         };
         app.update(Msg::Notes(Ok(vec![note("note_a"), note("note_b")])));
         app.update(key(KeyCode::Down));
@@ -3329,7 +3689,9 @@ mod tests {
         app.update(ctrl_key('u'));
         type_in(&mut app, "/lanes");
         let viewer = app.viewer.take().expect("the last task's attempts");
-        assert_eq!(plain(&viewer.lines)[..2], ["attempt 1 · tool calls", " 1 read Makefile"]);
+        let lines = plain(&viewer.lines);
+        assert!(lines[0].starts_with("attempt 1 · tool calls · 0s · $0.10"), "{}", lines[0]);
+        assert_eq!(lines[1], " 1 read Makefile");
     }
 
     #[test]

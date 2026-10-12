@@ -73,6 +73,8 @@ pub(crate) struct Ctx {
     pub effort: Option<Effort>,
     pub max_turns: u32,
     pub max_check_rounds: u32,
+    /// What file writes and edits the model asks for do about syntax errors they introduce.
+    pub syntax_check: fs::SyntaxCheck,
     pub budget_usd: f64,
     pub stream: bool,
     /// What memory knows about the workspace; empty when memory is not up.
@@ -143,6 +145,7 @@ impl Ctx {
             effort: req.effort,
             max_turns: req.max_turns.unwrap_or(cfg.max_turns),
             max_check_rounds: req.max_check_rounds.unwrap_or(cfg.max_check_rounds),
+            syntax_check: req.syntax_check.unwrap_or(cfg.syntax_check),
             budget_usd: req.budget_usd.unwrap_or(cfg.budget_usd),
             stream: req.stream,
             memory: Memory::default(),
@@ -390,9 +393,24 @@ impl Ctx {
         Ok(resp)
     }
 
+    /// Write a file of the run's own, such as a check file, which is never checked for syntax.
     pub async fn write(&self, workspace: &str, path: &str, content: &str) -> Result<fs::WriteResponse, RemoteError> {
-        let req =
-            fs::WriteRequest { workspace: workspace.to_owned(), path: path.to_owned(), content: content.to_owned() };
+        self.write_checked(workspace, path, content, fs::SyntaxCheck::Off).await
+    }
+
+    pub async fn write_checked(
+        &self,
+        workspace: &str,
+        path: &str,
+        content: &str,
+        syntax: fs::SyntaxCheck,
+    ) -> Result<fs::WriteResponse, RemoteError> {
+        let req = fs::WriteRequest {
+            workspace: workspace.to_owned(),
+            path: path.to_owned(),
+            content: content.to_owned(),
+            syntax,
+        };
         self.call(fs::WRITE, req, Budget::new(0, FILE_MS, 0)).await
     }
 

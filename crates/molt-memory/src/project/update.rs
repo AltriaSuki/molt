@@ -25,7 +25,7 @@ use rayon::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 
-use super::lang::{self, Lang, Symbols};
+use super::lang::{self, Lang, Symbols, Tags};
 use super::{project_id, project_key};
 use crate::db::Db;
 use crate::error::{self, invalid};
@@ -61,7 +61,7 @@ struct Stored {
     /// When the contents were last read.
     verified_ns: i64,
     hash: String,
-    /// What parsed it (see [`Lang::fingerprint`]).
+    /// What parsed it (see [`Tags::fingerprint`]).
     extractor: String,
 }
 
