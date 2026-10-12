@@ -127,8 +127,12 @@ with `--config` can change these in a `[confirm]` section (`max_lines`,
    with it; `e` edits the command, `v` shows the files, `n` runs without a
    check.
 2. The attempts run side by side, one box each, with their tool calls and
-   check runs as they happen (Tab shows one large). When one passes, you see
-   its message, the files it changed and, with `d`, the diff. Enter applies
+   check runs as they happen (Tab shows one large). Each box's title shows
+   its turn, how long it has run and what its finished model calls cost
+   (`turn 7 · 2m14s · $0.18`), and the status bar shows the task's spending
+   against its budget (`task $0.52 / $2.00`, in yellow from 80%). A call of
+   unknown cost makes the figure a lower bound (`≥ $0.18`). When one passes,
+   you see its message, the files it changed and, with `d`, the diff. Enter applies
    it; `k` keeps it in its fork, `n` discards it. `/last` opens the diff of
    the last finished task again, whatever was done with it. When no attempt
    passes, each one shows the end of why it stopped, and a failed check shows

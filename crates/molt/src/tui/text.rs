@@ -132,6 +132,16 @@ pub fn fit(text: &str, max: usize) -> String {
     out
 }
 
+/// A running time to the second: `45s`, `2m14s`, `1h02m`.
+pub fn duration(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+    }
+}
+
 /// A confidence from 0 to 1 as a bar ten cells wide, in eighths.
 pub fn bar(value: f64) -> String {
     const PARTS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
