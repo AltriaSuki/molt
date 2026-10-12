@@ -72,6 +72,7 @@ sender from that.
 | A model with no price stays of unknown cost and stops the run; prices come only from the user's environment or data directory, never from a project, and a download that does not validate replaces nothing | `crates/molt-gateway/src/prices.rs` (`the_data_directory_holds_the_snapshot_and_nothing_else_is_read`, `a_download_that_does_not_validate_is_refused`, `malformed_declared_prices_stop_startup_and_name_the_item`), `crates/molt-gateway/tests/gateway.rs` (`a_snapshot_prices_a_third_party_model…`) |
 | `molt do --commit` commits exactly the files the run merged and leaves what the user staged alone; `molt undo` takes it back with a new commit, never touching later changes, and the undone run no longer lends any note confidence | `crates/molt/src/git.rs` (`a_run_commit_holds_only_the_merged_files…`, `undo_refuses_files_that_changed_since_the_run`), `crates/molt/tests/agent.rs` (`a_committed_run_can_be_undone_and_memory_stops_counting_it`), `crates/molt-memory/src/notes.rs` (`an_undone_run_lends_no_note_confidence…`) |
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
+| Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
 
 ## Quick start
 
@@ -910,6 +911,35 @@ Dependencies mount at their canonical absolute paths. `--pass-env NAME` explicit
 Limits are inherited per process: address space, CPU time, file size, open files and process count, plus the existing command wall timeout. These are not aggregate cgroup quotas; RLIMIT_NPROC has the operating system's per-user semantics and does not limit root. TERM reaches the sandbox session group with 500 ms grace; KILL then tears down its PID namespace, including descendants that called setsid. Normal completion, cancelled handlers and service exit also tear down the namespace. Temporary mounts disappear with the last process. Future executable skills must use this shell path to share the policy.
 
 CI installs bubblewrap and requires namespace tests to run. A constrained local executor may skip only those integration tests after a failed capability probe; production startup still fails closed. Tests cover host paths, symlinks, read-only dependencies, network policy, host sockets, limits, C builds, cancellation and descendants with new sessions.
+
+## Project task commands
+
+Place Markdown templates in `.molt/commands/NAME.md`, then type `/NAME arguments`
+in the interface. `$ARGUMENTS` inserts the complete argument text; `$1`, `$2`,
+and later positions insert whitespace-separated words (missing words are empty).
+Expansion is one pass and does not execute a shell. Optional frontmatter uses
+flat, single-line YAML scalars:
+
+```markdown
+---
+description: Fix an issue and add a regression test
+argument-hint: ISSUE_NUMBER
+check: cargo test
+attempts: 2
+budget: 2.5
+---
+Fix issue $ARGUMENTS and add a regression test.
+```
+
+These defaults affect only that task. Explicit interface settings take precedence,
+and a template budget cannot raise an existing limit. Confirm mode shows a
+template's check before starting; auto and plan modes retain their existing rules.
+Templates cannot set modes, permissions or protected paths. `/help` lists project
+commands and Tab completes unique command prefixes (or lists matches). Built-ins
+win name conflicts. Invalid, oversized and out-of-workspace files are skipped
+with a startup warning; restart the interface after editing templates. Discovery
+is bounded to 128 directory entries and 64 KiB per file. Nested YAML structures
+and multiline frontmatter scalars are not supported.
 
 ## Terminal colors and controls
 

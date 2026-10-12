@@ -7,6 +7,7 @@
 
 mod app;
 mod backend;
+mod commands;
 mod preview;
 mod text;
 mod view;
@@ -113,6 +114,7 @@ async fn event_loop(
     let mut app = App::new(&workspace, home);
     app.secrets = secrets_in_env();
     app.rules = cfg.confirm.clone();
+    app.load_commands(Path::new(&workspace));
     let theme_file = cfg.kernel.data_dir.join("tui-theme.json");
     match std::fs::read(&theme_file) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
