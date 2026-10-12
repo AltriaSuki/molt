@@ -1690,6 +1690,16 @@ impl App {
                 return Vec::new();
             }
         };
+        // Progress can be dropped by a busy transport or suspended interface.
+        // The final attempt reports settle the archived lane totals as well.
+        for lane in &mut self.last_lanes {
+            if let Some(attempt) = resp.attempts.iter().find(|a| a.index == lane.index) {
+                lane.spend.usd = attempt.cost_usd;
+                lane.spend.unknown |= resp.uncounted_calls > 0;
+                lane.status = Some(attempt.status);
+                lane.turn = attempt.turns;
+            }
+        }
         self.spent_usd += resp.cost_usd;
         self.remember(&task.req.task, &resp);
         self.uncounted_calls = self.uncounted_calls.saturating_add(resp.uncounted_calls);
@@ -2493,6 +2503,22 @@ mod tests {
 
         app.update(Msg::Ran { trace, result: Ok(passed(false, Some("fork"))) });
         assert!((app.spent_usd - 0.3).abs() < 1e-9, "the reply settles the run once: {}", app.spent_usd);
+    }
+
+    #[test]
+    fn final_reports_settle_lane_cost_when_progress_was_lost() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        app.update(Msg::Progress(Progress::AttemptStarted { run: trace.to_string(), attempt: 1, fork: None }));
+        let resp = passed(false, Some("fork"));
+        let cost = resp.attempts.iter().find(|a| a.index == 1).unwrap().cost_usd;
+        app.update(Msg::Ran { trace, result: Ok(resp) });
+        assert_eq!(app.last_lanes.iter().find(|a| a.index == 1).unwrap().spend.usd, cost);
+        assert!(cost > 0.0);
     }
 
     #[test]
@@ -3486,7 +3512,7 @@ mod tests {
         type_in(&mut app, "/lanes");
         let viewer = app.viewer.take().expect("the last task's attempts");
         let lines = plain(&viewer.lines);
-        assert!(lines[0].starts_with("attempt 1 · tool calls · 0s · $0.00"), "{}", lines[0]);
+        assert!(lines[0].starts_with("attempt 1 · tool calls · 0s · $0.10"), "{}", lines[0]);
         assert_eq!(lines[1], " 1 read Makefile");
     }
 
