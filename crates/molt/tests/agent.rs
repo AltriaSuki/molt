@@ -1233,3 +1233,17 @@ async fn a_checkpointed_run_that_runs_out_of_budget_is_resumed_with_its_fork() {
     assert!(molt_planner::checkpoint::load(&runs, trace.as_str()).is_err(), "a finished run keeps no checkpoint");
     assert!(!std::path::Path::new(&fork).exists());
 }
+
+#[tokio::test]
+async fn a_comparison_suite_cannot_mutate_the_checked_candidate() {
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let mut req = setup.request(Some(CHECK), 2);
+    req.select = molt_api::planner::Select::All;
+    req.suite = Some("printf 'broken\\n' > greeting.txt".into());
+    let (resp, _) = setup.run(req).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
+    assert_eq!(resp.selection.as_ref().unwrap().candidates.len(), 2);
+    assert!(resp.applied);
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+}

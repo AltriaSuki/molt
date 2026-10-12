@@ -772,10 +772,21 @@ async fn run_suites(ctx: &Arc<Ctx>, suite: &str, candidates: &[(&Finished, Strin
     let mut runs = JoinSet::new();
     for (position, (_, fork)) in candidates.iter().enumerate() {
         let (ctx, fork, suite) = (ctx.clone(), fork.clone(), suite.to_owned());
-        runs.spawn(async move { (position, tools::run_command(&ctx, &fork, &suite, timeout_ms).await) });
+        runs.spawn(async move {
+            let result = match ctx.fork_from(&fork).await {
+                Ok(copy) => {
+                    let result = tools::run_command(&ctx, &copy, &suite, timeout_ms).await;
+                    ctx.drop_fork(&copy).await;
+                    result
+                }
+                Err(error) => Err(error),
+            };
+            (position, result)
+        });
     }
     let mut passed = vec![None; candidates.len()];
-    while let Some(Ok((position, ran))) = runs.join_next().await {
+    while let Some(joined) = runs.join_next().await {
+        let Ok((position, ran)) = joined else { continue };
         match ran {
             Ok(ran) => passed[position] = Some(ran.success()),
             Err(e) => tracing::warn!(run = %ctx.trace, error = %e, "could not run the project's suite"),

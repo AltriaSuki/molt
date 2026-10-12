@@ -221,13 +221,16 @@ impl Fake {
             }
             fs::FORK => {
                 let f: fs::ForkRequest = parse(payload);
-                if f.workspace != WORKSPACE {
-                    return Err(invalid(format!("{} is not a workspace", f.workspace)));
-                }
+                let files = if f.workspace == WORKSPACE {
+                    st.workspace.clone()
+                } else {
+                    st.forks.get(&f.workspace).ok_or_else(|| invalid("no such fork"))?.1.clone()
+                };
                 let fork = format!("/scratch/fork-{}", st.forked);
                 st.forked += 1;
-                st.forks.insert(fork.clone(), (st.workspace.clone(), st.workspace.clone()));
-                json!(fs::ForkResponse { fork, files: st.workspace.len() as u64 })
+                let count = files.len() as u64;
+                st.forks.insert(fork.clone(), (files.clone(), files));
+                json!(fs::ForkResponse { fork, files: count })
             }
             fs::DIFF => {
                 let d: fs::DiffRequest = parse(payload);
