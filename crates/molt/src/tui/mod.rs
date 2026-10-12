@@ -293,6 +293,13 @@ impl Runtime {
                 let result = s.forget(&id, &reason).await.map_err(|e| format!("{e:#}"));
                 Msg::Forgot { id, result }
             }),
+            Action::Remember { text } => self.call(move |s| async move {
+                Msg::Remembered(s.remember(&text).await.map(|r| r.note.id).map_err(|e| format!("{e:#}")))
+            }),
+            Action::Promote { id, reason } => self.call(move |s| async move {
+                let result = s.promote(&id, &reason).await.map(|n| n.id).map_err(|e| format!("{e:#}"));
+                Msg::Promoted { id, result }
+            }),
             Action::ChangeNote { review, text } => self.call(move |s| async move {
                 Msg::ChangedNote(s.change_note(review, text).await.map_err(|e| format!("{e:#}")))
             }),

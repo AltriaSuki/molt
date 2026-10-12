@@ -93,12 +93,17 @@ impl Tool {
     async fn execute(self, ctx: &Ctx, fork: &str) -> Result<String, String> {
         let name = self.name();
         let edit = matches!(self, Self::Edit(_));
-        self.call(ctx, fork).await.map_err(|e| {
-            let mut msg = format!("{name} failed: {}", e.message);
-            if edit && e.code == ErrorCode::Invalid {
-                msg.push_str(". Read the file again and copy old_string exactly, with enough context to be unique.");
+        self.call(ctx, fork).await.map_err(|e| match e {
+            Failure::Rejected(text) => text,
+            Failure::Remote(e) => {
+                let mut msg = format!("{name} failed: {}", e.message);
+                if edit && e.code == ErrorCode::Invalid {
+                    msg.push_str(
+                        ". Read the file again and copy old_string exactly, with enough context to be unique.",
+                    );
+                }
+                msg
             }
-            msg
         })
     }
 
@@ -115,15 +120,16 @@ impl Tool {
         }
     }
 
-    async fn call(self, ctx: &Ctx, fork: &str) -> Result<String, RemoteError> {
+    async fn call(self, ctx: &Ctx, fork: &str) -> Result<String, Failure> {
         let workspace = fork.to_owned();
         let files = Budget::new(0, FILE_MS, 0);
         match self {
             Self::Read(r) => Ok(show_read(ctx.read(fork, &r.path, r.offset, r.limit).await?)),
             Self::Write(w) => {
-                let resp = ctx.write(fork, &w.path, &w.content).await?;
+                let resp = ctx.write_checked(fork, &w.path, &w.content, ctx.syntax_check).await?;
                 let how = if resp.created { "created" } else { "replaced" };
-                Ok(format!("Wrote {} bytes to {} ({how}).", resp.bytes, w.path))
+                let done = format!("Wrote {} bytes to {} ({how}).", resp.bytes, w.path);
+                syntax_result(done, &w.path, resp.syntax)
             }
             Self::Edit(e) => {
                 let req = fs::EditRequest {
@@ -132,10 +138,12 @@ impl Tool {
                     old: e.old_string,
                     new: e.new_string,
                     replace_all: e.replace_all,
+                    syntax: ctx.syntax_check,
                 };
                 let resp: fs::EditResponse = ctx.call(fs::EDIT, req, files).await?;
                 let s = if resp.replacements == 1 { "" } else { "s" };
-                Ok(format!("Replaced {} occurrence{s} in {}.", resp.replacements, e.path))
+                let done = format!("Replaced {} occurrence{s} in {}.", resp.replacements, e.path);
+                syntax_result(done, &e.path, resp.syntax)
             }
             Self::List(l) => {
                 let req = fs::ListRequest { workspace, path: l.path, depth: l.depth };
@@ -187,6 +195,45 @@ impl Tool {
                 Ok(if resp.notes.is_empty() { "No notes match.".to_owned() } else { note_lines(&resp.notes) })
             }
         }
+    }
+}
+
+/// Why a call has an error for a result.
+enum Failure {
+    /// The service failed it.
+    Remote(RemoteError),
+    /// The service declined to make the change, and says why.
+    Rejected(String),
+}
+
+impl From<RemoteError> for Failure {
+    fn from(e: RemoteError) -> Self {
+        Self::Remote(e)
+    }
+}
+
+/// The result of a write or edit that `done` describes, with the syntax
+/// errors it introduced: an error result if they kept it from being made.
+fn syntax_result(done: String, path: &str, report: Option<fs::SyntaxReport>) -> Result<String, Failure> {
+    let Some(report) = report.filter(|r| !r.errors.is_empty()) else { return Ok(done) };
+    let mut out = if report.rejected {
+        format!(
+            "Not changed: this would introduce syntax errors in {path}, so {path} is as it was. Fix the change and \
+             try again:"
+        )
+    } else {
+        format!("{done} It introduced syntax errors in {path}; fix them before going on:")
+    };
+    for e in &report.errors {
+        out.push_str(&format!("\nline {}: {}\n{}", e.line, e.message, e.context));
+    }
+    if report.more > 0 {
+        out.push_str(&format!("\n[{} more not shown]", report.more));
+    }
+    if report.rejected {
+        Err(Failure::Rejected(out))
+    } else {
+        Ok(out)
     }
 }
 

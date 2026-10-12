@@ -7,7 +7,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use molt_api::fs::{FilesChanged, CHANGED};
 use molt_api::memory::{
-    ForgetResponse, IndexResponse, MapResponse, RecallResponse, RememberResponse, RetractResponse, SymbolsResponse,
+    ForgetResponse, IndexResponse, Layer, MapResponse, PromoteResponse, RecallResponse, RememberResponse,
+    RetractResponse, SymbolsResponse,
 };
 use molt_memory::{Bus, Config, Db, Memory, Project, Writer};
 use molt_proto::{Budget, CapId, Envelope, ErrorCode, RemoteError, ServiceId, TraceId};
@@ -292,4 +293,141 @@ async fn changes_reported_while_an_index_runs_are_all_indexed() {
             s.call("memory.symbols", json!({ "workspace": "app", "name": format!("new{i}") })).await;
         assert_eq!(found.definitions.len(), 1, "new{i}");
     }
+}
+
+/// `payload` to `memory` from `from`, in the run `trace`.
+async fn ask_in(memory: &Memory, from: &str, trace: &TraceId, to: &str, payload: Value) -> Result<Value, RemoteError> {
+    let mut msg = Envelope::request(trace.clone(), to.parse().unwrap(), CapId::random(), payload);
+    msg.from = Some(ServiceId::new(from).unwrap());
+    memory.handle(msg).await
+}
+
+#[tokio::test]
+async fn the_user_layer_is_shared_by_every_project_and_only_a_person_promotes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    for d in ["a", "b"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    let open = |db: &str, user: Option<&Arc<Db>>| {
+        let db = Arc::new(Db::open(&root.join(db)).unwrap());
+        let writer = Writer { service: "memory".into(), version: "v1".into() };
+        let memory = Memory::new(db, &root, Config::default(), writer, Arc::new(NoBus)).unwrap();
+        match user {
+            Some(user) => memory.with_user(user.clone()),
+            None => memory,
+        }
+    };
+    // A project database from before the user layer, used as it is.
+    let old = open("a.db", None);
+    let learned: RememberResponse =
+        serde_json::from_value(ask(&old, "memory.remember", remember("a", "Build with make.")).await).unwrap();
+    drop(old);
+
+    let user = Arc::new(Db::open(&root.join("user.db")).unwrap());
+    let a = open("a.db", Some(&user));
+    let b = open("b.db", Some(&user));
+    let trace = TraceId::random();
+    let mine = json!({ "kind": "preference", "text": "Answer in Chinese.", "trace": "trace_9", "version": "user" });
+    let refused = ask_in(&a, "planner", &trace, "memory.remember", mine.clone()).await.unwrap_err();
+    assert!(refused.message.contains("CLI"));
+    let mine: RememberResponse =
+        serde_json::from_value(ask_in(&a, "cli", &trace, "memory.remember", mine).await.unwrap()).unwrap();
+    assert_eq!(mine.note.workspace, None);
+    let a_notes: RecallResponse =
+        serde_json::from_value(ask(&a, "memory.recall", json!({ "workspace": "a" })).await).unwrap();
+    assert_eq!(a_notes.notes.len(), 2, "the old project note and the user's");
+
+    // Project B recalls it in a run, and the run's record says where it came from.
+    let run = TraceId::random();
+    let found =
+        ask_in(&b, "planner", &run, "memory.recall", json!({ "workspace": "b", "capture": "context" })).await.unwrap();
+    let found: RecallResponse = serde_json::from_value(found).unwrap();
+    assert_eq!(found.notes.len(), 1);
+    assert_eq!(found.notes[0].note.text, "Answer in Chinese.");
+    assert_eq!(found.notes[0].layer, Layer::User);
+    let b_db = Db::open(&root.join("b.db")).unwrap();
+    let key = root.join("b").to_str().unwrap().to_owned();
+    let snapshots = molt_memory::recall_snapshots(&b_db, &key, run.as_str()).unwrap();
+    assert_eq!(snapshots[0].notes[0].layer, Layer::User);
+
+    // Learning cannot promote; a person can, and the project note stays.
+    let promote = json!({ "workspace": "a", "id": learned.note.id, "reason": "every project here uses make" });
+    let refused = ask_in(&a, "planner", &trace, "memory.promote", promote.clone()).await.unwrap_err();
+    assert!(refused.message.contains("CLI"), "{refused:?}");
+    let promoted: PromoteResponse =
+        serde_json::from_value(ask_in(&a, "cli", &trace, "memory.promote", promote).await.unwrap()).unwrap();
+    assert_eq!(promoted.note.workspace, None);
+    assert_eq!(promoted.note.provenance, learned.note.provenance, "the evidence goes with it");
+    let in_b: RecallResponse =
+        serde_json::from_value(ask(&b, "memory.recall", json!({ "workspace": "b", "query": "build" })).await).unwrap();
+    assert_eq!(in_b.notes[0].note.id, promoted.note.id);
+    let in_a: RecallResponse = serde_json::from_value(
+        ask(&a, "memory.recall", json!({ "workspace": "a", "query": "build", "include_review": true })).await,
+    )
+    .unwrap();
+    let original = in_a.notes.iter().find(|r| r.note.id == learned.note.id).unwrap();
+    assert_eq!(original.details.promoted_to.as_deref(), Some(promoted.note.id.as_str()));
+
+    // Rolling back the version that learned it takes the copy back too.
+    let retract = json!({ "service": "planner", "version": "v7", "reason": "v7 was rolled back" });
+    let r: RetractResponse = serde_json::from_value(ask(&a, "memory.retract", retract).await).unwrap();
+    assert_eq!(r.retracted, 2, "the project note and its promoted copy");
+    let in_b: RecallResponse =
+        serde_json::from_value(ask(&b, "memory.recall", json!({ "workspace": "b" })).await).unwrap();
+    assert_eq!(in_b.notes.iter().map(|r| r.note.id.as_str()).collect::<Vec<_>>(), [mine.note.id.as_str()]);
+
+    // A user note is corrected and forgotten from any project.
+    let correct = json!({ "workspace": "b", "id": mine.note.id, "expected_rev": mine.note.rev, "reason": "simplified",
+        "text": "Answer in Simplified Chinese." });
+    let corrected: molt_api::memory::ReviewResponse =
+        serde_json::from_value(ask_in(&b, "cli", &trace, "memory.correct", correct).await.unwrap()).unwrap();
+    assert_eq!(corrected.note.workspace, None);
+    let forget = json!({ "id": corrected.note.id, "reason": "no longer" });
+    let forgot: ForgetResponse = serde_json::from_value(ask(&b, "memory.forget", forget).await).unwrap();
+    assert!(forgot.forgotten);
+    let left: RecallResponse =
+        serde_json::from_value(ask(&a, "memory.recall", json!({ "workspace": "a" })).await).unwrap();
+    assert!(left.notes.is_empty(), "{left:?}");
+}
+
+#[tokio::test]
+async fn promotion_rechecks_dependencies_changed_outside_molt() {
+    let mut setup = Setup::new();
+    setup.memory = setup.memory.with_user(Arc::new(Db::in_memory().unwrap()));
+    let remembered: RememberResponse = setup.call("memory.remember", remember("app", "The parser uses lengths.")).await;
+    let review = json!({"workspace":"app", "id":remembered.note.id, "expected_rev":remembered.note.rev,
+        "reason":"checked source", "depends_on":["src/lib.rs"]});
+    setup.ask("cli", "memory.review", review).await.unwrap();
+    std::fs::write(setup.root.join("app/src/lib.rs"), "changed externally").unwrap();
+    let error = setup
+        .ask(
+            "cli",
+            "memory.promote",
+            json!({"workspace":"app", "id":remembered.note.id,
+        "reason":"applies everywhere"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("awaits review"), "{error:?}");
+}
+
+#[tokio::test]
+async fn undo_withdraws_evidence_from_both_project_and_promoted_user_notes() {
+    let mut setup = Setup::new();
+    setup.memory = setup.memory.with_user(Arc::new(Db::in_memory().unwrap()));
+    let remembered: RememberResponse = setup.call("memory.remember", remember("app", "Build with make.")).await;
+    setup
+        .ask(
+            "cli",
+            "memory.promote",
+            json!({"workspace":"app", "id":remembered.note.id,
+        "reason":"applies everywhere"}),
+        )
+        .await
+        .unwrap();
+    let result = setup.ask("cli", "memory.undo", json!({"run":"trace_1", "reason":"reverted"})).await.unwrap();
+    assert_eq!(result["retracted"], 2);
+    let found: RecallResponse = setup.call("memory.recall", json!({"workspace":"app"})).await;
+    assert!(found.notes.is_empty());
 }

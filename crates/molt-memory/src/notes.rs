@@ -95,8 +95,8 @@ const REINFORCE: f64 = 0.3;
 /// remaining evidence is an episode that bore it out starts there too.
 const CONTRADICTED: f64 = 0.6;
 const CONTESTED: f64 = 0.5;
-const DEFAULT_K: u32 = 8;
-const MAX_K: u32 = 50;
+pub(crate) const DEFAULT_K: u32 = 8;
+pub(crate) const MAX_K: u32 = 50;
 /// Keyword matches considered before ranking, best matches first.
 const CANDIDATES: usize = 500;
 /// Recency halves a note's weight for ranking about every this many days.
@@ -819,7 +819,7 @@ pub(crate) fn select(
                 confidence: note.confidence,
                 recency,
             };
-            Recalled { note, score, reason, details }
+            Recalled { note, score, reason, details, layer: molt_api::memory::Layer::Project }
         })
         .collect();
     ranked.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.note.id.cmp(&b.note.id)));

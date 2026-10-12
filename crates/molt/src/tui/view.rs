@@ -586,6 +586,9 @@ fn draw_memory(frame: &mut Frame, area: Rect, view: &MemoryView, tick: u64) {
     let block = match &view.edit {
         Some(MemoryEdit::Filter(_)) => block.title(Line::from(span(" filter ", Tone::Shell))),
         Some(MemoryEdit::Reason(_)) => block.title(Line::from(span(" why is this note wrong? ", Tone::Shell))),
+        Some(MemoryEdit::Promote(_)) => {
+            block.title(Line::from(span(" why does it hold in every project? ", Tone::Shell)))
+        }
         Some(MemoryEdit::Change(change)) => block.title(Line::from(span(
             match change.step {
                 ChangeStep::Text => " corrected note ",
@@ -600,7 +603,9 @@ fn draw_memory(frame: &mut Frame, area: Rect, view: &MemoryView, tick: u64) {
     let inner = block.inner(bottom);
     frame.render_widget(block, bottom);
     match &view.edit {
-        Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input)) => draw_field(frame, inner, input, true),
+        Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input) | MemoryEdit::Promote(input)) => {
+            draw_field(frame, inner, input, true)
+        }
         Some(MemoryEdit::Change(change)) => {
             if let Some(input) = change.input() {
                 draw_field(frame, inner, input, true);
@@ -619,6 +624,7 @@ fn draw_memory(frame: &mut Frame, area: Rect, view: &MemoryView, tick: u64) {
                 ("a", "review"),
                 ("c", "correct"),
                 ("f", "forget"),
+                ("p", "promote"),
                 ("r", "reload"),
                 ("u", "used"),
                 ("esc", "back"),

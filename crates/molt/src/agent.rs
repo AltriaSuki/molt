@@ -62,7 +62,8 @@ pub struct Interrupted;
 /// could run any command with the user's secrets. `data_dir` replaces the
 /// configured data dir; the default setup otherwise uses `project`'s, or
 /// [`default_data_dir`] without one, and has memory keep the notes about the
-/// project under its id.
+/// project under its id and the user's notes for every project next to the
+/// registry ([`Registry::user_db`]).
 pub fn resolve_config(
     path: Option<&Path>,
     workspace: &Path,
@@ -99,6 +100,7 @@ pub fn resolve_config(
     let mut cfg = Config::agent(workspace, &data_dir, &bin_dir()?)?;
     if let Some(project) = project {
         cfg.for_project(&project.id, &project_paths(project, workspace))?;
+        cfg.with_user_db(&Registry::user()?.user_db())?;
     }
     Ok(cfg)
 }
@@ -192,6 +194,7 @@ pub fn memory_config(
             let mut cfg = Config::agent(workspace, &data_dir, &bin_dir()?)?;
             if let Some(project) = project {
                 cfg.for_project(&project.id, &project_paths(project, workspace))?;
+                cfg.with_user_db(&Registry::user()?.user_db())?;
             }
             cfg
         }
@@ -416,6 +419,18 @@ pub async fn run_task_as(
         Err(e) => Err(e),
     };
     running.shutdown().await;
+    // A foreground-group signal can make a service exit before Tokio has
+    // delivered the same signal to our listener. Recheck after shutdown,
+    // while preserving successful runs and never polling a completed stop.
+    let done = if done.as_ref().is_err_and(|error| !error.is::<Interrupted>()) {
+        tokio::select! {
+            biased;
+            () = &mut stop => Err(Interrupted.into()),
+            () = std::future::ready(()) => done,
+        }
+    } else {
+        done
+    };
     let kept = checkpointed && done.as_ref().map_or(true, |d| d.run.checkpoint.is_some());
     if let Some(forks) = forks.filter(|_| !kept) {
         let keep = done.as_ref().ok().and_then(|d| d.run.fork.as_deref());
