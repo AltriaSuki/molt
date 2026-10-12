@@ -22,6 +22,7 @@ use molt_sdk::{CallOpts, SdkError, Service};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::project::{Project, Registry};
 use crate::{Config, Running};
 
 /// The identity `molt do` joins the bus with.
@@ -57,8 +58,15 @@ pub struct Interrupted;
 /// for the canonical `workspace`, with the service executables next to the
 /// running one. No file is ever picked up on its own: one in the project
 /// could run any command with the user's secrets. `data_dir` replaces the
-/// configured data dir; the default setup otherwise uses [`default_data_dir`].
-pub fn resolve_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&Path>) -> anyhow::Result<Config> {
+/// configured data dir; the default setup otherwise uses `project`'s, or
+/// [`default_data_dir`] without one, and has memory keep the notes about the
+/// project under its id.
+pub fn resolve_config(
+    path: Option<&Path>,
+    workspace: &Path,
+    data_dir: Option<&Path>,
+    project: Option<&Project>,
+) -> anyhow::Result<Config> {
     if let Some(path) = path {
         let mut cfg = Config::load(path)?;
         require_services(&cfg).with_context(|| format!("{} cannot run tasks", path.display()))?;
@@ -75,9 +83,10 @@ pub fn resolve_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&P
             "ANTHROPIC_API_KEY or OPENAI_API_KEY is not set: export your provider API key, or pass --config with services of your own"
         );
     }
-    let data_dir = match data_dir {
-        Some(dir) => dir.to_path_buf(),
-        None => default_data_dir(workspace)?,
+    let data_dir = match (data_dir, project) {
+        (Some(dir), _) => dir.to_path_buf(),
+        (None, Some(project)) => project.data_dir.clone(),
+        (None, None) => default_data_dir(workspace)?,
     };
     // Checked before the directory is created, and again once it exists.
     let data_dir = resolved(&data_dir).with_context(|| format!("data dir {}", data_dir.display()))?;
@@ -85,7 +94,59 @@ pub fn resolve_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&P
     crate::lock::create_private_dir(&data_dir)?;
     let data_dir = data_dir.canonicalize().with_context(|| format!("data dir {}", data_dir.display()))?;
     outside(workspace, &data_dir)?;
-    Config::agent(workspace, &data_dir, &bin_dir()?)
+    let mut cfg = Config::agent(workspace, &data_dir, &bin_dir()?)?;
+    if let Some(project) = project {
+        cfg.for_project(&project.id, &project_paths(project, workspace))?;
+    }
+    Ok(cfg)
+}
+
+/// The workspace to work in and its project: the project `named` (by id or
+/// name) and its directory, or else the canonical `workspace` and the
+/// project it is a directory of, registered now if it is in none. A custom
+/// config, or a host without a registry, has no project.
+pub fn locate(
+    named: Option<&str>,
+    workspace: &Path,
+    custom_config: bool,
+) -> anyhow::Result<(PathBuf, Option<Project>)> {
+    if let Some(named) = named {
+        let registry = Registry::user()?;
+        let project = registry.find(named)?;
+        return Ok((registry.workspace(&project)?, Some(project)));
+    }
+    let workspace = workspace.canonicalize().with_context(|| format!("workspace {}", workspace.display()))?;
+    anyhow::ensure!(workspace.is_dir(), "the workspace {} is not a directory", workspace.display());
+    if custom_config {
+        return Ok((workspace, None));
+    }
+    let registry = match Registry::user() {
+        Ok(registry) => registry,
+        Err(e) => {
+            tracing::warn!("{e:#}; notes are kept by the workspace's path");
+            return Ok((workspace, None));
+        }
+    };
+    let project = registry.for_path(&workspace, || default_data_dir(&workspace))?;
+    Ok((workspace, Some(project)))
+}
+
+/// The directories memory keeps `project`'s notes for: its own, or the one it
+/// works in when it has none.
+fn project_paths(project: &Project, workspace: &Path) -> Vec<PathBuf> {
+    if project.paths.is_empty() {
+        vec![workspace.to_path_buf()]
+    } else {
+        project.paths.clone()
+    }
+}
+
+/// The data dir of a project made with `molt project new`, as
+/// [`default_data_dir`] names them, from its name and id.
+pub fn project_data_dir(name: &str, id: &str) -> anyhow::Result<PathBuf> {
+    let slug: String =
+        name.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
+    default_data_dir(&Path::new("/").join(id).join(slug.trim_matches('_')))
 }
 
 /// The directory of the running executable, where the services are.
@@ -98,7 +159,12 @@ fn bin_dir() -> anyhow::Result<PathBuf> {
 /// is given (with `data_dir` in place of its own, when given), otherwise the
 /// default setup of `molt do` for the canonical `workspace`, which must have
 /// run there before (nothing is created).
-pub fn memory_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&Path>) -> anyhow::Result<Config> {
+pub fn memory_config(
+    path: Option<&Path>,
+    workspace: &Path,
+    data_dir: Option<&Path>,
+    project: Option<&Project>,
+) -> anyhow::Result<Config> {
     let cfg = match path {
         Some(path) => {
             let mut cfg = Config::load(path)?;
@@ -108,9 +174,10 @@ pub fn memory_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&Pa
             cfg
         }
         None => {
-            let data_dir = match data_dir {
-                Some(dir) => dir.to_path_buf(),
-                None => default_data_dir(workspace)?,
+            let data_dir = match (data_dir, project) {
+                (Some(dir), _) => dir.to_path_buf(),
+                (None, Some(project)) => project.data_dir.clone(),
+                (None, None) => default_data_dir(workspace)?,
             };
             if !data_dir.is_dir() {
                 bail!(
@@ -120,7 +187,11 @@ pub fn memory_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&Pa
                 );
             }
             let data_dir = data_dir.canonicalize().with_context(|| format!("data dir {}", data_dir.display()))?;
-            Config::agent(workspace, &data_dir, &bin_dir()?)?
+            let mut cfg = Config::agent(workspace, &data_dir, &bin_dir()?)?;
+            if let Some(project) = project {
+                cfg.for_project(&project.id, &project_paths(project, workspace))?;
+            }
+            cfg
         }
     };
     cfg.service(MEMORY).context("the config has no memory service")?;

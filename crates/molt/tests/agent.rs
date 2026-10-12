@@ -435,6 +435,8 @@ fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) ->
         .args(args)
         .arg("--data-dir")
         .arg(data)
+        // The project registry, kept out of the developer's own.
+        .env("XDG_DATA_HOME", data.join("user-data"))
         // `--workspace` defaults to the current directory.
         .current_dir(workspace)
         .env("ANTHROPIC_BASE_URL", server.uri())
@@ -590,6 +592,7 @@ async fn a_second_run_starts_with_what_the_first_learned_and_a_map_of_the_code()
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
         .args(["memory", "used", &run, "--json", "--data-dir"])
         .arg(setup.data.path())
+        .env("XDG_DATA_HOME", setup.data.path().join("user-data"))
         .current_dir(setup.workspace.path())
         .output()
         .unwrap();
@@ -759,6 +762,64 @@ async fn a_service_that_cannot_start_ends_the_run_at_once_and_says_why() {
 }
 
 #[tokio::test]
+async fn a_project_keeps_its_notes_without_a_folder_and_after_a_move() {
+    let server = fake_api(Fake::Greets).await;
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let molt = |args: &[&str], dir: &Path| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+            .args(args)
+            .env("XDG_DATA_HOME", data.path().join("user-data"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "molt {args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        stdout.into_owned()
+    };
+    let run = |args: &[&str], dir: &Path| {
+        let mut all = vec!["--check", CHECK, "--attempts", "1"];
+        all.extend(args);
+        let cmd = molt_do(&server, dir, data.path(), &all).output();
+        async move {
+            let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "{stderr}");
+            assert!(stderr.contains("memory: learned 1 note"), "{stderr}");
+        }
+    };
+    let show = |args: &[&str], dir: &Path| {
+        let mut all = vec!["memory", "show", "--data-dir", data.path().to_str().unwrap()];
+        all.extend(args);
+        molt(&all, dir)
+    };
+
+    // A project with no folder works in a private one, and learns there.
+    let listed = molt(&["project", "new", "Japan trip"], home.path());
+    assert!(listed.contains("Japan trip  no folder"), "{listed}");
+    let id = listed.split_whitespace().next().unwrap().to_owned();
+    run(&["--project", "Japan trip"], home.path()).await;
+    let files = data.path().join(format!("user-data/molt/projects/{id}/files"));
+    assert_eq!(std::fs::read_to_string(files.join("greeting.txt")).unwrap(), "hello\n");
+    assert!(show(&["--project", &id], home.path()).contains(LEARNED_TEXT));
+
+    // A directory becomes a project the first time molt runs in it, and
+    // keeps its notes when it moves and molt is told.
+    let old = home.path().join("site");
+    std::fs::create_dir(&old).unwrap();
+    run(&[], &old).await;
+    let new = home.path().join("site-renamed");
+    std::fs::rename(&old, &new).unwrap();
+    let moved = molt(&["project", "move", "site", new.to_str().unwrap()], home.path());
+    assert!(moved.contains(new.canonicalize().unwrap().to_str().unwrap()), "{moved}");
+    assert!(show(&[], &new).contains(LEARNED_TEXT));
+    // Nothing in a project's directory says which project it is.
+    assert_eq!(std::fs::read_dir(&new).unwrap().count(), 1, "only the greeting");
+}
+
+#[tokio::test]
 async fn the_cli_carries_out_a_task() {
     let server = fake_api(Fake::Greets).await;
     let workspace = tempfile::tempdir().unwrap();
@@ -789,6 +850,7 @@ async fn the_cli_carries_out_a_task() {
             .args(args)
             .arg("--data-dir")
             .arg(data.path())
+            .env("XDG_DATA_HOME", data.path().join("user-data"))
             .current_dir(workspace.path())
             .output()
             .unwrap();
@@ -1070,9 +1132,11 @@ async fn a_task_runs_over_nats_with_provisioned_secrets() {
 fn the_cli_refuses_a_bad_setup_before_starting_anything() {
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
+    let user_data = tempfile::tempdir().unwrap();
     let molt_do = |data_dir: &Path, key: Option<&str>, args: &[&str]| {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_molt"));
         cmd.args(["do", "anything", "--data-dir"]).arg(data_dir).args(args).current_dir(workspace.path());
+        cmd.env("XDG_DATA_HOME", user_data.path());
         cmd.env_remove("OPENAI_API_KEY").env_remove("MOLT_PROVIDER");
         match key {
             Some(key) => cmd.env("ANTHROPIC_API_KEY", key),

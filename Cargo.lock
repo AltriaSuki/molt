@@ -1503,6 +1503,7 @@ dependencies = [
  "molt-sdk",
  "molt-tools",
  "molt-transport",
+ "rand 0.9.5",
  "ratatui",
  "serde",
  "serde_json",
