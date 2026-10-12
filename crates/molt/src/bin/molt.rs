@@ -10,7 +10,7 @@ use molt_api::memory::{
     ReviewResponse,
 };
 use molt_api::model::Effort;
-use molt_api::planner::{Outcome, Resume, RunRequest};
+use molt_api::planner::{Outcome, Resume, RunRequest, Select};
 use molt_planner::checkpoint;
 use molt_proto::{ServiceId, TraceId};
 
@@ -54,6 +54,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
+    /// The projects molt knows: each keeps its notes under a stable id,
+    /// whatever directories it has, or none.
+    Project {
+        #[command(subcommand)]
+        cmd: ProjectCmd,
+    },
     /// Benchmark Molt against a plain agent loop on coding tasks graded by hidden tests.
     Bench {
         #[command(subcommand)]
@@ -88,6 +94,12 @@ struct DoArgs {
     /// Parallel attempts.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=8))]
     attempts: u32,
+    /// How to pick among attempts that pass: `first` takes the first and
+    /// cancels the rest; `wait:<seconds>` gives the others that long to pass
+    /// too, and `all` lets every attempt finish, then the passing ones are
+    /// compared (project suite, diff size, review).
+    #[arg(long, default_value = "first", value_name = "first|wait:<seconds>|all")]
+    select: Select,
     /// Model for the attempts: opus, sonnet, haiku or a model id.
     #[arg(long)]
     model: Option<String>,
@@ -111,6 +123,10 @@ struct RunArgs {
     /// The project to work on.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    /// A project of `molt project list`, by id or name, in place of
+    /// --workspace: its directory, or its own private one when it has none.
+    #[arg(long, conflicts_with = "workspace")]
+    project: Option<String>,
     /// Spending limit for the whole run, learning included, in US dollars.
     /// It is checked before each model call, so the last one can go past it.
     /// For `molt resume`, it replaces the stopped run's, which counts what
@@ -180,6 +196,9 @@ struct UiArgs {
     /// The project to work on.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    /// A project of `molt project list`, by id or name, in place of --workspace.
+    #[arg(long, conflicts_with = "workspace")]
+    project: Option<String>,
     /// Where kernel state and forks go. Default: ~/.cache/molt/<project>-<hash>.
     #[arg(long)]
     data_dir: Option<PathBuf>,
@@ -195,6 +214,9 @@ struct MemoryAt {
     /// The project.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    /// A project of `molt project list`, by id or name, in place of --workspace.
+    #[arg(long, conflicts_with = "workspace")]
+    project: Option<String>,
     /// The data dir `molt do` used there. Default: ~/.cache/molt/<project>-<hash>.
     #[arg(long)]
     data_dir: Option<PathBuf>,
@@ -294,6 +316,36 @@ fn env_name(name: &str) -> Result<String, String> {
 }
 
 #[derive(Subcommand)]
+enum ProjectCmd {
+    /// Register a project called NAME, for the directory --path or, without
+    /// one, for work with no folder (it works in a private one of its own).
+    New {
+        name: String,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// List the projects, with their ids, directories and data dirs.
+    List,
+    /// Tell molt a project's directory moved to NEW_DIR. Its notes, audit
+    /// log and stopped runs stay with it.
+    Move {
+        /// The project's id or name.
+        project: String,
+        new_dir: PathBuf,
+        /// The directory that moved, when the project has several.
+        #[arg(long)]
+        from: Option<PathBuf>,
+    },
+    /// Add DIR, such as another clone, to a project: it shares the project's
+    /// notes and data dir.
+    Add {
+        /// The project's id or name.
+        project: String,
+        dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum PricesCmd {
     /// Download a price list, check it, and make it the snapshot runs use.
     /// Nothing is replaced when the download does not check out.
@@ -355,6 +407,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             let opts = molt::tui::Options {
                 config: cli.config,
                 workspace: args.workspace,
+                project: args.project,
                 data_dir: args.data_dir,
                 pass_env: args.pass_env,
             };
@@ -375,6 +428,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         Cmd::Do(args) => return do_task(cli.config.as_deref(), args).await,
         Cmd::Resume(args) => return resume_task(cli.config.as_deref(), args).await,
         Cmd::Memory { cmd } => memory_cmd(cli.config.as_deref(), cmd).await?,
+        Cmd::Project { cmd } => project_cmd(cmd)?,
         Cmd::Bench { cmd } => return molt_bench::cli::main(cmd).await,
         Cmd::Prices { cmd } => return prices_cmd(cmd).await,
         Cmd::Audit { cmd: AuditCmd::Verify { path } } => {
@@ -509,9 +563,8 @@ fn cfg_scratch(args: &[String]) -> anyhow::Result<PathBuf> {
 
 /// The config and canonical workspace a run of `molt do` or `molt resume` uses.
 fn prepare(config: Option<&Path>, args: &RunArgs) -> anyhow::Result<(Config, String)> {
-    let workspace = args.workspace.canonicalize().with_context(|| format!("workspace {}", args.workspace.display()))?;
-    anyhow::ensure!(workspace.is_dir(), "the workspace {} is not a directory", workspace.display());
-    let mut cfg = agent::resolve_config(config, &workspace, args.data_dir.as_deref())?;
+    let (workspace, project) = agent::locate(args.project.as_deref(), &args.workspace, config.is_some())?;
+    let mut cfg = agent::resolve_config(config, &workspace, args.data_dir.as_deref(), project.as_ref())?;
     if let Some(path) = config {
         eprintln!("config: {}", agent::printable(&path.display().to_string()));
     }
@@ -560,6 +613,7 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     req.check = args.check;
     req.verify = !args.no_check;
     req.attempts = args.attempts;
+    req.select = args.select;
     req.model = args.model;
     req.effort = args.effort;
     req.max_turns = args.max_turns;
@@ -698,19 +752,26 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
         | MemoryCmd::Used { at, .. } => at,
         MemoryCmd::Review(r) | MemoryCmd::Correct { review: r, .. } => &r.at,
     };
-    let workspace = at.workspace.canonicalize().with_context(|| format!("workspace {}", at.workspace.display()))?;
-    let key = workspace.to_str().context("the workspace path is not UTF-8")?.to_owned();
-    let cfg = agent::memory_config(config, &workspace, at.data_dir.as_deref())?;
+    let (workspace, project) = agent::locate(at.project.as_deref(), &at.workspace, config.is_some())?;
+    let path = workspace.to_str().context("the workspace path is not UTF-8")?.to_owned();
+    // Notes about a project are kept under its id; the service maps the path to it.
+    let key = project.as_ref().map_or_else(|| path.clone(), |p| p.id.clone());
+    let cfg = agent::memory_config(config, &workspace, at.data_dir.as_deref(), project.as_ref())?;
     let open = || -> anyhow::Result<molt_memory::Db> {
         let db = agent::memory_db(&cfg).context("the memory service has no --db")?;
         anyhow::ensure!(db.is_file(), "memory has nothing yet ({} does not exist)", db.display());
-        molt_memory::Db::open(&db)
+        let db = molt_memory::Db::open(&db)?;
+        if let Some(project) = &project {
+            let paths = if project.paths.is_empty() { vec![workspace.clone()] } else { project.paths.clone() };
+            molt_memory::adopt(&db, &molt_memory::Project { id: project.id.clone(), paths })?;
+        }
+        Ok(db)
     };
     match cmd {
         MemoryCmd::Show { words, n, json, .. } => {
             let req = RecallRequest {
                 query: words.join(" "),
-                workspace: Some(key),
+                workspace: Some(path),
                 k: Some(n),
                 include_review: true,
                 ..Default::default()
@@ -751,8 +812,8 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
                 }
             }
         }
-        MemoryCmd::Review(r) => change_note(&cfg, key, r, None).await?,
-        MemoryCmd::Correct { review, text } => change_note(&cfg, key, review, Some(text)).await?,
+        MemoryCmd::Review(r) => change_note(&cfg, path, r, None).await?,
+        MemoryCmd::Correct { review, text } => change_note(&cfg, path, review, Some(text)).await?,
         MemoryCmd::Forget { id, reason, .. } => {
             let req = serde_json::to_value(ForgetRequest { id: id.clone(), reason })?;
             let reply: ForgetResponse = serde_json::from_value(agent::call_memory(&cfg, memory::FORGET, req).await?)?;
@@ -764,11 +825,46 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
             let skip = agent::memory_skips(&cfg);
             molt_memory::project::index_skipping(&db, &workspace, None, &skip)
                 .map_err(|e| anyhow::anyhow!(e.message))?;
-            let req = MapRequest { workspace: key, query: words.join(" "), max_tokens: Some(tokens) };
+            let req = MapRequest { workspace: path, query: words.join(" "), max_tokens: Some(tokens) };
             let map = molt_memory::project::map(&db, &workspace, &req).map_err(|e| anyhow::anyhow!(e.message))?;
             print!("{}", agent::printable(&map.map));
             eprintln!("{} files, {} definitions, about {} tokens", map.files, map.symbols, map.tokens);
         }
+    }
+    Ok(())
+}
+
+fn project_cmd(cmd: ProjectCmd) -> anyhow::Result<()> {
+    let registry = molt::project::Registry::user()?;
+    let dir = |d: &Path| -> anyhow::Result<PathBuf> {
+        let d = d.canonicalize().with_context(|| format!("{}", d.display()))?;
+        anyhow::ensure!(d.is_dir(), "{} is not a directory", d.display());
+        Ok(d)
+    };
+    let show = |p: &molt::project::Project| {
+        let dirs = if p.paths.is_empty() {
+            "no folder".to_owned()
+        } else {
+            p.paths.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
+        };
+        println!("{}", agent::printable(&format!("{}  {}  {dirs}\n    data: {}", p.id, p.name, p.data_dir.display())));
+    };
+    match cmd {
+        ProjectCmd::New { name, path } => {
+            let path = path.as_deref().map(dir).transpose()?;
+            show(&registry.create(&name, path.as_deref(), |id| agent::project_data_dir(&name, id))?);
+        }
+        ProjectCmd::List => {
+            let projects = registry.list()?;
+            if projects.is_empty() {
+                eprintln!("no projects yet; one is registered the first time molt runs in a directory");
+            }
+            projects.iter().for_each(show);
+        }
+        ProjectCmd::Move { project, new_dir, from } => {
+            show(&registry.move_path(&project, &dir(&new_dir)?, from.as_deref())?);
+        }
+        ProjectCmd::Add { project, dir: d } => show(&registry.add_path(&project, &dir(&d)?)?),
     }
     Ok(())
 }

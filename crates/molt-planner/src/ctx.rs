@@ -335,7 +335,12 @@ impl Ctx {
     }
 
     pub async fn fork(&self) -> Result<String, RemoteError> {
-        let req = fs::ForkRequest { workspace: self.workspace.clone() };
+        self.fork_from(&self.workspace).await
+    }
+
+    /// Copy a candidate for checks that can write build artifacts or alter files.
+    pub async fn fork_from(&self, workspace: &str) -> Result<String, RemoteError> {
+        let req = fs::ForkRequest { workspace: workspace.to_owned() };
         let resp: fs::ForkResponse = self.call(fs::FORK, req, Budget::new(0, TREE_MS, 0)).await?;
         self.forks.lock().unwrap_or_else(PoisonError::into_inner).push(resp.fork.clone());
         Ok(resp.fork)

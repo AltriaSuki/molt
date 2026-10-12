@@ -28,6 +28,8 @@ pub(crate) enum Design {
         command: String,
         /// Path and full contents of each file the check depends on.
         files: Vec<(String, String)>,
+        /// The project's own test command, when the designer found one.
+        suite: Option<String>,
         rationale: String,
         /// The check run once in the designer's fork, before any work:
         /// only when asked for, and `None` when it could not be run.
@@ -179,5 +181,6 @@ async fn submitted(ctx: &Ctx, fork: &str, call: &ToolUse) -> Result<Design, Stri
         })?;
         files.push((path.to_owned(), content));
     }
-    Ok(Design::Check { command, files, rationale: submit.rationale, baseline: None })
+    let suite = submit.suite.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+    Ok(Design::Check { command, files, suite, rationale: submit.rationale, baseline: None })
 }

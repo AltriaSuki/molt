@@ -76,6 +76,8 @@ are restored before every check run, so an existing file among them would undo t
 - Do not implement the task itself. Only the new files you list in submit_check reach the other agents; \
 any other change you make is thrown away.
 - If no automated check fits the task (a question to answer, prose to write), call submit_check with command null.
+- If the project has its own test suite, name its command as suite: several results that pass the check are \
+compared by whether they keep it passing.
 
 Finish by calling submit_check.";
 
@@ -587,6 +589,10 @@ pub(crate) fn designer_tools(memory: bool) -> Vec<Value> {
                 "description": "Every new file you wrote that the check depends on, relative to the workspace \
                                 root. Only files that did not exist before; empty when the check uses only existing \
                                 files.",
+            },
+            "suite": {
+                "anyOf": [{ "type": "string" }, { "type": "null" }],
+                "description": "The project's own test command as it stands (for example `cargo test` or                                 `npm test`), when the project has one that runs without network access. It is not                                 the done-check: it is run on each result that passes the check, to compare them.                                 null when the project has none.",
             },
             "rationale": { "type": "string", "description": "Briefly, why this check shows the task is done." },
         }),
