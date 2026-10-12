@@ -341,6 +341,12 @@ enum Events {
     Bus(Arc<Service>),
     #[cfg(test)]
     Collect(Arc<Mutex<Vec<Progress>>>),
+    #[cfg(test)]
+    CancelWhilePublishing {
+        seen: Arc<Mutex<Vec<Progress>>>,
+        cancel: CancellationToken,
+        finish: bool,
+    },
 }
 
 /// A streamed call that has published `ModelStarted` and not yet
@@ -400,6 +406,8 @@ async fn handle_observed(
                         call: call_id.to_string(),
                         seq: 0,
                     };
+                    // Register before the first publication can yield to cancellation.
+                    *lock(&open) = Some(Open { context: call.clone(), publisher: None });
                     publish(&events, &req.trace_id, Progress::ModelStarted { context: call.clone() }).await;
                     // A slow event consumer cannot block the model response or
                     // build an unbounded queue. Missing previews produce seq gaps.
@@ -430,30 +438,6 @@ async fn handle_observed(
                         )
                         .await;
                     drop(tx);
-                    let drain =
-                        within.map_or(Duration::from_millis(400), |limit| limit.saturating_sub(started.elapsed()));
-                    let publisher = lock(&open).as_mut().and_then(|o| o.publisher.take());
-                    if let Some(mut publisher) = publisher {
-                        if tokio::time::timeout(drain, &mut publisher.0).await.is_err() {
-                            publisher.stop().await;
-                        }
-                    }
-                    // Taken before publishing, so a cancellation from here on
-                    // cannot send a second `ModelFinished`.
-                    let Some(Open { context: mut call, .. }) = lock(&open).take() else {
-                        return response;
-                    };
-                    call.seq += 1;
-                    let (usage, cost_usd, error) = match &response {
-                        Ok(resp) => (
-                            Some(resp.usage),
-                            resp.cost_usd,
-                            resp.is_refusal().then(|| "the model declined; preview is not a result".into()),
-                        ),
-                        Err(e) => (None, None, Some(e.to_string())),
-                    };
-                    publish(&events, &req.trace_id, Progress::ModelFinished { context: call, usage, cost_usd, error })
-                        .await;
                     response
                 } else {
                     gateway.complete_within(request, within).await
@@ -464,23 +448,30 @@ async fn handle_observed(
                 response = call => Some(response),
                 _ = cancel.cancelled() => None,
             };
-            let Some(response) = response else {
-                // A started call needs its end, or subscribers see it running
-                // forever. Usage and cost stay unknown, never zero.
-                let unfinished = lock(&open).take();
-                if let (Some(Open { mut context, publisher }), Some(events)) = (unfinished, events) {
-                    if let Some(publisher) = publisher {
+            // Settle progress outside the cancellable model future. Cancellation
+            // must not drop a final publication after ownership has been taken.
+            let unfinished = lock(&open).take();
+            if let (Some(Open { mut context, publisher }), Some(events)) = (unfinished, events) {
+                if let Some(mut publisher) = publisher {
+                    let drain =
+                        within.map_or(Duration::from_millis(400), |limit| limit.saturating_sub(started.elapsed()));
+                    if response.is_none() || tokio::time::timeout(drain, &mut publisher.0).await.is_err() {
                         publisher.stop().await;
                     }
-                    context.seq += 1;
-                    let error = Some("cancelled".into());
-                    publish(
-                        &events,
-                        &req.trace_id,
-                        Progress::ModelFinished { context, usage: None, cost_usd: None, error },
-                    )
-                    .await;
                 }
+                context.seq += 1;
+                let (usage, cost_usd, error) = match &response {
+                    Some(Ok(resp)) => (
+                        Some(resp.usage),
+                        resp.cost_usd,
+                        resp.is_refusal().then(|| "the model declined; preview is not a result".into()),
+                    ),
+                    Some(Err(e)) => (None, None, Some(e.to_string())),
+                    None => (None, None, Some("cancelled".into())),
+                };
+                publish(&events, &req.trace_id, Progress::ModelFinished { context, usage, cost_usd, error }).await;
+            }
+            let Some(response) = response else {
                 return Ok(cancelled_settlement(call_id, true));
             };
             serde_json::to_value(response?)
@@ -521,6 +512,19 @@ async fn publish(events: &Events, trace: &molt_proto::TraceId, event: Progress) 
         }
         #[cfg(test)]
         Events::Collect(seen) => lock(seen).push(event),
+        #[cfg(test)]
+        Events::CancelWhilePublishing { seen, cancel, finish } => {
+            if *finish && matches!(event, Progress::ModelFinished { .. }) {
+                cancel.cancel();
+                tokio::task::yield_now().await;
+            }
+            let started = matches!(event, Progress::ModelStarted { .. });
+            lock(seen).push(event);
+            if !*finish && started {
+                cancel.cancel();
+                tokio::task::yield_now().await;
+            }
+        }
     }
 }
 
@@ -834,6 +838,59 @@ mod tests {
         assert_eq!(kinds, ["started", "text", "finished"]);
         let Some(Progress::ModelFinished { usage, error, .. }) = seen.last() else { unreachable!() };
         assert_eq!((usage.map(|u| u.output_tokens), error), (Some(4), &None));
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_publishing_started_or_finished_still_closes_once() {
+        let server = MockServer::start().await;
+        let body = [
+            json!({"type":"message_start","message":{"id":"msg","model":"claude-opus-5-5","role":"assistant",
+                "type":"message","content":[],"usage":{"input_tokens":10,"output_tokens":1}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}),
+            json!({"type":"message_stop"}),
+        ]
+        .iter()
+        .map(|v| format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap()))
+        .collect::<String>();
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .mount(&server)
+            .await;
+        let mut cfg = from(&[("ANTHROPIC_API_KEY", "k")]).unwrap();
+        cfg.base_url = server.uri();
+        let gateway = Gateway::new(cfg).unwrap();
+        let request = CompleteRequest {
+            messages: vec![user_text("hi")],
+            stream: Some(molt_api::model::StreamContext { attempt: Some(0), turn: 1 }),
+            ..Default::default()
+        };
+        let request = envelope("model.complete", serde_json::to_value(request).unwrap());
+        for finish in [false, true] {
+            let request = request.clone();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let cancel = CancellationToken::new();
+            let result = handle_observed(
+                &gateway,
+                request,
+                Some(Events::CancelWhilePublishing { seen: seen.clone(), cancel: cancel.clone(), finish }),
+                cancel,
+            )
+            .await
+            .unwrap();
+            if finish {
+                assert!(result.get("error").is_none(), "{result}");
+            } else {
+                assert_eq!(result["error"]["code"], "cancelled");
+            }
+            let seen = lock(&seen);
+            assert!(matches!(seen.first(), Some(Progress::ModelStarted { .. })));
+            assert!(matches!(seen.last(), Some(Progress::ModelFinished { .. })), "{seen:?}");
+            assert_eq!(seen.iter().filter(|e| matches!(e, Progress::ModelFinished { .. })).count(), 1);
+        }
     }
 
     #[tokio::test]
