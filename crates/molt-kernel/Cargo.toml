@@ -4,6 +4,7 @@ description = "The Molt microkernel: bus, capabilities, supervisor, registry and
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 molt-proto.workspace = true

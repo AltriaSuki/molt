@@ -6,6 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2021"
 repository = "https://github.com/AltriaSuki/molt"
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 molt-proto = { path = "crates/molt-proto" }

@@ -167,11 +167,12 @@ impl Registry {
                     }
                 }
             };
-            project.paths.retain(|p| p != to);
             match project.paths.get_mut(at) {
                 Some(path) => *path = to.to_path_buf(),
                 None => project.paths.push(to.to_path_buf()),
             }
+            let mut seen = std::collections::HashSet::new();
+            project.paths.retain(|p| seen.insert(p.clone()));
             Ok(project.clone())
         })
     }
@@ -337,6 +338,18 @@ mod tests {
         let b = b.canonicalize().unwrap();
         assert!(registry.move_path("site", &b, None).unwrap_err().to_string().contains("--from"));
         assert_eq!(registry.move_path("site", &b, Some(&c)).unwrap().paths, [a.clone(), b.clone()]);
+    }
+
+    #[test]
+    fn moving_to_an_existing_clone_removes_only_the_selected_old_path() {
+        let (tmp, registry, a, b) = dirs();
+        let c = tmp.path().join("c");
+        std::fs::create_dir(&c).unwrap();
+        let project = registry.create("site", Some(&a), cache).unwrap();
+        registry.add_path(&project.id, &b).unwrap();
+        registry.add_path(&project.id, &c).unwrap();
+        assert_eq!(registry.move_path("site", &a, Some(&c)).unwrap().paths, [a.clone(), b.clone()]);
+        assert_eq!(registry.move_path("site", &a, Some(&a)).unwrap().paths, [a, b]);
     }
 
     #[test]
