@@ -17,6 +17,7 @@ mod memory;
 mod prompts;
 mod review;
 mod runner;
+mod select;
 mod tools;
 
 use std::sync::Arc;

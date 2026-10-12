@@ -159,6 +159,8 @@ leak, or a way around the audit log privately to the maintainer
 
 ## License
 
-No license has been chosen yet (#33). Until one is, contributions are
-accepted on the understanding that they will be released under the license
-the project adopts.
+Molt is dual-licensed under the [MIT license](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option. Unless you
+explicitly state otherwise, any contribution you intentionally submit for
+inclusion in Molt, as defined in the Apache-2.0 license, is dual-licensed as
+above, without any additional terms or conditions.
