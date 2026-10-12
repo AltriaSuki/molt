@@ -7,6 +7,8 @@ use anyhow::{bail, ensure, Context};
 
 pub const BUILTINS: &[&str] = &[
     "help",
+    "remember",
+    "theme",
     "memory",
     "memory-used",
     "check",
@@ -194,12 +196,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join(".molt/commands");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("help.md"), "wrong").unwrap();
+        for builtin in ["help", "remember", "theme"] {
+            std::fs::write(dir.join(format!("{builtin}.md")), "wrong").unwrap();
+        }
         std::fs::write(dir.join("bad.md"), "---\nbudget: -1\n---\ntask").unwrap();
         std::fs::write(dir.join("fix.md"), "Fix $ARGUMENTS").unwrap();
         std::os::unix::fs::symlink("/etc/hostname", dir.join("escape.md")).unwrap();
         let (commands, warnings) = load(root.path());
         assert_eq!(commands.keys().collect::<Vec<_>>(), ["fix"]);
-        assert_eq!(warnings.len(), 3);
+        assert_eq!(warnings.len(), 5);
     }
 }

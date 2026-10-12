@@ -6,6 +6,7 @@
 //! comes back, with the keys, to the app.
 
 mod app;
+mod backend;
 mod commands;
 mod preview;
 mod text;
@@ -95,7 +96,6 @@ async fn event_loop(
     stop: impl Future<Output = i32> + Send + 'static,
 ) -> anyhow::Result<Vec<String>> {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (sessions, mut started) = mpsc::unbounded_channel();
     let pause = Arc::new(Pause::default());
     read_terminal(tx.clone(), pause.clone());
     let ticks = tx.clone();
@@ -115,16 +115,22 @@ async fn event_loop(
     app.secrets = secrets_in_env();
     app.rules = cfg.confirm.clone();
     app.load_commands(Path::new(&workspace));
-    let mut rt =
-        Runtime { cfg: Arc::new(cfg), workspace, tx, sessions, session: None, starting: false, work: Vec::new() };
-    rt.exec(Action::StartSession);
+    let theme_file = cfg.kernel.data_dir.join("tui-theme.json");
+    match std::fs::read(&theme_file) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(theme) => app.theme = theme,
+            Err(e) => app.flash = Some(format!("saved theme ignored: {e}")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => app.flash = Some(format!("could not load saved theme: {e}")),
+    }
+    let data_dir = cfg.kernel.data_dir.clone();
+    let mut backend = backend::Backend::start(cfg, workspace, tx).await?;
+    backend.send(&Action::StartSession).await?;
     let mut keep = Vec::new();
     loop {
         terminal.draw(|frame| view::draw(frame, &mut app))?;
-        let msg = tokio::select! {
-            Some(msg) = rx.recv() => msg,
-            Some(session) = started.recv() => rt.started(session),
-        };
+        let Some(msg) = rx.recv().await else { break };
         let mut actions = app.update(msg);
         while let Ok(msg) = rx.try_recv() {
             actions.extend(app.update(msg));
@@ -132,29 +138,32 @@ async fn event_loop(
         for action in actions {
             match action {
                 Action::Quit { keep: k } => keep = k,
-                Action::Edit { text } => {
-                    let edited = edit_outside(terminal, &pause, &rt.cfg.kernel.data_dir, &text);
-                    let _ = rt.tx.send(Msg::Edited(edited));
+                Action::Redraw => redraw(terminal)?,
+                Action::Suspend => suspend(terminal, &pause)?,
+                Action::SaveTheme(theme) => {
+                    if let Err(e) = save_theme(&data_dir, theme) {
+                        app.flash = Some(format!("theme changed but could not be saved: {e}"));
+                    }
                 }
-                action => rt.exec(action),
+                Action::Edit { text } => {
+                    let edited = edit_outside(terminal, &pause, &data_dir, &text);
+                    app.update(Msg::Edited(edited));
+                }
+                action => backend.send(&action).await?,
             }
         }
         if app.quit {
             break;
         }
     }
-    for work in rt.work.drain(..) {
-        work.abort();
-    }
-    if rt.starting {
-        if let Some(Ok(session)) = started.recv().await {
-            rt.session = Some(session);
-        }
-    }
-    if let Some(session) = rt.session.take() {
-        session.shutdown(&keep).await;
-    }
+    backend.shutdown(&keep).await?;
     Ok(keep)
+}
+
+/// Internal child entry point. Standard input/output are private framed pipes,
+/// not a terminal or the capability bus.
+pub async fn serve_backend() -> anyhow::Result<()> {
+    backend::serve().await
 }
 
 /// Keeps the terminal reader off the terminal while another program has it.
@@ -295,6 +304,13 @@ impl Runtime {
                 let result = s.forget(&id, &reason).await.map_err(|e| format!("{e:#}"));
                 Msg::Forgot { id, result }
             }),
+            Action::Remember { text } => self.call(move |s| async move {
+                Msg::Remembered(s.remember(&text).await.map(|r| r.note.id).map_err(|e| format!("{e:#}")))
+            }),
+            Action::Promote { id, reason } => self.call(move |s| async move {
+                let result = s.promote(&id, &reason).await.map(|n| n.id).map_err(|e| format!("{e:#}"));
+                Msg::Promoted { id, result }
+            }),
             Action::ChangeNote { review, text } => self.call(move |s| async move {
                 Msg::ChangedNote(s.change_note(review, text).await.map_err(|e| format!("{e:#}")))
             }),
@@ -332,7 +348,7 @@ impl Runtime {
                 }
             }
             // The loop handles these: they need the terminal.
-            Action::Quit { .. } | Action::Edit { .. } => {}
+            Action::Quit { .. } | Action::Edit { .. } | Action::Redraw | Action::Suspend | Action::SaveTheme(_) => {}
         }
     }
 
@@ -399,6 +415,47 @@ fn edit_outside(terminal: &mut DefaultTerminal, pause: &Pause, dir: &Path, text:
     }
 }
 
+fn redraw(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+    execute!(std::io::stdout(), Clear(ClearType::All))?;
+    terminal.draw(|_| {}).map(|_| ())
+}
+
+fn save_theme(dir: &Path, theme: text::Theme) -> anyhow::Result<()> {
+    use std::io::Write;
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let temporary = dir.join(format!("tui-theme-{}-{nonce}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+    let result = (|| -> anyhow::Result<()> {
+        file.write_all(&serde_json::to_vec(&theme)?)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, dir.join("tui-theme.json"))?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(temporary);
+    result
+}
+
+fn suspend(terminal: &mut DefaultTerminal, pause: &Pause) -> anyhow::Result<()> {
+    pause.paused.store(true, Ordering::SeqCst);
+    let reading = pause.reading.lock().unwrap_or_else(PoisonError::into_inner);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    ratatui::restore();
+    // Stop only the interface process. Its service children continue working.
+    // SIGCONT resumes this call, before the terminal reader is unpaused.
+    let stopped = tokio::task::block_in_place(|| {
+        // SAFETY: raise sends a standard signal to the current process.
+        unsafe { libc::raise(libc::SIGTSTP) }
+    });
+    let restored = terminal::enable_raw_mode()
+        .and_then(|()| execute!(std::io::stdout(), EnterAlternateScreen, EnableBracketedPaste))
+        .and_then(|()| redraw(terminal));
+    drop(reading);
+    pause.paused.store(false, Ordering::SeqCst);
+    restored.context("could not restore the terminal after suspension")?;
+    anyhow::ensure!(stopped == 0, "could not suspend the interface");
+    Ok(())
+}
+
 /// Standard error sent to a file until dropped.
 struct Redirect {
     saved: libc::c_int,
@@ -431,5 +488,21 @@ impl Drop for Redirect {
             libc::dup2(self.saved, libc::STDERR_FILENO);
             libc::close(self.saved);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn themes_are_saved_privately_and_replaced_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        save_theme(dir.path(), text::Theme::Light).unwrap();
+        save_theme(dir.path(), text::Theme::Ansi).unwrap();
+        let path = dir.path().join("tui-theme.json");
+        assert_eq!(serde_json::from_slice::<text::Theme>(&std::fs::read(&path).unwrap()).unwrap(), text::Theme::Ansi);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

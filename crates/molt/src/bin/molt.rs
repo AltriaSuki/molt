@@ -5,9 +5,10 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use molt::agent::{self, Interrupted};
 use molt::{Config, Secrets};
+use molt_api::fs::SyntaxCheck;
 use molt_api::memory::{
-    self, CorrectRequest, ForgetRequest, ForgetResponse, MapRequest, RecallRequest, RecallResponse, ReviewRequest,
-    ReviewResponse,
+    self, CorrectRequest, ForgetRequest, ForgetResponse, Layer, MapRequest, NoteKind, PromoteRequest, PromoteResponse,
+    RecallRequest, RecallResponse, RememberRequest, RememberResponse, ReviewRequest, ReviewResponse,
 };
 use molt_api::model::Effort;
 use molt_api::planner::{Outcome, Resume, RunRequest, Select};
@@ -33,6 +34,8 @@ enum Cmd {
     /// Open the interface: tasks one after another in a workspace, the
     /// check shown before the attempts start, and what memory holds.
     Ui(UiArgs),
+    #[command(hide = true)]
+    UiBackend,
     /// Start the kernel and the configured services; stop on Ctrl-C, SIGTERM or SIGHUP.
     Run,
     /// Carry out a task in a workspace with the agent services, verified by a done-check.
@@ -107,6 +110,11 @@ struct DoArgs {
     /// Model turns per attempt.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     max_turns: Option<u32>,
+    /// What the model's file writes and edits do about syntax errors they
+    /// introduce: report them with the result, reject the change, or off.
+    /// Default: the planner's (report).
+    #[arg(long, value_name = "MODE", value_parser = syntax_check)]
+    syntax_check: Option<SyntaxCheck>,
     /// Save a checkpoint as the run goes, so that a run stopped before it
     /// finishes (interrupted, out of budget, killed) can go on with `molt resume`.
     #[arg(long)]
@@ -250,6 +258,31 @@ enum MemoryCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Write a note down yourself: about the project, or with --global
+    /// about you, for every project.
+    Remember {
+        #[command(flatten)]
+        at: MemoryAt,
+        /// One self-contained sentence, such as "Answer in Chinese."
+        text: String,
+        /// Keep it in your own layer, recalled in every project.
+        #[arg(long)]
+        global: bool,
+        /// fact, convention, decision, preference or lesson.
+        #[arg(long, default_value = "preference")]
+        kind: NoteKind,
+    },
+    /// Copy a project note to your own layer, recalled in every project.
+    /// Learning only proposes this ("proposed for every project" in show).
+    Promote {
+        #[command(flatten)]
+        at: MemoryAt,
+        /// The note's id, as `molt memory show` prints it.
+        id: String,
+        /// Why it holds in every project.
+        #[arg(long)]
+        reason: String,
+    },
     /// Forget a note. It is kept as a tombstone with the reason, and the
     /// forget is recorded in the audit log.
     Forget {
@@ -297,6 +330,15 @@ fn usd(text: &str) -> Result<f64, String> {
     match text.parse::<f64>() {
         Ok(usd) if usd.is_finite() && usd > 0.0 => Ok(usd),
         _ => Err(format!("{text:?} is not a positive amount")),
+    }
+}
+
+fn syntax_check(text: &str) -> Result<SyntaxCheck, String> {
+    match text {
+        "report" => Ok(SyntaxCheck::Report),
+        "reject" => Ok(SyntaxCheck::Reject),
+        "off" => Ok(SyntaxCheck::Off),
+        _ => Err(format!("{text:?} is not a mode: use report, reject or off")),
     }
 }
 
@@ -413,6 +455,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                 eprintln!("kept: {}", agent::printable(&fork));
             }
         }
+        Cmd::UiBackend => molt::tui::serve_backend().await?,
         Cmd::Run => {
             let stop = molt::stop_signal()?;
             let cfg = config()?;
@@ -614,6 +657,7 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     req.model = args.model;
     req.effort = args.effort;
     req.max_turns = args.max_turns;
+    req.syntax_check = args.syntax_check;
     req.budget_usd = args.common.budget_usd;
     req.apply = !args.common.no_apply;
     req.stream = args.common.stream;
@@ -745,6 +789,8 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
     let at = match &cmd {
         MemoryCmd::Show { at, .. }
         | MemoryCmd::Forget { at, .. }
+        | MemoryCmd::Remember { at, .. }
+        | MemoryCmd::Promote { at, .. }
         | MemoryCmd::Map { at, .. }
         | MemoryCmd::Used { at, .. } => at,
         MemoryCmd::Review(r) | MemoryCmd::Correct { review: r, .. } => &r.at,
@@ -775,7 +821,10 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
             };
             // Dependency checks can change note state: keep those checks
             // on the audited service path too, rather than editing offline.
-            drop(open()?);
+            // A project with no notes of its own yet still has the user's.
+            if project.is_none() || agent::memory_db(&cfg).is_some_and(|db| db.is_file()) {
+                drop(open()?);
+            }
             let response: RecallResponse =
                 serde_json::from_value(agent::call_memory(&cfg, memory::RECALL, serde_json::to_value(req)?).await?)?;
             let notes = response.notes;
@@ -811,6 +860,27 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
         }
         MemoryCmd::Review(r) => change_note(&cfg, path, r, None).await?,
         MemoryCmd::Correct { review, text } => change_note(&cfg, path, review, Some(text)).await?,
+        MemoryCmd::Remember { text, global, kind, .. } => {
+            let req = RememberRequest {
+                kind,
+                text,
+                workspace: (!global).then_some(path),
+                confidence: Some(0.95),
+                trace: TraceId::random().to_string(),
+                events: Vec::new(),
+                version: "user".into(),
+            };
+            let reply: RememberResponse =
+                serde_json::from_value(agent::call_memory(&cfg, memory::REMEMBER, serde_json::to_value(req)?).await?)?;
+            let layer = if reply.note.workspace.is_none() { "for every project" } else { "for this project" };
+            let verb = if reply.reinforced { "already knew" } else { "remembered" };
+            println!("{}", agent::printable(&format!("{verb} {} {layer}: {}", reply.note.id, reply.note.text)));
+        }
+        MemoryCmd::Promote { id, reason, .. } => {
+            let req = serde_json::to_value(PromoteRequest { workspace: path, id, reason })?;
+            let reply: PromoteResponse = serde_json::from_value(agent::call_memory(&cfg, memory::PROMOTE, req).await?)?;
+            println!("{}", agent::printable(&format!("{} for every project: {}", reply.note.id, reply.note.text)));
+        }
         MemoryCmd::Forget { id, reason, .. } => {
             let req = serde_json::to_value(ForgetRequest { id: id.clone(), reason })?;
             let reply: ForgetResponse = serde_json::from_value(agent::call_memory(&cfg, memory::FORGET, req).await?)?;
@@ -896,6 +966,15 @@ fn show_notes(notes: &[molt_api::memory::Recalled]) -> String {
         }
         if !n.conflicts.is_empty() {
             extra.push(format!("disputed by {}", n.conflicts.join(", ")));
+        }
+        if r.layer == Layer::User {
+            extra.push("yours, for every project".into());
+        }
+        if r.details.everywhere {
+            extra.push("proposed for every project; `molt memory promote` it if so".into());
+        }
+        if let Some(to) = &r.details.promoted_to {
+            extra.push(format!("promoted as {to}"));
         }
         if r.details.temporary {
             extra.push("temporary experience; verify before reuse".into());

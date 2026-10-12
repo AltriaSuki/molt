@@ -40,6 +40,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let shown: Vec<Line> = lines.into_iter().skip(viewer.scroll).take(usize::from(inner.height)).collect();
         frame.render_widget(Paragraph::new(shown), inner);
     }
+    app.theme.paint(frame.buffer_mut());
 }
 
 fn centered(area: Rect, w_pct: u16, h_pct: u16) -> Rect {
@@ -284,13 +285,24 @@ fn draw_lanes(frame: &mut Frame, area: Rect, app: &App) {
         let cols =
             Layout::horizontal(vec![Constraint::Ratio(1, per_row as u32); per_row]).spacing(1).split(row_areas[r]);
         for (c, lane) in chunk.iter().enumerate() {
-            let (status, tone) = match lane.status {
+            let (base, tone) = match lane.status {
                 None => (format!("{} turn {}", SPINNER[spin(app.tick)], lane.turn), Tone::Sea),
                 Some(molt_api::planner::AttemptStatus::Passed) => ("✓ passed".to_owned(), Tone::Ok),
                 Some(molt_api::planner::AttemptStatus::Failed) => ("✗ failed".to_owned(), Tone::Bad),
                 Some(molt_api::planner::AttemptStatus::Cancelled) => ("– cancelled".to_owned(), Tone::Dim),
                 Some(molt_api::planner::AttemptStatus::Error) => ("! error".to_owned(), Tone::Warn),
             };
+            // Two borders and the spaces around the right title. A narrow
+            // lane drops the word "attempt" before the status is cut.
+            let room = |name: &str| usize::from(cols[c].width).saturating_sub(text::width(name) + 4);
+            let mut name = format!(" attempt {} ", lane.index + 1);
+            if room(&name) < text::width(&base) {
+                name = format!(" {} ", lane.index + 1);
+            }
+            let room = room(&name);
+            // Without previews no call's cost arrives before the reply.
+            let cost = task.req.stream.then(|| lane.spend.label());
+            let status = lane_status(&base, &text::duration(lane.elapsed()), cost.as_deref(), room);
             let border = match lane.status {
                 Some(molt_api::planner::AttemptStatus::Passed) => Tone::Ok,
                 _ => Tone::Dim,
@@ -299,7 +311,7 @@ fn draw_lanes(frame: &mut Frame, area: Rect, app: &App) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(style(border))
-                .title(Line::from(span(format!(" attempt {} ", lane.index + 1), Tone::Sea)))
+                .title(Line::from(span(name, Tone::Sea)))
                 .title(Line::from(span(format!(" {status} "), tone)).right_aligned());
             let inner = block.inner(cols[c]);
             frame.render_widget(block, cols[c]);
@@ -311,6 +323,29 @@ fn draw_lanes(frame: &mut Frame, area: Rect, app: &App) {
             shown.extend(preview);
             frame.render_widget(Paragraph::new(shown), inner);
         }
+    }
+}
+
+/// A lane's status with its running time and cost, as many as fit in `room`
+/// cells: the cost goes first, then the time.
+fn lane_status(base: &str, time: &str, cost: Option<&str>, room: usize) -> String {
+    let with_cost = cost.map(|cost| format!("{base} · {time} · {cost}"));
+    with_cost
+        .into_iter()
+        .chain([format!("{base} · {time}")])
+        .find(|s| text::width(s) <= room)
+        .unwrap_or_else(|| base.to_owned())
+}
+
+/// The task's spending against its budget, warning from 80% of it.
+fn task_spend(task: &Task) -> (String, Tone) {
+    let spend = task.spend();
+    match task.budget_usd {
+        Some(b) => {
+            let tone = if spend.usd >= b * 0.8 { Tone::Warn } else { Tone::Dim };
+            (format!("task {} / ${b:.2}", spend.label()), tone)
+        }
+        None => (format!("task {}", spend.label()), Tone::Dim),
     }
 }
 
@@ -416,11 +451,18 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     if app.uncounted_calls > 0 {
         cost.push_str(&format!(" known · {} calls uncounted", app.uncounted_calls));
     }
-    if let Some(b) = s.budget_usd {
+    // Without previews no call's cost arrives before the reply.
+    let task = app.task.as_ref().filter(|t| t.req.stream && matches!(t.phase, Phase::Designing | Phase::Running));
+    if let (Some(b), None) = (s.budget_usd, task) {
         cost.push_str(&format!(" · ${b:.2}/task"));
     }
     parts.push(cost);
     left.push(span(format!("  {}", parts.join(" · ")), Tone::Dim));
+    if let Some(task) = task {
+        let (spent, tone) = task_spend(task);
+        left.push(span(" · ", Tone::Dim));
+        left.push(span(spent, tone));
+    }
 
     let mut right = Vec::new();
     if let Some(flash) = &app.flash {
@@ -545,6 +587,9 @@ fn draw_memory(frame: &mut Frame, area: Rect, view: &MemoryView, tick: u64) {
     let block = match &view.edit {
         Some(MemoryEdit::Filter(_)) => block.title(Line::from(span(" filter ", Tone::Shell))),
         Some(MemoryEdit::Reason(_)) => block.title(Line::from(span(" why is this note wrong? ", Tone::Shell))),
+        Some(MemoryEdit::Promote(_)) => {
+            block.title(Line::from(span(" why does it hold in every project? ", Tone::Shell)))
+        }
         Some(MemoryEdit::Change(change)) => block.title(Line::from(span(
             match change.step {
                 ChangeStep::Text => " corrected note ",
@@ -559,7 +604,9 @@ fn draw_memory(frame: &mut Frame, area: Rect, view: &MemoryView, tick: u64) {
     let inner = block.inner(bottom);
     frame.render_widget(block, bottom);
     match &view.edit {
-        Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input)) => draw_field(frame, inner, input, true),
+        Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input) | MemoryEdit::Promote(input)) => {
+            draw_field(frame, inner, input, true)
+        }
         Some(MemoryEdit::Change(change)) => {
             if let Some(input) = change.input() {
                 draw_field(frame, inner, input, true);
@@ -578,6 +625,7 @@ fn draw_memory(frame: &mut Frame, area: Rect, view: &MemoryView, tick: u64) {
                 ("a", "review"),
                 ("c", "correct"),
                 ("f", "forget"),
+                ("p", "promote"),
                 ("r", "reload"),
                 ("u", "used"),
                 ("esc", "back"),
@@ -601,5 +649,17 @@ mod tests {
         input.cursor = input.text.chars().count();
         assert_eq!(field_rows(&input, 6).1, (3, 2));
         assert_eq!(field_rows(&Input::default(), 6), (vec![String::new()], (0, 0)));
+    }
+
+    #[test]
+    fn a_lane_status_drops_the_cost_then_the_time_when_narrow() {
+        let status = |room| lane_status("◐ turn 7", "2m14s", Some("$0.18"), room);
+        assert_eq!(status(40), "◐ turn 7 · 2m14s · $0.18");
+        assert_eq!(status(24), "◐ turn 7 · 2m14s · $0.18");
+        assert_eq!(status(23), "◐ turn 7 · 2m14s");
+        assert_eq!(status(16), "◐ turn 7 · 2m14s");
+        assert_eq!(status(15), "◐ turn 7");
+        assert_eq!(status(0), "◐ turn 7");
+        assert_eq!(lane_status("◐ turn 7", "2m14s", None, 40), "◐ turn 7 · 2m14s");
     }
 }

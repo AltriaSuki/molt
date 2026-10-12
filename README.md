@@ -128,8 +128,12 @@ with `--config` can change these in a `[confirm]` section (`max_lines`,
    with it; `e` edits the command, `v` shows the files, `n` runs without a
    check.
 2. The attempts run side by side, one box each, with their tool calls and
-   check runs as they happen (Tab shows one large). When one passes, you see
-   its message, the files it changed and, with `d`, the diff. Enter applies
+   check runs as they happen (Tab shows one large). Each box's title shows
+   its turn, how long it has run and what its finished model calls cost
+   (`turn 7 · 2m14s · $0.18`), and the status bar shows the task's spending
+   against its budget (`task $0.52 / $2.00`, in yellow from 80%). A call of
+   unknown cost makes the figure a lower bound (`≥ $0.18`). When one passes,
+   you see its message, the files it changed and, with `d`, the diff. Enter applies
    it; `k` keeps it in its fork, `n` discards it. `/last` opens the diff of
    the last finished task again, whatever was done with it. When no attempt
    passes, each one shows the end of why it stopped, and a failed check shows
@@ -169,7 +173,8 @@ start and end.
 `/memory [words]` lists the notes about the project, strongest first, with
 where each came from: the run, the service version that wrote it and the
 messages in the audit log it rests on. `f` forgets one, with a reason, as
-`molt memory forget` does. The screen includes quarantined notes for inspection,
+`molt memory forget` does, and `p` promotes one to every project, as
+`molt memory promote` does. The screen includes quarantined notes for inspection,
 marked `[review]`, and temporary experience marked `[temporary]`. The detail
 pane shows recall scores, keywords, revision, dependencies and source evidence;
 `v` opens the full scrollable record. `a` reviews a note and `c` corrects it:
@@ -182,7 +187,8 @@ Ordinary planner recall still excludes notes awaiting review.
 `/memory-used [run]` opens the immutable recall snapshots for that run in this
 project, defaulting to the latest task. The task's memory log shows this command;
 `u` in the memory screen opens the latest task's context. Later corrections do
-not alter those recorded notes. `/attempts`, `/model`, `/effort`, `/budget` and
+not alter those recorded notes. `/remember TEXT` keeps a preference of yours
+for every project. `/attempts`, `/model`, `/effort`, `/budget` and
 `/check` set the next tasks' options (`/check` while a task runs changes only
 that task); `/memory-model NAME` sets the model
 memory learns with (`same` for the attempts' model, `default` for
@@ -370,6 +376,7 @@ Defaults come from the environment:
 | `MOLT_MAP_TOKENS` | planner | `3000` (the project map a run starts with; at most `32000`) |
 | `MOLT_CONTEXT_TOKENS` | planner | the model's context window: `200000` for Claude models, `128000` for others |
 | `MOLT_INSTRUCTION_FILES` | planner | `AGENTS.md,CLAUDE.md` (the project's instruction files; `none` reads none) |
+| `MOLT_SYNTAX_CHECK` | planner | `report` (see [Syntax errors after an edit](#syntax-errors-after-an-edit)); `reject` or `off` |
 | `MOLT_MEMORY_MODEL`, `MOLT_MEMORY_EFFORT`, `MOLT_MEMORY_MAX_TOKENS`, `MOLT_MEMORY_MODEL_TIMEOUT_S` | memory | `sonnet`, `low`, `8000`, `300` |
 
 The planner reads `MOLT_MAX_TOKENS` and `MOLT_MODEL_TIMEOUT_S` too: a model
@@ -406,6 +413,23 @@ that they win over notes. They are read with `fs.read`, so the audit log
 records what each run saw, and the run's progress lists the files.
 `--no-memory` does not turn them off; `MOLT_INSTRUCTION_FILES` names other
 files, or `none`.
+
+### Syntax errors after an edit
+
+When an attempt writes or edits a file in a language the project model
+parses (below), the `fs` service parses the file before and after the change
+with the same tree-sitter grammars and returns the syntax errors the change
+added, with the lines around each, in the tool's result. An error the file
+already had is not reported again, wherever the edit moved it, so a project
+that was broken before, or a construct a grammar does not know, does not get
+in the way. Nothing outside the service runs and nothing is fetched; a
+version that takes over 2 seconds to parse is not checked. By default the
+change is still made (`report`); `--syntax-check reject` (or
+`MOLT_SYNTAX_CHECK=reject`) leaves the file as it was and returns the errors
+as a failed call, as SWE-agent's edit guard does, and `off` does not look.
+The check files a run writes into forks are never checked. To compare the
+modes, run them as benchmark arms, such as
+`--arm reject="--syntax-check reject" --arm unchecked="--syntax-check off"`.
 
 ## Projects
 
@@ -516,6 +540,29 @@ index. Restoring a file does not reactivate a note: confirm it with `review`
 using its current revision and dependency list. Unrelated changes leave it
 alone. Files are limited to 1 MiB, at most 16 per note; symlinks, paths outside
 the project and Molt's own data are refused.
+
+### Your notes, for every project
+
+Notes about you, such as "Answer in Chinese.", belong to no project. They
+live in your own layer, `user.db` next to the project registry
+(`$XDG_DATA_HOME/molt`, else `~/.local/share/molt`), and every project's
+recall merges them with its own, best first. Each recalled note says which
+layer it came from, in `show`, on the memory screen and in a run's snapshot.
+
+```sh
+molt memory remember --global "Answer in Chinese."    # yours, everywhere
+molt memory remember "Deploy with make release."      # this project's
+molt memory promote NOTE_ID --reason "every project of mine builds with make"
+```
+
+Writing one goes through the kernel and is audited. Learning never writes
+there: a run's record holds text the project chose. When the model thinks a
+learned note holds everywhere, it only proposes it (`proposed for every
+project` in `show`, and in what a run reports learning); `promote` copies it
+once you say why. The project note stays, marked with where it went, and the
+copy keeps its evidence, so rolling back the version that learned it retracts
+the copy too. `forget` and `correct` work on your notes from any project.
+Project databases from before need no migration.
 
 `review --temporary` marks a workaround as temporary experience, and the
 model is explicitly told to verify it before reuse. Review metadata does not
@@ -759,7 +806,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.
 - Recall matches keywords (with stemming), not meaning: there is no vector index, since the Anthropic API has no embeddings endpoint. A note worded differently from the task can be missed; the strongest notes about the project are always shown.
-- Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. With the default setup, memory lives in the project's data dir, so nothing is shared between projects yet. Clones of one project share its data dir, so molt runs in one of them at a time.
+- Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. Only notes you write or promote yourself are shared between projects. Clones of one project share its data dir, so molt runs in one of them at a time.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.
 - Model prices are as current as the last `molt prices update` (or the release's snapshot) and as right as the community list they came from; a price that changes mid-run is not picked up until the next run. Models that LiteLLM lists only with tiered or regional prices, such as some Qwen models, have no price until declared in `MOLT_MODEL_PRICES`.
@@ -852,6 +899,26 @@ win name conflicts. Invalid, oversized and out-of-workspace files are skipped
 with a startup warning; restart the interface after editing templates. Discovery
 is bounded to 128 directory entries and 64 KiB per file. Nested YAML structures
 and multiline frontmatter scalars are not supported.
+
+## Terminal colors and controls
+
+`/theme dark`, `/theme light`, and `/theme ansi` change all interface colors,
+including earlier log entries. Dark and light set their own background; ANSI
+uses only the terminal's 16 colors and follows its background. Without a saved
+choice, `COLORTERM=truecolor` or `24bit` selects dark and other terminals select
+ANSI. Light's eight text colors meet WCAG AA (4.5:1) against its white background.
+`NO_COLOR` keeps colors disabled. The choice is saved privately in
+`<data dir>/tui-theme.json`; other interface settings are not saved yet.
+
+Ctrl+L clears and redraws the interface. On Unix, Ctrl+Z restores the terminal
+and suspends just the interface process; use the shell's `fg` to return. Its
+kernel and services run in an independent backend process group, so bus
+dispatch and later tool/model turns continue while the interface is stopped.
+Private pipes carry bounded frames; service stdout goes to the log, and output
+backpressure can drop progress previews while preserving final RPC settlement.
+Queued results are shown after resuming. This requires a shell with job control and a foreground
+process group (an orphaned process group can ignore SIGTSTP). Background color
+probing with OSC 11 is not implemented.
 
 ## License
 
