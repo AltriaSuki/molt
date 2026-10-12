@@ -411,3 +411,23 @@ async fn promotion_rechecks_dependencies_changed_outside_molt() {
         .unwrap_err();
     assert!(error.message.contains("awaits review"), "{error:?}");
 }
+
+#[tokio::test]
+async fn undo_withdraws_evidence_from_both_project_and_promoted_user_notes() {
+    let mut setup = Setup::new();
+    setup.memory = setup.memory.with_user(Arc::new(Db::in_memory().unwrap()));
+    let remembered: RememberResponse = setup.call("memory.remember", remember("app", "Build with make.")).await;
+    setup
+        .ask(
+            "cli",
+            "memory.promote",
+            json!({"workspace":"app", "id":remembered.note.id,
+        "reason":"applies everywhere"}),
+        )
+        .await
+        .unwrap();
+    let result = setup.ask("cli", "memory.undo", json!({"run":"trace_1", "reason":"reverted"})).await.unwrap();
+    assert_eq!(result["retracted"], 2);
+    let found: RecallResponse = setup.call("memory.recall", json!({"workspace":"app"})).await;
+    assert!(found.notes.is_empty());
+}

@@ -419,6 +419,18 @@ pub async fn run_task_as(
         Err(e) => Err(e),
     };
     running.shutdown().await;
+    // A foreground-group signal can make a service exit before Tokio has
+    // delivered the same signal to our listener. Recheck after shutdown,
+    // while preserving successful runs and never polling a completed stop.
+    let done = if done.as_ref().is_err_and(|error| !error.is::<Interrupted>()) {
+        tokio::select! {
+            biased;
+            () = &mut stop => Err(Interrupted.into()),
+            () = std::future::ready(()) => done,
+        }
+    } else {
+        done
+    };
     let kept = checkpointed && done.as_ref().map_or(true, |d| d.run.checkpoint.is_some());
     if let Some(forks) = forks.filter(|_| !kept) {
         let keep = done.as_ref().ok().and_then(|d| d.run.fork.as_deref());

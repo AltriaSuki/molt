@@ -118,6 +118,8 @@ mod what {
     pub const CONTESTS: &str = "contests";
     pub const FORGOTTEN: &str = "forgotten";
     pub const RETRACTED: &str = "retracted";
+    /// The run behind the note was undone.
+    pub const UNDONE: &str = "undone";
 }
 
 /// A note to store.
@@ -590,40 +592,85 @@ pub(crate) fn retract(
     }
     db.with(|conn| {
         let tx = conn.transaction()?;
-        let touched: Vec<String> = {
-            let mut stmt = tx.prepare(
-                "SELECT DISTINCT e.note FROM evidence e JOIN notes n ON n.id = e.note \
-                 WHERE e.service = ?1 AND e.version = ?2 AND e.void = 0 AND n.forgotten_ms IS NULL ORDER BY e.note",
-            )?;
-            let ids = stmt.query_map(params![service, version], |r| r.get(0))?.collect::<Result<_, _>>()?;
-            ids
-        };
-        tx.execute(
-            "UPDATE evidence SET void = 1 WHERE service = ?1 AND version = ?2 AND void = 0",
-            params![service, version],
-        )?;
-        let mut gone = Vec::new();
-        for id in &touched {
-            if replay(&tx, id)?.is_none() {
-                tombstone(&tx, id, what::RETRACTED, reason, trace, now)?;
-                gone.push(id.clone());
-            }
-        }
-        let mut adjusted = 0;
-        let mut others: Vec<String> = touched.iter().filter(|id| !gone.contains(id)).cloned().collect();
-        for id in partners(&tx, &gone)? {
-            if !others.contains(&id) {
-                others.push(id);
-            }
-        }
-        for id in &others {
-            adjusted += u64::from(settle(&tx, id)?);
-        }
+        let touched = voided(&tx, "e.service = ?1 AND e.version = ?2", params![service, version])?;
+        let done = rework(&tx, &touched, what::RETRACTED, reason, trace, now)?;
         tx.execute("DELETE FROM consolidated WHERE service = ?1 AND version = ?2", params![service, version])?;
         tx.commit()?;
-        Ok(Retracted { retracted: gone.len() as u64, adjusted })
+        Ok(done)
     })
     .map_err(error::db)
+}
+
+/// Undo what the run `run` did to the notes, because its result was taken
+/// back: void the evidence it gave, tombstone the notes nothing else shows,
+/// and work every other note it touched out again, so that it no longer
+/// lends any note confidence. The run stays marked as learned from, so it is
+/// not learned from again.
+pub(crate) fn undo_run(db: &Db, run: &str, reason: &str, trace: &str, now: u64) -> Result<Retracted, RemoteError> {
+    if run.trim().is_empty() {
+        return Err(invalid("name the run whose notes to undo"));
+    }
+    if reason.trim().is_empty() {
+        return Err(invalid("say why the run is undone"));
+    }
+    db.with(|conn| {
+        let tx = conn.transaction()?;
+        let touched = voided(&tx, "e.trace = ?1", params![run])?;
+        let done = rework(&tx, &touched, what::UNDONE, reason, trace, now)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO consolidated (episode, ms, service, version) VALUES (?1, ?2, 'cli', 'undo')",
+            params![run, now as i64],
+        )?;
+        tx.commit()?;
+        Ok(done)
+    })
+    .map_err(error::db)
+}
+
+/// Void the evidence in force that `filter` selects, a condition on the
+/// evidence table as `e`, and return the live notes it was about.
+fn voided(tx: &Transaction, filter: &str, params: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<Vec<String>> {
+    let touched: Vec<String> = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT DISTINCT e.note FROM evidence e JOIN notes n ON n.id = e.note \
+             WHERE {filter} AND e.void = 0 AND n.forgotten_ms IS NULL ORDER BY e.note"
+        ))?;
+        let ids = stmt.query_map(params, |r| r.get(0))?.collect::<Result<_, _>>()?;
+        ids
+    };
+    tx.execute(&format!("UPDATE evidence AS e SET void = 1 WHERE {filter} AND e.void = 0"), params)?;
+    Ok(touched)
+}
+
+/// After evidence about `touched` was voided: tombstone (as `what`) the notes
+/// none of whose evidence is in force any more, and work the rest, and the
+/// notes that disputed the gone ones, out again.
+fn rework(
+    tx: &Transaction,
+    touched: &[String],
+    what: &str,
+    reason: &str,
+    trace: &str,
+    now: u64,
+) -> rusqlite::Result<Retracted> {
+    let mut gone = Vec::new();
+    for id in touched {
+        if replay(tx, id)?.is_none() {
+            tombstone(tx, id, what, reason, trace, now)?;
+            gone.push(id.clone());
+        }
+    }
+    let mut adjusted = 0;
+    let mut others: Vec<String> = touched.iter().filter(|id| !gone.contains(id)).cloned().collect();
+    for id in partners(tx, &gone)? {
+        if !others.contains(&id) {
+            others.push(id);
+        }
+    }
+    for id in &others {
+        adjusted += u64::from(settle(tx, id)?);
+    }
+    Ok(Retracted { retracted: gone.len() as u64, adjusted })
 }
 
 /// Words worth matching on: none of the most common English words.
@@ -1069,6 +1116,48 @@ mod tests {
         });
         with_tx(&db, |tx| reinforce(tx, &good.id, by("trace_e", "v3"), 10));
         assert_eq!(now_of(&db, &good.id).reinforced, 1);
+    }
+
+    #[test]
+    fn an_undone_run_lends_no_note_confidence_and_is_not_learned_from_again() {
+        let db = Db::in_memory().unwrap();
+        let known = remember(&db, note(NoteKind::Fact, "Tests run with pytest.", Some("/w")), 1).unwrap().0;
+        let disputed = remember(&db, note(NoteKind::Fact, "Lint with flake8.", Some("/w")), 1).unwrap().0;
+        let before = (now_of(&db, &known.id), now_of(&db, &disputed.id));
+        // The run trace_u bears one note out, disputes another and learns a
+        // new one; a later run bears out a note trace_u also learned.
+        let mut wrong = note(NoteKind::Fact, "Lint with ruff.", Some("/w"));
+        wrong.provenance = provenance("trace_u");
+        let lone = NewNote { text: "The CLI is in src/cli.".into(), ..wrong.clone() };
+        let shared = NewNote { text: "Docs build with mdbook.".into(), ..wrong.clone() };
+        let shared_id = with_tx(&db, |tx| {
+            reinforce(tx, &known.id, by("trace_u", "v1"), 2)?;
+            contradict(tx, &disputed.id, &wrong, 2)?;
+            store(tx, &lone, 2)?;
+            Ok(store(tx, &shared, 2)?.0)
+        });
+        with_tx(&db, |tx| reinforce(tx, &shared_id, by("trace_v", "v1"), 3));
+        db.with(|c| {
+            c.execute("INSERT INTO consolidated VALUES ('trace_u', 2, 'memory', 'v1')", []).unwrap();
+        });
+        assert_eq!(now_of(&db, &known.id).reinforced, 1);
+
+        let done = undo_run(&db, "trace_u", "the run was undone", "trace_x", 9).unwrap();
+        assert_eq!(done, Retracted { retracted: 2, adjusted: 3 });
+        let after = (now_of(&db, &known.id), now_of(&db, &disputed.id));
+        assert_eq!((after.0.confidence, after.0.reinforced), (before.0.confidence, 0));
+        assert_eq!((after.1.confidence, after.1.conflicts.len()), (before.1.confidence, 0));
+        // What another run bore out stays, as that run found it.
+        let kept = now_of(&db, &shared_id);
+        assert_eq!((kept.reinforced, kept.provenance.trace.as_str()), (0, "trace_v"));
+        assert!(recall(&db, &ask("ruff cli", Some("/w")), 9).unwrap().is_empty());
+        // The run stays learned from, and undoing it again changes nothing.
+        db.with(|c| {
+            let n =
+                c.query_row("SELECT COUNT(*) FROM consolidated WHERE episode = 'trace_u'", [], |r| r.get::<_, i64>(0));
+            assert_eq!(n.unwrap(), 1);
+        });
+        assert_eq!(undo_run(&db, "trace_u", "again", "trace_y", 10).unwrap(), Retracted::default());
     }
 
     #[test]

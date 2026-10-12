@@ -70,6 +70,7 @@ sender from that.
 | Attempt symbol queries verify fork ownership and content freshness, isolate parallel views, and never update the durable project model | `crates/molt-memory/tests/forks.rs` (`rename_add_move_delete_and_shell_edits_stay_inside_the_attempt`, `unverified_wrong_workspace_and_symlink_forks_are_refused_without_widening_roots`, `an_edit_during_refresh_returns_no_stale_symbols`) |
 | A benchmark starts a run only while what it spent, plus the whole `--task-usd` of that run and of each run in flight, fits in `--max-usd`; it refuses models it has no price for | `crates/molt-bench/src/run.rs` (`runs_stop_before_they_could_pass_the_budget`, `a_run_of_unknown_cost_stops_the_benchmark`), `crates/molt-bench/src/cli.rs` (`a_model_without_a_price_is_refused`) |
 | A model with no price stays of unknown cost and stops the run; prices come only from the user's environment or data directory, never from a project, and a download that does not validate replaces nothing | `crates/molt-gateway/src/prices.rs` (`the_data_directory_holds_the_snapshot_and_nothing_else_is_read`, `a_download_that_does_not_validate_is_refused`, `malformed_declared_prices_stop_startup_and_name_the_item`), `crates/molt-gateway/tests/gateway.rs` (`a_snapshot_prices_a_third_party_model…`) |
+| `molt do --commit` commits exactly the files the run merged and leaves what the user staged alone; `molt undo` takes it back with a new commit, never touching later changes, and the undone run no longer lends any note confidence | `crates/molt/src/git.rs` (`a_run_commit_holds_only_the_merged_files…`, `undo_refuses_files_that_changed_since_the_run`), `crates/molt/tests/agent.rs` (`a_committed_run_can_be_undone_and_memory_stops_counting_it`), `crates/molt-memory/src/notes.rs` (`an_undone_run_lends_no_note_confidence…`) |
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
 
 ## Quick start
@@ -211,9 +212,11 @@ the same project is refused until it closes.
 
 ```
 molt do TASK [--check CMD | --no-check] [--attempts N] [--select MODE] [--model M] [--effort E] [--max-turns N]
-        [--budget-usd X] [--no-apply] [--no-review] [--json] [--stream] [--workspace DIR] [--data-dir DIR]
-        [--pass-env NAME]... [--no-memory] [--no-learn] [--memory-model MODEL] [--checkpoint] [--config FILE]
-molt resume [RUN] [--retry] [--list] [--budget-usd X] [--no-apply] [--json] [--workspace DIR] ...
+        [--budget-usd X] [--no-apply | --commit [--branch NAME]] [--no-review] [--json] [--stream]
+        [--workspace DIR] [--data-dir DIR] [--pass-env NAME]... [--no-memory] [--no-learn]
+        [--memory-model MODEL] [--checkpoint] [--config FILE]
+molt resume [RUN] [--retry] [--list] [--budget-usd X] [--no-apply] [--commit] [--json] [--workspace DIR] ...
+molt undo [RUN] [--workspace DIR] [--data-dir DIR]
 ```
 
 | Flag | Meaning |
@@ -225,6 +228,8 @@ molt resume [RUN] [--retry] [--list] [--budget-usd X] [--no-apply] [--json] [--w
 | `--model`, `--effort` | Model for the attempts (`opus`, `sonnet`, `haiku` or an id) and how hard it thinks. |
 | `--max-turns`, `--budget-usd` | Model turns per attempt, and the spending limit for the whole run. |
 | `--no-apply` | Keep the result in its fork and print its path instead of merging it. |
+| `--commit` | Commit the applied result to git (see below). |
+| `--branch NAME` | With `--commit`, commit on a new branch made from the current commit and switched to. |
 | `--no-review` | Skip the review of a passing result (see below). |
 | `--json` | Print the full result (`planner.run`'s reply in `molt-api`) as JSON. |
 | `--stream` | Show model text previews on stderr while the designer and attempts work. The final result still goes to stdout, including with `--json`. |
@@ -260,6 +265,40 @@ candidate with its scores, and the choice is noted in the audit log. When
 less budget is left than the first passing attempt cost, the run takes it
 without waiting, as `first` would. To compare the modes on the benchmark, add
 an arm: `molt bench --arm molt --arm select-all="--select all"`.
+
+### Commits and `molt undo`
+
+With `--commit`, an applied result is committed to git. The commit holds
+exactly the files the run merged, as the workspace has them: it is built in a
+scratch index from the current commit, so what you staged stays staged and
+out of it. Its subject is the first line of the winning attempt's summary, the
+rest of the summary is its body, and it ends with trailers:
+
+```
+Molt-Run: trace_…
+Molt-Check: cargo test
+```
+
+`Molt-Run` is the run id, so `git log` leads back to the run's audit trace and
+to `molt memory used RUN` for the notes it recalled. `Molt-Check` is the check
+the result passed, or `none (unverified)`. Git runs on your side, after the
+run; attempts never run it. A file git ignores is left out and named. Nothing
+is committed when a file the run changed had changes of yours not committed
+before it (the commit would take them in), or when the workspace is not in a
+git work tree; the result is still applied, the reason is printed, and the
+exit status is 4. A `--branch` name git refuses, or one that exists, stops the
+run before it starts.
+
+`molt undo [RUN]` takes back the commit of a run, by default the newest on the
+current branch not taken back yet. It makes a new commit that puts the run's
+files back as they were before it, with a `Molt-Undo: RUN` trailer; history is
+not rewritten, and what you have staged elsewhere stays staged. It refuses
+when one of those files changed after the run, or has changes not committed,
+and says so rather than overwriting them. Memory is then told: the evidence
+the run gave is voided, so it no longer lends any note confidence. Notes only
+it showed are forgotten, the notes it bore out or disputed are worked out
+again without it, and it is not learned from again. If memory cannot be
+reached, `molt undo RUN` again tells it without a second revert.
 
 ### Checkpoints and `molt resume`
 
@@ -321,6 +360,7 @@ through its progress callback, with previews enabled by default.
 | 1 | No attempt passed, or molt failed. |
 | 2 | The command line was wrong (an unknown flag, `--attempts 9`, ...); nothing started. |
 | 3 | Passed (or finished unverified), but the changes could not be merged, e.g. because the workspace changed under them; they are kept in the fork the report names. |
+| 4 | Passed and applied, but `--commit` could not commit the changes; the reason is printed. |
 | 128+N | Stopped by signal N: 130 for Ctrl-C, 129 for SIGHUP, 143 for SIGTERM. The services are stopped and the run's forks removed. |
 
 ### Config and secrets
@@ -526,7 +566,7 @@ as a tombstone with its reason.
 `review` and `correct` go through the kernel too, require a reason and the
 revision printed by `show`, and reject concurrent changes. Corrections keep
 the original note and evidence as a tombstone and link the replacement to it.
-Forgotten, corrected and retracted text cannot be automatically relearned.
+Forgotten, corrected, retracted and undone text cannot be automatically relearned.
 
 Use repeatable `--depends-on` arguments to attach project-relative files,
 including build configuration or a symbol's source file. These are explicit
@@ -801,6 +841,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - Reading one trace back from the audit log scans the log from the start: there is no index yet. One read looks through at most 256 MiB and keeps to its deadline, and two run at once.
 - The kernel drops a message nested more than 100 levels deep, so every logged message can be read back.
 - After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none. A run with `--checkpoint` that stops keeps its forks for `molt resume`.
+- Only `molt do --commit` and `molt resume --commit` commit a result; the interface (`molt ui`) does not yet. `molt undo` takes back only those commits, and refuses a file changed after the run rather than merging the revert into it (use `git revert` then).
 - A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.

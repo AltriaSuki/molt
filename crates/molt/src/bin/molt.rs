@@ -1,14 +1,16 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use molt::agent::{self, Interrupted};
-use molt::{Config, Secrets};
+use molt::{git, Config, Secrets};
 use molt_api::fs::SyntaxCheck;
 use molt_api::memory::{
     self, CorrectRequest, ForgetRequest, ForgetResponse, Layer, MapRequest, NoteKind, PromoteRequest, PromoteResponse,
-    RecallRequest, RecallResponse, RememberRequest, RememberResponse, ReviewRequest, ReviewResponse,
+    RecallRequest, RecallResponse, RememberRequest, RememberResponse, RetractResponse, ReviewRequest, ReviewResponse,
+    UndoRequest,
 };
 use molt_api::model::Effort;
 use molt_api::planner::{Outcome, Resume, RunRequest, Select};
@@ -43,13 +45,18 @@ enum Cmd {
         after_help = "Exit status: 0 when the run passed (or finished unverified) and its changes are applied, \
                             or kept as --no-apply asks; 1 when no attempt passed, or on an error; 2 for a usage error; \
                             3 when the run passed but its changes could not be applied and are kept in the fork the \
-                            report names; 128+N when stopped by signal N (130 for Ctrl-C, 129 for SIGHUP, 143 for SIGTERM)."
+                            report names; 4 when they are applied but --commit could not commit them; 128+N when \
+                            stopped by signal N (130 for Ctrl-C, 129 for SIGHUP, 143 for SIGTERM)."
     )]
     Do(DoArgs),
     /// Go on with a run of `molt do --checkpoint` that stopped before it
     /// finished, from its last checkpoint. Its attempts keep their forks and
     /// conversations, and the cost so far counts against its budget.
     Resume(ResumeArgs),
+    /// Take back the commit `molt do --commit` made for a run, with a new
+    /// commit that puts its files back, and have memory no longer count
+    /// what the run showed.
+    Undo(UndoArgs),
     /// See and correct what memory holds about a project.
     Memory {
         #[command(subcommand)]
@@ -142,6 +149,15 @@ struct RunArgs {
     /// Keep the result in its fork instead of applying it to the workspace.
     #[arg(long)]
     no_apply: bool,
+    /// Commit the applied result to git: exactly the files the run merged,
+    /// with a `Molt-Run:` trailer naming the run. What you have staged stays
+    /// staged and out of the commit. `molt undo` takes it back.
+    #[arg(long, conflicts_with = "no_apply")]
+    commit: bool,
+    /// With --commit, commit on a new branch NAME, made from the current
+    /// commit and switched to.
+    #[arg(long, value_name = "NAME", requires = "commit")]
+    branch: Option<String>,
     /// Print the result as JSON.
     #[arg(long)]
     json: bool,
@@ -212,6 +228,15 @@ struct UiArgs {
     /// runs (repeatable).
     #[arg(long, value_name = "NAME", value_parser = env_name)]
     pass_env: Vec<String>,
+}
+
+#[derive(Args)]
+struct UndoArgs {
+    /// The run to take back, as its commit's `Molt-Run:` trailer names it.
+    /// Default: the newest run on the current branch not taken back yet.
+    run: Option<String>,
+    #[command(flatten)]
+    at: MemoryAt,
 }
 
 /// Where a project's memory is.
@@ -428,7 +453,13 @@ async fn main() -> anyhow::Result<ExitCode> {
     molt::init_tracing(
         if matches!(
             cmd,
-            Cmd::Do(_) | Cmd::Resume(_) | Cmd::Memory { .. } | Cmd::Bench { .. } | Cmd::Prices { .. } | Cmd::Ui(_)
+            Cmd::Do(_)
+                | Cmd::Resume(_)
+                | Cmd::Undo(_)
+                | Cmd::Memory { .. }
+                | Cmd::Bench { .. }
+                | Cmd::Prices { .. }
+                | Cmd::Ui(_)
         ) {
             "warn"
         } else {
@@ -467,6 +498,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
         Cmd::Do(args) => return do_task(cli.config.as_deref(), args).await,
         Cmd::Resume(args) => return resume_task(cli.config.as_deref(), args).await,
+        Cmd::Undo(args) => return undo_cmd(cli.config.as_deref(), args).await,
         Cmd::Memory { cmd } => memory_cmd(cli.config.as_deref(), cmd).await?,
         Cmd::Project { cmd } => project_cmd(cmd)?,
         Cmd::Bench { cmd } => return molt_bench::cli::main(cmd).await,
@@ -743,6 +775,15 @@ async fn execute(
     let apply = req.apply;
     let checkpointed = req.checkpoint;
     let run = trace.to_string();
+    let task = req.task.clone();
+    // Looked at before the run, so that its own changes are told apart from the user's.
+    let target = match args.commit.then(|| commit_target(&req.workspace, args.branch.as_deref())).transpose()? {
+        Some(Err(e)) => {
+            eprintln!("{}", agent::printable(&format!("note: {e:#}; the result will be applied but not committed")));
+            Some(Err(e))
+        }
+        other => other,
+    };
     let mut signal = None;
     let stopped = async { signal = Some(stop.await) };
     let progress = |event: &_| eprintln!("{}", agent::describe(event));
@@ -762,8 +803,21 @@ async fn execute(
         Err(e) => return Err(e),
     };
     let resp = done.run;
+    let committed = match target {
+        Some(target) if resp.applied => {
+            Some(target.and_then(|(repo, dirty)| commit_run(&repo, &dirty, &resp, &run, &task, args.branch.as_deref())))
+        }
+        _ => None,
+    };
     if args.json {
         let mut out = serde_json::to_value(&resp)?;
+        if let Some(committed) = &committed {
+            out["commit"] = match committed {
+                Ok(Some(c)) => serde_json::json!({ "sha": c.sha, "branch": c.branch, "ignored": c.ignored }),
+                Ok(None) => serde_json::Value::Null,
+                Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+            };
+        }
         // What learning did and cost, next to the run's own spend.
         out["learning"] = done.learned.as_ref().map_or(serde_json::Value::Null, agent::learning_json);
         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -773,6 +827,28 @@ async fn execute(
     if let Some(learned) = &done.learned {
         eprintln!("{}", agent::learned(learned));
     }
+    let not_committed = match &committed {
+        None => false,
+        Some(Ok(None)) => {
+            eprintln!("nothing to commit: the workspace's commit has these files as they are");
+            false
+        }
+        Some(Ok(Some(c))) => {
+            let on = c.branch.as_deref().map_or_else(|| "a detached HEAD".to_owned(), |b| format!("branch {b}"));
+            eprintln!("{}", agent::printable(&format!("committed {} on {on}: {}", &c.sha[..12], c.subject)));
+            if !c.ignored.is_empty() {
+                eprintln!("{}", agent::printable(&format!("left out, as git ignores them: {}", c.ignored.join(", "))));
+            }
+            false
+        }
+        Some(Err(e)) => {
+            eprintln!(
+                "{}",
+                agent::printable(&format!("not committed: {e:#}. The result is applied; commit it yourself"))
+            );
+            true
+        }
+    };
     // A signal while memory learned from the run still ends it as stopped.
     if let Some(n) = signal {
         return Ok(ExitCode::from(u8::try_from(128 + n).unwrap_or(130)));
@@ -781,8 +857,89 @@ async fn execute(
         Outcome::Failed => ExitCode::FAILURE,
         // It passed, but the workspace does not have it: a script must not go on as if it did.
         Outcome::Passed | Outcome::Unverified if apply && !resp.applied && resp.fork.is_some() => ExitCode::from(3),
+        Outcome::Passed | Outcome::Unverified if not_committed => ExitCode::from(4),
         Outcome::Passed | Outcome::Unverified => ExitCode::SUCCESS,
     })
+}
+
+/// Where `molt do --commit` commits.
+type CommitTarget = anyhow::Result<(git::Repo, BTreeSet<String>)>;
+
+/// The git work tree `molt do --commit` commits in, with the paths that had
+/// changes not committed before the run; an inner error when the workspace
+/// is in none (the run still goes ahead and is applied). A `--branch` git
+/// would refuse is an error before anything starts.
+fn commit_target(workspace: &str, branch: Option<&str>) -> anyhow::Result<CommitTarget> {
+    let repo = match git::Repo::open(Path::new(workspace)) {
+        Ok(repo) => repo,
+        Err(e) => return Ok(Err(e.context("--commit"))),
+    };
+    if let Some(name) = branch {
+        repo.check_new_branch(name)?;
+    }
+    let dirty = repo.dirty()?;
+    Ok(Ok((repo, dirty)))
+}
+
+/// Commit what the run merged. Refused when one of its files had changes
+/// not committed before the run: the commit would take them in, and
+/// undoing the run would take them back too.
+fn commit_run(
+    repo: &git::Repo,
+    dirty: &BTreeSet<String>,
+    resp: &molt_api::planner::RunResponse,
+    run: &str,
+    task: &str,
+    branch: Option<&str>,
+) -> anyhow::Result<Option<git::Committed>> {
+    let paths: Vec<String> = resp.changes.iter().map(|c| c.path.clone()).collect();
+    let mixed: Vec<&str> = paths.iter().filter(|p| dirty.contains(*p)).map(String::as_str).collect();
+    anyhow::ensure!(
+        mixed.is_empty(),
+        "{} had changes of yours not committed before the run, which the commit would take in",
+        mixed.join(", ")
+    );
+    let check = match resp.outcome {
+        Outcome::Passed => resp.check.as_ref().map(|c| c.command.as_str()),
+        _ => None,
+    };
+    let summary = resp.summary.as_str();
+    repo.commit_run(&git::RunCommit { run, summary, task, check, paths, branch })
+}
+
+async fn undo_cmd(config: Option<&Path>, args: UndoArgs) -> anyhow::Result<ExitCode> {
+    let (workspace, project) = agent::locate(args.at.project.as_deref(), &args.at.workspace, config.is_some())?;
+    let repo = git::Repo::open(&workspace)?;
+    let run = match repo.undo(args.run.as_deref())? {
+        git::Undo::Reverted { run, commit, sha } => {
+            println!("undid run {run}: reverted {} in {}", &commit[..12], &sha[..12]);
+            run
+        }
+        git::Undo::Already { run, sha } => {
+            println!("run {run} was undone already, in {}", &sha[..12]);
+            run
+        }
+    };
+    let cfg = agent::memory_config(config, &workspace, args.at.data_dir.as_deref(), project.as_ref())?;
+    if !agent::memory_db(&cfg).is_some_and(|db| db.is_file()) {
+        eprintln!("memory has nothing about this project, so nothing to take back there");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let req = UndoRequest { run: run.clone(), reason: "the user undid the run with `molt undo`".into() };
+    match agent::call_memory(&cfg, memory::UNDO, serde_json::to_value(req)?).await {
+        Ok(reply) => {
+            let reply: RetractResponse = serde_json::from_value(reply)?;
+            eprintln!(
+                "memory no longer counts the run: {} notes only it showed forgotten, {} more worked out again",
+                reply.retracted, reply.adjusted
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            eprintln!("the commit is taken back, but memory could not be told: {e:#}. Run `molt undo {run}` again");
+            Ok(ExitCode::FAILURE)
+        }
+    }
 }
 
 async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()> {
