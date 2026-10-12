@@ -51,7 +51,7 @@ pub(crate) fn decode<T: DeserializeOwned>(text: &str) -> rusqlite::Result<T> {
 
 /// Open each component relative to the last directory descriptor. No
 /// symlink (including one swapped in during traversal) can escape the root.
-fn fingerprint(workspace: &Path, path: &str) -> Result<String, RemoteError> {
+pub(crate) fn fingerprint(workspace: &Path, path: &str) -> Result<String, RemoteError> {
     let components: Vec<_> = Path::new(path).components().collect();
     if components.is_empty()
         || components.len() > 64

@@ -1876,6 +1876,9 @@ impl App {
                 if !r.contradicted.is_empty() {
                     parts.push(format!("disputed {}", count(r.contradicted.len())));
                 }
+                if !r.skill_drafts.is_empty() {
+                    parts.push(format!("drafted {} project skills; molt skill evaluates them", r.skill_drafts.len()));
+                }
                 if parts.is_empty() {
                     parts.push(match &r.skipped {
                         Some(why) => format!("nothing new: {}", clean_line(why)),
@@ -2806,6 +2809,7 @@ mod tests {
     fn learning_that_was_skipped_says_why() {
         let mut app = App::new("/w", None);
         let skipped = ConsolidateResponse {
+            skill_drafts: Vec::new(),
             added: vec![],
             reinforced: vec![],
             contradicted: vec![],

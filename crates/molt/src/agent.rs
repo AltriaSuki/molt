@@ -796,6 +796,9 @@ pub fn learned(learned: &Result<ConsolidateResponse, String>) -> String {
             if !r.contradicted.is_empty() {
                 parts.push(format!("disputed {}", count(r.contradicted.len(), "note", "notes")));
             }
+            if !r.skill_drafts.is_empty() {
+                parts.push(format!("drafted {} project skills; use molt skill to evaluate", r.skill_drafts.len()));
+            }
             let what = if parts.is_empty() {
                 format!("learned nothing new ({})", r.skipped.as_deref().unwrap_or("nothing worth keeping"))
             } else {

@@ -333,6 +333,7 @@ impl Fake {
                     rev: 1,
                 };
                 json!(memory::RecallResponse {
+                    skills: Vec::new(),
                     notes: vec![memory::Recalled {
                         note,
                         score: 1.0,

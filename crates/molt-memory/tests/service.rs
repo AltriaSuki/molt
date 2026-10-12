@@ -241,3 +241,15 @@ async fn changes_reported_while_an_index_runs_are_all_indexed() {
         assert_eq!(found.definitions.len(), 1, "new{i}");
     }
 }
+
+#[tokio::test]
+async fn an_agent_cannot_manage_or_promote_its_own_skills() {
+    let s = Setup::new();
+    let payload = json!({"workspace":"app","action":"promote","id":"skill_1","revision":1});
+    for from in ["planner", "model", "memory"] {
+        let error = s.ask(from, "memory.skills", payload.clone()).await.unwrap_err();
+        assert!(error.message.contains("kernel-identified CLI"));
+    }
+    let listed = s.ask("cli", "memory.skills", json!({"workspace":"app","action":"list"})).await.unwrap();
+    assert_eq!(listed, json!([]));
+}

@@ -52,6 +52,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
+    /// Inspect, independently evaluate and manage declarative project skills.
+    Skill(SkillArgs),
     /// Benchmark Molt against a plain agent loop on coding tasks graded by hidden tests.
     Bench {
         #[command(subcommand)]
@@ -196,6 +198,55 @@ struct MemoryAt {
     /// The data dir `molt do` used there. Default: ~/.cache/molt/<project>-<hash>.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct SkillArgs {
+    #[command(flatten)]
+    at: MemoryAt,
+    #[command(subcommand)]
+    cmd: SkillCmd,
+}
+
+#[derive(Subcommand)]
+enum SkillCmd {
+    List,
+    /// Draft a workflow from a JSON spec and a verified source run.
+    Draft {
+        file: PathBuf,
+        #[arg(long)]
+        run: String,
+    },
+    /// Record an independent audited run; failures remain in the evidence.
+    Evaluate {
+        id: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        run: String,
+    },
+    /// Activate only after two successful independent audited evaluations.
+    Promote {
+        id: String,
+        #[arg(long)]
+        revision: u64,
+    },
+    Disable {
+        id: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Select an older evaluated revision, disabled until explicitly promoted.
+    Rollback {
+        id: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        reason: String,
+    },
+    Used {
+        run: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -359,6 +410,29 @@ async fn main() -> anyhow::Result<ExitCode> {
             for fork in molt::tui::run(opts).await? {
                 eprintln!("kept: {}", agent::printable(&fork));
             }
+        }
+        Cmd::Skill(args) => {
+            use molt_api::skills::{Action, Request, MANAGE};
+            let workspace = args.at.workspace.canonicalize()?;
+            let cfg = agent::memory_config(cli.config.as_deref(), &workspace, args.at.data_dir.as_deref())?;
+            let action = match args.cmd {
+                SkillCmd::List => Action::List,
+                SkillCmd::Draft { file, run } => {
+                    use std::io::Read;
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(file)?.take(65537).read_to_end(&mut bytes)?;
+                    anyhow::ensure!(bytes.len() <= 65536, "skill specification exceeds 64 KiB");
+                    Action::Draft { spec: serde_json::from_slice(&bytes)?, run }
+                }
+                SkillCmd::Evaluate { id, revision, run } => Action::Evaluate { id, revision, run },
+                SkillCmd::Promote { id, revision } => Action::Promote { id, revision },
+                SkillCmd::Disable { id, reason } => Action::Disable { id, reason },
+                SkillCmd::Rollback { id, revision, reason } => Action::Rollback { id, revision, reason },
+                SkillCmd::Used { run } => Action::Used { run },
+            };
+            let request = Request { workspace: workspace.to_str().context("workspace is not UTF-8")?.into(), action };
+            let response = agent::call_memory(&cfg, MANAGE, serde_json::to_value(request)?).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
         }
         Cmd::Run => {
             let stop = molt::stop_signal()?;

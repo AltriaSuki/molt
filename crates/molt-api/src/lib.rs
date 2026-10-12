@@ -21,3 +21,5 @@ pub mod model;
 pub mod planner;
 pub mod progress;
 pub mod shell;
+
+pub mod skills;

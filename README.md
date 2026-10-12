@@ -71,6 +71,7 @@ sender from that.
 | A benchmark starts a run only while what it spent, plus the whole `--task-usd` of that run and of each run in flight, fits in `--max-usd`; it refuses models it has no price for | `crates/molt-bench/src/run.rs` (`runs_stop_before_they_could_pass_the_budget`, `a_run_of_unknown_cost_stops_the_benchmark`), `crates/molt-bench/src/cli.rs` (`a_model_without_a_price_is_refused`) |
 | A model with no price stays of unknown cost and stops the run; prices come only from the user's environment or data directory, never from a project, and a download that does not validate replaces nothing | `crates/molt-gateway/src/prices.rs` (`the_data_directory_holds_the_snapshot_and_nothing_else_is_read`, `a_download_that_does_not_validate_is_refused`, `malformed_declared_prices_stop_startup_and_name_the_item`), `crates/molt-gateway/tests/gateway.rs` (`a_snapshot_prices_a_third_party_model…`) |
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
+| A skill source cannot approve itself; only the CLI manages activation and withdrawal preserves evidence | `skills::tests::drafts_need_independent_evidence_and_disable_cannot_be_undone_by_learning`, `tests/service.rs::an_agent_cannot_manage_or_promote_its_own_skills` |
 
 ## Quick start
 
@@ -781,3 +782,52 @@ Dependencies mount at their canonical absolute paths. `--pass-env NAME` explicit
 Limits are inherited per process: address space, CPU time, file size, open files and process count, plus the existing command wall timeout. These are not aggregate cgroup quotas; RLIMIT_NPROC has the operating system's per-user semantics and does not limit root. TERM reaches the sandbox session group with 500 ms grace; KILL then tears down its PID namespace, including descendants that called setsid. Normal completion, cancelled handlers and service exit also tear down the namespace. Temporary mounts disappear with the last process. Future executable skills must use this shell path to share the policy.
 
 CI installs bubblewrap and requires namespace tests to run. A constrained local executor may skip only those integration tests after a failed capability probe; production startup still fails closed. Tests cover host paths, symlinks, read-only dependencies, network policy, host sockets, limits, C builds, cancellation and descendants with new sessions.
+
+## Declarative project skills
+
+Memory may propose a small declarative workflow while learning from a verified
+successful task. It saves a **draft**, with its source run, audit message IDs,
+writer/version, trigger words, prerequisite file hashes, steps and acceptance
+command. Drafts never enter a later task's context. A successful source task
+cannot approve its own workflow, and no skill text is executed as a script.
+
+Inspect and manage them through the kernel-identified CLI:
+
+```sh
+molt skill --workspace . list
+molt skill --workspace . draft skill.json --run SOURCE_RUN
+molt skill --workspace . evaluate SKILL_ID --revision 1 --run HELD_OUT_RUN_A
+molt skill --workspace . evaluate SKILL_ID --revision 1 --run HELD_OUT_RUN_B
+molt skill --workspace . promote SKILL_ID --revision 1
+molt skill --workspace . used RUN
+molt skill --workspace . disable SKILL_ID --reason 'No longer suitable'
+molt skill --workspace . rollback SKILL_ID --revision 1 --reason 'Revision 2 regressed'
+```
+
+A manual draft's JSON fields are `name`, `trigger_terms` (single words),
+`prerequisites` (map of relative paths to SHA-256), `steps` and `acceptance`
+(the check command). Evaluation reads authenticated request/reply pairs from
+the audit; a forged note, tool output or an evaluation payload cannot assert
+success. Promotion needs two distinct independent successful runs in the same
+project, with the stored acceptance command, besides the source. Failed
+independent evaluations remain attached to the draft. The human must select
+independent cases and their protected checks: this registry does not establish
+that arbitrary chosen runs constitute an adequate held-out task set.
+
+Recall selects at most four active skills for the current project, only when
+all trigger words and prerequisite hashes match. The planner treats their
+steps as data below the task, check and permissions. Captured offerings retain
+full revision snapshots and their evidence, accessible with `skill used` even
+after disabling or rollback. These are records of offered context, not proof
+that the model followed every step. New drafts cannot re-enable a disabled
+skill. Rollback selects an evaluated older revision but keeps it disabled until
+an explicit human promotion. Disabling or rollback voids learned-note evidence
+from runs that were offered the withdrawn active revision, re-settles confidence
+and leaves tombstones and original audit/snapshot evidence intact. Learning
+cannot automatically recreate those withdrawn notes.
+
+The first implementation does not run executable skill scripts or perform
+automatic promotion. Real task success, cost and latency comparisons with a
+no-skill baseline remain to be run under an explicit evaluation budget. Stored
+independent evidence records each run's wall duration, known cost subtotal and
+unknown calls; these alone do not prove a workflow's causal benefit.
