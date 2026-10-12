@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context};
 use molt_api::fs::ChangeKind;
 use molt_api::memory::{self, ConsolidateRequest, ConsolidateResponse};
-use molt_api::planner::{self, AttemptStatus, Outcome, Requirement, RunRequest, RunResponse, RunState, Verdict};
+use molt_api::planner::{
+    self, AttemptStatus, Candidate, Outcome, Requirement, RunRequest, RunResponse, RunState, Verdict,
+};
 use molt_api::progress::{self, Progress};
 use molt_kernel::Kernel;
 use molt_proto::{Budget, CapId, Envelope, ErrorCode, Kind, ServiceId, Target, TraceId};
@@ -816,14 +818,10 @@ pub fn report(resp: &RunResponse) -> String {
         lines.extend(resp.changes.iter().map(|c| format!("  {:<9}{}", change_name(c.kind), c.path)));
     }
     if let Some(review) = &resp.review {
-        let verdict = match review.verdict {
-            Verdict::Approve => "approve",
-            Verdict::Concern => "concern",
-            Verdict::Reject => "reject",
-        };
-        lines.push(format!("review: {verdict}"));
+        lines.push(format!("review: {}", verdict_name(review.verdict)));
         lines.extend(review.findings.iter().map(|f| format!("  - {f}")));
     }
+    lines.extend(selection_lines(resp));
     if resp.applied {
         lines.push("applied to the workspace".to_owned());
     } else if let Some(fork) = &resp.fork {
@@ -840,6 +838,42 @@ pub fn report(resp: &RunResponse) -> String {
         lines.push(summary.to_owned());
     }
     printable(&(lines.join("\n") + "\n"))
+}
+
+/// How the winner was picked among several passing attempts: one line per
+/// candidate, best ranked first. Empty when there was no comparison.
+pub fn selection_lines(resp: &RunResponse) -> Vec<String> {
+    let Some(selection) = &resp.selection else { return Vec::new() };
+    let mut lines = vec![format!("picked among {} passing attempts:", selection.candidates.len())];
+    for c in &selection.candidates {
+        let mark = if resp.winner == Some(c.attempt) { "*" } else { " " };
+        lines.push(format!(" {mark} attempt {}: {}", c.attempt, candidate_scores(c)));
+    }
+    lines
+}
+
+/// What a passing candidate was compared on, in a few words.
+pub fn candidate_scores(c: &Candidate) -> String {
+    let mut parts = Vec::new();
+    match c.suite_passed {
+        Some(true) => parts.push("suite passed".to_owned()),
+        Some(false) => parts.push("suite failed".to_owned()),
+        None => {}
+    }
+    let at_least = if c.truncated { "≥" } else { "" };
+    parts.push(format!("{at_least}{} lines in {} files", c.lines_changed, c.files_changed));
+    if let Some(verdict) = c.verdict {
+        parts.push(format!("review: {}", verdict_name(verdict)));
+    }
+    parts.join(", ")
+}
+
+fn verdict_name(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Approve => "approve",
+        Verdict::Concern => "concern",
+        Verdict::Reject => "reject",
+    }
 }
 
 /// What memory learned from a run, as one line for the terminal, made
@@ -1220,7 +1254,7 @@ mod tests {
     fn report_lines() {
         let mut resp = RunResponse {
             outcome: Outcome::Passed,
-            check: Some(CheckSpec { command: "cargo test".into(), files: vec![], designed: false }),
+            check: Some(CheckSpec { command: "cargo test".into(), files: vec![], designed: false, suite: None }),
             winner: Some(0),
             summary: "Fixed the parser.\n".into(),
             changes: vec![Change { path: "src/lib.rs".into(), kind: ChangeKind::Modified }],
@@ -1235,6 +1269,7 @@ mod tests {
             uncounted_calls: 0,
             checkpoint: None,
             requirements: vec![],
+            selection: None,
         };
         assert_eq!(
             report(&resp),
@@ -1256,6 +1291,27 @@ mod tests {
             report(&resp)
         );
         resp.review = None;
+        let candidate = |attempt, suite_passed, lines_changed, verdict| planner::Candidate {
+            attempt,
+            suite_passed,
+            lines_changed,
+            files_changed: 1,
+            truncated: false,
+            verdict,
+        };
+        resp.selection = Some(planner::Selection {
+            rule: "fewer lines".into(),
+            candidates: vec![candidate(0, Some(true), 3, Some(Verdict::Approve)), candidate(1, Some(false), 1, None)],
+        });
+        assert!(
+            report(&resp).contains(
+                "picked among 2 passing attempts:\n * attempt 0: suite passed, 3 lines in 1 files, review: approve\n   \
+                 attempt 1: suite failed, 1 lines in 1 files\nnot applied"
+            ),
+            "{}",
+            report(&resp)
+        );
+        resp.selection = None;
         resp.changes = vec![Change { path: "\x1b[1Aevil".into(), kind: ChangeKind::Added }];
         resp.summary = "Done.\x1b]0;title\x07\n".into();
         let shown = report(&resp);

@@ -479,7 +479,7 @@ async fn a_given_check_passes_and_the_result_is_applied() {
     let (resp, events) = setup.run(setup.request(Some(CHECK), 2)).await;
 
     assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
-    assert_eq!(resp.check, Some(CheckSpec { command: CHECK.into(), files: vec![], designed: false }));
+    assert_eq!(resp.check, Some(CheckSpec { command: CHECK.into(), files: vec![], designed: false, suite: None }));
     assert!(resp.applied);
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
     assert_eq!(resp.changes.len(), 1, "{resp:#?}");
@@ -614,7 +614,7 @@ async fn without_a_check_the_designer_writes_one_and_it_is_merged_too() {
     assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
     assert_eq!(
         resp.check,
-        Some(CheckSpec { command: "sh check.sh".into(), files: vec!["check.sh".into()], designed: true })
+        Some(CheckSpec { command: "sh check.sh".into(), files: vec!["check.sh".into()], designed: true, suite: None })
     );
     assert!(resp.applied);
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
@@ -1204,7 +1204,7 @@ async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
     assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
     assert_eq!(
         resp.check,
-        Some(CheckSpec { command: "sh check.sh".into(), files: vec!["check.sh".into()], designed: true })
+        Some(CheckSpec { command: "sh check.sh".into(), files: vec!["check.sh".into()], designed: true, suite: None })
     );
     assert!(!resp.applied);
     // Only the run's own designer: the accepted check was not designed again.
@@ -1296,4 +1296,18 @@ async fn a_checkpointed_run_that_runs_out_of_budget_is_resumed_with_its_fork() {
     assert!(resumed.cost_usd > stopped.cost_usd, "the cost goes on: {} then {}", stopped.cost_usd, resumed.cost_usd);
     assert!(molt_planner::checkpoint::load(&runs, trace.as_str()).is_err(), "a finished run keeps no checkpoint");
     assert!(!std::path::Path::new(&fork).exists());
+}
+
+#[tokio::test]
+async fn a_comparison_suite_cannot_mutate_the_checked_candidate() {
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let mut req = setup.request(Some(CHECK), 2);
+    req.select = molt_api::planner::Select::All;
+    req.suite = Some("printf 'broken\\n' > greeting.txt".into());
+    let (resp, _) = setup.run(req).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
+    assert_eq!(resp.selection.as_ref().unwrap().candidates.len(), 2);
+    assert!(resp.applied);
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
 }

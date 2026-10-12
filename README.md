@@ -204,7 +204,7 @@ the same project is refused until it closes.
 ## `molt do`
 
 ```
-molt do TASK [--check CMD | --no-check] [--attempts N] [--model M] [--effort E] [--max-turns N]
+molt do TASK [--check CMD | --no-check] [--attempts N] [--select MODE] [--model M] [--effort E] [--max-turns N]
         [--budget-usd X] [--no-apply] [--no-review] [--json] [--stream] [--workspace DIR] [--data-dir DIR]
         [--pass-env NAME]... [--no-memory] [--no-learn] [--memory-model MODEL] [--checkpoint] [--config FILE]
 molt resume [RUN] [--retry] [--list] [--budget-usd X] [--no-apply] [--json] [--workspace DIR] ...
@@ -214,7 +214,8 @@ molt resume [RUN] [--retry] [--list] [--budget-usd X] [--no-apply] [--json] [--w
 | --- | --- |
 | `--check CMD` | Shell command that exits 0 once the task is done, run in each attempt's fork. Default: the planner designs one. |
 | `--no-check` | Design no check: one attempt does the task and its result is applied unverified. This is the plain agent loop `molt bench` compares Molt with. |
-| `--attempts N` | Parallel attempts, 1 to 8 (default 2). The first to pass wins and the others are cancelled. |
+| `--attempts N` | Parallel attempts, 1 to 8 (default 2). The first to pass wins and the others are cancelled, unless `--select` says otherwise. |
+| `--select MODE` | How to pick among attempts that pass: `first` (default) takes the first; `wait:<seconds>` gives the others that long after the first passes; `all` lets every attempt finish. Then the passing ones are compared (see below). |
 | `--model`, `--effort` | Model for the attempts (`opus`, `sonnet`, `haiku` or an id) and how hard it thinks. |
 | `--max-turns`, `--budget-usd` | Model turns per attempt, and the spending limit for the whole run. |
 | `--no-apply` | Keep the result in its fork and print its path instead of merging it. |
@@ -240,6 +241,19 @@ the task, the check and the diff with read-only tools and answers approve,
 concern or reject. Only an approved result is merged; otherwise it is kept in
 its fork and the findings are printed. Unverified results (`--no-check`) and
 empty changes are not reviewed.
+
+With `--select wait:<seconds>` or `--select all`, attempts go on after the
+first one passes, and when more than one passes they are compared on what can
+be audited, never on a model's opinion of its own work: first whether the
+project's own test suite still passes in each one's fork (the designer names
+the suite when it finds one), then fewer changed lines, then fewer changed
+files, then which passed first. With review on, the candidates are reviewed in
+that order and the first one approved wins, so a result that games the check
+gives way to the next. The report and `--json` (`selection`) list every
+candidate with its scores, and the choice is noted in the audit log. When
+less budget is left than the first passing attempt cost, the run takes it
+without waiting, as `first` would. To compare the modes on the benchmark, add
+an arm: `molt bench --arm molt --arm select-all="--select all"`.
 
 ### Checkpoints and `molt resume`
 

@@ -1600,6 +1600,7 @@ impl App {
                 }
                 task.req.check = Some(command.clone());
                 task.req.check_files = d.files;
+                task.req.suite = d.suite;
             }
             _ => {
                 lines.push(Line::from(vec![
@@ -1660,6 +1661,18 @@ impl App {
                 for l in last_lines(&scrub(&a.note, &self.secrets), NOTE_LINES) {
                     self.push(Line::from(span(format!("      {l}"), Tone::Dim)));
                 }
+            }
+        }
+
+        if let Some(selection) = &resp.selection {
+            let line = format!("  picked among {} passing attempts:", selection.candidates.len());
+            self.push(Line::from(span(line, Tone::Dim)));
+            for c in &selection.candidates {
+                let (mark, tone) = if resp.winner == Some(c.attempt) { ("*", Tone::Ok) } else { (" ", Tone::Dim) };
+                self.push(Line::from(vec![
+                    span(format!("    {mark} attempt {} ", c.attempt + 1), tone),
+                    span(agent::candidate_scores(c), Tone::Dim),
+                ]));
             }
         }
 
@@ -2420,6 +2433,7 @@ mod tests {
         DesignResponse {
             command: Some("cargo test --test commas".into()),
             files: vec![CheckFile { path: "tests/commas.rs".into(), content: "#[test]\nfn t() {}\n".into() }],
+            suite: None,
             rationale: "the parser has tests".into(),
             baseline: Some(Baseline { passed: false, exit_code: Some(101), tail: String::new() }),
             usage: Usage::default(),
@@ -2434,7 +2448,7 @@ mod tests {
     fn passed(apply: bool, fork: Option<&str>) -> RunResponse {
         RunResponse {
             outcome: Outcome::Passed,
-            check: Some(CheckSpec { command: "cargo test".into(), files: vec![], designed: true }),
+            check: Some(CheckSpec { command: "cargo test".into(), files: vec![], designed: true, suite: None }),
             winner: Some(1),
             summary: "Trailing commas parse.".into(),
             changes: vec![Change { path: "src/parser.rs".into(), kind: ChangeKind::Modified }],
@@ -2470,6 +2484,7 @@ mod tests {
             uncounted_calls: 0,
             checkpoint: None,
             requirements: vec![],
+            selection: None,
         }
     }
 

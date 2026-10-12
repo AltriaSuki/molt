@@ -228,7 +228,12 @@ mod tests {
     use super::*;
 
     fn spec(files: &[&str]) -> CheckSpec {
-        CheckSpec { command: "make test".into(), files: files.iter().map(|f| f.to_string()).collect(), designed: true }
+        CheckSpec {
+            command: "make test".into(),
+            files: files.iter().map(|f| f.to_string()).collect(),
+            designed: true,
+            suite: None,
+        }
     }
 
     fn change(path: &str, kind: ChangeKind) -> Change {
