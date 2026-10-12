@@ -61,6 +61,7 @@ sender from that.
 | A failing service never takes the kernel down | `a_service_that_never_replies…`, `a_crashed_and_reconnected…`, `a_flooding_service…`, `garbage_on_the_wire_is_ignored`, `crates/molt/tests/e2e.rs` |
 | Both transports behave the same: ordering, at-most-once, sender stamping, isolation, bounded inboxes | `crates/molt-transport/src/testkit.rs`, run by `conformance_unix.rs` and `conformance_nats.rs` |
 | `molt do` never runs a config the project ships, and the API key never reaches the commands it runs | `crates/molt/tests/agent.rs` (`the_cli_carries_out_a_task`) |
+| Only trusted external configuration installs hooks; formatting cannot bypass a protected done-check | `agent::tests::only_configuration_outside_the_project_can_install_hooks`, `tests/agent.rs::lifecycle_formatting_is_rechecked_and_cannot_weaken_the_protected_check` |
 | A conversation sent whole every turn grows the log by its new messages, and reads back byte for byte; a changed or missing referenced value fails verification | `a_conversation_sent_whole_every_turn_is_logged_once_and_read_back_exactly`, `a_changed_or_missing_blob_is_found` |
 | Reading the audit log takes a capability, and a read is recorded without a second copy of what it returned | `reading_the_log_takes_a_capability_and_is_recorded_without_a_second_copy` |
 | Every learned note cites the messages behind it, and a run is learned from once | `crates/molt/tests/agent.rs` (`a_second_run_starts_with_what_the_first_learned…`), `crates/molt-memory/src/consolidate.rs` |
@@ -470,6 +471,44 @@ as a failed call, as SWE-agent's edit guard does, and `off` does not look.
 The check files a run writes into forks are never checked. To compare the
 modes, run them as benchmark arms, such as
 `--arm reject="--syntax-check reject" --arm unchecked="--syntax-check off"`.
+
+## Trusted lifecycle hooks
+
+An explicitly selected `--config /outside/project/molt.toml` may contain
+`[[hooks]]` entries. Files inside the workspace never supply hooks, even with
+`--config`; no project file is discovered automatically.
+
+```toml
+[[hooks]]
+event = "before_apply"
+command = "cargo fmt"
+blocking = true
+timeout_ms = 30000
+
+[[hooks]]
+event = "run_finished"
+command = "printf 'Molt finished\\n'"
+```
+
+Supported events are `before_apply`, `after_apply`, `run_finished`, and
+`attempt_failed`. Only `before_apply` may block. Its commands run sequentially
+in each passing candidate's isolated fork after acceptance, before ranking, diff, review
+and application. The authoritative check files are restored, protected paths
+are checked, and acceptance runs again even if a nonblocking formatter failed.
+A failing check or blocking hook keeps the result in its fork and applies
+nothing. Retained results (including the TUI's confirm mode) are prepared the
+same way before they are shown, so the diff/review covers the formatted result.
+
+Notification hooks run in a separate disposable fork and cannot change the
+applied workspace. `after_apply` is also sent when the TUI user applies a kept
+result; `run_finished` means the planner finished, not that the user accepted a
+kept result. All commands use the existing shell sandbox, environment scrubbing,
+process-tree cleanup and bounded output. They do not gain host network or
+notification access. Shell requests/results record output, exit status and
+elapsed time in the audit; planner notes identify the lifecycle event. Timeouts
+are 1–600000 ms, commands at most 8192 bytes, and at most 32 hooks are accepted.
+An interrupted or resumed run may deliver notifications again; use idempotent
+notification commands. Hooks are not part of the model-editable RunRequest.
 
 ## Projects
 

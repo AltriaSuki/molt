@@ -70,7 +70,7 @@ pub(crate) async fn run_cancellable(
     let designed = req.verify && (req.check.is_none() || !req.check_files.is_empty());
     let check = match settle_check(&ctx, &req).await? {
         Ok(check) => check,
-        Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason))),
+        Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason)).await),
     };
     save_check(&ctx, check.as_ref(), designed);
     // Without a check there is nothing to pick a winner by, so one attempt is enough.
@@ -146,7 +146,7 @@ async fn resume_run(
                 save_check(&ctx, check.as_ref(), designed);
                 (check, designed)
             }
-            Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason))),
+            Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason)).await),
         }
     };
 
@@ -288,16 +288,18 @@ async fn finish(
         designed,
     })
     .await;
-    let (finished, passed) = race(ctx, slots, check.map(Arc::new), req.select).await;
+    let check = check.map(Arc::new);
+    let (finished, passed) = race(ctx, slots, check.clone(), req.select).await;
     ctx.control.freeze("the run is finishing");
     let stopped = ctx.checkpoint.is_some() && ctx.run_cancel.is_cancelled();
     // Cancelled attempts may have left model calls running, which are billed: give their replies a moment
     // to land and be counted, while the winner is applied.
     let (mut resp, tally) =
-        tokio::join!(conclude(ctx, req, spec, finished, passed, stopped), ctx.settle(ctx.cfg.late_reply_wait));
+        tokio::join!(conclude(ctx, req, (spec, check), finished, passed, stopped), ctx.settle(ctx.cfg.late_reply_wait));
     resp.usage = tally.spend.usage;
     resp.cost_usd = tally.spend.cost_usd;
     resp.uncounted_calls = tally.uncounted_calls() + ctx.carried_uncounted;
+    crate::hooks::notify(ctx, crate::hooks::Event::RunFinished).await;
     if stopped {
         let spend = SavedSpend { usage: resp.usage, cost_usd: resp.cost_usd, uncounted_calls: resp.uncounted_calls };
         ctx.save(|s| {
@@ -324,7 +326,7 @@ async fn finish(
 
 /// A run that ended before any attempt: a stopped one keeps its checkpoint,
 /// to design the check again when resumed; otherwise nothing is left.
-fn finish_early(ctx: &Ctx, mut resp: RunResponse) -> RunResponse {
+async fn finish_early(ctx: &Arc<Ctx>, mut resp: RunResponse) -> RunResponse {
     if let Some(store) = &ctx.checkpoint {
         if ctx.run_cancel.is_cancelled() {
             resp.checkpoint = Some(ctx.run_id());
@@ -332,6 +334,7 @@ fn finish_early(ctx: &Ctx, mut resp: RunResponse) -> RunResponse {
             store.remove();
         }
     }
+    crate::hooks::notify(ctx, crate::hooks::Event::RunFinished).await;
     resp
 }
 
@@ -507,6 +510,9 @@ async fn race(
                 }
             }
         }
+        if matches!(done.report.status, AttemptStatus::Failed | AttemptStatus::Error) {
+            crate::hooks::notify(ctx, crate::hooks::Event::AttemptFailed).await;
+        }
         finished.push(done);
     }
     finished.sort_by_key(|f| f.report.index);
@@ -541,11 +547,12 @@ async fn stop_after_first(ctx: &Ctx, select: Select, first: &Finished) -> Option
 async fn conclude(
     ctx: &Arc<Ctx>,
     req: &RunRequest,
-    spec: Option<CheckSpec>,
+    checks: (Option<CheckSpec>, Option<Arc<Check>>),
     finished: Vec<Finished>,
     passed: Vec<u32>,
     stopped: bool,
 ) -> RunResponse {
+    let (spec, check) = checks;
     let candidates: Vec<(&Finished, String)> = passed
         .iter()
         .filter(|_| !ctx.run_cancel.is_cancelled())
@@ -583,6 +590,26 @@ async fn conclude(
     // under the same requirements, as the first to pass froze them.
     if let (Some(check), Some(command)) = (&mut resp.check, ctx.control.check(first.report.requirements)) {
         check.command = command;
+    }
+    // Format and recheck before ranking and review, including kept results.
+    // A failing formatter removes that candidate from consideration.
+    let mut prepared = Vec::new();
+    let mut failures = Vec::new();
+    for (done, fork) in candidates {
+        match crate::hooks::prepare(ctx, &fork, check.as_deref(), done.report.requirements).await {
+            Ok(()) => prepared.push((done, fork)),
+            Err(error) => failures.push((done, fork, error)),
+        }
+    }
+    let candidates = prepared;
+    if candidates.is_empty() {
+        let (done, fork, error) = failures.remove(0);
+        ctx.drop_forks_except(Some(&fork)).await;
+        ctx.forget_fork(&fork);
+        resp.winner = Some(done.report.index);
+        resp.summary = format!("Not applied: {error}. The result is kept in {fork}.");
+        resp.fork = Some(fork);
+        return resp;
     }
     if let [(done, fork)] = candidates.as_slice() {
         ctx.drop_forks_except(Some(fork)).await;
@@ -663,7 +690,10 @@ async fn deliver(
                 keep = true;
             } else if req.apply && (verified || !resp.changes.is_empty()) {
                 match ctx.merge(&fork).await {
-                    Ok(_) => resp.applied = true,
+                    Ok(_) => {
+                        resp.applied = true;
+                        crate::hooks::notify(ctx, crate::hooks::Event::AfterApply).await;
+                    }
                     Err(e) => {
                         let what = if e.message.starts_with("partial:") {
                             "The apply needs recovery; the workspace may contain changes"

@@ -72,6 +72,16 @@ pub fn resolve_config(
 ) -> anyhow::Result<Config> {
     if let Some(path) = path {
         let mut cfg = Config::load(path)?;
+        let trusted = !path.canonicalize()?.starts_with(workspace);
+        if !trusted && !cfg.hooks.is_empty() {
+            eprintln!("lifecycle hooks in a project configuration are ignored; keep trusted hook configuration outside the project");
+            cfg.hooks.clear();
+        }
+        molt_planner::hooks::validate(&cfg.hooks)?;
+        let hooks = serde_json::to_string(&cfg.hooks)?;
+        if let Some(planner) = cfg.service_mut("planner") {
+            planner.env.insert("MOLT_HOOKS_JSON".into(), hooks);
+        }
         require_services(&cfg).with_context(|| format!("{} cannot run tasks", path.display()))?;
         if let Some(dir) = data_dir {
             cfg.kernel.data_dir = dir.to_path_buf();
@@ -588,7 +598,12 @@ async fn consolidate(
 /// `molt memory forget` uses, so that the change is in the audit log.
 pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::Result<Value> {
     let service = cfg.service(MEMORY).context("the config has no memory service")?.clone();
-    let alone = Config { kernel: cfg.kernel.clone(), services: vec![service], confirm: cfg.confirm.clone() };
+    let alone = Config {
+        kernel: cfg.kernel.clone(),
+        services: vec![service],
+        confirm: cfg.confirm.clone(),
+        hooks: cfg.hooks.clone(),
+    };
     let running = crate::start(&alone).await?;
     let result = async {
         let kernel = running.kernel();
@@ -980,6 +995,28 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn only_configuration_outside_the_project_can_install_hooks() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        std::fs::create_dir(&workspace).unwrap();
+        let services = SERVICES
+            .iter()
+            .map(|name| format!("[[service]]\nname = \"{name}\"\nexec = {{ command = \"/bin/true\" }}\n"))
+            .collect::<String>();
+        let config = format!("{services}\n[[hooks]]\nevent = \"before_apply\"\ncommand = \"true\"\nblocking = true\n");
+        let outside = root.path().join("config.toml");
+        std::fs::write(&outside, &config).unwrap();
+        let trusted = resolve_config(Some(&outside), &workspace, None, None).unwrap();
+        assert_eq!(trusted.hooks.len(), 1);
+        assert!(trusted.service("planner").unwrap().env["MOLT_HOOKS_JSON"].contains("before_apply"));
+        let inside = workspace.join("config.toml");
+        std::fs::write(&inside, config).unwrap();
+        let ignored = resolve_config(Some(&inside), &workspace, None, None).unwrap();
+        assert!(ignored.hooks.is_empty());
+        assert_eq!(ignored.service("planner").unwrap().env["MOLT_HOOKS_JSON"], "[]");
+    }
 
     #[test]
     fn memory_learns_with_the_model_asked_for_or_the_attempts_one() {

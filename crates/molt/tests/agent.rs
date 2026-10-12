@@ -1440,6 +1440,57 @@ async fn a_checkpointed_run_that_runs_out_of_budget_is_resumed_with_its_fork() {
 }
 
 #[tokio::test]
+async fn lifecycle_formatting_is_rechecked_and_cannot_weaken_the_protected_check() {
+    use molt_planner::hooks::{Event, Hook};
+    for (command, should_apply) in [
+        ("printf '\\n' >> greeting.txt", true),
+        ("printf goodbye > greeting.txt", false),
+        ("printf 'exit 0\\n' > check.sh; printf goodbye > greeting.txt", false),
+        ("sleep 10", false),
+    ] {
+        let server = fake_api(Fake::DesignsThenGreets).await;
+        let mut setup = Setup::new(&server);
+        let hooks = vec![
+            Hook {
+                event: Event::BeforeApply,
+                command: command.into(),
+                blocking: true,
+                timeout_ms: if command == "sleep 10" { 20 } else { 5000 },
+            },
+            Hook {
+                event: Event::AfterApply,
+                command: "printf notification > notification.txt".into(),
+                blocking: false,
+                timeout_ms: 5000,
+            },
+        ];
+        setup
+            .cfg
+            .service_mut("planner")
+            .unwrap()
+            .env
+            .insert("MOLT_HOOKS_JSON".into(), serde_json::to_string(&hooks).unwrap());
+        let (response, events) = setup.run(setup.request(None, 1)).await;
+        assert_eq!(response.applied, should_apply, "{command}: {}", response.summary);
+        if should_apply {
+            assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n\n"));
+            assert_eq!(setup.file("check.sh").as_deref(), Some(&format!("{CHECK}\n")[..]));
+        } else {
+            assert_eq!(response.outcome, Outcome::Failed);
+            assert!(response.fork.is_some());
+            assert!(setup.file("greeting.txt").is_none());
+            assert!(response.summary.contains("Not applied"));
+        }
+        assert!(setup.file("notification.txt").is_none(), "notifications only write in a disposable fork");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Progress::Note { message, .. } if message.contains("hook BeforeApply"))));
+        let audit = std::fs::read_to_string(setup.data.path().join("audit.jsonl")).unwrap();
+        assert!(audit.contains("duration_ms") && audit.contains("shell.run"));
+    }
+}
+
+#[tokio::test]
 async fn a_comparison_suite_cannot_mutate_the_checked_candidate() {
     let server = fake_api(Fake::Greets).await;
     let setup = Setup::new(&server);
@@ -1451,6 +1502,20 @@ async fn a_comparison_suite_cannot_mutate_the_checked_candidate() {
     assert_eq!(resp.selection.as_ref().unwrap().candidates.len(), 2);
     assert!(resp.applied);
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+}
+
+#[tokio::test]
+async fn all_candidates_are_formatted_and_rechecked_before_selection() {
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    let hooks = serde_json::json!([{"event":"before_apply", "command":"printf '\\n' >> greeting.txt", "blocking":true, "timeout_ms":5000}]);
+    setup.cfg.service_mut("planner").unwrap().env.insert("MOLT_HOOKS_JSON".into(), hooks.to_string());
+    let mut req = setup.request(Some(CHECK), 2);
+    req.select = molt_api::planner::Select::All;
+    let (resp, _) = setup.run(req).await;
+    assert!(resp.applied, "{resp:#?}");
+    assert_eq!(resp.selection.as_ref().unwrap().candidates.len(), 2);
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n\n"));
 }
 
 #[tokio::test]

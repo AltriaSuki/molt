@@ -158,6 +158,8 @@ pub struct Config {
     pub services: Vec<ServiceSection>,
     #[serde(default)]
     pub confirm: ConfirmSection,
+    #[serde(default)]
+    pub hooks: Vec<molt_planner::hooks::Hook>,
 }
 
 /// When the interface's confirm mode stops for the user. It goes on by
@@ -341,6 +343,7 @@ impl Config {
             kernel: KernelSection { data_dir: data_dir.to_path_buf(), ..KernelSection::default() },
             services: vec![model, fs, shell, memory, planner],
             confirm: ConfirmSection::default(),
+            hooks: Vec::new(),
         })
     }
 
