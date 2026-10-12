@@ -4,6 +4,7 @@ description = "Molt's file and shell services: workspace files, forks, diffs and
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 molt-api.workspace = true

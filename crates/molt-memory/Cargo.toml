@@ -4,6 +4,7 @@ description = "Molt's memory service: notes learned from past episodes, and a li
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 molt-api.workspace = true
