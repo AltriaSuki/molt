@@ -128,8 +128,12 @@ with `--config` can change these in a `[confirm]` section (`max_lines`,
    with it; `e` edits the command, `v` shows the files, `n` runs without a
    check.
 2. The attempts run side by side, one box each, with their tool calls and
-   check runs as they happen (Tab shows one large). When one passes, you see
-   its message, the files it changed and, with `d`, the diff. Enter applies
+   check runs as they happen (Tab shows one large). Each box's title shows
+   its turn, how long it has run and what its finished model calls cost
+   (`turn 7 · 2m14s · $0.18`), and the status bar shows the task's spending
+   against its budget (`task $0.52 / $2.00`, in yellow from 80%). A call of
+   unknown cost makes the figure a lower bound (`≥ $0.18`). When one passes,
+   you see its message, the files it changed and, with `d`, the diff. Enter applies
    it; `k` keeps it in its fork, `n` discards it. `/last` opens the diff of
    the last finished task again, whatever was done with it. When no attempt
    passes, each one shows the end of why it stopped, and a failed check shows
@@ -205,7 +209,7 @@ the same project is refused until it closes.
 ## `molt do`
 
 ```
-molt do TASK [--check CMD | --no-check] [--attempts N] [--model M] [--effort E] [--max-turns N]
+molt do TASK [--check CMD | --no-check] [--attempts N] [--select MODE] [--model M] [--effort E] [--max-turns N]
         [--budget-usd X] [--no-apply | --commit [--branch NAME]] [--no-review] [--json] [--stream]
         [--workspace DIR] [--data-dir DIR] [--pass-env NAME]... [--no-memory] [--no-learn]
         [--memory-model MODEL] [--checkpoint] [--config FILE]
@@ -217,7 +221,8 @@ molt undo [RUN] [--workspace DIR] [--data-dir DIR]
 | --- | --- |
 | `--check CMD` | Shell command that exits 0 once the task is done, run in each attempt's fork. Default: the planner designs one. |
 | `--no-check` | Design no check: one attempt does the task and its result is applied unverified. This is the plain agent loop `molt bench` compares Molt with. |
-| `--attempts N` | Parallel attempts, 1 to 8 (default 2). The first to pass wins and the others are cancelled. |
+| `--attempts N` | Parallel attempts, 1 to 8 (default 2). The first to pass wins and the others are cancelled, unless `--select` says otherwise. |
+| `--select MODE` | How to pick among attempts that pass: `first` (default) takes the first; `wait:<seconds>` gives the others that long after the first passes; `all` lets every attempt finish. Then the passing ones are compared (see below). |
 | `--model`, `--effort` | Model for the attempts (`opus`, `sonnet`, `haiku` or an id) and how hard it thinks. |
 | `--max-turns`, `--budget-usd` | Model turns per attempt, and the spending limit for the whole run. |
 | `--no-apply` | Keep the result in its fork and print its path instead of merging it. |
@@ -245,6 +250,19 @@ the task, the check and the diff with read-only tools and answers approve,
 concern or reject. Only an approved result is merged; otherwise it is kept in
 its fork and the findings are printed. Unverified results (`--no-check`) and
 empty changes are not reviewed.
+
+With `--select wait:<seconds>` or `--select all`, attempts go on after the
+first one passes, and when more than one passes they are compared on what can
+be audited, never on a model's opinion of its own work: first whether the
+project's own test suite still passes in each one's fork (the designer names
+the suite when it finds one), then fewer changed lines, then fewer changed
+files, then which passed first. With review on, the candidates are reviewed in
+that order and the first one approved wins, so a result that games the check
+gives way to the next. The report and `--json` (`selection`) list every
+candidate with its scores, and the choice is noted in the audit log. When
+less budget is left than the first passing attempt cost, the run takes it
+without waiting, as `first` would. To compare the modes on the benchmark, add
+an arm: `molt bench --arm molt --arm select-all="--select all"`.
 
 ### Commits and `molt undo`
 
@@ -431,6 +449,34 @@ that they win over notes. They are read with `fs.read`, so the audit log
 records what each run saw, and the run's progress lists the files.
 `--no-memory` does not turn them off; `MOLT_INSTRUCTION_FILES` names other
 files, or `none`.
+
+## Projects
+
+A project is what molt keeps memory for. Each has a stable id and a name in
+the user's registry (`$XDG_DATA_HOME/molt/projects.json`, else
+`~/.local/share/molt/projects.json`), and any number of directories: one
+usually, several for clones, or none. The first run in a directory registers
+it under the directory's name, keeping the data dir it had before, so nothing
+is lost on upgrade. Notes about any of a project's directories are kept under
+its id, so clones share them and a moved directory keeps them once molt is
+told where it went; the data dir, with the audit log and stopped runs, stays
+with the project too. Nothing in a project's directory decides which project
+it is.
+
+```sh
+molt project list                         # ids, names, directories, data dirs
+molt project new "Japan trip"             # a project with no folder
+molt project new site --path ~/src/site   # a directory under a name of your own
+molt project add site ~/src/site-2        # another clone, with the same notes
+molt project move site ~/code/site        # the directory moved (--from DIR for one of several)
+molt do "plan five days in Kyoto" --project "Japan trip" --no-check
+```
+
+`--project ID|NAME` stands in for `--workspace` in `molt do`, `molt resume`,
+`molt ui` and `molt memory`. A project with no folder works in a private one
+of its own, `<registry dir>/projects/<id>/files`, which is where its
+research and writing end up. With `--config`, the registry is left out and
+notes are kept by the workspace's path, as before.
 
 ## Memory
 
@@ -757,11 +803,10 @@ needed. Deleting an unfinished record loses its recovery material.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.
 - Recall matches keywords (with stemming), not meaning: there is no vector index, since the Anthropic API has no embeddings endpoint. A note worded differently from the task can be missed; the strongest notes about the project are always shown.
-- Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. With the default setup, memory lives in the project's data dir, so nothing is shared between projects yet.
+- Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. With the default setup, memory lives in the project's data dir, so nothing is shared between projects yet. Clones of one project share its data dir, so molt runs in one of them at a time.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.
 - Model prices are as current as the last `molt prices update` (or the release's snapshot) and as right as the community list they came from; a price that changes mid-run is not picked up until the next run. Models that LiteLLM lists only with tiered or regional prices, such as some Qwen models, have no price until declared in `MOLT_MODEL_PRICES`.
-- No license has been chosen yet.
 
 ### Cancellation and model settlement
 
@@ -822,3 +867,7 @@ Dependencies mount at their canonical absolute paths. `--pass-env NAME` explicit
 Limits are inherited per process: address space, CPU time, file size, open files and process count, plus the existing command wall timeout. These are not aggregate cgroup quotas; RLIMIT_NPROC has the operating system's per-user semantics and does not limit root. TERM reaches the sandbox session group with 500 ms grace; KILL then tears down its PID namespace, including descendants that called setsid. Normal completion, cancelled handlers and service exit also tear down the namespace. Temporary mounts disappear with the last process. Future executable skills must use this shell path to share the policy.
 
 CI installs bubblewrap and requires namespace tests to run. A constrained local executor may skip only those integration tests after a failed capability probe; production startup still fails closed. Tests cover host paths, symlinks, read-only dependencies, network policy, host sockets, limits, C builds, cancellation and descendants with new sessions.
+
+## License
+
+Molt is dual-licensed under the [MIT license](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option. Contributions are accepted under the same terms; see [CONTRIBUTING.md](CONTRIBUTING.md#license).

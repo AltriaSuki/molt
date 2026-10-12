@@ -37,6 +37,8 @@ const TICK: Duration = Duration::from_millis(150);
 pub struct Options {
     pub config: Option<PathBuf>,
     pub workspace: PathBuf,
+    /// A project of the registry, by id or name, in place of `workspace`.
+    pub project: Option<String>,
     pub data_dir: Option<PathBuf>,
     pub pass_env: Vec<String>,
 }
@@ -48,10 +50,10 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
         "molt needs a terminal for its interface; in scripts, use `molt do TASK`"
     );
     let stop = crate::stop_signal()?;
-    let workspace = opts.workspace.canonicalize().with_context(|| format!("workspace {}", opts.workspace.display()))?;
-    anyhow::ensure!(workspace.is_dir(), "the workspace {} is not a directory", workspace.display());
+    let (workspace, project) = agent::locate(opts.project.as_deref(), &opts.workspace, opts.config.is_some())?;
     let path = workspace.to_str().context("the workspace path is not UTF-8")?.to_owned();
-    let mut cfg = agent::resolve_config(opts.config.as_deref(), &workspace, opts.data_dir.as_deref())?;
+    let mut cfg =
+        agent::resolve_config(opts.config.as_deref(), &workspace, opts.data_dir.as_deref(), project.as_ref())?;
     if let Some(shell) = cfg.service_mut("shell") {
         shell.pass_env.extend(opts.pass_env);
     }

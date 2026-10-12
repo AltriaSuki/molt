@@ -4,6 +4,7 @@ description = "Wire types shared by the Molt kernel and its services"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 rand.workspace = true

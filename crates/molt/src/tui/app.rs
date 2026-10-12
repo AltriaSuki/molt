@@ -4,6 +4,7 @@
 //! tested with plain values.
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use molt_api::fs::ChangeKind;
 use molt_api::memory::{ConsolidateResponse, RecallSnapshot, Recalled, ReviewRequest, ReviewResponse};
@@ -228,6 +229,36 @@ pub enum Phase {
     Applying,
 }
 
+/// What settled model calls cost so far. A call whose cost is unknown makes
+/// the sum a lower bound; it is never counted as free.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Spend {
+    pub usd: f64,
+    pub unknown: bool,
+}
+
+impl Spend {
+    fn add(&mut self, cost: Option<f64>) {
+        match cost {
+            Some(c) if c.is_finite() && c >= 0.0 => self.usd += c,
+            _ => self.unknown = true,
+        }
+    }
+
+    /// `$0.18`, or `≥ $0.18` when some cost is unknown.
+    pub fn label(&self) -> String {
+        let at_least = if self.unknown { "≥ " } else { "" };
+        format!("{at_least}${:.2}", self.usd)
+    }
+}
+
+impl std::ops::Add for Spend {
+    type Output = Spend;
+    fn add(self, other: Spend) -> Spend {
+        Spend { usd: self.usd + other.usd, unknown: self.unknown || other.unknown }
+    }
+}
+
 pub struct Lane {
     pub index: u32,
     /// The attempt's fork, once the planner has said which.
@@ -236,6 +267,11 @@ pub struct Lane {
     pub status: Option<AttemptStatus>,
     pub lines: Vec<Line<'static>>,
     pub preview: Preview,
+    /// The attempt's model calls that have finished.
+    pub spend: Spend,
+    /// When the TUI first heard of the attempt, and when it ended.
+    pub started: Instant,
+    pub ended: Option<Instant>,
 }
 
 pub struct Task {
@@ -244,6 +280,14 @@ pub struct Task {
     pub phase: Phase,
     pub lanes: Vec<Lane>,
     pub designer_preview: Preview,
+    /// The whole task's budget, as the user set it; `req.budget_usd` is
+    /// what is left for the attempts once the check is designed.
+    pub budget_usd: Option<f64>,
+    /// The check design: its finished calls while it runs, then its settled
+    /// cost.
+    pub design_spend: Spend,
+    /// Model calls already counted, so a repeated event is not counted twice.
+    counted: HashSet<String>,
     /// The check is in the log already.
     check_shown: bool,
     recalled_shown: bool,
@@ -261,9 +305,12 @@ impl Task {
     fn new(trace: TraceId, req: RunRequest, phase: Phase) -> Self {
         Self {
             trace,
+            budget_usd: req.budget_usd,
             req,
             phase,
             lanes: Vec::new(),
+            design_spend: Spend::default(),
+            counted: HashSet::new(),
             check_shown: false,
             recalled_shown: false,
             notes_seen: HashSet::new(),
@@ -273,6 +320,12 @@ impl Task {
             state: RunState::Running,
             waiting: Vec::new(),
         }
+    }
+
+    /// What this task has cost so far, by finished model calls; the run's
+    /// reply settles it.
+    pub fn spend(&self) -> Spend {
+        self.lanes.iter().fold(self.design_spend, |sum, lane| sum + lane.spend)
     }
 }
 
@@ -1399,23 +1452,33 @@ impl App {
                 }
             }
             event @ (Progress::ModelStarted { .. } | Progress::ModelText { .. } | Progress::ModelFinished { .. }) => {
+                let context = event.model_call().expect("a model event has a context");
+                let attempt = context.attempt.filter(|&a| a < task.req.attempts && a < 8);
+                let settles = matches!(event, Progress::ModelFinished { .. });
+                if let Some(attempt) = attempt.filter(|_| task.req.stream || settles) {
+                    if !task.lanes.iter().any(|l| l.index == attempt) {
+                        task.lanes.push(Lane::new(attempt, None));
+                        task.lanes.sort_by_key(|l| l.index);
+                    }
+                }
+                // Counted even when previews are off or the lane has ended:
+                // a cancelled attempt's last call settles after it stops.
+                if let Progress::ModelFinished { cost_usd, .. } = &event {
+                    if task.counted.insert(context.call.clone()) {
+                        match (context.attempt, attempt) {
+                            (None, _) => task.design_spend.add(*cost_usd),
+                            (_, Some(attempt)) => {
+                                lane(task, attempt).expect("the lane was created").spend.add(*cost_usd)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 if !task.req.stream {
                     return;
                 }
-                let context = event.model_call().expect("a model event has a context");
                 match context.attempt {
                     Some(attempt) if attempt < task.req.attempts && attempt < 8 => {
-                        if !task.lanes.iter().any(|l| l.index == attempt) {
-                            task.lanes.push(Lane {
-                                index: attempt,
-                                fork: None,
-                                turn: 0,
-                                status: None,
-                                lines: Vec::new(),
-                                preview: Preview::default(),
-                            });
-                            task.lanes.sort_by_key(|l| l.index);
-                        }
                         let lane = lane(task, attempt).expect("the lane was created");
                         if context.turn < lane.turn || lane.status.is_some() {
                             return;
@@ -1438,14 +1501,7 @@ impl App {
                 if let Some(lane) = lane(task, attempt) {
                     lane.fork = lane.fork.take().or(fork);
                 } else {
-                    task.lanes.push(Lane {
-                        index: attempt,
-                        fork,
-                        turn: 0,
-                        status: None,
-                        lines: Vec::new(),
-                        preview: Preview::default(),
-                    });
+                    task.lanes.push(Lane::new(attempt, fork));
                     task.lanes.sort_by_key(|l| l.index);
                 }
             }
@@ -1478,6 +1534,7 @@ impl App {
                         lane.push(line);
                     }
                     lane.status = Some(status);
+                    lane.ended.get_or_insert_with(Instant::now);
                 }
             }
             Progress::Required { requirement, .. } => task.version = task.version.max(requirement.version),
@@ -1501,6 +1558,7 @@ impl App {
         self.log.extend(task.designer_preview.finish("ended; final preview event unavailable", true));
         match result {
             Ok(d) => {
+                task.design_spend = Spend { usd: d.cost_usd, unknown: d.uncounted_calls > 0 };
                 self.spent_usd += d.cost_usd;
                 self.uncounted_calls = self.uncounted_calls.saturating_add(d.uncounted_calls);
                 if d.cancelled || d.error.is_some() {
@@ -1600,6 +1658,7 @@ impl App {
                 }
                 task.req.check = Some(command.clone());
                 task.req.check_files = d.files;
+                task.req.suite = d.suite;
             }
             _ => {
                 lines.push(Line::from(vec![
@@ -1620,6 +1679,10 @@ impl App {
         }
         let mut task = self.task.take().expect("checked above");
         self.zoom = None;
+        let now = Instant::now();
+        for lane in &mut task.lanes {
+            lane.ended.get_or_insert(now);
+        }
         self.last_lanes = std::mem::take(&mut task.lanes);
         let resp = match result {
             Ok(resp) => resp,
@@ -1628,6 +1691,16 @@ impl App {
                 return Vec::new();
             }
         };
+        // Progress can be dropped by a busy transport or suspended interface.
+        // The final attempt reports settle the archived lane totals as well.
+        for lane in &mut self.last_lanes {
+            if let Some(attempt) = resp.attempts.iter().find(|a| a.index == lane.index) {
+                lane.spend.usd = attempt.cost_usd;
+                lane.spend.unknown |= resp.uncounted_calls > 0;
+                lane.status = Some(attempt.status);
+                lane.turn = attempt.turns;
+            }
+        }
         self.spent_usd += resp.cost_usd;
         self.remember(&task.req.task, &resp);
         self.uncounted_calls = self.uncounted_calls.saturating_add(resp.uncounted_calls);
@@ -1660,6 +1733,18 @@ impl App {
                 for l in last_lines(&scrub(&a.note, &self.secrets), NOTE_LINES) {
                     self.push(Line::from(span(format!("      {l}"), Tone::Dim)));
                 }
+            }
+        }
+
+        if let Some(selection) = &resp.selection {
+            let line = format!("  picked among {} passing attempts:", selection.candidates.len());
+            self.push(Line::from(span(line, Tone::Dim)));
+            for c in &selection.candidates {
+                let (mark, tone) = if resp.winner == Some(c.attempt) { ("*", Tone::Ok) } else { (" ", Tone::Dim) };
+                self.push(Line::from(vec![
+                    span(format!("    {mark} attempt {} ", c.attempt + 1), tone),
+                    span(agent::candidate_scores(c), Tone::Dim),
+                ]));
             }
         }
 
@@ -2079,6 +2164,25 @@ fn snapshot_lines(snapshots: &[RecallSnapshot]) -> Vec<Line<'static>> {
 }
 
 impl Lane {
+    fn new(index: u32, fork: Option<String>) -> Self {
+        Self {
+            index,
+            fork,
+            turn: 0,
+            status: None,
+            lines: Vec::new(),
+            preview: Preview::default(),
+            spend: Spend::default(),
+            started: Instant::now(),
+            ended: None,
+        }
+    }
+
+    /// How long the attempt has run, or ran.
+    pub fn elapsed(&self) -> Duration {
+        self.ended.unwrap_or_else(Instant::now).saturating_duration_since(self.started)
+    }
+
     fn push(&mut self, line: Line<'static>) {
         self.lines.push(line);
         if self.lines.len() > LANE_LINES {
@@ -2173,7 +2277,10 @@ fn covers(rule: &str, path: &str) -> bool {
 fn lane_lines(lanes: &[Lane]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for lane in lanes {
-        lines.push(Line::from(span(format!("attempt {} · tool calls", lane.index + 1), Tone::Shell)));
+        lines.push(Line::from(vec![
+            span(format!("attempt {} · tool calls", lane.index + 1), Tone::Shell),
+            span(format!(" · {} · {}", text::duration(lane.elapsed()), lane.spend.label()), Tone::Dim),
+        ]));
         lines.extend(lane.lines.iter().cloned());
         lines.push(Line::default());
     }
@@ -2312,10 +2419,15 @@ mod tests {
     }
 
     fn frame_text(app: &mut App) -> String {
-        let backend = ratatui::backend::TestBackend::new(140, 40);
+        frame_rows(app, 140).concat()
+    }
+
+    fn frame_rows(app: &mut App, width: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, 40);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| super::super::view::draw(frame, app)).unwrap();
-        terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect()
+        let cells: Vec<String> = terminal.backend().buffer().content.iter().map(|c| c.symbol().to_owned()).collect();
+        cells.chunks(usize::from(width)).map(|row| row.concat()).collect()
     }
 
     fn model_context(app: &App, attempt: Option<u32>, seq: u64) -> molt_api::progress::ModelCall {
@@ -2364,6 +2476,104 @@ mod tests {
         assert!(app.update(Msg::Ran { trace, result: Err("the model refused".into()) }).is_empty());
         assert!(app.task.is_none() && app.prompt.is_none());
         assert!(log(&app).contains("the model refused"));
+    }
+
+    fn finished(app: &App, attempt: Option<u32>, call: &str, cost_usd: Option<f64>) -> Msg {
+        let context = molt_api::progress::ModelCall { call: call.into(), ..model_context(app, attempt, 9) };
+        Msg::Progress(Progress::ModelFinished { context, usage: None, cost_usd, error: None })
+    }
+
+    #[test]
+    fn each_lane_shows_what_its_finished_calls_cost_and_unknown_cost_is_a_lower_bound() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        app.settings.budget_usd = Some(1.0);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        // Each call counts once.
+        app.update(finished(&app, Some(0), "a", Some(0.3)));
+        app.update(finished(&app, Some(0), "a", Some(0.3)));
+        app.update(finished(&app, Some(1), "b", None));
+        let task = app.task.as_ref().unwrap();
+        assert_eq!(task.lanes[0].spend.label(), "$0.30");
+        assert_eq!(task.lanes[1].spend.label(), "≥ $0.00");
+        assert_eq!(task.spend().label(), "≥ $0.30");
+        let shown = frame_text(&mut app);
+        assert!(shown.contains("turn 1 · 0s · $0.30"), "{shown}");
+        assert!(shown.contains("task ≥ $0.30 / $1.00"), "{shown}");
+        assert_eq!(app.spent_usd, 0.0, "progress events do not settle spending");
+
+        // An attempt stopped by the winner still settles its last call.
+        app.update(Msg::Progress(Progress::AttemptFinished {
+            run: trace.to_string(),
+            attempt: 1,
+            status: AttemptStatus::Cancelled,
+        }));
+        app.update(finished(&app, Some(1), "c", Some(0.05)));
+        assert_eq!(app.task.as_ref().unwrap().lanes[1].spend.label(), "≥ $0.05");
+
+        app.update(Msg::Ran { trace, result: Ok(passed(false, Some("fork"))) });
+        assert!((app.spent_usd - 0.3).abs() < 1e-9, "the reply settles the run once: {}", app.spent_usd);
+    }
+
+    #[test]
+    fn final_reports_settle_lane_cost_when_progress_was_lost() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        app.update(Msg::Progress(Progress::AttemptStarted { run: trace.to_string(), attempt: 1, fork: None }));
+        let resp = passed(false, Some("fork"));
+        let cost = resp.attempts.iter().find(|a| a.index == 1).unwrap().cost_usd;
+        app.update(Msg::Ran { trace, result: Ok(resp) });
+        assert_eq!(app.last_lanes.iter().find(|a| a.index == 1).unwrap().spend.usd, cost);
+        assert!(cost > 0.0);
+    }
+
+    #[test]
+    fn the_check_designs_calls_count_until_its_reply_settles_them() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        app.update(finished(&app, None, "d", Some(0.04)));
+        assert_eq!(app.task.as_ref().unwrap().spend().label(), "$0.04");
+        app.update(Msg::Designed { trace, result: Ok(design()), existing: vec![] });
+        let task = app.task.as_ref().unwrap();
+        assert_eq!(task.spend().label(), format!("${:.2}", design().cost_usd));
+    }
+
+    #[test]
+    fn narrow_lanes_keep_their_status_on_one_row() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        app.settings.attempts = Some(4);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        for attempt in 0..4 {
+            app.update(Msg::Progress(Progress::AttemptStarted { run: trace.to_string(), attempt, fork: None }));
+            app.update(Msg::Progress(Progress::ToolCall {
+                run: trace.to_string(),
+                attempt,
+                turn: 12,
+                tool: "read_file".into(),
+                detail: "read".into(),
+            }));
+            app.update(finished(&app, Some(attempt), &format!("call {attempt}"), Some(0.25)));
+        }
+        let rows = frame_rows(&mut app, 79);
+        let titles = rows.iter().find(|r| r.contains("turn 12")).expect("the lane titles");
+        assert_eq!(titles.matches("turn 12").count(), 4, "{titles}");
+        let wide = frame_rows(&mut app, 200);
+        let titles = wide.iter().find(|r| r.contains("turn 12")).expect("the lane titles");
+        assert_eq!(titles.matches("turn 12 · 0s · $0.25").count(), 4, "{titles}");
+        assert_eq!(titles.matches("attempt").count(), 4, "{titles}");
     }
 
     #[test]
@@ -2420,6 +2630,7 @@ mod tests {
         DesignResponse {
             command: Some("cargo test --test commas".into()),
             files: vec![CheckFile { path: "tests/commas.rs".into(), content: "#[test]\nfn t() {}\n".into() }],
+            suite: None,
             rationale: "the parser has tests".into(),
             baseline: Some(Baseline { passed: false, exit_code: Some(101), tail: String::new() }),
             usage: Usage::default(),
@@ -2434,7 +2645,7 @@ mod tests {
     fn passed(apply: bool, fork: Option<&str>) -> RunResponse {
         RunResponse {
             outcome: Outcome::Passed,
-            check: Some(CheckSpec { command: "cargo test".into(), files: vec![], designed: true }),
+            check: Some(CheckSpec { command: "cargo test".into(), files: vec![], designed: true, suite: None }),
             winner: Some(1),
             summary: "Trailing commas parse.".into(),
             changes: vec![Change { path: "src/parser.rs".into(), kind: ChangeKind::Modified }],
@@ -2470,6 +2681,7 @@ mod tests {
             uncounted_calls: 0,
             checkpoint: None,
             requirements: vec![],
+            selection: None,
         }
     }
 
@@ -3314,7 +3526,9 @@ mod tests {
         app.update(ctrl_key('u'));
         type_in(&mut app, "/lanes");
         let viewer = app.viewer.take().expect("the last task's attempts");
-        assert_eq!(plain(&viewer.lines)[..2], ["attempt 1 · tool calls", " 1 read Makefile"]);
+        let lines = plain(&viewer.lines);
+        assert!(lines[0].starts_with("attempt 1 · tool calls · 0s · $0.10"), "{}", lines[0]);
+        assert_eq!(lines[1], " 1 read Makefile");
     }
 
     #[test]
