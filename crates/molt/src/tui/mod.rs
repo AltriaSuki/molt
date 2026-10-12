@@ -6,6 +6,7 @@
 //! comes back, with the keys, to the app.
 
 mod app;
+mod commands;
 mod preview;
 mod text;
 mod view;
@@ -111,6 +112,7 @@ async fn event_loop(
     let mut app = App::new(&workspace, home);
     app.secrets = secrets_in_env();
     app.rules = cfg.confirm.clone();
+    app.load_commands(Path::new(&workspace));
     let mut rt =
         Runtime { cfg: Arc::new(cfg), workspace, tx, sessions, session: None, starting: false, work: Vec::new() };
     rt.exec(Action::StartSession);

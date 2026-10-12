@@ -609,6 +609,7 @@ pub struct App {
     workspace_path: String,
     pub mode: Mode,
     pub settings: Settings,
+    pub commands: std::collections::BTreeMap<String, super::commands::Command>,
     pub session: SessionState,
     pub log: Vec<Line<'static>>,
     /// Lines scrolled up from the end of the log; 0 follows it.
@@ -670,6 +671,7 @@ impl App {
             workspace_path: workspace_path.to_owned(),
             mode: Mode::Confirm,
             settings: Settings::default(),
+            commands: Default::default(),
             session: SessionState::Starting,
             log: Vec::new(),
             scroll: 0,
@@ -696,6 +698,27 @@ impl App {
             quit_armed: None,
             quit: false,
         }
+    }
+
+    pub fn load_commands(&mut self, workspace: &std::path::Path) {
+        let (commands, warnings) = super::commands::load(workspace);
+        self.commands = commands;
+        for warning in warnings {
+            self.push(Line::from(span(clean_line(&warning), Tone::Warn)));
+        }
+    }
+
+    pub fn command_candidates(&self, prefix: &str) -> Vec<String> {
+        let mut names: Vec<_> = super::commands::BUILTINS
+            .iter()
+            .copied()
+            .chain(self.commands.keys().map(String::as_str))
+            .filter(|name| name.starts_with(prefix))
+            .map(str::to_owned)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     pub fn memory_up(&self) -> bool {
@@ -934,6 +957,16 @@ impl App {
                 return Vec::new();
             }
             KeyCode::Tab => {
+                if !editing_check && self.input.text.starts_with('/') && !self.input.text.contains(char::is_whitespace)
+                {
+                    let names = self.command_candidates(&self.input.text[1..]);
+                    if names.len() == 1 {
+                        self.input = Input::with(&format!("/{} ", names[0]));
+                    } else if !names.is_empty() {
+                        self.flash = Some(names.iter().map(|n| format!("/{n}")).collect::<Vec<_>>().join(" · "));
+                    }
+                    return Vec::new();
+                }
                 if let Some(task) = &self.task {
                     let indices: Vec<u32> = task.lanes.iter().map(|l| l.index).collect();
                     self.zoom = match self.zoom.and_then(|z| indices.iter().position(|&i| i == z)) {
@@ -1099,6 +1132,10 @@ impl App {
         if let Some(command) = line.strip_prefix('/') {
             return self.command(command);
         }
+        self.submit_task(line)
+    }
+
+    fn submit_task(&mut self, line: String) -> Vec<Action> {
         if self.task.as_ref().is_some_and(|t| t.phase == Phase::Running) {
             // Typed while the attempts run: more of what the task asks.
             self.echo_constraint(&line);
@@ -1153,7 +1190,7 @@ impl App {
                 return self.open_used(run);
             }
             "help" => {
-                self.viewer = Some(Viewer { title: "help".into(), lines: help(), scroll: 0 });
+                self.viewer = Some(Viewer { title: "help".into(), lines: self.help(), scroll: 0 });
             }
             "memory" => {
                 if !self.memory_up() {
@@ -1283,9 +1320,69 @@ impl App {
                 self.quit = true;
                 return vec![Action::Quit { keep: self.keep() }];
             }
-            other => self.flash = Some(format!("no command /{}; /help lists them", clean_line(other))),
+            other => {
+                if let Some(template) = self.commands.get(other).cloned() {
+                    if self.task.is_some() {
+                        self.flash = Some("a task is waiting; project commands start a new task".into());
+                        return Vec::new();
+                    }
+                    let saved = self.settings.clone();
+                    self.settings.attempts = saved.attempts.or(template.attempts);
+                    self.settings.budget_usd = match (saved.budget_usd, template.budget) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    self.settings.check = saved.check.clone().or(template.check.clone());
+                    let expanded = template.expand(arg);
+                    if expanded.trim().is_empty() {
+                        self.settings = saved;
+                        self.flash = Some("project command produced an empty task".into());
+                        return Vec::new();
+                    }
+                    let mut actions = self.submit_task(expanded);
+                    self.settings = saved;
+                    // A repository-supplied check needs a look before any attempt runs.
+                    if self.mode == Mode::Confirm {
+                        if let Some(task) = &mut self.task {
+                            if let Some(check) = &task.req.check {
+                                task.phase = Phase::Confirming;
+                                task.stops = vec!["project command check needs confirmation".into()];
+                                self.prompt = Some(Prompt::Check(DesignResponse {
+                                    command: Some(check.clone()),
+                                    files: Vec::new(),
+                                    rationale: "Check from the project command; baseline not run yet.".into(),
+                                    baseline: None,
+                                    usage: Default::default(),
+                                    cost_usd: 0.0,
+                                    uncounted_calls: 0,
+                                    remaining_budget_usd: task.req.budget_usd,
+                                    error: None,
+                                    cancelled: false,
+                                }));
+                                actions.clear();
+                            }
+                        }
+                    }
+                    return actions;
+                }
+                self.flash = Some(format!("no command /{}; /help lists them", clean_line(other)));
+            }
         }
         Vec::new()
+    }
+
+    fn help(&self) -> Vec<Line<'static>> {
+        let mut lines = help();
+        if !self.commands.is_empty() {
+            lines.push(Line::from(span("project commands", Tone::Dim)));
+            for (name, c) in &self.commands {
+                lines.push(Line::from(vec![
+                    span(format!("  /{name} {}  ", clean_line(&c.hint)), Tone::Shell),
+                    span(clean_line(&c.description), Tone::Plain),
+                ]));
+            }
+        }
+        lines
     }
 
     /// The attempts of a task are running.
@@ -2414,6 +2511,38 @@ mod tests {
         let trace = app.task.as_ref().unwrap().trace.clone();
         assert!(app.update(Msg::Designed { trace, result: Err("cancelled".into()), existing: vec![] }).is_empty());
         assert!(app.task.is_none() && app.prompt.is_none());
+    }
+
+    #[test]
+    fn project_commands_set_one_request_and_confirm_their_check() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".molt/commands");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("fix-issue.md"),
+            "---\ncheck: cargo test\nattempts: 3\nbudget: 2.5\n---\nFix issue $ARGUMENTS",
+        )
+        .unwrap();
+        std::fs::write(dir.join("help.md"), "wrong").unwrap();
+        let mut app = App::new(root.path().to_str().unwrap(), None);
+        app.load_commands(root.path());
+        up(&mut app);
+        app.settings.budget_usd = Some(1.0);
+        assert_eq!(app.command_candidates("fix-"), ["fix-issue"]);
+        assert!(type_in(&mut app, "/fix-issue 12").is_empty());
+        let task = app.task.as_ref().unwrap();
+        assert_eq!(task.req.task, "Fix issue 12");
+        assert_eq!(task.req.attempts, 3);
+        assert_eq!(task.req.budget_usd, Some(1.0));
+        assert_eq!(task.phase, Phase::Confirming);
+        assert_eq!(app.settings.check, None);
+        let actions = app.update(key(KeyCode::Enter));
+        assert!(matches!(&actions[0], Action::Run { req, .. } if req.check.as_deref() == Some("cargo test")));
+        app.task = None;
+        type_in(&mut app, "/help");
+        let viewer = app.viewer.as_ref().unwrap();
+        assert_eq!(viewer.title, "help");
+        assert!(plain(&viewer.lines).iter().any(|l| l.contains("/fix-issue")));
     }
 
     fn design() -> DesignResponse {
