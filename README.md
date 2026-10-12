@@ -794,7 +794,10 @@ ANSI. Light's eight text colors meet WCAG AA (4.5:1) against its white backgroun
 
 Ctrl+L clears and redraws the interface. On Unix, Ctrl+Z restores the terminal
 and suspends just the interface process; use the shell's `fg` to return. Its
-services keep working while the interface is stopped, and queued progress is
-shown after resuming. This requires a shell with job control and a foreground
+kernel and services run in an independent backend process group, so bus
+dispatch and later tool/model turns continue while the interface is stopped.
+Private pipes carry bounded frames; service stdout goes to the log, and output
+backpressure can drop progress previews while preserving final RPC settlement.
+Queued results are shown after resuming. This requires a shell with job control and a foreground
 process group (an orphaned process group can ignore SIGTSTP). Background color
 probing with OSC 11 is not implemented.

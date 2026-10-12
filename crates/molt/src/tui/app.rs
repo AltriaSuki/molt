@@ -97,7 +97,7 @@ impl Default for Settings {
 }
 
 /// Work for the runtime.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     StartSession,
     Redraw,
@@ -159,8 +159,9 @@ pub enum Action {
 }
 
 /// What happened.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum Msg {
+    #[serde(skip)]
     Key(KeyEvent),
     Paste(String),
     Tick,

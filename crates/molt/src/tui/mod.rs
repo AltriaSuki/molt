@@ -6,6 +6,7 @@
 //! comes back, with the keys, to the app.
 
 mod app;
+mod backend;
 mod preview;
 mod text;
 mod view;
@@ -92,7 +93,6 @@ async fn event_loop(
     stop: impl Future<Output = i32> + Send + 'static,
 ) -> anyhow::Result<Vec<String>> {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (sessions, mut started) = mpsc::unbounded_channel();
     let pause = Arc::new(Pause::default());
     read_terminal(tx.clone(), pause.clone());
     let ticks = tx.clone();
@@ -120,16 +120,13 @@ async fn event_loop(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => app.flash = Some(format!("could not load saved theme: {e}")),
     }
-    let mut rt =
-        Runtime { cfg: Arc::new(cfg), workspace, tx, sessions, session: None, starting: false, work: Vec::new() };
-    rt.exec(Action::StartSession);
+    let data_dir = cfg.kernel.data_dir.clone();
+    let mut backend = backend::Backend::start(cfg, workspace, tx).await?;
+    backend.send(&Action::StartSession).await?;
     let mut keep = Vec::new();
     loop {
         terminal.draw(|frame| view::draw(frame, &mut app))?;
-        let msg = tokio::select! {
-            Some(msg) = rx.recv() => msg,
-            Some(session) = started.recv() => rt.started(session),
-        };
+        let Some(msg) = rx.recv().await else { break };
         let mut actions = app.update(msg);
         while let Ok(msg) = rx.try_recv() {
             actions.extend(app.update(msg));
@@ -140,33 +137,29 @@ async fn event_loop(
                 Action::Redraw => redraw(terminal)?,
                 Action::Suspend => suspend(terminal, &pause)?,
                 Action::SaveTheme(theme) => {
-                    if let Err(e) = save_theme(&rt.cfg.kernel.data_dir, theme) {
+                    if let Err(e) = save_theme(&data_dir, theme) {
                         app.flash = Some(format!("theme changed but could not be saved: {e}"));
                     }
                 }
                 Action::Edit { text } => {
-                    let edited = edit_outside(terminal, &pause, &rt.cfg.kernel.data_dir, &text);
-                    let _ = rt.tx.send(Msg::Edited(edited));
+                    let edited = edit_outside(terminal, &pause, &data_dir, &text);
+                    app.update(Msg::Edited(edited));
                 }
-                action => rt.exec(action),
+                action => backend.send(&action).await?,
             }
         }
         if app.quit {
             break;
         }
     }
-    for work in rt.work.drain(..) {
-        work.abort();
-    }
-    if rt.starting {
-        if let Some(Ok(session)) = started.recv().await {
-            rt.session = Some(session);
-        }
-    }
-    if let Some(session) = rt.session.take() {
-        session.shutdown(&keep).await;
-    }
+    backend.shutdown(&keep).await?;
     Ok(keep)
+}
+
+/// Internal child entry point. Standard input/output are private framed pipes,
+/// not a terminal or the capability bus.
+pub async fn serve_backend() -> anyhow::Result<()> {
+    backend::serve().await
 }
 
 /// Keeps the terminal reader off the terminal while another program has it.
