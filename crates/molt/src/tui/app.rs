@@ -1350,6 +1350,7 @@ impl App {
                                 self.prompt = Some(Prompt::Check(DesignResponse {
                                     command: Some(check.clone()),
                                     files: Vec::new(),
+                                    suite: None,
                                     rationale: "Check from the project command; baseline not run yet.".into(),
                                     baseline: None,
                                     usage: Default::default(),
