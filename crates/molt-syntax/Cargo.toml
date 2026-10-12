@@ -4,6 +4,7 @@ description = "Source languages Molt can parse with tree-sitter, and the syntax 
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 tree-sitter.workspace = true

@@ -166,26 +166,38 @@ fn errors(lang: Lang, source: &str, deadline: Instant) -> Option<Vec<Found>> {
     )?;
     let root = tree.root_node();
     let mut nodes = Vec::new();
-    if root.has_error() {
-        collect(root, &mut nodes);
+    if root.has_error() && !collect(root, &mut nodes, deadline) {
+        return None;
     }
     let lines: Vec<&str> = source.lines().collect();
     Some(nodes.into_iter().map(|node| found(node, bytes, &lines)).collect())
 }
 
 /// The outermost `ERROR` and every `MISSING` node under `node`, in order.
-fn collect<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>) {
-    if out.len() >= MAX_SCANNED {
-        return;
-    }
-    if node.is_missing() || node.is_error() {
-        out.push(node);
-        return;
-    }
+fn collect<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>, deadline: Instant) -> bool {
+    // A deeply nested file is untrusted input; walk with the tree cursor,
+    // without using one Rust stack frame per syntax node.
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.has_error() {
-            collect(child, out);
+    loop {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let current = cursor.node();
+        if current.is_missing() || current.is_error() {
+            out.push(current);
+            if out.len() >= MAX_SCANNED {
+                return true;
+            }
+        } else if current.has_error() && cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return true;
+            }
         }
     }
 }
@@ -225,6 +237,20 @@ fn clip(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deeply_nested_errors_do_not_exhaust_the_service_stack() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let source = format!("fn f() {{ let x = {}1{}; }}", "(".repeat(4000), ")".repeat(3999));
+                let found = introduced("deep.rs", None, &source);
+                assert!(!found.is_empty());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     #[test]
     fn languages_are_chosen_by_extension() {
