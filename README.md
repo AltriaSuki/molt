@@ -77,6 +77,7 @@ sender from that.
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
 | A skill source cannot approve itself; only the CLI manages activation and withdrawal preserves evidence | `skills::tests::drafts_need_independent_evidence_and_disable_cannot_be_undone_by_learning`, `tests/service.rs::an_agent_cannot_manage_or_promote_its_own_skills` |
 | Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
+| Offline embedding models are hash-pinned and cannot reintroduce forgotten or cross-project notes | `semantic::tests::pinned_models_retrieve_synonyms_and_reject_changed_files`, `semantic::tests::synonyms_are_recalled_with_scores_and_snapshots_survive_forgetting` |
 
 ## Quick start
 
@@ -958,7 +959,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.
-- Recall matches keywords (with stemming), not meaning: there is no vector index, since the Anthropic API has no embeddings endpoint. A note worded differently from the task can be missed; the strongest notes about the project are always shown.
+- Default recall matches keywords with stemming, so differently worded notes can be missed. Optional offline word-vector recall needs a reviewed hash-pinned local model; its mean-pooling backend does not understand word order or supply a pretrained vocabulary.
 - Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. Only notes you write or promote yourself are shared between projects. Clones of one project share its data dir, so molt runs in one of them at a time.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.
@@ -973,7 +974,7 @@ Link loss ends concurrent admission immediately, even if every slot is occupied.
 
 Dropping the SDK service itself closes every pending call's waiter and requests cancellation without awaiting a reply. Background cancellation after a drop is best effort and bounded to one second, so a stalled transport cannot retain the link forever. Remote cancellation and unsettled usage remain unconfirmed.
 
-The planner gives each attempt its own cancellation token. A winner stops competing attempts; budget exhaustion or unknown model cost stops new actions throughout the run. Shell cancellation and timeout send TERM to the process group, allow 500 ms for cleanup, then send KILL and reap the leader before replying. Service shutdown uses the same grace. Process groups alone cannot contain a program that deliberately creates a new session; OS isolation is tracked by #9.
+The planner gives each attempt its own cancellation token. A winner stops competing attempts; budget exhaustion or unknown model cost stops new actions throughout the run. The one exception is a call cancelled because its attempt was stopped while the run went on, such as one that lost the race: its cost is unknown too, and is reported in `uncounted_calls`, but it does not stop the winner's review and apply, so a run can pass its budget by up to one call for each attempt it stopped. Shell cancellation and timeout send TERM to the process group, allow 500 ms for cleanup, then send KILL and reap the leader before replying. Service shutdown uses the same grace. Process groups alone cannot contain a program that deliberately creates a new session; OS isolation is tracked by #9.
 
 The gateway closes its local HTTP request on cancellation and audits a correlated settlement record with `local_stopped`, `remote_cancel_confirmed`, `usage` and `cost_usd`. Anthropic Messages has no remote cancellation acknowledgement here, so remote cancellation and missing usage remain unknown. A completion already received wins the race and is counted once. After a kernel timeout, one authenticated late model reply can still be audited for up to one hour, without delivering a second run result; the late-settlement registry is bounded and temporary, while accepted records persist in the audit log. `molt audit --help` describes querying the log.
 
@@ -1073,6 +1074,35 @@ automatic promotion. Real task success, cost and latency comparisons with a
 no-skill baseline remain to be run under an explicit evaluation budget. Stored
 independent evidence records each run's wall duration, known cost subtotal and
 unknown calls; these alone do not prove a workflow's causal benefit.
+
+## Offline semantic notes (optional)
+
+Build with `cargo build --workspace --features molt/semantic`. In a trusted
+memory-service configuration, add `--embedding-model /outside/project/model.json`
+and `--embedding-sha256 HASH` to `molt-memory`'s arguments. No model is downloaded;
+its SHA-256 is required and checked before parsing. The model is a data-only JSON
+export of pretrained word vectors, with `format: "mean-word-vectors-v1"`,
+`dimensions` (1–1024), and a `vectors` map of lowercase words to finite arrays.
+Mean pooling and cosine similarity run locally on CPU. This first backend does
+not run MiniLM/ONNX, understand word order or supply a pretrained vocabulary.
+Use a licensed, reviewed vocabulary suitable for the project's languages.
+
+`--semantic-weight` (default 0.5) mixes normalized FTS5 relevance and cosine
+similarity; `--semantic-min-similarity` (default 0.4) admits non-keyword matches.
+Confidence and recency retain their weights. Empty/OOV queries keep lexical
+behavior. Without the feature/configuration, recall is unchanged. Snapshot
+reasons record lexical relevance, similarity, weight and model SHA-256, so old
+snapshots retain the exact evidence even after correction or forgetting.
+
+SQLite caches note vectors by model and text hashes. Writes/corrections refresh
+the derived cache, and recall retries invalid or stale entries. Forgotten,
+retracted and review-pending notes stay excluded before semantic selection.
+Model input is bounded to 64 MiB, 200000 vocabulary words and 1024 dimensions;
+semantic databases are limited to 10000 live notes. Changing the model hash
+keeps old snapshot evidence and reindexes the new model. No additional key or
+network access is used. The lightweight backend should be compared against
+keyword-only recall on real tasks before claiming a success-rate improvement;
+fixture synonym recall demonstrates functionality, not production quality.
 
 ## Project task commands
 

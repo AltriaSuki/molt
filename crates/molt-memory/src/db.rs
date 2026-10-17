@@ -18,6 +18,7 @@ const SCHEMA_VERSION: i64 = 2;
 /// project model's map and lookups) go through a second connection with
 /// [`Db::read`], so they hold up neither writes nor other reads of notes.
 pub struct Db {
+    semantic: Option<std::sync::Arc<crate::semantic::Model>>,
     conn: Mutex<Connection>,
     /// `None` for a database in memory, which one connection must serve.
     reader: Option<Mutex<Connection>>,
@@ -84,14 +85,33 @@ impl Db {
         conn.execute_batch(crate::review::SCHEMA)?;
         conn.execute_batch(crate::skills::SCHEMA)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        Ok(Self { conn: Mutex::new(conn), reader: None })
+        Ok(Self { conn: Mutex::new(conn), reader: None, semantic: None })
+    }
+
+    pub fn enable_semantic(&mut self, model: crate::semantic::Model) -> anyhow::Result<()> {
+        self.with(|c| model.sync(c))?;
+        self.semantic = Some(std::sync::Arc::new(model));
+        Ok(())
+    }
+
+    pub(crate) fn semantic(&self) -> Option<&crate::semantic::Model> {
+        self.semantic.as_deref()
     }
 
     /// Run `f` with the connection. A panic in an earlier `f` does not lock
     /// the database for good: each write is one transaction, so a panic
     /// mid-way leaves nothing half done.
     pub fn with<R>(&self, f: impl FnOnce(&mut Connection) -> R) -> R {
-        f(&mut self.conn.lock().unwrap_or_else(PoisonError::into_inner))
+        let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        let result = f(&mut conn);
+        if let Some(model) = &self.semantic {
+            // Keep newly written/corrected vectors current. A later recall retries
+            // and returns any cache error rather than accepting stale text.
+            if let Err(e) = model.sync(&conn) {
+                tracing::warn!(error = %e, "embedding cache update failed");
+            }
+        }
+        result
     }
 
     /// Run `f`, which only reads, with the reading connection, in one

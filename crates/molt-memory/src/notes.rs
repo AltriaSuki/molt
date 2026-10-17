@@ -751,7 +751,7 @@ pub(crate) fn recall(db: &Db, req: &RecallRequest, now: u64) -> Result<Vec<Recal
 /// [`recall`], over the notes `scope` names.
 pub(crate) fn recall_in(db: &Db, req: &RecallRequest, scope: Scope, now: u64) -> Result<Vec<Recalled>, RemoteError> {
     validate_recall(req)?;
-    db.with(|conn| select(conn, req, scope, now)).map_err(error::db)
+    db.with(|conn| select(conn, req, scope, now, db.semantic())).map_err(error::db)
 }
 
 pub(crate) fn validate_recall(req: &RecallRequest) -> Result<(), RemoteError> {
@@ -774,7 +774,9 @@ pub(crate) fn select(
     req: &RecallRequest,
     scope: Scope,
     now: u64,
+    model: Option<&crate::semantic::Model>,
 ) -> rusqlite::Result<Vec<Recalled>> {
+    let model = model.filter(|m| m.weight > 0.0);
     let k = req.k.unwrap_or(DEFAULT_K).clamp(1, MAX_K) as usize;
     let fts = fts_query(&req.query);
     if fts.is_none() && !req.query.trim().is_empty() {
@@ -797,7 +799,7 @@ pub(crate) fn select(
     }
     let columns = COLUMNS.split(", ").map(|c| format!("n.{c}")).collect::<Vec<_>>().join(", ");
     let min = req.min_confidence.unwrap_or(0.0);
-    let candidates: Vec<(Note, f64, molt_api::memory::NoteDetails)> = {
+    let mut candidates: Vec<(Note, f64, molt_api::memory::NoteDetails)> = {
         let details = "COALESCE((SELECT details FROM note_details WHERE note = n.id), '{}')";
         let sql = match &fts {
                 Some(_) => format!(
@@ -822,27 +824,66 @@ pub(crate) fn select(
         rows.collect::<rusqlite::Result<_>>()?
     };
 
+    let query_vector = model.and_then(|m| m.embed(&req.query));
+    if let (Some(model), Some(_)) = (model, &query_vector) {
+        model.sync(conn)?;
+        // Apply exactly the same state/scope filters to semantic candidates.
+        let details = "COALESCE((SELECT details FROM note_details WHERE note = n.id), '{}')";
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {columns}, 0.0, {details} FROM notes n WHERE {filter} AND ?2 IS NULL ORDER BY n.id LIMIT 10001"
+        ))?;
+        let extra: Vec<_> = stmt
+            .query_map(params![req.workspace, None::<String>, min], |r| {
+                let details: String = r.get(15)?;
+                Ok((note_from(r)?, 0.0, crate::review::decode(&details)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut ids: HashSet<_> = candidates.iter().map(|(n, _, _)| n.id.clone()).collect();
+        for (note, rel, details) in extra {
+            if let Some(v) = model.cached(conn, &note.id, &note.text)? {
+                if crate::semantic::cosine(&v, query_vector.as_ref().expect("present")) >= model.min_similarity
+                    && ids.insert(note.id.clone())
+                {
+                    candidates.push((note, rel, details));
+                }
+            }
+        }
+    }
+
     let best = candidates.iter().map(|(_, rel, _)| *rel).fold(0.0, f64::max);
     let matched = fts.is_some();
     let mut ranked: Vec<Recalled> = candidates
         .into_iter()
         .map(|(note, rel, details)| {
             let recency = recency(note.updated_ms as i64, now);
-            let score = if matched {
+            let mut score = if matched {
                 let relevance = if best > 0.0 { rel / best } else { 0.0 };
                 0.6 * relevance + 0.25 * note.confidence + 0.15 * recency
             } else {
                 0.7 * note.confidence + 0.3 * recency
             };
+            let similarity = match (model, &query_vector) {
+                (Some(m), Some(q)) => m.cached(conn, &note.id, &note.text)?.map(|v| crate::semantic::cosine(&v, q)),
+                _ => None,
+            };
+            if let (Some(m), Some(similarity)) = (model, similarity) {
+                let lexical = if best > 0.0 { rel / best } else { 0.0 };
+                score = 0.6 * ((1.0 - m.weight) * lexical + m.weight * similarity.max(0.0))
+                    + 0.25 * note.confidence
+                    + 0.15 * recency;
+            }
             let reason = RecallReason {
                 keywords: fts.clone(),
                 relevance: matched.then_some(if best > 0.0 { rel / best } else { 0.0 }),
                 confidence: note.confidence,
                 recency,
+                similarity,
+                model_sha256: query_vector.as_ref().and(model.map(|m| m.hash().to_owned())),
+                semantic_weight: query_vector.as_ref().and(model.map(|m| m.weight)),
             };
-            Recalled { note, score, reason, details, layer: molt_api::memory::Layer::Project }
+            Ok(Recalled { note, score, reason, details, layer: molt_api::memory::Layer::Project })
         })
-        .collect();
+        .collect::<rusqlite::Result<_>>()?;
     ranked.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.note.id.cmp(&b.note.id)));
     ranked.truncate(k);
     Ok(ranked)
