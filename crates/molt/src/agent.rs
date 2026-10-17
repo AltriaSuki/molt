@@ -768,6 +768,10 @@ pub fn describe(event: &Progress) -> String {
             }
             line
         }
+        Progress::CheckReady { command: None, rubric, .. } if !rubric.is_empty() => {
+            let numbered: Vec<String> = rubric.iter().enumerate().map(|(i, c)| format!("{}. {c}", i + 1)).collect();
+            format!("no command checks this task; a model judges the result against: {}", numbered.join(" "))
+        }
         Progress::CheckReady { command: None, designed: true, .. } => {
             "no automated check fits this task; the result will be unverified".to_owned()
         }
@@ -776,6 +780,12 @@ pub fn describe(event: &Progress) -> String {
         }
         Progress::AttemptStarted { attempt, .. } => format!("attempt {attempt}: started"),
         Progress::ToolCall { attempt, detail, .. } => format!("attempt {attempt}: {detail}"),
+        Progress::CheckRan { attempt, passed: true, judged: true, .. } => {
+            format!("attempt {attempt}: the judge found every criterion met")
+        }
+        Progress::CheckRan { attempt, passed: false, judged: true, tail, .. } => {
+            format!("attempt {attempt}: judged: {tail}")
+        }
         Progress::CheckRan { attempt, passed: true, .. } => format!("attempt {attempt}: check passed"),
         Progress::CheckRan { attempt, passed: false, exit_code: Some(code), .. } => {
             format!("attempt {attempt}: check failed (exit code {code})")
@@ -841,6 +851,21 @@ pub fn report(resp: &RunResponse) -> String {
         let by = if check.designed { " (designed by the planner)" } else { "" };
         lines.push(format!("check: {}{by}", check.command));
     }
+    if !resp.rubric.is_empty() {
+        lines.push("criteria (judged by a model, no command checked them):".to_owned());
+        for (i, c) in resp.rubric.iter().enumerate() {
+            match resp.judgement.iter().find(|f| f.criterion == c.text) {
+                Some(f) => {
+                    let mark = if f.met { "met" } else { "NOT met" };
+                    lines.push(format!("  {}. [{mark}] {}", i + 1, c.text));
+                    if !f.reason.trim().is_empty() {
+                        lines.push(format!("     {}", f.reason.trim()));
+                    }
+                }
+                None => lines.push(format!("  {}. {}", i + 1, c.text)),
+            }
+        }
+    }
     if resp.changes.is_empty() {
         lines.push("changes: none".to_owned());
     } else {
@@ -885,6 +910,9 @@ pub fn selection_lines(resp: &RunResponse) -> Vec<String> {
 /// What a passing candidate was compared on, in a few words.
 pub fn candidate_scores(c: &Candidate) -> String {
     let mut parts = Vec::new();
+    if let Some(met) = c.criteria_met {
+        parts.push(format!("{met} criteria met"));
+    }
     match c.suite_passed {
         Some(true) => parts.push("suite passed".to_owned()),
         Some(false) => parts.push("suite failed".to_owned()),
@@ -967,6 +995,7 @@ pub fn outcome_name(outcome: Outcome) -> &'static str {
         Outcome::Passed => "passed",
         Outcome::Failed => "failed",
         Outcome::Unverified => "unverified",
+        Outcome::Judged => "passed (judged by a model)",
     }
 }
 
@@ -1273,9 +1302,10 @@ mod tests {
                 command: Some("sh check.sh".into()),
                 files: vec!["check.sh".into()],
                 designed: true,
+                rubric: vec![],
             },
-            Progress::CheckReady { run: run.clone(), command: None, files: vec![], designed: true },
-            Progress::CheckReady { run: run.clone(), command: None, files: vec![], designed: false },
+            Progress::CheckReady { run: run.clone(), command: None, files: vec![], designed: true, rubric: vec![] },
+            Progress::CheckReady { run: run.clone(), command: None, files: vec![], designed: false, rubric: vec![] },
             Progress::ToolCall {
                 run: run.clone(),
                 attempt: 1,
@@ -1283,7 +1313,14 @@ mod tests {
                 tool: "read_file".into(),
                 detail: "read a.rs".into(),
             },
-            Progress::CheckRan { run: run.clone(), attempt: 0, passed: false, exit_code: Some(1), tail: "boom".into() },
+            Progress::CheckRan {
+                run: run.clone(),
+                attempt: 0,
+                passed: false,
+                exit_code: Some(1),
+                tail: "boom".into(),
+                judged: false,
+            },
             Progress::AttemptFinished { run, attempt: 1, status: AttemptStatus::Cancelled },
         ]
         .iter()
@@ -1322,6 +1359,8 @@ mod tests {
             checkpoint: None,
             requirements: vec![],
             selection: None,
+            rubric: vec![],
+            judgement: vec![],
         };
         assert_eq!(
             report(&resp),
@@ -1345,6 +1384,7 @@ mod tests {
         resp.review = None;
         let candidate = |attempt, suite_passed, lines_changed, verdict| planner::Candidate {
             attempt,
+            criteria_met: None,
             suite_passed,
             lines_changed,
             files_changed: 1,
@@ -1364,6 +1404,37 @@ mod tests {
             report(&resp)
         );
         resp.selection = None;
+        resp.outcome = Outcome::Judged;
+        resp.rubric = vec![
+            planner::Criterion { text: "Cites sources.".into(), command: None },
+            planner::Criterion { text: "Under 500 words.".into(), command: Some("wc".into()) },
+        ];
+        resp.judgement = vec![
+            planner::Finding {
+                criterion: "Cites sources.".into(),
+                met: true,
+                reason: "Each claim links.".into(),
+                by_command: false,
+            },
+            planner::Finding {
+                criterion: "Under 500 words.".into(),
+                met: true,
+                reason: String::new(),
+                by_command: true,
+            },
+        ];
+        let shown = report(&resp);
+        assert!(shown.starts_with("outcome: passed (judged by a model)\n"), "{shown}");
+        assert!(
+            shown.contains(
+                "criteria (judged by a model, no command checked them):\n  1. [met] Cites sources.\n     Each claim \
+                 links.\n  2. [met] Under 500 words.\n"
+            ),
+            "{shown}"
+        );
+        resp.outcome = Outcome::Passed;
+        resp.rubric.clear();
+        resp.judgement.clear();
         resp.changes = vec![Change { path: "\x1b[1Aevil".into(), kind: ChangeKind::Added }];
         resp.summary = "Done.\x1b]0;title\x07\n".into();
         let shown = report(&resp);

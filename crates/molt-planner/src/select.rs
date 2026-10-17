@@ -5,7 +5,8 @@ use molt_api::fs::DiffResponse;
 use molt_api::planner::Candidate;
 
 /// The ranking rule, as reported with the result.
-pub(crate) const RULE: &str = "keeps the project's suite passing (when there is one), then fewer changed lines, \
+pub(crate) const RULE: &str = "meets more of the rubric's criteria (when there is one), then keeps the project's \
+                               suite passing (when there is one), then fewer changed lines, \
                                then fewer changed files, then the earlier to pass; with review on, the best ranked \
                                one the reviewer approves wins";
 
@@ -13,6 +14,7 @@ pub(crate) const RULE: &str = "keeps the project's suite passing (when there is 
 pub(crate) fn candidate(attempt: u32, suite_passed: Option<bool>, diff: &DiffResponse) -> Candidate {
     Candidate {
         attempt,
+        criteria_met: None,
         suite_passed,
         lines_changed: changed_lines(&diff.patch),
         files_changed: u32::try_from(diff.changes.len()).unwrap_or(u32::MAX),
@@ -23,18 +25,21 @@ pub(crate) fn candidate(attempt: u32, suite_passed: Option<bool>, diff: &DiffRes
 
 /// The sort key: lower is better. A suite that could not be run ranks
 /// between one that passed and one that failed.
-pub(crate) fn rank(c: &Candidate) -> (u8, u32, u32) {
+pub(crate) fn rank(c: &Candidate) -> (std::cmp::Reverse<u32>, u8, u32, u32) {
     let suite = match c.suite_passed {
         Some(true) => 0,
         None => 1,
         Some(false) => 2,
     };
-    (suite, c.lines_changed, c.files_changed)
+    (std::cmp::Reverse(c.criteria_met.unwrap_or(0)), suite, c.lines_changed, c.files_changed)
 }
 
 /// What a candidate scored, in words.
 pub(crate) fn describe(c: &Candidate) -> String {
     let mut parts = Vec::new();
+    if let Some(met) = c.criteria_met {
+        parts.push(format!("{met} criteria met"));
+    }
     match c.suite_passed {
         Some(true) => parts.push("the suite passed".to_owned()),
         Some(false) => parts.push("the suite failed".to_owned()),
@@ -122,6 +127,7 @@ mod tests {
     fn a_passing_suite_outranks_a_smaller_change() {
         let c = |suite_passed, lines_changed, files_changed| Candidate {
             attempt: 0,
+            criteria_met: None,
             suite_passed,
             lines_changed,
             files_changed,
