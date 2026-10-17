@@ -2536,6 +2536,15 @@ pub fn memory_lines(r: &Recalled) -> Vec<Line<'static>> {
         fields.push(format!("needs review: {}", r.details.needs_review.join(", ")));
     }
     fields.push(format!("review reason: {}", if r.details.reason.is_empty() { "none" } else { &r.details.reason }));
+    if let Some(similarity) = r.reason.similarity {
+        fields.push(format!("cosine similarity: {similarity:.3}"));
+    }
+    if let Some(hash) = &r.reason.model_sha256 {
+        fields.push(format!("embedding model SHA-256: {hash}"));
+    }
+    if let Some(weight) = r.reason.semantic_weight {
+        fields.push(format!("semantic weight: {weight:.3}"));
+    }
     for d in &r.details.dependencies {
         fields.push(format!("depends on: {} · sha256 {}", d.path, d.sha256));
     }
