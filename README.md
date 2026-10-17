@@ -42,6 +42,7 @@ that starts with milestone 5.
 | File and shell services | `fs.*` and `shell.*`: files, forks, diffs, merges and commands, confined to a root | `molt-tools` |
 | Planner | `planner.run`: check first, parallel attempts, verify, apply; `planner.control` steers a run that is going | `molt-planner` |
 | Memory | `memory.*`: notes with provenance, learned from finished runs; the project model (definitions, references, repo map) | `molt-memory` |
+| Web service | `web.fetch`: pages from the hosts the user allows, over https, as text; off unless allowed | `molt-web` |
 
 The kernel never trusts the sender named in a message. The transport
 authenticates each service's endpoint (a per-service secret on Unix sockets,
@@ -72,6 +73,7 @@ sender from that.
 | A benchmark starts a run only while what it spent, plus the whole `--task-usd` of that run and of each run in flight, fits in `--max-usd`; it refuses models it has no price for | `crates/molt-bench/src/run.rs` (`runs_stop_before_they_could_pass_the_budget`, `a_run_of_unknown_cost_stops_the_benchmark`), `crates/molt-bench/src/cli.rs` (`a_model_without_a_price_is_refused`) |
 | A model with no price stays of unknown cost and stops the run; prices come only from the user's environment or data directory, never from a project, and a download that does not validate replaces nothing | `crates/molt-gateway/src/prices.rs` (`the_data_directory_holds_the_snapshot_and_nothing_else_is_read`, `a_download_that_does_not_validate_is_refused`, `malformed_declared_prices_stop_startup_and_name_the_item`), `crates/molt-gateway/tests/gateway.rs` (`a_snapshot_prices_a_third_party_model…`) |
 | `molt do --commit` commits exactly the files the run merged and leaves what the user staged alone; `molt undo` takes it back with a new commit, never touching later changes, and the undone run no longer lends any note confidence | `crates/molt/src/git.rs` (`a_run_commit_holds_only_the_merged_files…`, `undo_refuses_files_that_changed_since_the_run`), `crates/molt/tests/agent.rs` (`a_committed_run_can_be_undone_and_memory_stops_counting_it`), `crates/molt-memory/src/notes.rs` (`an_undone_run_lends_no_note_confidence…`) |
+| The agent reads the web only when the user allows hosts: over https, from those hosts after every redirect, never from a loopback, private or link-local address; commands stay offline, and every page read is in the audit log | `crates/molt-web/src/allow.rs` (`only_https_urls_on_allowed_hosts_pass`, `only_public_addresses_are_public`), `crates/molt-web/tests/web.rs` (`hosts_off_the_list_are_refused_before_any_request_and_on_every_redirect`), `crates/molt/tests/agent.rs` (`allowed_web_hosts_start_the_web_service_and_offer_fetch_url_only_then`), `crates/molt-planner/tests/planner.rs` (`fetch_url_is_offered_only_to_a_planner_that_may_read_the_web`) |
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
 | Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
 
@@ -578,6 +580,34 @@ molt do "plan five days in Kyoto" --project "Japan trip" --no-check
 of its own, `<registry dir>/projects/<id>/files`, which is where its
 research and writing end up. With `--config`, the registry is left out and
 notes are kept by the workspace's path, as before.
+### Reading the web
+
+Commands have no network, so an attempt cannot look up an unfamiliar API.
+`--allow-web HOST` (repeatable, for `molt do`, `molt resume` and the
+interface) lets it read pages from those hosts: `docs.rs` is that host,
+`*.python.org` any host below python.org. It starts a `web` service of its
+own and gives the planner the capability to call it; attempts and the check
+designer are then offered `fetch_url`, and without the flag they are not.
+The service fetches over https on the default port only, checks every
+redirect against the list, resolves names itself and never connects to a
+loopback, private, link-local or other non-public address, and uses no
+proxy. It reads at most 2 MiB of a page and returns at most 100 KB of text,
+with HTML turned into plain text and links kept; other content that is not
+text is refused. The model is told the page is data, not instructions. Each
+URL and the text read from it go through the kernel, so the audit log has
+them for replaying a run without the network. In a config file, the
+same is a protected service:
+
+```toml
+[[service]]
+name = "web"
+tier = "protected"
+exec = { command = "molt-web", args = ["--allow", "docs.rs", "--allow", "*.python.org"] }
+provides = ["web.*"]
+```
+
+with `{ target = "web.fetch", budget = { calls = 1000000 } }` in the
+planner's `requests`.
 
 ## Memory
 
@@ -932,6 +962,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.
 - Model prices are as current as the last `molt prices update` (or the release's snapshot) and as right as the community list they came from; a price that changes mid-run is not picked up until the next run. Models that LiteLLM lists only with tiered or regional prices, such as some Qwen models, have no price until declared in `MOLT_MODEL_PRICES`.
+- The web service has no search: an attempt reads pages whose URL it knows or finds in pages it read. It does not use a proxy, so a network that only reaches the web through one cannot use it, and it reads pages as served, without running their scripts.
 
 ### Cancellation and model settlement
 

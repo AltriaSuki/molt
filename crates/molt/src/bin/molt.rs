@@ -182,6 +182,12 @@ struct RunArgs {
     /// Trusted shell sandbox JSON policy outside the project and scratch.
     #[arg(long)]
     sandbox_policy: Option<PathBuf>,
+    /// Let the agent read web pages from this host (repeatable): `docs.rs`,
+    /// or `*.python.org` for the hosts below it. Pages are fetched over
+    /// https by a service of their own and recorded in the audit log;
+    /// commands still have no network.
+    #[arg(long, value_name = "HOST")]
+    allow_web: Vec<String>,
     /// Run without memory: no project map or notes for the model, and
     /// nothing learned from the run.
     #[arg(long)]
@@ -232,6 +238,10 @@ struct UiArgs {
     /// runs (repeatable).
     #[arg(long, value_name = "NAME", value_parser = env_name)]
     pass_env: Vec<String>,
+    /// Let the agent read web pages from this host (repeatable): `docs.rs`,
+    /// or `*.python.org` for the hosts below it.
+    #[arg(long, value_name = "HOST")]
+    allow_web: Vec<String>,
 }
 
 #[derive(Args)]
@@ -485,6 +495,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                 project: args.project,
                 data_dir: args.data_dir,
                 pass_env: args.pass_env,
+                allow_web: args.allow_web,
             };
             for fork in molt::tui::run(opts).await? {
                 eprintln!("kept: {}", agent::printable(&fork));
@@ -672,6 +683,7 @@ fn prepare(config: Option<&Path>, args: &RunArgs) -> anyhow::Result<(Config, Str
     if args.no_memory {
         cfg.services.retain(|s| s.name.as_str() != agent::MEMORY);
     }
+    agent::allow_web(&mut cfg, &args.allow_web)?;
     if std::env::var_os("RUST_LOG").is_none() {
         for svc in &mut cfg.services {
             svc.env.entry("RUST_LOG".into()).or_insert_with(|| "warn".into());
