@@ -11,6 +11,7 @@ mod commands;
 mod notice;
 mod preview;
 mod text;
+mod transcript;
 mod view;
 
 use std::future::Future;
@@ -159,6 +160,18 @@ async fn event_loop(
                         let _ = tx.send(list_files(&root));
                     });
                 }
+                Action::ReadAudit { trace, cursor } => {
+                    let (tx, log) = (lister.clone(), data_dir.join("audit.jsonl"));
+                    tokio::task::spawn_blocking(move || {
+                        let result = read_audit(&log, &trace, cursor);
+                        let _ = tx.send(Msg::Audit { trace, result });
+                    });
+                }
+                Action::Export { text } => {
+                    if let Err(e) = edit_outside(terminal, &pause, &data_dir, "transcript", &text) {
+                        app.flash = Some(format!("the editor failed: {}", text::clean_line(&e)));
+                    }
+                }
                 Action::Redraw => redraw(terminal)?,
                 Action::Suspend => {
                     suspend(terminal, &pause)?;
@@ -171,7 +184,7 @@ async fn event_loop(
                     }
                 }
                 Action::Edit { text } => {
-                    let edited = edit_outside(terminal, &pause, &data_dir, &text);
+                    let edited = edit_outside(terminal, &pause, &data_dir, "task", &text);
                     app.update(Msg::Edited(edited));
                 }
                 action => backend.send(&action).await?,
@@ -381,7 +394,9 @@ impl Runtime {
             | Action::Suspend
             | Action::SaveTheme(_)
             | Action::Alert { .. }
-            | Action::ListFiles => {}
+            | Action::ListFiles
+            | Action::ReadAudit { .. }
+            | Action::Export { .. } => {}
         }
     }
 
@@ -404,7 +419,13 @@ impl Runtime {
 
 /// `text` as the user leaves it in `$VISUAL` or `$EDITOR` (`vi` without
 /// either), run on the terminal while the interface steps aside.
-fn edit_outside(terminal: &mut DefaultTerminal, pause: &Pause, dir: &Path, text: &str) -> Result<String, String> {
+fn edit_outside(
+    terminal: &mut DefaultTerminal,
+    pause: &Pause,
+    dir: &Path,
+    name: &str,
+    text: &str,
+) -> Result<String, String> {
     use std::io::Write;
 
     let editor = ["VISUAL", "EDITOR"]
@@ -412,7 +433,7 @@ fn edit_outside(terminal: &mut DefaultTerminal, pause: &Pause, dir: &Path, text:
         .find_map(|v| std::env::var(v).ok().filter(|e| !e.trim().is_empty()))
         .unwrap_or_else(|| "vi".into());
     // In the private data dir: the draft may hold anything the user typed.
-    let path = dir.join(format!("task-{}.md", std::process::id()));
+    let path = dir.join(format!("{name}-{}.md", std::process::id()));
     std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -511,6 +532,39 @@ fn list_files(root: &Path) -> Msg {
     Msg::Files { files, complete }
 }
 
+/// Bytes of log looked through per read of the audit log, so a read hands
+/// back a place to read on from even where the run has nothing.
+const AUDIT_SCAN: u64 = 1 << 20;
+/// Messages handed to the app at once; the app asks for the rest.
+const AUDIT_ENTRIES: usize = 2_000;
+
+/// Run `trace`'s messages in the audit log at `log` from `cursor` on, read
+/// directly as `molt audit` does, cut down to what the transcript shows.
+fn read_audit(log: &Path, trace: &molt_proto::TraceId, cursor: Option<u64>) -> Result<app::AuditPage, String> {
+    use molt_kernel::audit::{read_trace_within, Scan, MAX_READ_PAGE};
+    use molt_proto::audit::ReadRequest;
+
+    let mut req = ReadRequest::new(trace.clone());
+    req.max_bytes = Some(MAX_READ_PAGE);
+    req.cursor = cursor;
+    let mut entries = Vec::new();
+    loop {
+        let page = read_trace_within(log, &req, Scan { until: None, max_bytes: AUDIT_SCAN })
+            .map_err(|e| format!("{}: {e}", log.display()))?;
+        entries.extend(page.entries.into_iter().map(|mut e| {
+            transcript::slim(&mut e);
+            e
+        }));
+        // The end of the log: the last line-aligned place is where to read on
+        // next time, and what was read again from there is skipped.
+        let Some(next) = page.next else { return Ok(app::AuditPage { entries, cursor: req.cursor, more: false }) };
+        req.cursor = Some(next);
+        if entries.len() >= AUDIT_ENTRIES {
+            return Ok(app::AuditPage { entries, cursor: req.cursor, more: true });
+        }
+    }
+}
+
 /// Escape sequences straight to the terminal, between frames; best effort.
 fn emit(bytes: &str) {
     use std::io::Write;
@@ -581,5 +635,46 @@ mod tests {
         let Msg::Files { files, complete } = list_files(&root) else { panic!() };
         assert!(complete);
         assert_eq!(files, [".gitignore", "src/lexer.rs"]);
+    }
+
+    #[tokio::test]
+    async fn a_runs_transcript_is_read_from_the_audit_log_and_read_on_from_where_it_stopped() {
+        use molt_kernel::audit::{AuditEvent, AuditLog};
+        use molt_proto::TraceId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let trace = TraceId::random();
+        let mut log = transcript::tests::two_turns(&trace);
+        let last = log.pop().unwrap();
+        let audit = AuditLog::open(&path, false).await.unwrap();
+        let other = transcript::tests::two_turns(&TraceId::random());
+        for entry in other.into_iter().take(2).chain(log) {
+            audit.append(AuditEvent::Message { envelope: entry.envelope }).await.unwrap();
+        }
+        let page = tokio::task::spawn_blocking({
+            let (path, trace) = (path.clone(), trace.clone());
+            move || read_audit(&path, &trace, None)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!page.more);
+        assert_eq!(page.entries.len(), 6, "the run's messages alone");
+        assert!(page.entries.iter().all(|e| e.envelope.trace_id == trace));
+        let shell = page.entries.iter().find(|e| e.envelope.to.to_string() == "shell.run").unwrap();
+        assert!(shell.envelope.payload.is_null(), "requests to tools are not kept");
+        let mut reader = transcript::Reader::default();
+        reader.add(page.entries);
+        assert_eq!(reader.turns.len(), 2);
+        assert_eq!(reader.turns[1].steps[0].result, None);
+
+        audit.append(AuditEvent::Message { envelope: last.envelope }).await.unwrap();
+        audit.close().await;
+        let more = read_audit(&path, &trace, page.cursor).unwrap();
+        reader.add(more.entries);
+        assert_eq!(reader.turns[1].steps[0].result.as_deref(), Some("edited"));
+        let missing = read_audit(&dir.path().join("none.jsonl"), &trace, None).unwrap_err();
+        assert!(missing.contains("none.jsonl"), "{missing}");
     }
 }

@@ -14,12 +14,14 @@ use molt_api::planner::{
     RunResponse, RunState, Verdict,
 };
 use molt_api::progress::Progress;
+use molt_proto::audit::Logged;
 use molt_proto::TraceId;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::Line;
 
 use super::preview::Preview;
 use super::text::{self, block, clean_line, span, Tone};
+use super::transcript::{self, Reader};
 use crate::agent;
 use crate::agent::outcome_name;
 use crate::config::ConfirmSection;
@@ -47,6 +49,8 @@ const SUGGESTIONS: usize = 8;
 /// Workspace files listed for `@` completion; past this, a path is not
 /// checked against the list.
 pub const LISTED_FILES: usize = 50_000;
+/// Ticks between reads of a running task's transcript: about a second.
+const TRANSCRIPT_TICKS: u64 = 7;
 
 /// When the interface calls the user from outside the terminal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -204,6 +208,26 @@ pub enum Action {
     /// List the workspace's files for `@` completion; they come back as
     /// [`Msg::Files`].
     ListFiles,
+    /// Read run `trace`'s messages in the audit log from `cursor` on; they
+    /// come back as [`Msg::Audit`].
+    ReadAudit {
+        trace: TraceId,
+        cursor: Option<u64>,
+    },
+    /// Open `text` in the user's editor, to read or keep; nothing comes back.
+    Export {
+        text: String,
+    },
+}
+
+/// A stretch of a run's messages in the audit log.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct AuditPage {
+    pub entries: Vec<Logged>,
+    /// Where to read on.
+    pub cursor: Option<u64>,
+    /// The read stopped before the end of the log.
+    pub more: bool,
 }
 
 /// What happened.
@@ -273,6 +297,10 @@ pub enum Msg {
     UsedNotes {
         run: String,
         result: Result<Vec<RecallSnapshot>, String>,
+    },
+    Audit {
+        trace: TraceId,
+        result: Result<AuditPage, String>,
     },
 }
 
@@ -418,6 +446,26 @@ pub enum Prompt {
 struct LastDiff {
     patch: String,
     truncated: bool,
+}
+
+/// A run's model turns, tool calls and results, over everything else.
+pub struct TranscriptView {
+    pub trace: TraceId,
+    /// The attempt it was opened on; `None` shows every turn of the run.
+    pub only: Option<u32>,
+    reader: Reader,
+    /// Why the audit log could not be read; the run's progress shows instead.
+    pub unreadable: Option<String>,
+    reading: bool,
+    /// Read again: the log has more, or the run moved on.
+    stale: bool,
+    read_at: u64,
+    pub unfold: bool,
+    /// In lines, not wrapped rows.
+    pub scroll: usize,
+    pub lines: Vec<Line<'static>>,
+    /// Where each turn starts among the lines.
+    starts: Vec<usize>,
 }
 
 /// Text shown over everything else: a diff, a check's files, help.
@@ -742,6 +790,7 @@ pub struct App {
     pub task: Option<Task>,
     pub prompt: Option<Prompt>,
     pub viewer: Option<Viewer>,
+    pub transcript: Option<TranscriptView>,
     pub screen: Screen,
     pub last_run: Option<String>,
     /// Spent in this session: designs, runs and learning.
@@ -820,6 +869,7 @@ impl App {
             task: None,
             prompt: None,
             viewer: None,
+            transcript: None,
             screen: Screen::Main,
             last_run: None,
             spent_usd: 0.0,
@@ -914,12 +964,21 @@ impl App {
         if matches!(msg, Msg::Ran { .. } | Msg::Applied(_) | Msg::Stopped { .. }) {
             self.files_stale = true;
         }
+        // The last turns of a run that ended are read once more.
+        if let (Msg::Ran { trace, .. }, Some(view)) = (&msg, &mut self.transcript) {
+            view.stale |= view.trace == *trace;
+        }
         let mut actions = self.handle(msg);
         if !self.listing && self.files_stale && self.at_query().is_some() {
             self.listing = true;
             self.files_stale = false;
             actions.push(Action::ListFiles);
         }
+        if self.transcript.as_ref().is_some_and(|v| v.reader.turns.is_empty()) {
+            // What the run published shows meanwhile, and changes as it goes.
+            self.render_transcript();
+        }
+        actions.extend(self.read_transcript());
         let now = self.attention();
         let text = match (now, self.ended.take()) {
             (Some(now), _) if Some(now) != before && self.settings.notify != Notify::Off => Some(match now {
@@ -1180,6 +1239,22 @@ impl App {
                     }
                 }
             }
+            Msg::Audit { trace, result } => {
+                let Some(view) = self.transcript.as_mut().filter(|v| v.trace == trace) else {
+                    return Vec::new();
+                };
+                (view.reading, view.read_at) = (false, self.tick);
+                match result {
+                    Ok(page) => {
+                        view.reader.add(page.entries);
+                        view.reader.cursor = page.cursor;
+                        view.stale |= page.more;
+                    }
+                    Err(e) => view.unreadable = Some(clean_line(&e)),
+                }
+                self.render_transcript();
+                Vec::new()
+            }
             Msg::UsedNotes { run, result } => {
                 let Some(viewer) = self.viewer.as_mut().filter(|v| v.title == format!("memory used: {run}")) else {
                     return Vec::new();
@@ -1239,8 +1314,15 @@ impl App {
             self.viewer_key(&key);
             return Vec::new();
         }
+        if self.transcript.is_some() {
+            return self.transcript_key(&key);
+        }
         if let Screen::Memory(_) = self.screen {
             return self.memory_key(&key);
+        }
+        let zoomed = self.zoom.is_some() && self.prompt.is_none() && self.input.text.is_empty();
+        if ctrl(&key, 'o') || (zoomed && key.code == KeyCode::Char('o') && key.modifiers.is_empty()) {
+            return self.open_transcript();
         }
         if ctrl(&key, 'c') && !self.input.text.is_empty() {
             self.input.take();
@@ -2424,6 +2506,121 @@ impl App {
         }
     }
 
+    /// The transcript of the running task, or else of the last one; of the
+    /// attempt drawn large, if one is.
+    fn open_transcript(&mut self) -> Vec<Action> {
+        let trace = match (&self.task, &self.last_run) {
+            (Some(task), _) => task.trace.clone(),
+            (None, Some(run)) => TraceId::from_raw(run.clone()),
+            (None, None) => {
+                self.flash = Some("no task has run yet".into());
+                return Vec::new();
+            }
+        };
+        self.transcript = Some(TranscriptView {
+            trace,
+            only: self.zoom,
+            reader: Reader::default(),
+            unreadable: None,
+            reading: false,
+            stale: true,
+            read_at: self.tick,
+            unfold: false,
+            scroll: 0,
+            lines: Vec::new(),
+            starts: Vec::new(),
+        });
+        self.render_transcript();
+        Vec::new()
+    }
+
+    /// The next read of the open transcript: when it opens, while its run
+    /// goes on, and once more when the run ends.
+    fn read_transcript(&mut self) -> Option<Action> {
+        let live = self.task.as_ref().map(|t| &t.trace);
+        let view = self.transcript.as_mut()?;
+        if view.reading || view.unreadable.is_some() {
+            return None;
+        }
+        let due = live == Some(&view.trace) && self.tick.saturating_sub(view.read_at) >= TRANSCRIPT_TICKS;
+        if !view.stale && !due {
+            return None;
+        }
+        (view.reading, view.stale, view.read_at) = (true, false, self.tick);
+        Some(Action::ReadAudit { trace: view.trace.clone(), cursor: view.reader.cursor })
+    }
+
+    fn render_transcript(&mut self) {
+        let Some(view) = &mut self.transcript else { return };
+        let secrets = &self.secrets;
+        let (mut lines, mut starts) =
+            transcript::render(&view.reader.turns, view.only, view.unfold, &|s: &str| scrub(s, secrets));
+        if view.reader.turns.is_empty() {
+            // No turns to show: what the run published, as its lanes have it.
+            let note = match &view.unreadable {
+                Some(e) => format!("the audit log could not be read ({e}); the tool calls the run published:"),
+                None if view.reading && view.reader.cursor.is_none() => "reading the audit log".to_owned(),
+                None => "nothing for this run in the audit log yet; the tool calls the run published:".to_owned(),
+            };
+            lines = vec![Line::from(span(note, Tone::Dim)), Line::default()];
+            starts.clear();
+            let lanes = match &self.task {
+                Some(task) if task.trace == view.trace => &task.lanes,
+                _ if self.last_run.as_deref() == Some(view.trace.as_str()) => &self.last_lanes,
+                _ => &Vec::new(),
+            };
+            for lane in lanes.iter().filter(|l| view.only.is_none_or(|a| a == l.index)) {
+                starts.push(lines.len());
+                lines.extend(lane_lines(std::slice::from_ref(lane)));
+            }
+        }
+        (view.lines, view.starts) = (lines, starts);
+    }
+
+    fn transcript_key(&mut self, key: &KeyEvent) -> Vec<Action> {
+        let Some(view) = &mut self.transcript else { return Vec::new() };
+        let last = view.lines.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.transcript = None,
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => self.transcript = None,
+            KeyCode::Down | KeyCode::Char('j') => view.scroll = (view.scroll + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => view.scroll = view.scroll.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::Char(' ') => view.scroll = (view.scroll + 20).min(last),
+            KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(20),
+            KeyCode::Char('g') | KeyCode::Home => view.scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => view.scroll = last,
+            KeyCode::Char('}') => {
+                if let Some(&next) = view.starts.iter().find(|&&s| s > view.scroll) {
+                    view.scroll = next;
+                }
+            }
+            KeyCode::Char('{') => {
+                view.scroll = view.starts.iter().rev().find(|&&s| s < view.scroll).copied().unwrap_or(0)
+            }
+            KeyCode::Char('e') => {
+                // Stay on the same turn.
+                let at = view.starts.iter().rposition(|&s| s <= view.scroll);
+                view.unfold = !view.unfold;
+                self.render_transcript();
+                let view = self.transcript.as_mut().expect("still open");
+                view.scroll = at.and_then(|i| view.starts.get(i).copied()).unwrap_or(0);
+            }
+            KeyCode::Char('v') => {
+                let (lines, _) =
+                    transcript::render(&view.reader.turns, view.only, true, &|s: &str| scrub(s, &self.secrets));
+                let lines = if view.reader.turns.is_empty() { &view.lines } else { &lines };
+                let mut text = format!("molt transcript · run {}\n\n", view.trace);
+                for line in lines {
+                    text.extend(line.spans.iter().map(|s| s.content.as_ref()));
+                    text.push('\n');
+                }
+                return vec![Action::Export { text }];
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
     fn open_used(&mut self, run: Option<String>) -> Vec<Action> {
         let Some(run) = run else {
             self.flash = Some("no task has run yet; use /memory-used RUN".into());
@@ -2826,6 +3023,7 @@ fn help() -> Vec<Line<'static>> {
         row("enter", "run the task in the input"),
         row("shift+tab", "mode: plan only, confirm, auto"),
         row("tab", "show one attempt large; again for the next"),
+        row("ctrl+o", "the transcript: model text, tool arguments and results (o: of the attempt shown large)"),
         row("esc", "stop the task"),
         row("enter (running)", "add what you typed to the running task"),
         row("pgup / pgdn", "scroll the log"),
@@ -3208,6 +3406,87 @@ mod tests {
         assert_eq!(matching(&files, "SRC/LE"), ["src/lexer.rs", "src/a/l_e_x.rs"]);
         assert!(matching(&files, "zzz").is_empty());
         assert_eq!(matching(&files, "").len(), 4);
+    }
+
+    fn reads(actions: &[Action]) -> Vec<(TraceId, Option<u64>)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::ReadAudit { trace, cursor } => Some((trace.clone(), *cursor)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn attempt_with_tool_call(app: &mut App, trace: &TraceId, detail: &str) {
+        let run = trace.to_string();
+        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 0, fork: None }));
+        let (tool, detail) = ("shell".into(), detail.into());
+        app.update(Msg::Progress(Progress::ToolCall { run, attempt: 0, turn: 1, tool, detail }));
+    }
+
+    #[test]
+    fn the_transcript_lists_each_turn_and_keeps_reading_while_the_run_goes_on() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        type_in(&mut app, "implement it");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        attempt_with_tool_call(&mut app, &trace, "cargo test");
+        app.update(key(KeyCode::Tab));
+        assert_eq!(reads(&app.update(key(KeyCode::Char('o')))), [(trace.clone(), None)]);
+        // Until the log is read, the tool calls the run published show.
+        let shown = |app: &App| plain(&app.transcript.as_ref().unwrap().lines);
+        assert!(shown(&app).iter().any(|l| l.contains("cargo test")), "{:?}", shown(&app));
+        assert!((0..20).all(|_| reads(&app.update(Msg::Tick)).is_empty()), "one read at a time");
+
+        let mut log = transcript::tests::two_turns(&trace);
+        log.iter_mut().for_each(transcript::slim);
+        let later = log.split_off(5);
+        let page = |entries, cursor| Ok(AuditPage { entries, cursor: Some(cursor), more: false });
+        app.update(Msg::Audit { trace: trace.clone(), result: page(log, 100) });
+        assert!(shown(&app).iter().any(|l| l == "      lexer::eof"), "{:?}", shown(&app));
+        assert_eq!(app.transcript.as_ref().unwrap().starts.len(), 1);
+        // About a second later it reads on from where it stopped, and the new turn is added.
+        let again: Vec<Action> = (0..TRANSCRIPT_TICKS).flat_map(|_| app.update(Msg::Tick)).collect();
+        assert_eq!(reads(&again), [(trace.clone(), Some(100))]);
+        app.update(Msg::Audit { trace: trace.clone(), result: page(later, 200) });
+        let starts = app.transcript.as_ref().unwrap().starts.clone();
+        assert_eq!(starts.len(), 2);
+        app.update(key(KeyCode::Char('}')));
+        assert_eq!(app.transcript.as_ref().unwrap().scroll, starts[1]);
+        app.update(key(KeyCode::Char('{')));
+        assert_eq!(app.transcript.as_ref().unwrap().scroll, 0);
+        assert!(frame_text(&mut app).contains(" transcript · attempt 1 "));
+
+        let Some(Action::Export { text }) = app.update(key(KeyCode::Char('v'))).pop() else { panic!("exported") };
+        assert!(text.starts_with(&format!("molt transcript · run {trace}")));
+        assert!(text.contains("    command: cargo test") && text.contains("    path: src/lexer.rs"), "{text}");
+        // The end of the run is read once more.
+        let ended = app.update(Msg::Ran { trace: trace.clone(), result: Err("stopped".into()) });
+        assert_eq!(reads(&ended), [(trace, Some(200))]);
+        app.update(key(KeyCode::Esc));
+        assert!(app.transcript.is_none() && app.task.is_none());
+    }
+
+    #[test]
+    fn a_finished_runs_transcript_still_opens_and_shows_its_progress_without_the_log() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        type_in(&mut app, "implement it");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        attempt_with_tool_call(&mut app, &trace, "cargo build");
+        app.update(Msg::Ran { trace: trace.clone(), result: Err("stopped".into()) });
+        assert!(app.task.is_none());
+        assert_eq!(reads(&app.update(ctrl_key('o'))), [(trace.clone(), None)]);
+        app.update(Msg::Audit { trace, result: Err("audit.jsonl: permission denied".into()) });
+        let lines = plain(&app.transcript.as_ref().unwrap().lines);
+        assert!(lines[0].contains("could not be read (audit.jsonl: permission denied)"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("cargo build")), "{lines:?}");
+        assert!((0..20).all(|_| reads(&app.update(Msg::Tick)).is_empty()), "the log is not tried again");
+        app.update(ctrl_key('o'));
+        assert!(app.transcript.is_none());
     }
 
     #[test]
