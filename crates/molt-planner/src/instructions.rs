@@ -58,7 +58,7 @@ pub(crate) async fn gather(ctx: &Ctx) -> Option<String> {
 
 /// What `fs.read` answers for a file that is not there (or is a directory,
 /// or binary): nothing to say about it.
-fn absent(e: &RemoteError) -> bool {
+pub(crate) fn absent(e: &RemoteError) -> bool {
     e.code == ErrorCode::Invalid
 }
 
@@ -129,7 +129,7 @@ fn block(files: &[File]) -> String {
 
 /// The start of `text`, at most `max` bytes, ending at a line end when one
 /// is close enough and never inside a character.
-fn cut(text: &str, max: usize) -> &str {
+pub(crate) fn cut(text: &str, max: usize) -> &str {
     if text.len() <= max {
         return text;
     }
@@ -143,7 +143,7 @@ fn cut(text: &str, max: usize) -> &str {
     }
 }
 
-fn size(bytes: usize) -> String {
+pub(crate) fn size(bytes: usize) -> String {
     if bytes < 1024 {
         format!("{bytes} bytes")
     } else {

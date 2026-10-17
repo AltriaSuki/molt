@@ -1463,6 +1463,42 @@ async fn memory_gives_every_conversation_the_project_context_and_its_tools() {
 }
 
 #[tokio::test]
+async fn files_the_user_points_at_reach_the_designer_and_every_attempt() {
+    let model = |req: &CompleteRequest| match turn(req) {
+        1 if is_designer(req) => use_tools(
+            req,
+            &[("submit_check", json!({ "command": "check", "files": [], "rationale": "hello.txt says hi" }))],
+        ),
+        1 => write_hello(req, "hi\n"),
+        _ => done("Wrote hello.txt."),
+    };
+    let fake = Fake::new(model, hello_check);
+    fake.set(|st| {
+        st.workspace.insert("spec/hello.md".into(), "hello.txt says hi.\n".into());
+        st.workspace.insert("big.txt".into(), "x\n".repeat(5_000));
+    });
+    let req = RunRequest {
+        task: "Do what @spec/hello.md says.".into(),
+        files: vec!["spec/hello.md".into(), "big.txt".into(), "gone.rs".into()],
+        ..request(None, 2)
+    };
+    let resp = run(&fake, req).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    let requests = fake.requests();
+    assert!(requests.iter().any(is_designer) && requests.len() >= 3);
+    for req in &requests {
+        let first = req.messages[0]["content"][0]["text"].as_str().unwrap();
+        assert!(first.starts_with("<referenced_files>\n"), "{first}");
+        assert!(first.contains("<file path=\"spec/hello.md\">\nhello.txt says hi.\n</file>"), "{first}");
+        assert!(first.contains("<file path=\"big.txt\" lines=\"5000\" omitted=\"too large"), "{first}");
+        assert!(first.contains("<file path=\"gone.rs\" omitted="), "{first}");
+        assert!(!first.contains("x\nx\n"), "{first}");
+    }
+    assert!(fake.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
+        if message.starts_with("referenced files: 1 of 3 given"))));
+}
+
+#[tokio::test]
 async fn the_projects_instruction_files_open_every_conversation_as_data() {
     let model = |req: &CompleteRequest| match turn(req) {
         1 if is_designer(req) => use_tools(

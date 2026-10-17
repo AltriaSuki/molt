@@ -42,6 +42,11 @@ const EARLIER_SUMMARY_BYTES: usize = 4000;
 /// Ticks after a key within which the user is taken to be looking: about
 /// five seconds.
 const LOOKING_TICKS: u64 = 33;
+/// Suggestions shown for an `@path` being typed.
+const SUGGESTIONS: usize = 8;
+/// Workspace files listed for `@` completion; past this, a path is not
+/// checked against the list.
+pub const LISTED_FILES: usize = 50_000;
 
 /// When the interface calls the user from outside the terminal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -196,6 +201,9 @@ pub enum Action {
     Alert {
         text: String,
     },
+    /// List the workspace's files for `@` completion; they come back as
+    /// [`Msg::Files`].
+    ListFiles,
 }
 
 /// What happened.
@@ -206,6 +214,12 @@ pub enum Msg {
     Paste(String),
     /// The terminal gained or lost focus, where it reports that.
     Focus(bool),
+    /// The workspace's files, relative, as `.gitignore` leaves them;
+    /// `complete` is false when the listing stopped at [`LISTED_FILES`].
+    Files {
+        files: Vec<String>,
+        complete: bool,
+    },
     Tick,
     /// SIGTERM or SIGHUP.
     Signal,
@@ -764,6 +778,16 @@ pub struct App {
     focused: Option<bool>,
     /// How the last task ended, for an alert: a short label.
     ended: Option<String>,
+    /// The workspace's files for `@` completion, once listed.
+    pub files: Option<Vec<String>>,
+    files_complete: bool,
+    /// The files may have changed since they were listed.
+    files_stale: bool,
+    listing: bool,
+    /// The suggestion picked with the arrows.
+    pub pick: usize,
+    /// An `@` query whose suggestions Esc put away.
+    hidden: Option<String>,
 }
 
 fn key_is(key: &KeyEvent, code: KeyCode) -> bool {
@@ -815,6 +839,12 @@ impl App {
             last_key: None,
             focused: None,
             ended: None,
+            files: None,
+            files_complete: false,
+            files_stale: true,
+            listing: false,
+            pick: 0,
+            hidden: None,
         }
     }
 
@@ -881,7 +911,15 @@ impl App {
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
         let before = self.attention();
+        if matches!(msg, Msg::Ran { .. } | Msg::Applied(_) | Msg::Stopped { .. }) {
+            self.files_stale = true;
+        }
         let mut actions = self.handle(msg);
+        if !self.listing && self.files_stale && self.at_query().is_some() {
+            self.listing = true;
+            self.files_stale = false;
+            actions.push(Action::ListFiles);
+        }
         let now = self.attention();
         let text = match (now, self.ended.take()) {
             (Some(now), _) if Some(now) != before && self.settings.notify != Notify::Off => Some(match now {
@@ -910,6 +948,66 @@ impl App {
     /// The user is at the terminal: it has focus, or a key came just now.
     fn looking(&self) -> bool {
         self.focused == Some(true) || self.last_key.is_some_and(|at| self.tick.wrapping_sub(at) <= LOOKING_TICKS)
+    }
+
+    /// The `@path` being typed where the cursor is: where its `@` is, in
+    /// characters, and what follows it.
+    fn at_query(&self) -> Option<(usize, String)> {
+        if !matches!(self.screen, Screen::Main) || self.prompt.is_some() || self.task.is_some() {
+            return None;
+        }
+        let before: Vec<char> = self.input.text.chars().take(self.input.cursor).collect();
+        let start = before.iter().rposition(|c| c.is_whitespace()).map_or(0, |i| i + 1);
+        (before.get(start) == Some(&'@')).then(|| (start, before[start + 1..].iter().collect()))
+    }
+
+    /// Workspace files matching the `@path` being typed, best first.
+    pub fn suggestions(&self) -> Vec<String> {
+        let (Some((_, query)), Some(files)) = (self.at_query(), &self.files) else { return Vec::new() };
+        if self.hidden.as_ref() == Some(&query) {
+            return Vec::new();
+        }
+        matching(files, &query)
+    }
+
+    /// Put `path` in place of the `@path` being typed.
+    fn complete(&mut self, path: &str) {
+        let Some((start, _)) = self.at_query() else { return };
+        let chars: Vec<char> = self.input.text.chars().collect();
+        let head: String = chars[..start].iter().collect();
+        let tail: String = chars[self.input.cursor..].iter().collect();
+        let put = format!("@{path} ");
+        self.input.cursor = start + put.chars().count();
+        self.input.text = format!("{head}{put}{}", tail.trim_start_matches(' '));
+        self.pick = 0;
+    }
+
+    /// The files a task points at with `@path`, or why one cannot be used.
+    fn referenced(&self, line: &str) -> Result<Vec<String>, String> {
+        let mut files: Vec<String> = Vec::new();
+        for word in line.split_whitespace() {
+            let Some(path) = word.strip_prefix('@') else { continue };
+            let path = path.trim_end_matches([',', '.', ';', ':', '!', '?', ')', '`', '\'', '"']);
+            let path = path.strip_prefix("./").unwrap_or(path);
+            if path.is_empty() {
+                continue;
+            }
+            let inside = std::path::Path::new(path)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir));
+            if !inside {
+                return Err(format!("@{path} is outside the workspace"));
+            }
+            if let Some(listed) = self.files.as_ref().filter(|_| self.files_complete) {
+                if !listed.iter().any(|f| f == path) {
+                    return Err(format!("@{path}: no such file in the workspace"));
+                }
+            }
+            if !files.iter().any(|f| f == path) {
+                files.push(path.to_owned());
+            }
+        }
+        Ok(files)
     }
 
     /// The terminal window's title: what the interface is doing or waits for.
@@ -943,6 +1041,12 @@ impl App {
             }
             Msg::Focus(focused) => {
                 self.focused = Some(focused);
+                Vec::new()
+            }
+            Msg::Files { files, complete } => {
+                self.files = Some(files);
+                self.files_complete = complete;
+                self.listing = false;
                 Vec::new()
             }
             Msg::Paste(text) => {
@@ -1156,6 +1260,24 @@ impl App {
             Some(Prompt::EditCheck(_)) | None => {}
         }
         let editing_check = matches!(self.prompt, Some(Prompt::EditCheck(_)));
+        // While an `@path` has suggestions, the arrows pick one, Tab puts it
+        // in and Esc puts them away; every other key edits as usual.
+        let suggestions = self.suggestions();
+        if !suggestions.is_empty() && key.modifiers.is_empty() {
+            let n = suggestions.len();
+            let at = self.pick.min(n - 1);
+            match key.code {
+                KeyCode::Up => self.pick = (at + n - 1) % n,
+                KeyCode::Down => self.pick = (at + 1) % n,
+                KeyCode::Tab => self.complete(&suggestions[at]),
+                KeyCode::Esc => self.hidden = self.at_query().map(|(_, q)| q),
+                _ => {}
+            }
+            if matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Esc) {
+                return Vec::new();
+            }
+        }
+        self.pick = 0;
         match key.code {
             KeyCode::BackTab => {
                 self.mode = self.mode.next();
@@ -1356,8 +1478,17 @@ impl App {
             self.input = Input::with(&line);
             return Vec::new();
         }
+        let files = match self.referenced(&line) {
+            Ok(files) => files,
+            Err(e) => {
+                self.flash = Some(e);
+                self.input = Input::with(&line);
+                return Vec::new();
+            }
+        };
         let trace = TraceId::random();
         let mut req = RunRequest::new(line.clone(), self.workspace_path.clone());
+        req.files = files;
         if let Some(n) = self.settings.attempts {
             req.attempts = n;
         }
@@ -2518,6 +2649,38 @@ impl Lane {
     }
 }
 
+/// The files `query` picks out, best first: those it starts, then those
+/// whose name it starts, then those containing it, then those holding its
+/// characters in order; shorter paths first within each.
+fn matching(files: &[String], query: &str) -> Vec<String> {
+    let query = query.to_lowercase();
+    let in_order = |path: &str| {
+        let mut chars = path.chars();
+        query.chars().all(|q| chars.any(|c| c == q))
+    };
+    let mut found: Vec<(u8, usize, &String)> = files
+        .iter()
+        .filter_map(|file| {
+            let path = file.to_lowercase();
+            let name = path.rsplit('/').next().unwrap_or_default();
+            let rank = if path.starts_with(&query) {
+                0
+            } else if name.starts_with(&query) {
+                1
+            } else if path.contains(&query) {
+                2
+            } else if in_order(&path) {
+                3
+            } else {
+                return None;
+            };
+            Some((rank, file.len(), file))
+        })
+        .collect();
+    found.sort();
+    found.into_iter().take(SUGGESTIONS).map(|(_, _, f)| f.clone()).collect()
+}
+
 fn lane(task: &mut Task, attempt: u32) -> Option<&mut Lane> {
     task.lanes.iter_mut().find(|l| l.index == attempt)
 }
@@ -2685,6 +2848,7 @@ fn help() -> Vec<Line<'static>> {
         row("/new", "a new conversation: later tasks forget the earlier ones"),
         row("/attempts N", "attempts at once, 1 to 8"),
         row("/stream on|off", "model text previews for the next task"),
+        row("@path", "point the task at a file; tab puts in the picked suggestion"),
         row("/notify on|all|off", "bell and desktop notice when waiting (all: also when a task ends)"),
         row("/model NAME", "opus, sonnet, haiku or a model id"),
         row("/memory-model NAME", "model memory learns with; same: the attempts'"),
@@ -2982,6 +3146,68 @@ mod tests {
         app.update(Msg::Focus(false));
         type_in(&mut app, "/notify off");
         assert!(run(&mut app, Err("boom".into())).is_empty());
+    }
+
+    fn workspace_files() -> Msg {
+        let files = ["Cargo.toml", "src/lexer.rs", "src/lib.rs", "src/parser/lex_table.rs", "tests/lexer.rs"];
+        Msg::Files { files: files.map(str::to_owned).to_vec(), complete: true }
+    }
+
+    #[test]
+    fn an_at_path_completes_from_the_workspace_and_goes_with_the_task() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        // The files are listed once, when an `@` is first typed.
+        app.update(Msg::Paste("fix ".into()));
+        let actions = app.update(key(KeyCode::Char('@')));
+        assert_eq!(actions, [Action::ListFiles]);
+        assert!(app.update(key(KeyCode::Char('s'))).is_empty(), "listed once");
+        app.update(workspace_files());
+        app.update(Msg::Paste("rc/le".into()));
+        assert_eq!(app.suggestions(), ["src/lexer.rs", "src/parser/lex_table.rs"]);
+        assert!(frame_text(&mut app).contains("› @src/lexer.rs"));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Up));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "fix @src/lexer.rs ");
+        assert!(app.suggestions().is_empty());
+        app.update(Msg::Paste("and @src/lexer.rs, please".into()));
+        let actions = app.update(key(KeyCode::Enter));
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.files, ["src/lexer.rs"]);
+        assert_eq!(req.task, "fix @src/lexer.rs and @src/lexer.rs, please");
+    }
+
+    #[test]
+    fn an_at_path_outside_the_workspace_or_not_in_it_is_refused() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        assert!(type_in(&mut app, "read @../outside").is_empty());
+        assert_eq!(app.flash.as_deref(), Some("@../outside is outside the workspace"));
+        assert_eq!(app.input.text, "read @../outside");
+        app.input.take();
+        assert!(type_in(&mut app, "read @/etc/passwd").is_empty());
+        app.input.take();
+        app.update(workspace_files());
+        assert!(type_in(&mut app, "read @src/missing.rs").is_empty());
+        assert_eq!(app.flash.as_deref(), Some("@src/missing.rs: no such file in the workspace"));
+        app.input.take();
+        // An address is not a reference, and Esc puts suggestions away.
+        let actions = type_in(&mut app, "mail me@example.com about @Cargo.toml");
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.files, ["Cargo.toml"]);
+    }
+
+    #[test]
+    fn suggestions_rank_the_start_of_the_path_then_the_name_then_any_part() {
+        let files: Vec<String> =
+            ["docs/lexer.md", "src/lexer.rs", "lexicon.txt", "src/a/l_e_x.rs"].map(str::to_owned).to_vec();
+        assert_eq!(matching(&files, "lex"), ["lexicon.txt", "src/lexer.rs", "docs/lexer.md", "src/a/l_e_x.rs"]);
+        assert_eq!(matching(&files, "SRC/LE"), ["src/lexer.rs", "src/a/l_e_x.rs"]);
+        assert!(matching(&files, "zzz").is_empty());
+        assert_eq!(matching(&files, "").len(), 4);
     }
 
     #[test]

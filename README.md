@@ -210,6 +210,14 @@ once per stop. `/notify all` also calls when a task ends
 title follows what it is doing (`molt · running 2/4`, `molt · waiting:
 apply`, `molt · idle`), and the terminal's own title is put back on exit.
 
+Typing `@` starts a file path: the workspace's files (as `.gitignore` leaves
+them) are suggested as you type, ↑/↓ picks one and Tab puts it in. The files
+a task names this way go with it: the check designer and every attempt get
+their text at the start, next to the project's instruction files, and a file
+too large is named with its size for the model to read itself. A path outside
+the workspace, or one that is not a file in it, is refused before the task
+starts.
+
 The interface shows model text previews by default, including while designing
 the check. `/stream off` disables previews for subsequent tasks; `/stream on`
 enables them again. Each attempt keeps only the latest 2,048 characters, with

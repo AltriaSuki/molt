@@ -132,6 +132,7 @@ async fn event_loop(
         Err(e) => app.flash = Some(format!("could not load saved theme: {e}")),
     }
     let data_dir = cfg.kernel.data_dir.clone();
+    let (lister, root) = (tx.clone(), PathBuf::from(&workspace));
     let mut backend = backend::Backend::start(cfg, workspace, tx).await?;
     backend.send(&Action::StartSession).await?;
     let notice = Notice::from_env(|name| std::env::var(name).ok());
@@ -152,6 +153,12 @@ async fn event_loop(
             match action {
                 Action::Quit { keep: k } => keep = k,
                 Action::Alert { text } => emit(&notice.alert(&text)),
+                Action::ListFiles => {
+                    let (tx, root) = (lister.clone(), root.clone());
+                    tokio::task::spawn_blocking(move || {
+                        let _ = tx.send(list_files(&root));
+                    });
+                }
                 Action::Redraw => redraw(terminal)?,
                 Action::Suspend => {
                     suspend(terminal, &pause)?;
@@ -373,7 +380,8 @@ impl Runtime {
             | Action::Redraw
             | Action::Suspend
             | Action::SaveTheme(_)
-            | Action::Alert { .. } => {}
+            | Action::Alert { .. }
+            | Action::ListFiles => {}
         }
     }
 
@@ -491,6 +499,18 @@ fn suspend(terminal: &mut DefaultTerminal, pause: &Pause) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// The workspace's files for `@` completion, as the services see them:
+/// `.gitignore` applies, and `.git` and `.molt` are left out.
+fn list_files(root: &Path) -> Msg {
+    let mut files: Vec<String> = molt_tools::workspace_files(root, |_| false)
+        .filter_map(|p| p.strip_prefix(root).ok()?.to_str().map(str::to_owned))
+        .take(app::LISTED_FILES + 1)
+        .collect();
+    let complete = files.len() <= app::LISTED_FILES;
+    files.truncate(app::LISTED_FILES);
+    Msg::Files { files, complete }
+}
+
 /// Escape sequences straight to the terminal, between frames; best effort.
 fn emit(bytes: &str) {
     use std::io::Write;
@@ -547,5 +567,19 @@ mod tests {
         assert_eq!(serde_json::from_slice::<text::Theme>(&std::fs::read(&path).unwrap()).unwrap(), text::Theme::Ansi);
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn listed_files_are_relative_and_follow_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(root.join("src/lexer.rs"), "").unwrap();
+        std::fs::write(root.join("target/out"), "").unwrap();
+        let Msg::Files { files, complete } = list_files(&root) else { panic!() };
+        assert!(complete);
+        assert_eq!(files, [".gitignore", "src/lexer.rs"]);
     }
 }

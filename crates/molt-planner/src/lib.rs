@@ -15,6 +15,7 @@ pub mod hooks;
 mod instructions;
 mod memory;
 mod prompts;
+mod referenced;
 mod review;
 mod runner;
 mod select;
