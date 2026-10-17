@@ -322,6 +322,8 @@ pub struct ReviewResponse {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecallResponse {
     pub notes: Vec<Recalled>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<crate::skills::Skill>,
 }
 
 /// Tombstone a note. It is no longer recalled; the tombstone and its reason
@@ -385,6 +387,8 @@ pub struct ConsolidateRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConsolidateResponse {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_drafts: Vec<String>,
     /// Notes created.
     pub added: Vec<Note>,
     /// Ids of existing notes the episode bore out.

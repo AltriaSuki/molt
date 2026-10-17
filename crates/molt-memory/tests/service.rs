@@ -295,6 +295,18 @@ async fn changes_reported_while_an_index_runs_are_all_indexed() {
     }
 }
 
+#[tokio::test]
+async fn an_agent_cannot_manage_or_promote_its_own_skills() {
+    let s = Setup::new();
+    let payload = json!({"workspace":"app","action":"promote","id":"skill_1","revision":1});
+    for from in ["planner", "model", "memory"] {
+        let error = s.ask(from, "memory.skills", payload.clone()).await.unwrap_err();
+        assert!(error.message.contains("kernel-identified CLI"));
+    }
+    let listed = s.ask("cli", "memory.skills", json!({"workspace":"app","action":"list"})).await.unwrap();
+    assert_eq!(listed, json!([]));
+}
+
 /// `payload` to `memory` from `from`, in the run `trace`.
 async fn ask_in(memory: &Memory, from: &str, trace: &TraceId, to: &str, payload: Value) -> Result<Value, RemoteError> {
     let mut msg = Envelope::request(trace.clone(), to.parse().unwrap(), CapId::random(), payload);

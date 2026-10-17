@@ -83,6 +83,7 @@ impl Db {
         conn.execute_batch(crate::notes::SCHEMA)?;
         conn.execute_batch(crate::project::SCHEMA)?;
         conn.execute_batch(crate::review::SCHEMA)?;
+        conn.execute_batch(crate::skills::SCHEMA)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn: Mutex::new(conn), reader: None, semantic: None })
     }

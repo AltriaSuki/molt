@@ -75,6 +75,7 @@ sender from that.
 | `molt do --commit` commits exactly the files the run merged and leaves what the user staged alone; `molt undo` takes it back with a new commit, never touching later changes, and the undone run no longer lends any note confidence | `crates/molt/src/git.rs` (`a_run_commit_holds_only_the_merged_files…`, `undo_refuses_files_that_changed_since_the_run`), `crates/molt/tests/agent.rs` (`a_committed_run_can_be_undone_and_memory_stops_counting_it`), `crates/molt-memory/src/notes.rs` (`an_undone_run_lends_no_note_confidence…`) |
 | The agent reads the web only when the user allows hosts: over https, from those hosts after every redirect, never from a loopback, private or link-local address; commands stay offline, and every page read is in the audit log | `crates/molt-web/src/allow.rs` (`only_https_urls_on_allowed_hosts_pass`, `only_public_addresses_are_public`), `crates/molt-web/tests/web.rs` (`hosts_off_the_list_are_refused_before_any_request_and_on_every_redirect`), `crates/molt/tests/agent.rs` (`allowed_web_hosts_start_the_web_service_and_offer_fetch_url_only_then`), `crates/molt-planner/tests/planner.rs` (`fetch_url_is_offered_only_to_a_planner_that_may_read_the_web`) |
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
+| A skill source cannot approve itself; only the CLI manages activation and withdrawal preserves evidence | `skills::tests::drafts_need_independent_evidence_and_disable_cannot_be_undone_by_learning`, `tests/service.rs::an_agent_cannot_manage_or_promote_its_own_skills` |
 | Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
 | Offline embedding models are hash-pinned and cannot reintroduce forgotten or cross-project notes | `semantic::tests::pinned_models_retrieve_synonyms_and_reject_changed_files`, `semantic::tests::synonyms_are_recalled_with_scores_and_snapshots_survive_forgetting` |
 
@@ -1024,6 +1025,55 @@ Dependencies mount at their canonical absolute paths. `--pass-env NAME` explicit
 Limits are inherited per process: address space, CPU time, file size, open files and process count, plus the existing command wall timeout. These are not aggregate cgroup quotas; RLIMIT_NPROC has the operating system's per-user semantics and does not limit root. TERM reaches the sandbox session group with 500 ms grace; KILL then tears down its PID namespace, including descendants that called setsid. Normal completion, cancelled handlers and service exit also tear down the namespace. Temporary mounts disappear with the last process. Future executable skills must use this shell path to share the policy.
 
 CI installs bubblewrap and requires namespace tests to run. A constrained local executor may skip only those integration tests after a failed capability probe; production startup still fails closed. Tests cover host paths, symlinks, read-only dependencies, network policy, host sockets, limits, C builds, cancellation and descendants with new sessions.
+
+## Declarative project skills
+
+Memory may propose a small declarative workflow while learning from a verified
+successful task. It saves a **draft**, with its source run, audit message IDs,
+writer/version, trigger words, prerequisite file hashes, steps and acceptance
+command. Drafts never enter a later task's context. A successful source task
+cannot approve its own workflow, and no skill text is executed as a script.
+
+Inspect and manage them through the kernel-identified CLI:
+
+```sh
+molt skill --workspace . list
+molt skill --workspace . draft skill.json --run SOURCE_RUN
+molt skill --workspace . evaluate SKILL_ID --revision 1 --run HELD_OUT_RUN_A
+molt skill --workspace . evaluate SKILL_ID --revision 1 --run HELD_OUT_RUN_B
+molt skill --workspace . promote SKILL_ID --revision 1
+molt skill --workspace . used RUN
+molt skill --workspace . disable SKILL_ID --reason 'No longer suitable'
+molt skill --workspace . rollback SKILL_ID --revision 1 --reason 'Revision 2 regressed'
+```
+
+A manual draft's JSON fields are `name`, `trigger_terms` (single words),
+`prerequisites` (map of relative paths to SHA-256), `steps` and `acceptance`
+(the check command). Evaluation reads authenticated request/reply pairs from
+the audit; a forged note, tool output or an evaluation payload cannot assert
+success. Promotion needs two distinct independent successful runs in the same
+project, with the stored acceptance command, besides the source. Failed
+independent evaluations remain attached to the draft. The human must select
+independent cases and their protected checks: this registry does not establish
+that arbitrary chosen runs constitute an adequate held-out task set.
+
+Recall selects at most four active skills for the current project, only when
+all trigger words and prerequisite hashes match. The planner treats their
+steps as data below the task, check and permissions. Captured offerings retain
+full revision snapshots and their evidence, accessible with `skill used` even
+after disabling or rollback. These are records of offered context, not proof
+that the model followed every step. New drafts cannot re-enable a disabled
+skill. Rollback selects an evaluated older revision but keeps it disabled until
+an explicit human promotion. Disabling or rollback voids learned-note evidence
+from runs that were offered the withdrawn active revision, re-settles confidence
+and leaves tombstones and original audit/snapshot evidence intact. Learning
+cannot automatically recreate those withdrawn notes.
+
+The first implementation does not run executable skill scripts or perform
+automatic promotion. Real task success, cost and latency comparisons with a
+no-skill baseline remain to be run under an explicit evaluation budget. Stored
+independent evidence records each run's wall duration, known cost subtotal and
+unknown calls; these alone do not prove a workflow's causal benefit.
 
 ## Offline semantic notes (optional)
 

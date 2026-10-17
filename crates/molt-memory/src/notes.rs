@@ -543,6 +543,26 @@ pub(crate) fn settle_partners(tx: &Transaction, id: &str) -> rusqlite::Result<()
     Ok(())
 }
 
+/// Withdraw learning from runs that used a disabled/rolled-back workflow.
+/// Evidence and recall snapshots remain; consolidated prevents automatic relearning.
+pub(crate) fn void_runs(tx: &Transaction, runs: &[String], trace: &str, now: u64) -> rusqlite::Result<()> {
+    let mut touched = HashSet::new();
+    for run in runs {
+        let mut stmt = tx.prepare("SELECT DISTINCT note FROM evidence WHERE trace=?1 AND void=0")?;
+        touched.extend(stmt.query_map([run], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?);
+        tx.execute("UPDATE evidence SET void=1 WHERE trace=?1 AND void=0", [run])?;
+    }
+    for id in touched {
+        if replay(tx, &id)?.is_none() {
+            tombstone(tx, &id, "skill_withdrawn", "workflow was disabled or rolled back", trace, now)?;
+        } else {
+            settle(tx, &id)?;
+        }
+        settle_partners(tx, &id)?;
+    }
+    Ok(())
+}
+
 /// Tombstone the live note `id`. False when there is none.
 pub(crate) fn forget(db: &Db, id: &str, reason: &str, trace: &str, now: u64) -> Result<bool, RemoteError> {
     if reason.trim().is_empty() {
@@ -594,6 +614,7 @@ pub(crate) fn retract(
         let tx = conn.transaction()?;
         let touched = voided(&tx, "e.service = ?1 AND e.version = ?2", params![service, version])?;
         let done = rework(&tx, &touched, what::RETRACTED, reason, trace, now)?;
+        crate::skills::retract_in(&tx, service, version, trace, now)?;
         tx.execute("DELETE FROM consolidated WHERE service = ?1 AND version = ?2", params![service, version])?;
         tx.commit()?;
         Ok(done)

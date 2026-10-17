@@ -14,6 +14,7 @@ mod notes;
 pub mod project;
 mod review;
 pub mod semantic;
+mod skills;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -406,13 +407,30 @@ impl Memory {
                 }
                 let run = req.trace_id.to_string();
                 let call = req.id.to_string();
+                let context = (r.workspace.clone(), r.query.clone(), r.capture.is_some(), run.clone(), call.clone());
                 let user = self.user.clone();
                 let notes = self
                     .blocking(move |db| {
                         review::recall(db, &r, path.as_deref(), user.as_deref(), Some((&run, &call)), now)
                     })
                     .await?;
-                reply(RecallResponse { notes })
+                let skills = if let (Some(ws), query, captured, run, call) = context {
+                    self.blocking(move |db| {
+                        skills::discover(db, &ws, &query, captured.then_some((run.as_str(), call.as_str())))
+                    })
+                    .await?
+                } else {
+                    Vec::new()
+                };
+                reply(RecallResponse { notes, skills })
+            }
+            "skills" => {
+                if req.from.as_ref().map(|s| s.as_str()) != Some("cli") {
+                    return Err(invalid("only the kernel-identified CLI may manage skills or evaluation evidence"));
+                }
+                let mut r: molt_api::skills::Request = parse(&method, req.payload)?;
+                r.workspace = self.workspace_key(&r.workspace)?;
+                skills::manage(&self.db, self.bus.as_ref(), r, &self.writer, &req.trace_id).await
             }
             "review" | "correct" => {
                 if req.from.as_ref().map(|s| s.as_str()) != Some("cli") {
