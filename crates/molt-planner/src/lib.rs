@@ -16,6 +16,7 @@ mod instructions;
 mod judge;
 mod memory;
 mod prompts;
+mod referenced;
 mod review;
 mod runner;
 mod select;

@@ -259,9 +259,32 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 lines
             }
             Some(Task { phase: Phase::Applying, .. }) => busy("applying"),
-            _ => Vec::new(),
+            Some(_) => Vec::new(),
+            None => suggestion_lines(app),
         },
     }
+}
+
+/// The files an `@path` being typed could be, the picked one marked.
+fn suggestion_lines(app: &App) -> Vec<Line<'static>> {
+    let suggestions = app.suggestions();
+    if suggestions.is_empty() {
+        return Vec::new();
+    }
+    let picked = app.pick.min(suggestions.len() - 1);
+    let mut lines: Vec<Line> = suggestions
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let (mark, tone) = if i == picked { ("› @", Tone::Shell) } else { ("  @", Tone::Dim) };
+            Line::from(vec![
+                span(mark, tone),
+                span(clean_line(path), if i == picked { Tone::Plain } else { Tone::Dim }),
+            ])
+        })
+        .collect();
+    lines.push(keys(&[("↑↓", "pick"), ("tab", "put in"), ("esc", "hide")]));
+    lines
 }
 
 /// Why confirm mode stopped, when a rule did it.

@@ -133,6 +133,11 @@ pub struct RunRequest {
     /// model as context. The run still has its own check and budget.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub earlier: Vec<Earlier>,
+    /// Workspace-relative files the user pointed at for this task (`@path`
+    /// in the TUI). Their text goes to the designer and the attempts as
+    /// project data; a file too large is named with its size only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
 }
 
 /// A task done before this one in the same conversation.
@@ -235,6 +240,7 @@ impl RunRequest {
             resume: None,
             review: true,
             earlier: Vec::new(),
+            files: Vec::new(),
         }
     }
 }
@@ -702,6 +708,16 @@ pub mod tools {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_without_files_reads_and_writes_as_before() {
+        let wire = serde_json::json!({"task": "t", "workspace": "/w"});
+        let req: RunRequest = serde_json::from_value(wire).unwrap();
+        assert!(req.files.is_empty());
+        assert!(serde_json::to_value(&req).unwrap().get("files").is_none());
+        let req = RunRequest { files: vec!["src/lexer.rs".into()], ..req };
+        assert_eq!(serde_json::to_value(&req).unwrap()["files"], serde_json::json!(["src/lexer.rs"]));
+    }
 
     #[test]
     fn old_design_replies_remain_readable_without_inventing_a_budget() {

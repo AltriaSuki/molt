@@ -94,6 +94,9 @@ pub(crate) struct Ctx {
     pub web: bool,
     /// The `<project_instructions>` block, when the project has instruction files.
     pub instructions: Option<String>,
+    /// The files the user pointed at, and their `<referenced_files>` block.
+    pub files: Vec<String>,
+    pub referenced: Option<String>,
     tally: watch::Sender<Tally>,
     /// Forks created and not yet dropped or merged, so none outlives the run by accident.
     forks: Arc<Mutex<Vec<String>>>,
@@ -168,6 +171,8 @@ impl Ctx {
             memory: Memory::default(),
             web,
             instructions: None,
+            files: req.files.clone(),
+            referenced: None,
             cfg,
             tally: watch::Sender::new(Tally::default()),
             forks: Arc::default(),
@@ -220,7 +225,13 @@ impl Ctx {
     /// this one in the user's conversation. The same in every conversation of
     /// the run, so the prompt cache can share it.
     pub fn preamble(&self) -> Vec<&str> {
-        self.instructions.iter().chain(&self.memory.context).chain(&self.earlier).map(String::as_str).collect()
+        self.instructions
+            .iter()
+            .chain(&self.referenced)
+            .chain(&self.memory.context)
+            .chain(&self.earlier)
+            .map(String::as_str)
+            .collect()
     }
 
     pub fn scoped(&self, cancel: CancellationToken) -> Arc<Self> {

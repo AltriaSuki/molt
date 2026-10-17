@@ -20,7 +20,7 @@ use crate::control::{self, Control, Registered};
 use crate::ctx::Ctx;
 use crate::designer::{self, Design};
 use crate::review::{self, Winner};
-use crate::{instructions, memory, select, tools};
+use crate::{instructions, memory, referenced, select, tools};
 use crate::{Bus, Config};
 
 const MAX_ATTEMPTS: u32 = 8;
@@ -59,6 +59,7 @@ pub(crate) async fn run_cancellable(
         ctx.checkpoint = Some(Arc::new(store));
     }
     ctx.instructions = instructions::gather(&ctx).await;
+    ctx.referenced = referenced::gather(&ctx).await;
     let ctx = Arc::new(ctx);
     let _steer = steer(&ctx);
     if let Some(dir) = &state {
@@ -106,6 +107,7 @@ async fn resume_run(
     ctx.run_cancel = cancel;
     ctx.memory = memory::prepare(&ctx).await;
     ctx.instructions = instructions::gather(&ctx).await;
+    ctx.referenced = referenced::gather(&ctx).await;
     ctx.restore(&saved.spend, saved.open_calls);
     ctx.control = Control::new(saved.requirements.clone());
     let mut next = saved.clone();
@@ -403,6 +405,7 @@ pub(crate) async fn design_cancellable(
     ctx.run_cancel = cancel;
     ctx.memory = memory::prepare(&ctx).await;
     ctx.instructions = instructions::gather(&ctx).await;
+    ctx.referenced = referenced::gather(&ctx).await;
     let ctx = Arc::new(ctx);
     let design = designer::design(&ctx, true).await;
     // A failed or cancelled design still issued billable calls. Settle it
@@ -456,6 +459,13 @@ pub(crate) async fn design_cancellable(
     Ok(resp)
 }
 
+/// A relative path that stays in the workspace.
+fn inside(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    !path.as_os_str().is_empty()
+        && path.components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir))
+}
+
 fn validate(req: &RunRequest) -> Result<(), RemoteError> {
     let problem = if req.task.trim().is_empty() {
         "task is empty".to_owned()
@@ -489,6 +499,8 @@ fn validate(req: &RunRequest) -> Result<(), RemoteError> {
         "max_check_rounds must be at least 1".to_owned()
     } else if req.budget_usd.is_some_and(|b| !(b.is_finite() && b > 0.0)) {
         "budget_usd must be a positive amount".to_owned()
+    } else if let Some(f) = req.files.iter().find(|f| !inside(f)) {
+        format!("file {f:?} is not a path inside the workspace")
     } else {
         return Ok(());
     };
@@ -1094,10 +1106,14 @@ mod tests {
             RunRequest { max_check_rounds: Some(0), ..ok.clone() },
             RunRequest { budget_usd: Some(0.0), ..ok.clone() },
             RunRequest { budget_usd: Some(f64::INFINITY), ..ok.clone() },
+            RunRequest { files: vec!["../outside".into()], ..ok.clone() },
+            RunRequest { files: vec!["/etc/passwd".into()], ..ok.clone() },
+            RunRequest { files: vec![String::new()], ..ok.clone() },
         ];
         for req in bad {
             assert_eq!(validate(&req).unwrap_err().code, ErrorCode::Invalid, "{req:?}");
         }
+        assert!(validate(&RunRequest { files: vec!["src/lexer.rs".into(), "./a".into()], ..ok.clone() }).is_ok());
         assert!(validate(&RunRequest { attempts: 8, ..ok }).is_ok());
     }
 }
