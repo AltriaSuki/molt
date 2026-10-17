@@ -4,9 +4,11 @@
 //!
 //! 1. **Check first.** The done-check is a shell command whose exit status 0
 //!    means the task is done. If the caller gives none, a designer agent
-//!    writes one (possibly with new test files) before any work starts. A
-//!    caller can also ask for no check: one attempt then does the task and
-//!    its result is returned unverified.
+//!    writes one (possibly with new test files) before any work starts. For
+//!    a task no command can check (research, writing), the designer gives a
+//!    rubric instead: criteria an independent judge decides one by one (see
+//!    [`Criterion`]). A caller can also ask for no check: one attempt then
+//!    does the task and its result is returned unverified.
 //! 2. **Parallel attempts.** Each attempt is an agent loop (model and tools)
 //!    in its own fork of the workspace, with its own approach hint.
 //! 3. **Verify.** When an attempt says it is done, the planner restores the
@@ -67,6 +69,14 @@ pub struct RunRequest {
     /// How to pick among attempts that pass.
     #[serde(default, skip_serializing_if = "Select::is_first")]
     pub select: Select,
+    /// Criteria the result must meet, as `planner.design` returned them, for
+    /// a task no command can check: an independent judge decides each.
+    /// Only without `check`, and with `verify`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rubric: Vec<Criterion>,
+    /// Model for the judge of a rubric. Default: the attempts' model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_model: Option<String>,
     /// False: run without a done-check, one attempt, result unverified. Only
     /// without `check`.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
@@ -214,6 +224,8 @@ impl RunRequest {
             check_files: Vec::new(),
             suite: None,
             select: Select::First,
+            rubric: Vec::new(),
+            judge_model: None,
             verify: true,
             attempts: two(),
             model: None,
@@ -313,6 +325,35 @@ pub enum Outcome {
     /// No automated check applies to this task; the single attempt's answer
     /// is returned without verification.
     Unverified,
+    /// An attempt met every criterion of the run's rubric, as an independent
+    /// model judge (and the criteria's own commands) found. Weaker evidence
+    /// than a passing check. New: an older reader does not know it.
+    Judged,
+}
+
+/// One thing a result must satisfy, for a task no single command can check:
+/// a statement that can be decided true or false by looking at the result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Criterion {
+    pub text: String,
+    /// A command, run from the workspace root, that exits 0 when the
+    /// criterion is met. Without one, the judge model decides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+/// How a result did on one criterion.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    /// The criterion, as the rubric words it.
+    pub criterion: String,
+    pub met: bool,
+    /// The judge's reason, or the end of the command's output.
+    #[serde(default)]
+    pub reason: String,
+    /// Decided by the criterion's command rather than the judge model.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub by_command: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +402,10 @@ pub struct DesignResponse {
     /// The project's own test command, when the designer found one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suite: Option<String>,
+    /// Without a command: the criteria the designer gave instead, for an
+    /// independent judge. Empty when there is nothing to judge either.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rubric: Vec<Criterion>,
     /// Why the designer settled on this check, or on none.
     #[serde(default)]
     pub rationale: String,
@@ -488,6 +533,12 @@ pub struct RunResponse {
     /// How the winner was picked when more than one attempt passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<Selection>,
+    /// The criteria the result was judged by, in a run with a rubric.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rubric: Vec<Criterion>,
+    /// How the winner did on each criterion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judgement: Vec<Finding>,
 }
 
 /// How the passing attempts were compared.
@@ -504,6 +555,9 @@ pub struct Selection {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Candidate {
     pub attempt: u32,
+    /// Criteria of the rubric it met, in a run with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criteria_met: Option<u32>,
     /// The project's suite passed in its fork. `None`: there is no suite,
     /// or it could not be run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -522,7 +576,8 @@ pub struct Candidate {
 /// Names and inputs of the tools the planner offers the model. Each maps to
 /// one `fs` or `shell` call in the attempt's fork, or, for [`FIND_SYMBOL`]
 /// and [`RECALL`] (offered when memory is up), one `memory` call about the
-/// workspace.
+/// workspace, or, for [`FETCH_URL`] (offered when the planner may call
+/// `web.fetch`), one `web` call.
 pub mod tools {
     use serde::{Deserialize, Serialize};
 
@@ -534,10 +589,13 @@ pub mod tools {
     pub const RUN: &str = "run";
     pub const FIND_SYMBOL: &str = "find_symbol";
     pub const RECALL: &str = "recall";
+    pub const FETCH_URL: &str = "fetch_url";
     /// Offered only to the check designer: the check it settled on.
     pub const SUBMIT_CHECK: &str = "submit_check";
     /// Offered only to the reviewer: its verdict.
     pub const SUBMIT_REVIEW: &str = "submit_review";
+    /// Offered only to the judge of a rubric: its finding on each criterion.
+    pub const SUBMIT_JUDGEMENT: &str = "submit_judgement";
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ReadFile {
@@ -602,6 +660,11 @@ pub mod tools {
         pub query: String,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct FetchUrl {
+        pub url: String,
+    }
+
     /// `command` is `None` when no automated check fits the task (a
     /// question to answer, say); the run is then unverified.
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -614,7 +677,24 @@ pub mod tools {
         /// The project's own test command, when it has one.
         #[serde(default)]
         pub suite: Option<String>,
+        /// Without a command: criteria for an independent judge instead.
+        #[serde(default)]
+        pub rubric: Vec<super::Criterion>,
         pub rationale: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SubmitJudgement {
+        pub findings: Vec<Judged>,
+    }
+
+    /// The judge's finding on one criterion, by its number from 1.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Judged {
+        pub criterion: u32,
+        pub met: bool,
+        #[serde(default)]
+        pub reason: String,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

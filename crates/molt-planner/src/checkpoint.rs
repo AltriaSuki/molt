@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use molt_api::model::Usage;
-use molt_api::planner::{AttemptStatus, CheckFile, Requirement, RunRequest};
+use molt_api::planner::{AttemptStatus, CheckFile, Criterion, Finding, Requirement, RunRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -42,6 +42,9 @@ pub struct Saved {
     pub settled: bool,
     #[serde(default)]
     pub check: Option<SavedCheck>,
+    /// Without a check: the criteria the run is judged by.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rubric: Vec<Criterion>,
     #[serde(default)]
     pub spend: SavedSpend,
     /// Model calls started and not yet answered: if the run stopped here,
@@ -85,6 +88,9 @@ pub struct SavedAttempt {
     /// It was offered memory's tools.
     #[serde(default)]
     pub memory_tools: bool,
+    /// It was offered `fetch_url`.
+    #[serde(default)]
+    pub web_tools: bool,
     /// Its conversation, the first message included.
     #[serde(default)]
     pub messages: Vec<Value>,
@@ -113,6 +119,9 @@ pub struct SavedEnd {
     pub note: String,
     #[serde(default)]
     pub summary: String,
+    /// How it did on the run's rubric, when it was judged and met it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<Finding>,
 }
 
 impl Saved {
@@ -125,6 +134,7 @@ impl Saved {
             request,
             settled: false,
             check: None,
+            rubric: Vec::new(),
             spend: SavedSpend::default(),
             open_calls: 0,
             attempts: Vec::new(),
@@ -141,6 +151,7 @@ impl Saved {
                     index,
                     fork: None,
                     memory_tools: false,
+                    web_tools: false,
                     messages: Vec::new(),
                     known: None,
                     turns: 0,

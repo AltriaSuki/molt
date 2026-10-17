@@ -70,6 +70,8 @@ pub(crate) struct Ctx {
     pub task: String,
     pub workspace: String,
     pub model: Option<String>,
+    /// The judge's model, when it is not the run's.
+    pub judge_model: Option<String>,
     pub effort: Option<Effort>,
     pub max_turns: u32,
     pub max_check_rounds: u32,
@@ -79,6 +81,9 @@ pub(crate) struct Ctx {
     pub stream: bool,
     /// What memory knows about the workspace; empty when memory is not up.
     pub memory: Memory,
+    /// The planner may read the web (it holds a capability for `web.fetch`):
+    /// attempts are offered `fetch_url`.
+    pub web: bool,
     /// The `<project_instructions>` block, when the project has instruction files.
     pub instructions: Option<String>,
     /// The files the user pointed at, and their `<referenced_files>` block.
@@ -108,6 +113,8 @@ pub(crate) struct Conversation {
     pub(crate) tools: Arc<Vec<Value>>,
     pub(crate) messages: Vec<Value>,
     pub(crate) attempt: Option<u32>,
+    /// The model for this conversation, in place of the run's.
+    pub(crate) model: Option<String>,
     /// How many messages the model last measured, and the tokens it counted
     /// for them, its reply included.
     pub(crate) known: Option<(usize, u64)>,
@@ -115,7 +122,7 @@ pub(crate) struct Conversation {
 
 impl Conversation {
     pub fn new(system: &'static str, tools: Arc<Vec<Value>>, first: Value, attempt: Option<u32>) -> Self {
-        Self { system, tools, messages: vec![first], attempt, known: None }
+        Self { system, tools, messages: vec![first], attempt, model: None, known: None }
     }
 
     pub fn push(&mut self, message: Value) {
@@ -139,12 +146,14 @@ impl Ctx {
     /// Limits come from the request where it sets them and from `cfg` otherwise.
     pub fn new(bus: Arc<dyn Bus>, cfg: Arc<Config>, trace: TraceId, req: &RunRequest) -> Self {
         let model = req.model.clone().filter(|m| !m.trim().is_empty()).or_else(|| cfg.default_model.clone());
+        let web = bus.holds(molt_api::web::FETCH);
         Self {
             bus,
             trace,
             task: req.task.clone(),
             workspace: req.workspace.clone(),
             model,
+            judge_model: req.judge_model.clone().filter(|m| !m.trim().is_empty()),
             effort: req.effort,
             max_turns: req.max_turns.unwrap_or(cfg.max_turns),
             max_check_rounds: req.max_check_rounds.unwrap_or(cfg.max_check_rounds),
@@ -152,6 +161,7 @@ impl Ctx {
             budget_usd: req.budget_usd.unwrap_or(cfg.budget_usd),
             stream: req.stream,
             memory: Memory::default(),
+            web,
             instructions: None,
             files: req.files.clone(),
             referenced: None,
@@ -303,7 +313,7 @@ impl Ctx {
     /// so a caller that stops waiting leaves it pending until the reply lands.
     pub async fn complete(self: &Arc<Self>, conv: &Conversation, turn: u32) -> Result<CompleteResponse, RemoteError> {
         let req = CompleteRequest {
-            model: self.model.clone(),
+            model: conv.model.clone().or_else(|| self.model.clone()),
             system: Some(conv.system.to_owned()),
             messages: conv.messages.clone(),
             tools: conv.tools.as_ref().clone(),
@@ -319,6 +329,7 @@ impl Ctx {
         let who = match conv.attempt {
             Some(n) => format!("attempt {n}"),
             None if conv.system == crate::prompts::REVIEWER_SYSTEM => "the reviewer".to_owned(),
+            None if conv.system == crate::prompts::JUDGE_SYSTEM => "the judge".to_owned(),
             None => "the check's designer".to_owned(),
         };
         let busy = self.control.busy(format!("{who}: a model call"));
