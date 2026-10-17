@@ -25,20 +25,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_status(frame, status, app);
     if let Some(viewer) = &mut app.viewer {
-        let r = centered(area, 92, 88);
-        frame.render_widget(Clear, r);
-        let block = Block::new()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(style(Tone::Dim))
-            .title(Line::from(span(format!(" {} ", viewer.title), Tone::Shell)))
-            .title_bottom(Line::from(span(" j/k scroll · g/G ends · esc close ", Tone::Dim)).right_aligned());
-        let inner = block.inner(r);
-        frame.render_widget(block, r);
-        let lines = wrap_all(&viewer.lines, inner.width);
-        viewer.scroll = viewer.scroll.min(lines.len().saturating_sub(1));
-        let shown: Vec<Line> = lines.into_iter().skip(viewer.scroll).take(usize::from(inner.height)).collect();
-        frame.render_widget(Paragraph::new(shown), inner);
+        draw_viewer(frame, area, viewer, " j/k scroll · g/G ends · esc close ");
     }
     if let Some(view) = &mut app.transcript {
         let r = centered(area, 92, 88);
@@ -64,7 +51,27 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let shown: Vec<Line> = wrap_all(&rest, inner.width).into_iter().take(height).collect();
         frame.render_widget(Paragraph::new(shown), inner);
     }
+    if let Some(viewer) = &mut app.shortcuts {
+        draw_viewer(frame, area, viewer, " j/k scroll · ? / esc close ");
+    }
     app.theme.paint(frame.buffer_mut());
+}
+
+fn draw_viewer(frame: &mut Frame, area: Rect, viewer: &mut super::app::Viewer, hint: &str) {
+    let r = centered(area, 92, 88);
+    frame.render_widget(Clear, r);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(style(Tone::Dim))
+        .title(Line::from(span(format!(" {} ", viewer.title), Tone::Shell)))
+        .title_bottom(Line::from(span(hint.to_owned(), Tone::Dim)).right_aligned());
+    let inner = block.inner(r);
+    frame.render_widget(block, r);
+    let lines = wrap_all(&viewer.lines, inner.width);
+    viewer.scroll = viewer.scroll.min(lines.len().saturating_sub(1));
+    let shown: Vec<Line> = lines.into_iter().skip(viewer.scroll).take(usize::from(inner.height)).collect();
+    frame.render_widget(Paragraph::new(shown), inner);
 }
 
 fn centered(area: Rect, w_pct: u16, h_pct: u16) -> Rect {
@@ -116,16 +123,23 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App) {
     // The input grows with its lines, up to half the screen.
     let (rows, _) = field_rows(&app.input, field_width(area.width));
     let input_height = u16::try_from(rows.len()).unwrap_or(u16::MAX).clamp(1, (area.height / 2).max(1)) + 2;
-    let taken = area.height.saturating_sub(input_height + 2);
+    let completion_room = area.height.saturating_sub(input_height + 1);
+    let completions = command_lines(app, usize::from(completion_room.saturating_sub(1)).min(6));
+    let completion_height = u16::try_from(completions.len()).unwrap_or(0);
+    let taken = area.height.saturating_sub(input_height + completion_height + 2);
     let live_height = if lanes {
         let room = taken.saturating_sub(1);
         if app.zoom.is_some() { room * 2 / 3 } else { (room / 2).min(14) }.max(4)
     } else {
         u16::try_from(live.len()).unwrap_or(u16::MAX).min(taken)
     };
-    let [log, live_area, input] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(live_height), Constraint::Length(input_height)])
-            .areas(area);
+    let [log, live_area, completion_area, input] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(live_height),
+        Constraint::Length(completion_height),
+        Constraint::Length(input_height),
+    ])
+    .areas(area);
 
     // The log, from its end unless scrolled.
     let width = log.width.saturating_sub(2).max(1);
@@ -155,7 +169,36 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App) {
         let inner = Rect { x: live_area.x + 1, width: live_area.width.saturating_sub(2), ..live_area };
         frame.render_widget(Paragraph::new(live), inner);
     }
+    let inner = Rect { x: completion_area.x + 1, width: completion_area.width.saturating_sub(2), ..completion_area };
+    frame.render_widget(Paragraph::new(completions), inner);
     draw_input(frame, input, app);
+}
+
+/// Keep the picked command visible while showing at most six candidates.
+fn command_lines(app: &App, limit: usize) -> Vec<Line<'static>> {
+    let completions = app.command_completions();
+    if completions.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let picked = app.command_pick.min(completions.len() - 1);
+    let start = picked.saturating_sub(limit - 1);
+    let mut lines: Vec<_> = completions
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(limit)
+        .map(|(i, c)| {
+            let tone = if i == picked { Tone::Shell } else { Tone::Dim };
+            Line::from(vec![
+                span(if i == picked { "› " } else { "  " }, tone),
+                span(clean_line(&c.label), tone),
+                span(format!("  {}", clean_line(&c.description)), Tone::Dim),
+            ])
+        })
+        .collect();
+    let count = format!("{}/{}", picked + 1, completions.len());
+    lines.push(keys(&[("↑↓", "pick"), ("tab", "complete"), ("esc", "hide"), (&count, "")]));
+    lines
 }
 
 /// What is under way, or what waits on the user, above the input.
@@ -412,7 +455,8 @@ fn task_spend(task: &Task) -> (String, Tone) {
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     let waiting = matches!(app.prompt, Some(Prompt::Check(_) | Prompt::Apply { .. }))
         || app.viewer.is_some()
-        || app.transcript.is_some();
+        || app.transcript.is_some()
+        || app.shortcuts.is_some();
     let editing_check = matches!(app.prompt, Some(Prompt::EditCheck(_)));
     let mut block = Block::new()
         .borders(Borders::ALL)

@@ -200,7 +200,13 @@ for every project. `/attempts`, `/model`, `/effort`, `/budget` and
 that task); `/memory-model NAME` sets the model
 memory learns with (`same` for the attempts' model, `default` for
 `MOLT_MEMORY_MODEL` or `sonnet`), and when learning finds nothing the log
-says why. `/help` lists the keys. The services'
+says why. Typing `/` shows matching commands and argument hints above the input
+(up to six at once). ↑/↓ selects a candidate and Tab puts it in; commands with
+fixed values, such as `/effort` and `/model`, suggest those values next. Esc
+hides the list; editing brings it back. Tab otherwise still enlarges attempts.
+With an empty input, `?` opens shortcuts for the current screen, including check
+and apply confirmations and memory; `?` again or Esc closes them. In text, `?`
+is typed normally. `/help` lists all commands and keys. The services'
 log goes to `tui.log` in the data dir, and colors are left out under
 `NO_COLOR`.
 
@@ -1152,7 +1158,8 @@ These defaults affect only that task. Explicit interface settings take precedenc
 and a template budget cannot raise an existing limit. Confirm mode shows a
 template's check before starting; auto and plan modes retain their existing rules.
 Templates cannot set modes, permissions or protected paths. `/help` lists project
-commands and Tab completes unique command prefixes (or lists matches). Built-ins
+commands, and their argument hints and descriptions appear in the same live
+completion list as built-ins. Built-ins
 win name conflicts. Invalid, oversized and out-of-workspace files are skipped
 with a startup warning; restart the interface after editing templates. Discovery
 is bounded to 128 directory entries and 64 KiB per file. Nested YAML structures
