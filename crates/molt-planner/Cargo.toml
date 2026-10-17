@@ -4,6 +4,7 @@ description = "Molt's planner: check-first, parallel verified attempts over the 
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 molt-api.workspace = true

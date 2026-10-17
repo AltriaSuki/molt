@@ -78,6 +78,16 @@ requests = [
   { target = "fs.view", budget = { calls = 100000000 } },
 ]
 
+# Web pages for the agent, from the hosts listed here only, over https and
+# never from local or private addresses; commands still have no network. To
+# use it, uncomment it and add `{ target = "web.fetch", budget = { calls =
+# 1000000 } }` to the planner's requests below.
+# [[service]]
+# name = "web"
+# tier = "protected"
+# exec = { command = "molt-web", args = ["--allow", "docs.rs", "--allow", "*.python.org"] }
+# provides = ["web.*"]
+
 # Calls 0 would refuse every call; ms 0 leaves deadlines to each request.
 # Of memory, the planner may only ask: not remember, forget or learn.
 [[service]]
@@ -88,7 +98,7 @@ provides = ["planner.*"]
 pass_env = [
   "MOLT_PLANNER_MODEL", "MOLT_MAX_TURNS", "MOLT_MAX_CHECK_ROUNDS", "MOLT_BUDGET_USD", "MOLT_MAX_TOKENS",
   "MOLT_MODEL_TIMEOUT_S", "MOLT_CHECK_TIMEOUT_S", "MOLT_MAP_TOKENS", "MOLT_CONTEXT_TOKENS",
-  "MOLT_INSTRUCTION_FILES",
+  "MOLT_INSTRUCTION_FILES", "MOLT_SYNTAX_CHECK",
 ]
 requests = [
   { target = "model.complete", budget = { tokens = 4000000000, calls = 1000000 } },

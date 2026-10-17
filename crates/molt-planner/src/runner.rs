@@ -3,9 +3,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use molt_api::planner::{
-    AttemptStatus, CheckFile, CheckSpec, DesignResponse, Outcome, Resume, RunRequest, RunResponse, Verdict,
+    AttemptStatus, Candidate, CheckFile, CheckSpec, Criterion, DesignResponse, Outcome, Resume, Review, RunRequest,
+    RunResponse, Select, Selection, Verdict,
 };
 use molt_api::progress::Progress;
 use molt_proto::{ErrorCode, RemoteError, TraceId};
@@ -18,7 +20,7 @@ use crate::control::{self, Control, Registered};
 use crate::ctx::Ctx;
 use crate::designer::{self, Design};
 use crate::review::{self, Winner};
-use crate::{instructions, memory};
+use crate::{instructions, memory, select, tools};
 use crate::{Bus, Config};
 
 const MAX_ATTEMPTS: u32 = 8;
@@ -64,17 +66,16 @@ pub(crate) async fn run_cancellable(
     }
     tracing::info!(run = %ctx.trace, workspace = %ctx.workspace, attempts = req.attempts, "run started");
 
-    // A check with files came from planner.design.
-    let designed = req.verify && (req.check.is_none() || !req.check_files.is_empty());
-    let check = match settle_check(&ctx, &req).await? {
-        Ok(check) => check,
-        Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason))),
+    let designed = designed_here(&req);
+    let settled = match settle_check(&ctx, &req).await? {
+        Ok(settled) => settled,
+        Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason)).await),
     };
-    save_check(&ctx, check.as_ref(), designed);
-    // Without a check there is nothing to pick a winner by, so one attempt is enough.
-    let count = if check.is_some() { req.attempts } else { 1 };
+    save_check(&ctx, &settled, designed);
+    // Without a check or a rubric there is nothing to pick a winner by, so one attempt is enough.
+    let count = if settled.verified() { req.attempts } else { 1 };
     let slots = (0..count).map(|index| Slot::Run { index, saved: None }).collect();
-    Ok(finish(&ctx, &req, check, designed, slots).await)
+    Ok(finish(&ctx, &req, settled, designed, slots).await)
 }
 
 /// Go on with the checkpointed run `resume.run`.
@@ -129,25 +130,27 @@ async fn resume_run(
         ctx.note(format!("the checkpoint was saved by planner {}", saved.planner)).await;
     }
 
-    let (check, designed) = if saved.settled {
+    let (settled, designed) = if saved.settled {
         let check = saved.check.as_ref().map(|c| Check {
             command: c.command.clone(),
             files: c.files.iter().map(|f| (f.path.clone(), f.content.clone())).collect(),
+            suite: c.suite.clone(),
         });
-        (check, saved.check.as_ref().is_some_and(|c| c.designed))
+        let designed = saved.check.as_ref().is_some_and(|c| c.designed);
+        (Settled { check, rubric: saved.rubric.clone() }, designed)
     } else {
         // Stopped while the check was being designed: design it again.
-        let designed = run_req.verify && (run_req.check.is_none() || !run_req.check_files.is_empty());
+        let designed = designed_here(&run_req);
         match settle_check(&ctx, &run_req).await? {
-            Ok(check) => {
-                save_check(&ctx, check.as_ref(), designed);
-                (check, designed)
+            Ok(settled) => {
+                save_check(&ctx, &settled, designed);
+                (settled, designed)
             }
-            Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason))),
+            Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason)).await),
         }
     };
 
-    let count = if check.is_some() { run_req.attempts } else { 1 };
+    let count = if settled.verified() { run_req.attempts } else { 1 };
     let passed = saved.attempts.iter().any(|a| a.end.as_ref().is_some_and(|e| e.status == AttemptStatus::Passed));
     let mut slots = Vec::new();
     for attempt in &saved.attempts {
@@ -159,7 +162,12 @@ async fn resume_run(
             // A winner is in already: nothing else needs to go on.
             None if passed || resume.retry => {
                 let why = if passed { "another attempt had passed" } else { "left as it was for a retry" };
-                let end = SavedEnd { status: AttemptStatus::Cancelled, note: why.into(), summary: String::new() };
+                let end = SavedEnd {
+                    status: AttemptStatus::Cancelled,
+                    note: why.into(),
+                    summary: String::new(),
+                    findings: Vec::new(),
+                };
                 ctx.save(|s| s.attempt(attempt.index).end = Some(end.clone()));
                 slots.push(Slot::Done(Finished::saved(attempt, &end)));
             }
@@ -176,7 +184,7 @@ async fn resume_run(
     if !passed && !slots.iter().any(|s| matches!(s, Slot::Run { .. })) {
         ctx.note("every attempt of this run had ended; resume with retry to start new ones").await;
     }
-    Ok(finish(&ctx, &run_req, check, designed, slots).await)
+    Ok(finish(&ctx, &run_req, settled, designed, slots).await)
 }
 
 /// Make the run steerable with `planner.control` and report its state, until
@@ -201,30 +209,63 @@ fn failed(message: impl Into<String>) -> RemoteError {
     RemoteError { code: ErrorCode::Failed, message: message.into() }
 }
 
-/// The check the run goes by: given, designed, or none (`Ok(None)`). An
-/// `Err` inside says why the designer could not produce one.
-async fn settle_check(ctx: &Arc<Ctx>, req: &RunRequest) -> Result<Result<Option<Check>, String>, RemoteError> {
+/// Whether this run designs its check: it is given none (a check with files
+/// came from `planner.design`, and so did a rubric).
+fn designed_here(req: &RunRequest) -> bool {
+    req.verify && ((req.check.is_none() && req.rubric.is_empty()) || !req.check_files.is_empty())
+}
+
+/// How a run accepts a result: by its done-check, by a rubric an
+/// independent judge decides, or, with neither, not at all (unverified).
+struct Settled {
+    check: Option<Check>,
+    rubric: Vec<Criterion>,
+}
+
+impl Settled {
+    fn verified(&self) -> bool {
+        self.check.is_some() || !self.rubric.is_empty()
+    }
+}
+
+/// What the run goes by: a check or a rubric, given or designed, or
+/// neither. An `Err` inside says why the designer could not produce one.
+async fn settle_check(ctx: &Arc<Ctx>, req: &RunRequest) -> Result<Result<Settled, String>, RemoteError> {
+    let none = Settled { check: None, rubric: Vec::new() };
     Ok(Ok(match &req.check {
-        Some(command) => Some(Check {
-            command: command.clone(),
-            files: req.check_files.iter().map(|f| (f.path.clone(), f.content.clone())).collect(),
-        }),
+        Some(command) => Settled {
+            check: Some(Check {
+                command: command.clone(),
+                files: req.check_files.iter().map(|f| (f.path.clone(), f.content.clone())).collect(),
+                suite: req.suite.clone(),
+            }),
+            rubric: Vec::new(),
+        },
+        None if !req.rubric.is_empty() => Settled { check: None, rubric: req.rubric.clone() },
         None if !req.verify => {
             ctx.note("running without a done-check, as asked").await;
-            None
+            none
         }
         None => match designer::design(ctx, false).await? {
-            Design::Check { command, files, .. } => Some(Check { command, files }),
+            Design::Check { command, files, suite, .. } => {
+                Settled { check: Some(Check { command, files, suite }), rubric: Vec::new() }
+            }
+            Design::Rubric { criteria, .. } => {
+                ctx.note(format!("no done-check command fits; a judge decides {} criteria", criteria.len())).await;
+                Settled { check: None, rubric: criteria }
+            }
             Design::Unverified(reason) => {
                 ctx.note(format!("no automated done-check: {reason}")).await;
-                None
+                none
             }
             Design::Failed(reason) => return Ok(Err(reason)),
         },
     }))
 }
 
-fn save_check(ctx: &Ctx, check: Option<&Check>, designed: bool) {
+fn save_check(ctx: &Ctx, settled: &Settled, designed: bool) {
+    let check = settled.check.as_ref();
+    let rubric = settled.rubric.clone();
     let saved = check.map(|c| SavedCheck {
         command: c.command.clone(),
         files: c
@@ -233,10 +274,12 @@ fn save_check(ctx: &Ctx, check: Option<&Check>, designed: bool) {
             .map(|(path, content)| CheckFile { path: path.clone(), content: content.clone() })
             .collect(),
         designed,
+        suite: c.suite.clone(),
     });
     ctx.save(|s| {
         s.settled = true;
         s.check = saved;
+        s.rubric = rubric;
     });
     ctx.control.settle(check.is_some(), check.map(Check::paths).unwrap_or_default());
 }
@@ -263,31 +306,37 @@ enum Slot {
 
 /// Race the attempts, apply the winner and total up. A checkpointed run
 /// stopped before it finished keeps its checkpoint and forks.
-async fn finish(
-    ctx: &Arc<Ctx>,
-    req: &RunRequest,
-    check: Option<Check>,
-    designed: bool,
-    slots: Vec<Slot>,
-) -> RunResponse {
-    let spec = check.as_ref().map(|c| CheckSpec { command: c.command.clone(), files: c.paths(), designed });
+async fn finish(ctx: &Arc<Ctx>, req: &RunRequest, settled: Settled, designed: bool, slots: Vec<Slot>) -> RunResponse {
+    let Settled { check, rubric } = settled;
+    let spec = check.as_ref().map(|c| CheckSpec {
+        command: c.command.clone(),
+        files: c.paths(),
+        designed,
+        suite: c.suite.clone(),
+    });
     ctx.progress(Progress::CheckReady {
         run: ctx.run_id(),
         command: spec.as_ref().map(|s| s.command.clone()),
         files: spec.as_ref().map(|s| s.files.clone()).unwrap_or_default(),
         designed,
+        rubric: rubric.iter().map(|c| c.text.clone()).collect(),
     })
     .await;
-    let (finished, winner) = race(ctx, slots, check.map(Arc::new)).await;
+    let check = check.map(Arc::new);
+    let rubric = Arc::new(rubric);
+    let (finished, passed) = race(ctx, slots, check.clone(), rubric.clone(), req.select).await;
     ctx.control.freeze("the run is finishing");
     let stopped = ctx.checkpoint.is_some() && ctx.run_cancel.is_cancelled();
     // Cancelled attempts may have left model calls running, which are billed: give their replies a moment
     // to land and be counted, while the winner is applied.
-    let (mut resp, tally) =
-        tokio::join!(conclude(ctx, req, spec, finished, winner, stopped), ctx.settle(ctx.cfg.late_reply_wait));
+    let (mut resp, tally) = tokio::join!(
+        conclude(ctx, req, (spec, check), &rubric, finished, passed, stopped),
+        ctx.settle(ctx.cfg.late_reply_wait)
+    );
     resp.usage = tally.spend.usage;
     resp.cost_usd = tally.spend.cost_usd;
     resp.uncounted_calls = tally.uncounted_calls() + ctx.carried_uncounted;
+    crate::hooks::notify(ctx, crate::hooks::Event::RunFinished).await;
     if stopped {
         let spend = SavedSpend { usage: resp.usage, cost_usd: resp.cost_usd, uncounted_calls: resp.uncounted_calls };
         ctx.save(|s| {
@@ -314,7 +363,7 @@ async fn finish(
 
 /// A run that ended before any attempt: a stopped one keeps its checkpoint,
 /// to design the check again when resumed; otherwise nothing is left.
-fn finish_early(ctx: &Ctx, mut resp: RunResponse) -> RunResponse {
+async fn finish_early(ctx: &Arc<Ctx>, mut resp: RunResponse) -> RunResponse {
     if let Some(store) = &ctx.checkpoint {
         if ctx.run_cancel.is_cancelled() {
             resp.checkpoint = Some(ctx.run_id());
@@ -322,6 +371,7 @@ fn finish_early(ctx: &Ctx, mut resp: RunResponse) -> RunResponse {
             store.remove();
         }
     }
+    crate::hooks::notify(ctx, crate::hooks::Event::RunFinished).await;
     resp
 }
 
@@ -344,8 +394,8 @@ pub(crate) async fn design_cancellable(
     cancel: CancellationToken,
 ) -> Result<DesignResponse, RemoteError> {
     validate(&req)?;
-    if req.check.is_some() || !req.verify {
-        let message = "planner.design designs a check: leave out check, and keep verify".to_owned();
+    if req.check.is_some() || !req.rubric.is_empty() || !req.verify {
+        let message = "planner.design designs a check: leave out check and rubric, and keep verify".to_owned();
         return Err(RemoteError { code: ErrorCode::Invalid, message });
     }
     let mut ctx = Ctx::new(bus, cfg, trace, &req);
@@ -361,6 +411,8 @@ pub(crate) async fn design_cancellable(
     let mut resp = DesignResponse {
         command: None,
         files: Vec::new(),
+        suite: None,
+        rubric: Vec::new(),
         rationale: String::new(),
         baseline: None,
         usage: tally.spend.usage,
@@ -371,11 +423,16 @@ pub(crate) async fn design_cancellable(
         cancelled: false,
     };
     match design {
-        Ok(Design::Check { command, files, rationale, baseline }) => {
+        Ok(Design::Check { command, files, suite, rationale, baseline }) => {
             resp.command = Some(command);
+            resp.suite = suite;
             resp.files = files.into_iter().map(|(path, content)| CheckFile { path, content }).collect();
             resp.rationale = rationale;
             resp.baseline = baseline;
+        }
+        Ok(Design::Rubric { criteria, rationale }) => {
+            resp.rubric = criteria;
+            resp.rationale = rationale;
         }
         Ok(Design::Unverified(reason)) => resp.rationale = reason,
         Ok(Design::Failed(reason)) => {
@@ -387,6 +444,8 @@ pub(crate) async fn design_cancellable(
     if ctx.cancel.is_cancelled() && !ctx.over_budget() {
         resp.command = None;
         resp.files.clear();
+        resp.suite = None;
+        resp.rubric.clear();
         resp.cancelled = true;
         resp.error = Some("design stopped; remote settlement may remain incomplete".into());
     }
@@ -408,8 +467,20 @@ fn validate(req: &RunRequest) -> Result<(), RemoteError> {
         "check is empty: leave it out to have one designed".to_owned()
     } else if req.check.is_none() && !req.check_files.is_empty() {
         "check_files without a check".to_owned()
+    } else if req.check.is_none() && req.suite.is_some() {
+        "a suite without a check: the suite only compares results that pass a check".to_owned()
+    } else if req.suite.as_ref().is_some_and(|s| s.trim().is_empty()) {
+        "suite is empty: leave it out when the project has none".to_owned()
     } else if req.check.is_some() && !req.verify {
         "a check with verify off: leave out one or the other".to_owned()
+    } else if !req.rubric.is_empty() && req.check.is_some() {
+        "a check and a rubric: give one, the rubric only for a task no command can check".to_owned()
+    } else if !req.rubric.is_empty() && !req.verify {
+        "a rubric with verify off: leave out one or the other".to_owned()
+    } else if req.rubric.iter().any(|c| c.text.trim().is_empty()) {
+        "a criterion of the rubric has no text".to_owned()
+    } else if req.rubric.len() > designer::MAX_CRITERIA {
+        format!("the rubric has {} criteria; give at most {}", req.rubric.len(), designer::MAX_CRITERIA)
     } else if req.check_files.iter().any(|f| f.path.trim().is_empty()) {
         "a check file has no path".to_owned()
     } else if req.max_turns == Some(0) {
@@ -424,31 +495,55 @@ fn validate(req: &RunRequest) -> Result<(), RemoteError> {
     Err(RemoteError { code: ErrorCode::Invalid, message: problem })
 }
 
-/// Run the attempts at once. The first to pass wins and cancels the rest;
-/// every attempt is waited for. One that passed before a resume wins
-/// without running. Reports come back in index order.
-async fn race(ctx: &Arc<Ctx>, slots: Vec<Slot>, check: Option<Arc<Check>>) -> (Vec<Finished>, Option<u32>) {
+/// Run the attempts at once until `select` says to stop: with
+/// [`Select::First`] the first to pass cancels the rest. Every attempt is
+/// waited for. Ones that passed before a resume count without running.
+/// Reports come back in index order, the passing attempts in the order they
+/// passed.
+async fn race(
+    ctx: &Arc<Ctx>,
+    slots: Vec<Slot>,
+    check: Option<Arc<Check>>,
+    rubric: Arc<Vec<Criterion>>,
+    select: Select,
+) -> (Vec<Finished>, Vec<u32>) {
     let cancel = ctx.cancel.child_token();
     let mut tasks = JoinSet::new();
     let mut indices = HashMap::new();
     let mut finished = Vec::new();
-    let mut winner = None;
+    let mut passed = Vec::new();
     for slot in slots {
         match slot {
             Slot::Done(done) => {
-                if winner.is_none() && done.report.status == AttemptStatus::Passed {
-                    winner = Some(done.report.index);
+                if done.report.status == AttemptStatus::Passed && (passed.is_empty() || !select.is_first()) {
+                    passed.push(done.report.index);
                 }
                 finished.push(done);
             }
             Slot::Run { index, saved } => {
                 let token = cancel.child_token();
-                let handle = tasks.spawn(attempt::run(ctx.scoped(token.clone()), index, check.clone(), token, saved));
+                let attempt =
+                    attempt::run(ctx.scoped(token.clone()), index, check.clone(), rubric.clone(), token, saved);
+                let handle = tasks.spawn(attempt);
                 indices.insert(handle.id(), index);
             }
         }
     }
-    while let Some(joined) = tasks.join_next_with_id().await {
+    // When the others stop being waited for, once one has passed.
+    let mut deadline: Option<tokio::time::Instant> = None;
+    loop {
+        let wait = deadline.unwrap_or_else(tokio::time::Instant::now);
+        let joined = tokio::select! {
+            joined = tasks.join_next_with_id() => match joined {
+                Some(joined) => joined,
+                None => break,
+            },
+            _ = tokio::time::sleep_until(wait), if deadline.is_some() && !cancel.is_cancelled() => {
+                ctx.note("the time to wait for more passing attempts is up; the ones still going are cancelled").await;
+                cancel.cancel();
+                continue;
+            }
+        };
         let done = match joined {
             Ok((_, done)) => done,
             Err(e) => {
@@ -457,29 +552,68 @@ async fn race(ctx: &Arc<Ctx>, slots: Vec<Slot>, check: Option<Arc<Check>>) -> (V
                 Finished::lost(index, format!("the attempt died: {e}"))
             }
         };
-        if winner.is_none() && done.report.status == AttemptStatus::Passed {
-            winner = Some(done.report.index);
-            cancel.cancel();
+        if done.report.status == AttemptStatus::Passed && (passed.is_empty() || !select.is_first()) {
+            passed.push(done.report.index);
+            if passed.len() == 1 && !tasks.is_empty() {
+                match stop_after_first(ctx, select, &done).await {
+                    None => cancel.cancel(),
+                    // A wait too long to represent is no deadline at all.
+                    Some(secs) => {
+                        deadline = secs.and_then(|s| tokio::time::Instant::now().checked_add(Duration::from_secs(s)))
+                    }
+                }
+            }
+        }
+        if matches!(done.report.status, AttemptStatus::Failed | AttemptStatus::Error) {
+            crate::hooks::notify(ctx, crate::hooks::Event::AttemptFailed).await;
         }
         finished.push(done);
     }
     finished.sort_by_key(|f| f.report.index);
-    (finished, winner)
+    (finished, passed)
+}
+
+/// What to do about the attempts still going once `first` has passed:
+/// `None` to cancel them now, `Some(None)` to let them run to their end,
+/// `Some(Some(secs))` to give them that long. Waiting needs budget: when
+/// less is left than the passing attempt cost, another is unlikely to
+/// finish, and the run takes the first as `first` would.
+async fn stop_after_first(ctx: &Ctx, select: Select, first: &Finished) -> Option<Option<u64>> {
+    let wait = match select {
+        Select::First | Select::Wait { secs: 0 } => return None,
+        Select::Wait { secs } => Some(secs),
+        Select::All => None,
+    };
+    let left = ctx.budget_usd - ctx.tally().spend.cost_usd;
+    if left < first.report.cost_usd {
+        ctx.note(format!(
+            "attempt {} passed; ${left:.2} of the budget is left, less than it cost (${:.2}), so the others are \
+             cancelled rather than waited for",
+            first.report.index, first.report.cost_usd
+        ))
+        .await;
+        return None;
+    }
+    Some(wait)
 }
 
 /// The response, without the run's totals.
 async fn conclude(
     ctx: &Arc<Ctx>,
     req: &RunRequest,
-    spec: Option<CheckSpec>,
+    checks: (Option<CheckSpec>, Option<Arc<Check>>),
+    rubric: &[Criterion],
     finished: Vec<Finished>,
-    winner: Option<u32>,
+    passed: Vec<u32>,
     stopped: bool,
 ) -> RunResponse {
-    let won = winner
+    let (spec, check) = checks;
+    let candidates: Vec<(&Finished, String)> = passed
+        .iter()
         .filter(|_| !ctx.run_cancel.is_cancelled())
-        .and_then(|w| finished.iter().find(|f| f.report.index == w))
-        .and_then(|f| Some((f, f.fork.clone()?)));
+        .filter_map(|w| finished.iter().find(|f| f.report.index == *w))
+        .filter_map(|f| Some((f, f.fork.clone()?)))
+        .collect();
     let mut resp = RunResponse {
         outcome: Outcome::Failed,
         check: spec.clone(),
@@ -497,97 +631,280 @@ async fn conclude(
         uncounted_calls: 0,
         checkpoint: None,
         requirements: ctx.control.all(),
+        selection: None,
+        rubric: rubric.to_vec(),
+        judgement: Vec::new(),
     };
-
-    match won {
-        None => {
-            resp.summary = failure_summary(spec.as_ref(), &finished);
-            // A stopped run's forks are its checkpoint's: kept for the resume.
-            if !stopped {
-                ctx.drop_forks_except(None).await;
-            }
+    let outcome = match (&spec, rubric.is_empty()) {
+        (Some(_), _) => Outcome::Passed,
+        (None, false) => Outcome::Judged,
+        (None, true) => Outcome::Unverified,
+    };
+    let Some((first, _)) = candidates.first() else {
+        resp.summary = failure_summary(spec.as_ref(), rubric, &finished);
+        // A stopped run's forks are its checkpoint's: kept for the resume.
+        if !stopped {
+            ctx.drop_forks_except(None).await;
         }
-        Some((done, fork)) => {
-            ctx.drop_forks_except(Some(&fork)).await;
-            resp.winner = Some(done.report.index);
-            // The check the result passed: a constraint may have replaced the run's own.
-            if let (Some(check), Some(command)) = (&mut resp.check, ctx.control.check(done.report.requirements)) {
-                check.command = command;
-            }
-            resp.outcome = if spec.is_some() { Outcome::Passed } else { Outcome::Unverified };
-            resp.summary = if done.summary.is_empty() {
-                "The attempt finished without a summary.".to_owned()
-            } else {
-                done.summary.clone()
-            };
-            let mut keep = false;
-            match ctx.diff(&fork).await {
-                Ok(diff) => {
-                    resp.changes = diff.changes;
-                    resp.patch = diff.patch;
-                    resp.patch_truncated = diff.truncated;
-                    // Reviewed against the check it passed and the requirements it followed.
-                    let passed = resp.check.clone();
-                    let requirements = ctx.control.upto(done.report.requirements);
-                    if let (true, Some(check), false) = (req.review, passed.as_ref(), resp.changes.is_empty()) {
-                        let winner = Winner {
-                            fork: &fork,
-                            check,
-                            changes: &resp.changes,
-                            patch: &resp.patch,
-                            truncated: resp.patch_truncated,
-                            requirements: &requirements,
-                        };
-                        resp.review = Some(review::review(ctx, &winner).await);
-                    }
-                    let held = resp.review.as_ref().filter(|r| r.verdict != Verdict::Approve);
-                    // An unverified attempt that changed nothing (it answered a question) has nothing to merge.
-                    if let (true, Some(review)) = (req.apply, held) {
-                        let what = if review.verdict == Verdict::Reject { "rejected" } else { "questioned" };
-                        resp.summary.push_str(&format!(
-                            "\n\nNot applied: the review {what} the changes. They are kept in {fork}."
-                        ));
-                        keep = true;
-                    } else if req.apply && (spec.is_some() || !resp.changes.is_empty()) {
-                        match ctx.merge(&fork).await {
-                            Ok(_) => resp.applied = true,
-                            Err(e) => {
-                                let what = if e.message.starts_with("partial:") {
-                                    "The apply needs recovery; the workspace may contain changes"
-                                } else {
-                                    "The changes were not applied"
-                                };
-                                resp.summary
-                                    .push_str(&format!("\n\n{what}: {}. They are all kept in {fork}.", e.message));
-                                keep = true;
-                            }
-                        }
-                    } else {
-                        keep = !req.apply;
-                    }
-                }
-                Err(e) => {
-                    resp.summary.push_str(&format!(
-                        "\n\nThe changes could not be listed or applied: {}. They are kept in {fork}.",
-                        e.message
-                    ));
-                    keep = true;
-                }
-            }
-            if keep {
-                ctx.forget_fork(&fork);
-                resp.fork = Some(fork);
-            } else if !resp.applied {
-                ctx.drop_fork(&fork).await;
-            }
+        return resp;
+    };
+    // The check the result passed: a constraint may have replaced the run's own. Every candidate passed
+    // under the same requirements, as the first to pass froze them.
+    if let (Some(check), Some(command)) = (&mut resp.check, ctx.control.check(first.report.requirements)) {
+        check.command = command;
+    }
+    // Format and recheck before ranking and review, including kept results.
+    // A failing formatter removes that candidate from consideration.
+    let mut prepared = Vec::new();
+    let mut failures = Vec::new();
+    for (done, fork) in candidates {
+        match crate::hooks::prepare(ctx, &fork, check.as_deref(), done.report.requirements).await {
+            Ok(()) => prepared.push((done, fork)),
+            Err(error) => failures.push((done, fork, error)),
         }
     }
+    let candidates = prepared;
+    if candidates.is_empty() {
+        let (done, fork, error) = failures.remove(0);
+        ctx.drop_forks_except(Some(&fork)).await;
+        ctx.forget_fork(&fork);
+        resp.winner = Some(done.report.index);
+        resp.summary = format!("Not applied: {error}. The result is kept in {fork}.");
+        resp.fork = Some(fork);
+        return resp;
+    }
+    if let [(done, fork)] = candidates.as_slice() {
+        ctx.drop_forks_except(Some(fork)).await;
+        let diff = ctx.diff(fork).await;
+        let review = match &diff {
+            Ok(diff) => review_of(ctx, req, resp.check.as_ref(), done, fork, diff).await,
+            Err(_) => None,
+        };
+        deliver(ctx, req, outcome, &mut resp, done, fork.clone(), diff, review).await;
+        return resp;
+    }
+    let check = resp.check.clone();
+    let picked = compare(ctx, req, check.as_ref(), !rubric.is_empty(), &candidates).await;
+    let (done, fork) = &candidates[picked.position];
+    ctx.drop_forks_except(Some(fork)).await;
+    resp.selection = Some(picked.selection);
+    deliver(ctx, req, outcome, &mut resp, done, fork.clone(), picked.diff, picked.review).await;
     resp
 }
 
-fn failure_summary(spec: Option<&CheckSpec>, finished: &[Finished]) -> String {
+/// The review of a candidate, when the run asks for one and it changed something.
+async fn review_of(
+    ctx: &Arc<Ctx>,
+    req: &RunRequest,
+    check: Option<&CheckSpec>,
+    done: &Finished,
+    fork: &str,
+    diff: &molt_api::fs::DiffResponse,
+) -> Option<Review> {
+    // Reviewed against the check it passed and the requirements it followed.
+    let check = check.filter(|_| req.review && !diff.changes.is_empty())?;
+    let requirements = ctx.control.upto(done.report.requirements);
+    let winner = Winner {
+        fork,
+        check,
+        changes: &diff.changes,
+        patch: &diff.patch,
+        truncated: diff.truncated,
+        requirements: &requirements,
+    };
+    Some(review::review(ctx, &winner).await)
+}
+
+/// Fill in `resp` from the winner `done`, and apply its changes when the run
+/// asks for it and its review does not hold them back.
+#[allow(clippy::too_many_arguments)] // The winner, its fork, diff and review, and where they go.
+async fn deliver(
+    ctx: &Arc<Ctx>,
+    req: &RunRequest,
+    outcome: Outcome,
+    resp: &mut RunResponse,
+    done: &Finished,
+    fork: String,
+    diff: Result<molt_api::fs::DiffResponse, RemoteError>,
+    review: Option<Review>,
+) {
+    resp.winner = Some(done.report.index);
+    resp.outcome = outcome;
+    resp.judgement = done.findings.clone();
+    resp.summary = if done.summary.is_empty() {
+        "The attempt finished without a summary.".to_owned()
+    } else {
+        done.summary.clone()
+    };
+    let mut keep = false;
+    match diff {
+        Ok(diff) => {
+            resp.changes = diff.changes;
+            resp.patch = diff.patch;
+            resp.patch_truncated = diff.truncated;
+            resp.review = review;
+            let held = resp.review.as_ref().filter(|r| r.verdict != Verdict::Approve);
+            // An attempt without a check that changed nothing (it answered a question) has nothing to merge.
+            if let (true, Some(review)) = (req.apply, held) {
+                let what = if review.verdict == Verdict::Reject { "rejected" } else { "questioned" };
+                resp.summary
+                    .push_str(&format!("\n\nNot applied: the review {what} the changes. They are kept in {fork}."));
+                keep = true;
+            } else if req.apply && (outcome == Outcome::Passed || !resp.changes.is_empty()) {
+                match ctx.merge(&fork).await {
+                    Ok(_) => {
+                        resp.applied = true;
+                        crate::hooks::notify(ctx, crate::hooks::Event::AfterApply).await;
+                    }
+                    Err(e) => {
+                        let what = if e.message.starts_with("partial:") {
+                            "The apply needs recovery; the workspace may contain changes"
+                        } else {
+                            "The changes were not applied"
+                        };
+                        resp.summary.push_str(&format!("\n\n{what}: {}. They are all kept in {fork}.", e.message));
+                        keep = true;
+                    }
+                }
+            } else {
+                keep = !req.apply;
+            }
+        }
+        Err(e) => {
+            resp.summary.push_str(&format!(
+                "\n\nThe changes could not be listed or applied: {}. They are kept in {fork}.",
+                e.message
+            ));
+            keep = true;
+        }
+    }
+    if keep {
+        ctx.forget_fork(&fork);
+        resp.fork = Some(fork);
+    } else if !resp.applied {
+        ctx.drop_fork(&fork).await;
+    }
+}
+
+/// The candidate [`compare`] picked, with its diff and review.
+struct Picked {
+    /// Where it is in the candidates.
+    position: usize,
+    selection: Selection,
+    diff: Result<molt_api::fs::DiffResponse, RemoteError>,
+    review: Option<Review>,
+}
+
+/// Rank the passing candidates on what can be audited, and pick the best
+/// one the review approves (see [`select::RULE`]). `judged`: the run has a
+/// rubric, whose criteria met count first.
+async fn compare(
+    ctx: &Arc<Ctx>,
+    req: &RunRequest,
+    check: Option<&CheckSpec>,
+    judged: bool,
+    candidates: &[(&Finished, String)],
+) -> Picked {
+    let mut diffs = Vec::new();
+    for (_, fork) in candidates {
+        diffs.push(ctx.diff(fork).await);
+    }
+    let suites = match check.and_then(|c| c.suite.as_ref()) {
+        Some(suite) => run_suites(ctx, suite, candidates).await,
+        None => vec![None; candidates.len()],
+    };
+    let mut scored: Vec<(usize, Candidate)> = Vec::new();
+    for (position, ((done, _), diff)) in candidates.iter().zip(&diffs).enumerate() {
+        match diff {
+            Ok(diff) => {
+                let mut candidate = select::candidate(done.report.index, suites[position], diff);
+                if judged {
+                    let met = done.findings.iter().filter(|f| f.met).count();
+                    candidate.criteria_met = Some(u32::try_from(met).unwrap_or(u32::MAX));
+                }
+                scored.push((position, candidate));
+            }
+            Err(e) => {
+                ctx.note(format!(
+                    "attempt {} is left out of the comparison: its changes could not be listed: {}",
+                    done.report.index, e.message
+                ))
+                .await
+            }
+        }
+    }
+    // A stable sort: ties go to the earlier to pass.
+    scored.sort_by_key(|(_, a)| select::rank(a));
+    let mut reviews: Vec<Option<Review>> = vec![None; candidates.len()];
+    let mut picked = None;
+    for (position, candidate) in &mut scored {
+        let (done, fork) = &candidates[*position];
+        let Ok(diff) = &diffs[*position] else { continue };
+        let review = review_of(ctx, req, check, done, fork, diff).await;
+        candidate.verdict = review.as_ref().map(|r| r.verdict);
+        let approved = review.as_ref().is_none_or(|r| r.verdict == Verdict::Approve);
+        reviews[*position] = review;
+        if approved {
+            picked = Some(*position);
+            break;
+        }
+        if ctx.over_budget() {
+            ctx.note("the budget ran out before every passing attempt was reviewed").await;
+            break;
+        }
+    }
+    // None approved: the one the review held back least, then the best ranked.
+    let position = picked
+        .or_else(|| scored.iter().filter(|(_, c)| c.verdict.is_some()).min_by_key(|(_, c)| c.verdict).map(|(p, _)| *p));
+    let position = position.unwrap_or(0);
+    let candidates_ranked: Vec<Candidate> = scored.into_iter().map(|(_, c)| c).collect();
+    let winner = candidates[position].0.report.index;
+    if let Some(c) = candidates_ranked.iter().find(|c| c.attempt == winner) {
+        ctx.note(format!("picked attempt {winner} of {} passing: {}", candidates_ranked.len(), select::describe(c)))
+            .await;
+    }
+    Picked {
+        position,
+        selection: Selection { rule: select::RULE.to_owned(), candidates: candidates_ranked },
+        diff: std::mem::replace(&mut diffs[position], Err(failed("taken"))),
+        review: reviews[position].take(),
+    }
+}
+
+/// Run the project's suite in each candidate's fork at once: whether it
+/// passed, or `None` when it could not be run.
+async fn run_suites(ctx: &Arc<Ctx>, suite: &str, candidates: &[(&Finished, String)]) -> Vec<Option<bool>> {
+    let timeout_ms = u64::try_from(ctx.cfg.check_timeout.as_millis()).unwrap_or(u64::MAX);
+    let mut runs = JoinSet::new();
+    for (position, (_, fork)) in candidates.iter().enumerate() {
+        let (ctx, fork, suite) = (ctx.clone(), fork.clone(), suite.to_owned());
+        runs.spawn(async move {
+            let result = match ctx.fork_from(&fork).await {
+                Ok(copy) => {
+                    let result = tools::run_command(&ctx, &copy, &suite, timeout_ms).await;
+                    ctx.drop_fork(&copy).await;
+                    result
+                }
+                Err(error) => Err(error),
+            };
+            (position, result)
+        });
+    }
+    let mut passed = vec![None; candidates.len()];
+    while let Some(joined) = runs.join_next().await {
+        let Ok((position, ran)) = joined else { continue };
+        match ran {
+            Ok(ran) => passed[position] = Some(ran.success()),
+            Err(e) => tracing::warn!(run = %ctx.trace, error = %e, "could not run the project's suite"),
+        }
+    }
+    passed
+}
+
+fn failure_summary(spec: Option<&CheckSpec>, rubric: &[Criterion], finished: &[Finished]) -> String {
     let mut summary = match spec {
         Some(check) => format!("No attempt passed the done-check `{}`.", check.command),
+        None if !rubric.is_empty() => "No attempt met every criterion of the rubric.".to_owned(),
         None => "The attempt did not finish.".to_owned(),
     };
     for f in finished {
@@ -628,6 +945,9 @@ fn not_designed(ctx: &Ctx, reason: &str) -> RunResponse {
         uncounted_calls: tally.uncounted_calls() + ctx.carried_uncounted,
         checkpoint: None,
         requirements: ctx.control.all(),
+        selection: None,
+        rubric: Vec::new(),
+        judgement: Vec::new(),
     }
 }
 

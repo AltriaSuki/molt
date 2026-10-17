@@ -445,9 +445,13 @@ mod tests {
         };
         let (learned, _) = crate::notes::remember(&db, learned, 1).unwrap();
         change(&db, "/w", &s.id, None, "disable", "unsafe", "t").unwrap();
-        let gone =
-            crate::recall(&db, &molt_api::memory::RecallRequest { workspace: Some("/w".into()), ..Default::default() })
-                .unwrap();
+        let gone = crate::recall(
+            &db,
+            &molt_api::memory::RecallRequest { workspace: Some("/w".into()), ..Default::default() },
+            None,
+            None,
+        )
+        .unwrap();
         assert!(gone.iter().all(|n| n.note.id != learned.id));
         let evidence: i64 = db
             .with(|c| c.query_row("SELECT COUNT(*) FROM evidence WHERE note=?1", [learned.id], |r| r.get(0)))

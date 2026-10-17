@@ -4,9 +4,10 @@
 //! tested with plain values.
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use molt_api::fs::ChangeKind;
-use molt_api::memory::{ConsolidateResponse, RecallSnapshot, Recalled, ReviewRequest, ReviewResponse};
+use molt_api::memory::{ConsolidateResponse, Layer, RecallSnapshot, Recalled, ReviewRequest, ReviewResponse};
 use molt_api::model::Effort;
 use molt_api::planner::{
     AttemptReport, AttemptStatus, Constraint, Control, ControlResponse, DesignResponse, Earlier, Outcome, RunRequest,
@@ -38,6 +39,28 @@ const CHECK_TAIL_LINES: usize = 2;
 const EARLIER_TASKS: usize = 5;
 /// Bytes of an earlier task's summary kept for the tasks after it.
 const EARLIER_SUMMARY_BYTES: usize = 4000;
+/// Ticks after a key within which the user is taken to be looking: about
+/// five seconds.
+const LOOKING_TICKS: u64 = 33;
+
+/// When the interface calls the user from outside the terminal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Notify {
+    Off,
+    /// When it stops for the user, or the services go down.
+    #[default]
+    Waiting,
+    /// Also when a task ends.
+    All,
+}
+
+/// What the interface is waiting on the user for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Attention {
+    Check,
+    Apply,
+    Down,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -80,6 +103,9 @@ pub struct Settings {
     /// `None` for memory's default.
     pub memory_model: Option<String>,
     pub stream: bool,
+    pub notify: Notify,
+    /// Commit each applied result to git, as `molt do --commit` does.
+    pub commit: bool,
 }
 
 impl Default for Settings {
@@ -92,14 +118,19 @@ impl Default for Settings {
             check: None,
             stream: true,
             memory_model: None,
+            notify: Notify::default(),
+            commit: false,
         }
     }
 }
 
 /// Work for the runtime.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     StartSession,
+    Redraw,
+    Suspend,
+    SaveTheme(text::Theme),
     Design {
         req: RunRequest,
         trace: TraceId,
@@ -121,6 +152,16 @@ pub enum Action {
     Apply {
         fork: String,
     },
+    /// Look at the work tree before the task `trace` changes it, for `/commit on`.
+    PrepareCommit {
+        trace: TraceId,
+    },
+    /// Commit the applied result of the task `trace`; the answer comes back as [`Msg::Committed`].
+    Commit {
+        trace: TraceId,
+        task: String,
+        resp: Box<RunResponse>,
+    },
     Discard {
         fork: String,
     },
@@ -128,6 +169,15 @@ pub enum Action {
         query: String,
     },
     Forget {
+        id: String,
+        reason: String,
+    },
+    /// Keep a preference of the user's for every project.
+    Remember {
+        text: String,
+    },
+    /// Copy a project note to the user's layer, for every project.
+    Promote {
         id: String,
         reason: String,
     },
@@ -153,13 +203,22 @@ pub enum Action {
     Edit {
         text: String,
     },
+    /// Call the user from outside the terminal: a bell, and a desktop
+    /// notification where the terminal shows one. `text` is a short label,
+    /// never the task or its output.
+    Alert {
+        text: String,
+    },
 }
 
 /// What happened.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum Msg {
+    #[serde(skip)]
     Key(KeyEvent),
     Paste(String),
+    /// The terminal gained or lost focus, where it reports that.
+    Focus(bool),
     Tick,
     /// SIGTERM or SIGHUP.
     Signal,
@@ -194,6 +253,8 @@ pub enum Msg {
         result: Result<ControlResponse, String>,
     },
     Applied(Result<(), String>),
+    /// `None`: the workspace's commit has the files as they are already.
+    Committed(Result<Option<crate::git::Committed>, String>),
     Discarded(Result<(), String>),
     Notes(Result<Vec<Recalled>, String>),
     /// The input as the user's editor left it.
@@ -201,6 +262,13 @@ pub enum Msg {
     Forgot {
         id: String,
         result: Result<bool, String>,
+    },
+    /// The id of the note `/remember` kept.
+    Remembered(Result<String, String>),
+    /// The id of the user-layer copy of note `id`.
+    Promoted {
+        id: String,
+        result: Result<String, String>,
     },
     ChangedNote(Result<ReviewResponse, String>),
     UsedNotes {
@@ -228,6 +296,36 @@ pub enum Phase {
     Applying,
 }
 
+/// What settled model calls cost so far. A call whose cost is unknown makes
+/// the sum a lower bound; it is never counted as free.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Spend {
+    pub usd: f64,
+    pub unknown: bool,
+}
+
+impl Spend {
+    fn add(&mut self, cost: Option<f64>) {
+        match cost {
+            Some(c) if c.is_finite() && c >= 0.0 => self.usd += c,
+            _ => self.unknown = true,
+        }
+    }
+
+    /// `$0.18`, or `≥ $0.18` when some cost is unknown.
+    pub fn label(&self) -> String {
+        let at_least = if self.unknown { "≥ " } else { "" };
+        format!("{at_least}${:.2}", self.usd)
+    }
+}
+
+impl std::ops::Add for Spend {
+    type Output = Spend;
+    fn add(self, other: Spend) -> Spend {
+        Spend { usd: self.usd + other.usd, unknown: self.unknown || other.unknown }
+    }
+}
+
 pub struct Lane {
     pub index: u32,
     /// The attempt's fork, once the planner has said which.
@@ -236,6 +334,11 @@ pub struct Lane {
     pub status: Option<AttemptStatus>,
     pub lines: Vec<Line<'static>>,
     pub preview: Preview,
+    /// The attempt's model calls that have finished.
+    pub spend: Spend,
+    /// When the TUI first heard of the attempt, and when it ended.
+    pub started: Instant,
+    pub ended: Option<Instant>,
 }
 
 pub struct Task {
@@ -244,6 +347,14 @@ pub struct Task {
     pub phase: Phase,
     pub lanes: Vec<Lane>,
     pub designer_preview: Preview,
+    /// The whole task's budget, as the user set it; `req.budget_usd` is
+    /// what is left for the attempts once the check is designed.
+    pub budget_usd: Option<f64>,
+    /// The check design: its finished calls while it runs, then its settled
+    /// cost.
+    pub design_spend: Spend,
+    /// Model calls already counted, so a repeated event is not counted twice.
+    counted: HashSet<String>,
     /// The check is in the log already.
     check_shown: bool,
     recalled_shown: bool,
@@ -261,9 +372,12 @@ impl Task {
     fn new(trace: TraceId, req: RunRequest, phase: Phase) -> Self {
         Self {
             trace,
+            budget_usd: req.budget_usd,
             req,
             phase,
             lanes: Vec::new(),
+            design_spend: Spend::default(),
+            counted: HashSet::new(),
             check_shown: false,
             recalled_shown: false,
             notes_seen: HashSet::new(),
@@ -273,6 +387,12 @@ impl Task {
             state: RunState::Running,
             waiting: Vec::new(),
         }
+    }
+
+    /// What this task has cost so far, by finished model calls; the run's
+    /// reply settles it.
+    pub fn spend(&self) -> Spend {
+        self.lanes.iter().fold(self.design_spend, |sum, lane| sum + lane.spend)
     }
 }
 
@@ -326,6 +446,8 @@ pub enum MemoryEdit {
     Filter(Input),
     /// Why the selected note is wrong.
     Reason(Input),
+    /// Why the selected note holds in every project.
+    Promote(Input),
     Change(Box<NoteChange>),
 }
 
@@ -609,6 +731,8 @@ pub struct App {
     workspace_path: String,
     pub mode: Mode,
     pub settings: Settings,
+    pub commands: std::collections::BTreeMap<String, super::commands::Command>,
+    pub theme: text::Theme,
     pub session: SessionState,
     pub log: Vec<Line<'static>>,
     /// Lines scrolled up from the end of the log; 0 follows it.
@@ -629,6 +753,8 @@ pub struct App {
     pub learning: HashSet<String>,
     /// Results the user kept in their forks; never removed.
     pub kept: Vec<String>,
+    /// The result waiting to be applied, to commit once it is: `/commit on`.
+    to_commit: Option<Action>,
     /// The diff of the last task that finished, for `/last`.
     last: Option<LastDiff>,
     /// The attempts of the last task that finished, for `/lanes`.
@@ -649,6 +775,12 @@ pub struct App {
     /// The tick of a first Ctrl+C or Ctrl+D; a second soon after quits.
     quit_armed: Option<u64>,
     pub quit: bool,
+    /// The tick of the last key or paste.
+    last_key: Option<u64>,
+    /// Whether the terminal has focus; `None` until it says.
+    focused: Option<bool>,
+    /// How the last task ended, for an alert: a short label.
+    ended: Option<String>,
 }
 
 fn key_is(key: &KeyEvent, code: KeyCode) -> bool {
@@ -670,6 +802,8 @@ impl App {
             workspace_path: workspace_path.to_owned(),
             mode: Mode::Confirm,
             settings: Settings::default(),
+            commands: Default::default(),
+            theme: text::Theme::detect(std::env::var("COLORTERM").ok().as_deref()),
             session: SessionState::Starting,
             log: Vec::new(),
             scroll: 0,
@@ -685,6 +819,7 @@ impl App {
             uncounted_calls: 0,
             learning: HashSet::new(),
             kept: Vec::new(),
+            to_commit: None,
             last: None,
             last_lanes: Vec::new(),
             earlier: Vec::new(),
@@ -695,7 +830,31 @@ impl App {
             tick: 0,
             quit_armed: None,
             quit: false,
+            last_key: None,
+            focused: None,
+            ended: None,
         }
+    }
+
+    pub fn load_commands(&mut self, workspace: &std::path::Path) {
+        let (commands, warnings) = super::commands::load(workspace);
+        self.commands = commands;
+        for warning in warnings {
+            self.push(Line::from(span(clean_line(&warning), Tone::Warn)));
+        }
+    }
+
+    pub fn command_candidates(&self, prefix: &str) -> Vec<String> {
+        let mut names: Vec<_> = super::commands::BUILTINS
+            .iter()
+            .copied()
+            .chain(self.commands.keys().map(String::as_str))
+            .filter(|name| name.starts_with(prefix))
+            .map(str::to_owned)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     pub fn memory_up(&self) -> bool {
@@ -739,16 +898,78 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
+        let before = self.attention();
+        let mut actions = self.handle(msg);
+        let now = self.attention();
+        let text = match (now, self.ended.take()) {
+            (Some(now), _) if Some(now) != before && self.settings.notify != Notify::Off => Some(match now {
+                Attention::Check => "molt: check ready".to_owned(),
+                Attention::Apply => "molt: result ready".to_owned(),
+                Attention::Down => "molt: services down".to_owned(),
+            }),
+            (_, Some(ended)) if self.settings.notify == Notify::All => Some(ended),
+            _ => None,
+        };
+        if let Some(text) = text.filter(|_| !self.looking()) {
+            actions.push(Action::Alert { text });
+        }
+        actions
+    }
+
+    fn attention(&self) -> Option<Attention> {
+        match (&self.session, &self.prompt) {
+            (SessionState::Down(_), _) => Some(Attention::Down),
+            (_, Some(Prompt::Check(_))) => Some(Attention::Check),
+            (_, Some(Prompt::Apply { .. })) => Some(Attention::Apply),
+            _ => None,
+        }
+    }
+
+    /// The user is at the terminal: it has focus, or a key came just now.
+    fn looking(&self) -> bool {
+        self.focused == Some(true) || self.last_key.is_some_and(|at| self.tick.wrapping_sub(at) <= LOOKING_TICKS)
+    }
+
+    /// The terminal window's title: what the interface is doing or waits for.
+    pub fn title(&self) -> String {
+        let state = match (self.attention(), &self.task) {
+            (Some(Attention::Down), _) => "services down".to_owned(),
+            (Some(Attention::Check), _) => "waiting: check".to_owned(),
+            (Some(Attention::Apply), _) => "waiting: apply".to_owned(),
+            (None, Some(task)) => match task.phase {
+                Phase::Designing => "designing the check".to_owned(),
+                Phase::Running if task.state == RunState::Paused => "paused".to_owned(),
+                Phase::Running => {
+                    let running = task.lanes.iter().filter(|l| l.status.is_none()).count();
+                    format!("running {running}/{}", task.req.attempts)
+                }
+                Phase::Applying => "applying".to_owned(),
+                Phase::Confirming | Phase::Deciding => "waiting".to_owned(),
+            },
+            (None, None) => "idle".to_owned(),
+        };
+        format!("molt · {state}")
+    }
+
+    fn handle(&mut self, msg: Msg) -> Vec<Action> {
         match msg {
             Msg::Key(key) if key.kind == KeyEventKind::Release => Vec::new(),
             Msg::Key(key) => {
                 self.flash = None;
+                self.last_key = Some(self.tick);
                 self.key(key)
             }
+            Msg::Focus(focused) => {
+                self.focused = Some(focused);
+                Vec::new()
+            }
             Msg::Paste(text) => {
+                self.last_key = Some(self.tick);
                 match &mut self.screen {
                     Screen::Memory(view) => match &mut view.edit {
-                        Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input)) => input.insert(&text),
+                        Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input) | MemoryEdit::Promote(input)) => {
+                            input.insert(&text)
+                        }
                         Some(MemoryEdit::Change(change)) => {
                             if let Some(input) = change.input_mut() {
                                 input.insert(&text);
@@ -809,6 +1030,7 @@ impl App {
                 Vec::new()
             }
             Msg::Applied(result) => {
+                let commit = self.to_commit.take().filter(|_| result.is_ok());
                 match result {
                     Ok(()) => {
                         self.push(Line::from(span("  applied", Tone::Ok)));
@@ -821,6 +1043,23 @@ impl App {
                     Err(e) => self.error("could not apply", &e),
                 }
                 self.task = None;
+                commit.into_iter().collect()
+            }
+            Msg::Committed(result) => {
+                match result {
+                    Ok(Some(c)) => {
+                        let on =
+                            c.branch.as_deref().map_or_else(|| "a detached HEAD".to_owned(), |b| format!("on {b}"));
+                        let line = format!("  committed {} {on}: {}", &c.sha[..12.min(c.sha.len())], c.subject);
+                        self.push(Line::from(span(clean_line(&line), Tone::Ok)));
+                        if !c.ignored.is_empty() {
+                            let line = format!("  left out, as git ignores them: {}", c.ignored.join(", "));
+                            self.push(Line::from(span(clean_line(&line), Tone::Dim)));
+                        }
+                    }
+                    Ok(None) => self.push(Line::from(span("  nothing to commit", Tone::Dim))),
+                    Err(e) => self.error("not committed; the result is applied", &e),
+                }
                 Vec::new()
             }
             Msg::Discarded(result) => {
@@ -856,13 +1095,7 @@ impl App {
                     Ok(false) => self.flash = Some(format!("{id} was already forgotten")),
                     Err(e) => self.flash = Some(format!("could not forget {id}: {}", clean_line(&e))),
                 }
-                match &mut self.screen {
-                    Screen::Memory(view) => {
-                        view.loading = true;
-                        vec![Action::LoadNotes { query: view.query.clone() }]
-                    }
-                    Screen::Main => Vec::new(),
-                }
+                self.reload_notes()
             }
             Msg::ChangedNote(result) => {
                 let Screen::Memory(view) = &mut self.screen else { return Vec::new() };
@@ -889,10 +1122,41 @@ impl App {
                 };
                 Vec::new()
             }
+            Msg::Remembered(result) => {
+                self.flash = Some(match result {
+                    Ok(id) => format!("remembered {id} for every project"),
+                    Err(e) => format!("could not remember that: {}", clean_line(&e)),
+                });
+                self.reload_notes()
+            }
+            Msg::Promoted { id, result } => {
+                self.flash = Some(match result {
+                    Ok(copy) => format!("{id} now holds in every project as {copy}"),
+                    Err(e) => format!("could not promote {id}: {}", clean_line(&e)),
+                });
+                self.reload_notes()
+            }
+        }
+    }
+
+    /// Load the notes again when the memory screen is open.
+    fn reload_notes(&mut self) -> Vec<Action> {
+        match &mut self.screen {
+            Screen::Memory(view) => {
+                view.loading = true;
+                vec![Action::LoadNotes { query: view.query.clone() }]
+            }
+            Screen::Main => Vec::new(),
         }
     }
 
     fn key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if ctrl(&key, 'l') {
+            return vec![Action::Redraw];
+        }
+        if ctrl(&key, 'z') {
+            return vec![Action::Suspend];
+        }
         if ctrl(&key, 'd') || (ctrl(&key, 'c') && self.task.is_none() && self.input.text.is_empty()) {
             if self.quit_armed.is_some_and(|at| self.tick.wrapping_sub(at) <= QUIT_TICKS) {
                 self.quit = true;
@@ -934,6 +1198,16 @@ impl App {
                 return Vec::new();
             }
             KeyCode::Tab => {
+                if !editing_check && self.input.text.starts_with('/') && !self.input.text.contains(char::is_whitespace)
+                {
+                    let names = self.command_candidates(&self.input.text[1..]);
+                    if names.len() == 1 {
+                        self.input = Input::with(&format!("/{} ", names[0]));
+                    } else if !names.is_empty() {
+                        self.flash = Some(names.iter().map(|n| format!("/{n}")).collect::<Vec<_>>().join(" · "));
+                    }
+                    return Vec::new();
+                }
                 if let Some(task) = &self.task {
                     let indices: Vec<u32> = task.lanes.iter().map(|l| l.index).collect();
                     self.zoom = match self.zoom.and_then(|z| indices.iter().position(|&i| i == z)) {
@@ -1099,6 +1373,10 @@ impl App {
         if let Some(command) = line.strip_prefix('/') {
             return self.command(command);
         }
+        self.submit_task(line)
+    }
+
+    fn submit_task(&mut self, line: String) -> Vec<Action> {
         if self.task.as_ref().is_some_and(|t| t.phase == Phase::Running) {
             // Typed while the attempts run: more of what the task asks.
             self.echo_constraint(&line);
@@ -1139,9 +1417,20 @@ impl App {
         } else {
             Action::Run { req: task.req.clone(), trace }
         };
+        let trace = task.trace.clone();
         self.task = Some(task);
         self.zoom = None;
-        vec![action]
+        self.starting(trace, action)
+    }
+
+    /// The actions that start a task with `action`: looking at the work tree
+    /// first, when results are committed.
+    fn starting(&self, trace: TraceId, action: Action) -> Vec<Action> {
+        if self.settings.commit {
+            vec![Action::PrepareCommit { trace }, action]
+        } else {
+            vec![action]
+        }
     }
 
     fn command(&mut self, command: &str) -> Vec<Action> {
@@ -1152,8 +1441,19 @@ impl App {
                 let run = if arg.is_empty() { self.last_run.clone() } else { Some(arg.to_owned()) };
                 return self.open_used(run);
             }
+            "theme" => {
+                if arg.is_empty() {
+                    self.flash = Some(format!("theme: {}; /theme dark|light|ansi", self.theme.name()));
+                } else if let Some(theme) = text::Theme::parse(arg) {
+                    self.theme = theme;
+                    self.flash = Some(format!("theme: {}", theme.name()));
+                    return vec![Action::SaveTheme(theme), Action::Redraw];
+                } else {
+                    self.flash = Some("theme: dark, light or ansi".into());
+                }
+            }
             "help" => {
-                self.viewer = Some(Viewer { title: "help".into(), lines: help(), scroll: 0 });
+                self.viewer = Some(Viewer { title: "help".into(), lines: self.help(), scroll: 0 });
             }
             "memory" => {
                 if !self.memory_up() {
@@ -1170,6 +1470,17 @@ impl App {
                     edit: None,
                 });
                 return vec![Action::LoadNotes { query }];
+            }
+            "remember" => {
+                if !self.memory_up() {
+                    self.flash = Some("memory is not running".into());
+                    return Vec::new();
+                }
+                if arg.is_empty() {
+                    self.flash = Some("/remember TEXT: a preference of yours, for every project".into());
+                    return Vec::new();
+                }
+                return vec![Action::Remember { text: arg.to_owned() }];
             }
             "check" if self.running() => {
                 if arg.is_empty() {
@@ -1214,6 +1525,17 @@ impl App {
                 }
                 _ => self.flash = Some("attempts: 1 to 8".into()),
             },
+            "commit" => {
+                match arg {
+                    "on" => self.settings.commit = true,
+                    "off" | "default" | "" => self.settings.commit = false,
+                    _ => {
+                        self.flash = Some("commit: on or off".into());
+                        return Vec::new();
+                    }
+                }
+                self.flash = Some(format!("commit: {} (next task)", if self.settings.commit { "on" } else { "off" }));
+            }
             "stream" => {
                 match arg {
                     "on" | "default" | "" => self.settings.stream = true,
@@ -1224,6 +1546,25 @@ impl App {
                     }
                 }
                 self.flash = Some(format!("stream: {} (next task)", if self.settings.stream { "on" } else { "off" }));
+            }
+            "notify" => {
+                self.settings.notify = match arg {
+                    "on" | "default" | "" => Notify::Waiting,
+                    "all" => Notify::All,
+                    "off" => Notify::Off,
+                    _ => {
+                        self.flash = Some("notify: on, all or off".into());
+                        return Vec::new();
+                    }
+                };
+                self.flash = Some(
+                    match self.settings.notify {
+                        Notify::Off => "notify: off",
+                        Notify::Waiting => "notify: when waiting for you",
+                        Notify::All => "notify: when waiting for you and when a task ends",
+                    }
+                    .into(),
+                );
             }
             "model" => {
                 self.settings.model = (!arg.is_empty() && arg != "default").then(|| arg.to_owned());
@@ -1283,9 +1624,71 @@ impl App {
                 self.quit = true;
                 return vec![Action::Quit { keep: self.keep() }];
             }
-            other => self.flash = Some(format!("no command /{}; /help lists them", clean_line(other))),
+            other => {
+                if let Some(template) = self.commands.get(other).cloned() {
+                    if self.task.is_some() {
+                        self.flash = Some("a task is waiting; project commands start a new task".into());
+                        return Vec::new();
+                    }
+                    let saved = self.settings.clone();
+                    self.settings.attempts = saved.attempts.or(template.attempts);
+                    self.settings.budget_usd = match (saved.budget_usd, template.budget) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    self.settings.check = saved.check.clone().or(template.check.clone());
+                    let expanded = template.expand(arg);
+                    if expanded.trim().is_empty() {
+                        self.settings = saved;
+                        self.flash = Some("project command produced an empty task".into());
+                        return Vec::new();
+                    }
+                    let mut actions = self.submit_task(expanded);
+                    self.settings = saved;
+                    // A repository-supplied check needs a look before any attempt runs.
+                    if self.mode == Mode::Confirm {
+                        if let Some(task) = &mut self.task {
+                            if let Some(check) = &task.req.check {
+                                task.phase = Phase::Confirming;
+                                task.stops = vec!["project command check needs confirmation".into()];
+                                self.prompt = Some(Prompt::Check(DesignResponse {
+                                    command: Some(check.clone()),
+                                    files: Vec::new(),
+                                    suite: None,
+                                    rationale: "Check from the project command; baseline not run yet.".into(),
+                                    rubric: Vec::new(),
+                                    baseline: None,
+                                    usage: Default::default(),
+                                    cost_usd: 0.0,
+                                    uncounted_calls: 0,
+                                    remaining_budget_usd: task.req.budget_usd,
+                                    error: None,
+                                    cancelled: false,
+                                }));
+                                actions.clear();
+                            }
+                        }
+                    }
+                    return actions;
+                }
+                self.flash = Some(format!("no command /{}; /help lists them", clean_line(other)));
+            }
         }
         Vec::new()
+    }
+
+    fn help(&self) -> Vec<Line<'static>> {
+        let mut lines = help();
+        if !self.commands.is_empty() {
+            lines.push(Line::from(span("project commands", Tone::Dim)));
+            for (name, c) in &self.commands {
+                lines.push(Line::from(vec![
+                    span(format!("  /{name} {}  ", clean_line(&c.hint)), Tone::Shell),
+                    span(clean_line(&c.description), Tone::Plain),
+                ]));
+            }
+        }
+        lines
     }
 
     /// The attempts of a task are running.
@@ -1354,7 +1757,7 @@ impl App {
             return;
         }
         match event {
-            Progress::CheckReady { command, files, designed, .. } => {
+            Progress::CheckReady { command, files, designed, rubric, .. } => {
                 if task.check_shown {
                     return;
                 }
@@ -1362,6 +1765,7 @@ impl App {
                 let mut lines = vec![check_head(designed)];
                 match command {
                     Some(c) => lines.push(Line::from(vec![span("  $ ", Tone::Dim), span(clean_line(&c), Tone::Plain)])),
+                    None if !rubric.is_empty() => lines.extend(rubric_lines(&rubric)),
                     None => {
                         lines.push(Line::from(span("  no automated check fits; the result is unverified", Tone::Dim)))
                     }
@@ -1399,23 +1803,33 @@ impl App {
                 }
             }
             event @ (Progress::ModelStarted { .. } | Progress::ModelText { .. } | Progress::ModelFinished { .. }) => {
+                let context = event.model_call().expect("a model event has a context");
+                let attempt = context.attempt.filter(|&a| a < task.req.attempts && a < 8);
+                let settles = matches!(event, Progress::ModelFinished { .. });
+                if let Some(attempt) = attempt.filter(|_| task.req.stream || settles) {
+                    if !task.lanes.iter().any(|l| l.index == attempt) {
+                        task.lanes.push(Lane::new(attempt, None));
+                        task.lanes.sort_by_key(|l| l.index);
+                    }
+                }
+                // Counted even when previews are off or the lane has ended:
+                // a cancelled attempt's last call settles after it stops.
+                if let Progress::ModelFinished { cost_usd, .. } = &event {
+                    if task.counted.insert(context.call.clone()) {
+                        match (context.attempt, attempt) {
+                            (None, _) => task.design_spend.add(*cost_usd),
+                            (_, Some(attempt)) => {
+                                lane(task, attempt).expect("the lane was created").spend.add(*cost_usd)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 if !task.req.stream {
                     return;
                 }
-                let context = event.model_call().expect("a model event has a context");
                 match context.attempt {
                     Some(attempt) if attempt < task.req.attempts && attempt < 8 => {
-                        if !task.lanes.iter().any(|l| l.index == attempt) {
-                            task.lanes.push(Lane {
-                                index: attempt,
-                                fork: None,
-                                turn: 0,
-                                status: None,
-                                lines: Vec::new(),
-                                preview: Preview::default(),
-                            });
-                            task.lanes.sort_by_key(|l| l.index);
-                        }
                         let lane = lane(task, attempt).expect("the lane was created");
                         if context.turn < lane.turn || lane.status.is_some() {
                             return;
@@ -1438,14 +1852,7 @@ impl App {
                 if let Some(lane) = lane(task, attempt) {
                     lane.fork = lane.fork.take().or(fork);
                 } else {
-                    task.lanes.push(Lane {
-                        index: attempt,
-                        fork,
-                        turn: 0,
-                        status: None,
-                        lines: Vec::new(),
-                        preview: Preview::default(),
-                    });
+                    task.lanes.push(Lane::new(attempt, fork));
                     task.lanes.sort_by_key(|l| l.index);
                 }
             }
@@ -1458,10 +1865,12 @@ impl App {
                     ]));
                 }
             }
-            Progress::CheckRan { attempt, passed, exit_code, tail, .. } => {
+            Progress::CheckRan { attempt, passed, exit_code, tail, judged, .. } => {
                 let tail = scrub(&tail, &self.secrets);
                 if let Some(lane) = lane(task, attempt) {
                     let line = match (passed, exit_code) {
+                        (true, _) if judged => span("   judge: criteria met", Tone::Ok),
+                        (false, _) if judged => span("   judge: criteria not met", Tone::Bad),
                         (true, _) => span("   check passed", Tone::Ok),
                         (false, Some(code)) => span(format!("   check failed (exit {code})"), Tone::Bad),
                         (false, None) => span("   check failed (killed or timed out)", Tone::Bad),
@@ -1478,6 +1887,7 @@ impl App {
                         lane.push(line);
                     }
                     lane.status = Some(status);
+                    lane.ended.get_or_insert_with(Instant::now);
                 }
             }
             Progress::Required { requirement, .. } => task.version = task.version.max(requirement.version),
@@ -1501,6 +1911,7 @@ impl App {
         self.log.extend(task.designer_preview.finish("ended; final preview event unavailable", true));
         match result {
             Ok(d) => {
+                task.design_spend = Spend { usd: d.cost_usd, unknown: d.uncounted_calls > 0 };
                 self.spent_usd += d.cost_usd;
                 self.uncounted_calls = self.uncounted_calls.saturating_add(d.uncounted_calls);
                 if d.cancelled || d.error.is_some() {
@@ -1600,6 +2011,12 @@ impl App {
                 }
                 task.req.check = Some(command.clone());
                 task.req.check_files = d.files;
+                task.req.suite = d.suite;
+            }
+            (None, true) if !d.rubric.is_empty() => {
+                lines.push(check_head(true));
+                lines.extend(rubric_lines(&d.rubric.iter().map(|c| c.text.clone()).collect::<Vec<_>>()));
+                task.req.rubric = d.rubric;
             }
             _ => {
                 lines.push(Line::from(vec![
@@ -1620,15 +2037,39 @@ impl App {
         }
         let mut task = self.task.take().expect("checked above");
         self.zoom = None;
+        let now = Instant::now();
+        for lane in &mut task.lanes {
+            lane.ended.get_or_insert(now);
+        }
         self.last_lanes = std::mem::take(&mut task.lanes);
         let resp = match result {
             Ok(resp) => resp,
             Err(e) => {
+                self.ended = Some("molt: run failed".to_owned());
                 self.error("the run failed", &e);
                 return Vec::new();
             }
         };
+        // Progress can be dropped by a busy transport or suspended interface.
+        // The final attempt reports settle the archived lane totals as well.
+        for lane in &mut self.last_lanes {
+            if let Some(attempt) = resp.attempts.iter().find(|a| a.index == lane.index) {
+                lane.spend.usd = attempt.cost_usd;
+                lane.spend.unknown |= resp.uncounted_calls > 0;
+                lane.status = Some(attempt.status);
+                lane.turn = attempt.turns;
+            }
+        }
         self.spent_usd += resp.cost_usd;
+        self.ended = Some(match resp.outcome {
+            Outcome::Passed => match resp.changes.len() {
+                1 => "molt: passed · 1 file".to_owned(),
+                n => format!("molt: passed · {n} files"),
+            },
+            Outcome::Judged => "molt: passed · judged by a model".to_owned(),
+            Outcome::Unverified => "molt: done, unverified".to_owned(),
+            Outcome::Failed => "molt: failed".to_owned(),
+        });
         self.remember(&task.req.task, &resp);
         self.uncounted_calls = self.uncounted_calls.saturating_add(resp.uncounted_calls);
         let mut actions = Vec::new();
@@ -1663,6 +2104,18 @@ impl App {
             }
         }
 
+        if let Some(selection) = &resp.selection {
+            let line = format!("  picked among {} passing attempts:", selection.candidates.len());
+            self.push(Line::from(span(line, Tone::Dim)));
+            for c in &selection.candidates {
+                let (mark, tone) = if resp.winner == Some(c.attempt) { ("*", Tone::Ok) } else { (" ", Tone::Dim) };
+                self.push(Line::from(vec![
+                    span(format!("    {mark} attempt {} ", c.attempt + 1), tone),
+                    span(agent::candidate_scores(c), Tone::Dim),
+                ]));
+            }
+        }
+
         let (added, removed) = text::diff_counts(&resp.patch);
         let files = match resp.changes.len() {
             1 => "1 file".to_owned(),
@@ -1686,7 +2139,7 @@ impl App {
                 self.log.extend(block(summary, "  ", Tone::Dim));
                 self.log.extend(cut_note);
             }
-            Outcome::Passed | Outcome::Unverified => {
+            Outcome::Passed | Outcome::Unverified | Outcome::Judged => {
                 let tone = if resp.outcome == Outcome::Passed { Tone::Ok } else { Tone::Warn };
                 let mut head = vec![span(format!("✓ {}", outcome_name(resp.outcome)), tone)];
                 if !resp.changes.is_empty() {
@@ -1703,6 +2156,13 @@ impl App {
                     };
                     self.push(Line::from(span(format!("  {kind} {}", clean_line(&c.path)), Tone::Dim)));
                 }
+                for f in &resp.judgement {
+                    let (mark, tone) = if f.met { ("✓", Tone::Ok) } else { ("✗", Tone::Bad) };
+                    self.push(Line::from(vec![
+                        span(format!("  {mark} "), tone),
+                        span(clean_line(&f.criterion), Tone::Dim),
+                    ]));
+                }
             }
         }
         if resp.uncounted_calls > 0 {
@@ -1715,8 +2175,13 @@ impl App {
         }
         let mut deciding = false;
         let mut applying = false;
+        self.to_commit =
+            (self.settings.commit && resp.outcome != Outcome::Failed && !resp.changes.is_empty()).then(|| {
+                Action::Commit { trace: trace.clone(), task: task.req.task.clone(), resp: Box::new(resp.clone()) }
+            });
         if resp.applied {
             self.push(Line::from(span("  applied", Tone::Ok)));
+            actions.extend(self.to_commit.take());
         } else if let Some(fork) = resp.fork.clone() {
             if resp.changes.is_empty() {
                 actions.push(Action::Discard { fork });
@@ -1734,6 +2199,9 @@ impl App {
                 self.push(Line::from(span(format!("  kept in {}", clean_line(&fork)), Tone::Dim)));
                 self.kept.push(fork);
             }
+        }
+        if !(deciding || applying) {
+            self.to_commit = None;
         }
         if deciding {
             self.task = Some(Task { phase: Phase::Deciding, lanes: Vec::new(), ..task });
@@ -1781,6 +2249,7 @@ impl App {
             KeyCode::Char('n') => {
                 let fork = fork.clone();
                 self.prompt = None;
+                self.to_commit = None;
                 self.task = None;
                 self.push(Line::from(span("  discarded", Tone::Dim)));
                 vec![Action::Discard { fork }]
@@ -1792,6 +2261,7 @@ impl App {
             KeyCode::Char('k') | KeyCode::Esc => {
                 let fork = fork.clone();
                 self.prompt = None;
+                self.to_commit = None;
                 self.task = None;
                 self.push(Line::from(span(format!("  kept in {}", clean_line(&fork)), Tone::Dim)));
                 self.kept.push(fork);
@@ -1856,7 +2326,7 @@ impl App {
         self.zoom = None;
         self.last_run = Some(trace.to_string());
         self.task = Some(Task { check_shown: true, ..Task::new(trace.clone(), req.clone(), Phase::Running) });
-        vec![Action::Run { req, trace }]
+        self.starting(trace.clone(), Action::Run { req, trace })
     }
 
     fn learned(&mut self, result: Result<ConsolidateResponse, String>) {
@@ -1878,6 +2348,9 @@ impl App {
                 }
                 if !r.skill_drafts.is_empty() {
                     parts.push(format!("drafted {} project skills; molt skill evaluates them", r.skill_drafts.len()));
+                }
+                if !r.proposed.is_empty() {
+                    parts.push(format!("proposed {} for every project (/memory, p)", count(r.proposed.len())));
                 }
                 if parts.is_empty() {
                     parts.push(match &r.skipped {
@@ -1975,10 +2448,20 @@ impl App {
                         }
                         return vec![Action::Forget { id: note.note.id.clone(), reason }];
                     }
+                    Some(MemoryEdit::Promote(mut input)) => {
+                        let reason = input.take().trim().to_owned();
+                        let Some(note) = view.notes.get(view.selected) else { return Vec::new() };
+                        if reason.is_empty() {
+                            view.edit = Some(MemoryEdit::Promote(input));
+                            self.flash = Some("say why the note holds in every project".into());
+                            return Vec::new();
+                        }
+                        return vec![Action::Promote { id: note.note.id.clone(), reason }];
+                    }
                     Some(MemoryEdit::Change(_)) | None => {}
                 },
                 _ => {
-                    if let MemoryEdit::Filter(input) | MemoryEdit::Reason(input) = edit {
+                    if let MemoryEdit::Filter(input) | MemoryEdit::Reason(input) | MemoryEdit::Promote(input) = edit {
                         input.key(key);
                     }
                 }
@@ -1996,6 +2479,13 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => view.selected = view.selected.saturating_sub(1),
             KeyCode::Char('/') => view.edit = Some(MemoryEdit::Filter(Input::with(&view.query))),
             KeyCode::Char('f') if !view.notes.is_empty() => view.edit = Some(MemoryEdit::Reason(Input::default())),
+            KeyCode::Char('p') => match view.notes.get(view.selected) {
+                Some(note) if note.layer == Layer::User => {
+                    self.flash = Some("that note holds everywhere already".into())
+                }
+                Some(_) => view.edit = Some(MemoryEdit::Promote(Input::default())),
+                None => {}
+            },
             KeyCode::Char('a') | KeyCode::Char('c') => {
                 if let Some(note) = view.notes.get(view.selected) {
                     view.edit = Some(MemoryEdit::Change(Box::new(NoteChange::new(
@@ -2035,6 +2525,13 @@ pub fn memory_lines(r: &Recalled) -> Vec<Line<'static>> {
         format!("keywords: {}", r.reason.keywords.as_deref().unwrap_or("none (confidence and recency)")),
         format!("relevance: {}", r.reason.relevance.map_or("unavailable".into(), |v| format!("{v:.3}"))),
     ];
+    if r.layer == Layer::User {
+        fields.push("layer: yours, for every project".into());
+    } else if r.details.everywhere {
+        fields.push("layer: this project · proposed for every project (p to promote)".into());
+    } else if let Some(to) = &r.details.promoted_to {
+        fields.push(format!("layer: this project · promoted as {to}"));
+    }
     if r.details.temporary {
         fields.push("temporary experience · verify before reuse".into());
     }
@@ -2082,6 +2579,25 @@ fn snapshot_lines(snapshots: &[RecallSnapshot]) -> Vec<Line<'static>> {
 }
 
 impl Lane {
+    fn new(index: u32, fork: Option<String>) -> Self {
+        Self {
+            index,
+            fork,
+            turn: 0,
+            status: None,
+            lines: Vec::new(),
+            preview: Preview::default(),
+            spend: Spend::default(),
+            started: Instant::now(),
+            ended: None,
+        }
+    }
+
+    /// How long the attempt has run, or ran.
+    pub fn elapsed(&self) -> Duration {
+        self.ended.unwrap_or_else(Instant::now).saturating_duration_since(self.started)
+    }
+
     fn push(&mut self, line: Line<'static>) {
         self.lines.push(line);
         if self.lines.len() > LANE_LINES {
@@ -2102,8 +2618,20 @@ fn diff_viewer(patch: &str, truncated: bool) -> Viewer {
     Viewer { title: "diff".into(), lines, scroll: 0 }
 }
 
+/// A rubric's criteria, one line each, for the log.
+fn rubric_lines(rubric: &[String]) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(span("  judged by a model against these criteria:", Tone::Warn))];
+    for (i, c) in rubric.iter().enumerate() {
+        lines.push(Line::from(span(format!("  {}. {}", i + 1, clean_line(c)), Tone::Plain)));
+    }
+    lines
+}
+
 /// Why a designed check needs the user's look before the attempts start.
 fn check_stops(d: &DesignResponse, existing: &[String]) -> Vec<String> {
+    if d.command.is_none() && !d.rubric.is_empty() {
+        return vec!["criteria judged by a model".into()];
+    }
     if d.command.is_none() {
         return vec!["no automated check".into()];
     }
@@ -2176,7 +2704,10 @@ fn covers(rule: &str, path: &str) -> bool {
 fn lane_lines(lanes: &[Lane]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for lane in lanes {
-        lines.push(Line::from(span(format!("attempt {} · tool calls", lane.index + 1), Tone::Shell)));
+        lines.push(Line::from(vec![
+            span(format!("attempt {} · tool calls", lane.index + 1), Tone::Shell),
+            span(format!(" · {} · {}", text::duration(lane.elapsed()), lane.spend.label()), Tone::Dim),
+        ]));
         lines.extend(lane.lines.iter().cloned());
         lines.push(Line::default());
     }
@@ -2237,6 +2768,8 @@ fn help() -> Vec<Line<'static>> {
         row("pgup / pgdn", "scroll the log"),
         row("ctrl+home / end", "the start or end of the log"),
         row("shift+enter", "a new line in the task; also ctrl+j, or \\ then enter"),
+        row("ctrl+l", "clear and redraw the screen"),
+        row("ctrl+z", "suspend the interface; fg returns, services keep running"),
         row("ctrl+g", "write the task in $VISUAL or $EDITOR"),
         row("↑ / ↓", "the line above or below, then earlier inputs"),
         row("ctrl+d twice", "quit"),
@@ -2244,6 +2777,7 @@ fn help() -> Vec<Line<'static>> {
         head("commands"),
         row("/memory [words]", "notes about this project"),
         row("/memory-used [run]", "recorded context for this run (default: latest)"),
+        row("/remember TEXT", "a preference of yours, for every project"),
         row("/check [command]", "use this check for every task; empty: design one"),
         row("", "while a task runs: check its result with this instead"),
         row("/protect PATH...", "the running task must leave these as they are"),
@@ -2251,12 +2785,15 @@ fn help() -> Vec<Line<'static>> {
         row("/new", "a new conversation: later tasks forget the earlier ones"),
         row("/attempts N", "attempts at once, 1 to 8"),
         row("/stream on|off", "model text previews for the next task"),
+        row("/notify on|all|off", "bell and desktop notice when waiting (all: also when a task ends)"),
+        row("/commit on|off", "commit each applied result to git; `molt undo` takes it back"),
         row("/model NAME", "opus, sonnet, haiku or a model id"),
         row("/memory-model NAME", "model memory learns with; same: the attempts'"),
         row("/effort LEVEL", "low, medium, high, xhigh or max"),
         row("/budget USD", "spending limit per task"),
         row("/last", "the diff of the last finished task"),
         row("/lanes", "the tool calls of the last finished task"),
+        row("/theme NAME", "dark, light or terminal ANSI colors; saved for next time"),
         row("/clear", "clear the log"),
         row("/quit", "quit"),
         Line::default(),
@@ -2315,10 +2852,15 @@ mod tests {
     }
 
     fn frame_text(app: &mut App) -> String {
-        let backend = ratatui::backend::TestBackend::new(140, 40);
+        frame_rows(app, 140).concat()
+    }
+
+    fn frame_rows(app: &mut App, width: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, 40);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| super::super::view::draw(frame, app)).unwrap();
-        terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect()
+        let cells: Vec<String> = terminal.backend().buffer().content.iter().map(|c| c.symbol().to_owned()).collect();
+        cells.chunks(usize::from(width)).map(|row| row.concat()).collect()
     }
 
     fn model_context(app: &App, attempt: Option<u32>, seq: u64) -> molt_api::progress::ModelCall {
@@ -2367,6 +2909,235 @@ mod tests {
         assert!(app.update(Msg::Ran { trace, result: Err("the model refused".into()) }).is_empty());
         assert!(app.task.is_none() && app.prompt.is_none());
         assert!(log(&app).contains("the model refused"));
+    }
+
+    fn finished(app: &App, attempt: Option<u32>, call: &str, cost_usd: Option<f64>) -> Msg {
+        let context = molt_api::progress::ModelCall { call: call.into(), ..model_context(app, attempt, 9) };
+        Msg::Progress(Progress::ModelFinished { context, usage: None, cost_usd, error: None })
+    }
+
+    #[test]
+    fn each_lane_shows_what_its_finished_calls_cost_and_unknown_cost_is_a_lower_bound() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        app.settings.budget_usd = Some(1.0);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        // Each call counts once.
+        app.update(finished(&app, Some(0), "a", Some(0.3)));
+        app.update(finished(&app, Some(0), "a", Some(0.3)));
+        app.update(finished(&app, Some(1), "b", None));
+        let task = app.task.as_ref().unwrap();
+        assert_eq!(task.lanes[0].spend.label(), "$0.30");
+        assert_eq!(task.lanes[1].spend.label(), "≥ $0.00");
+        assert_eq!(task.spend().label(), "≥ $0.30");
+        let shown = frame_text(&mut app);
+        assert!(shown.contains("turn 1 · 0s · $0.30"), "{shown}");
+        assert!(shown.contains("task ≥ $0.30 / $1.00"), "{shown}");
+        assert_eq!(app.spent_usd, 0.0, "progress events do not settle spending");
+
+        // An attempt stopped by the winner still settles its last call.
+        app.update(Msg::Progress(Progress::AttemptFinished {
+            run: trace.to_string(),
+            attempt: 1,
+            status: AttemptStatus::Cancelled,
+        }));
+        app.update(finished(&app, Some(1), "c", Some(0.05)));
+        assert_eq!(app.task.as_ref().unwrap().lanes[1].spend.label(), "≥ $0.05");
+
+        app.update(Msg::Ran { trace, result: Ok(passed(false, Some("fork"))) });
+        assert!((app.spent_usd - 0.3).abs() < 1e-9, "the reply settles the run once: {}", app.spent_usd);
+    }
+
+    #[test]
+    fn final_reports_settle_lane_cost_when_progress_was_lost() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        app.update(Msg::Progress(Progress::AttemptStarted { run: trace.to_string(), attempt: 1, fork: None }));
+        let resp = passed(false, Some("fork"));
+        let cost = resp.attempts.iter().find(|a| a.index == 1).unwrap().cost_usd;
+        app.update(Msg::Ran { trace, result: Ok(resp) });
+        assert_eq!(app.last_lanes.iter().find(|a| a.index == 1).unwrap().spend.usd, cost);
+        assert!(cost > 0.0);
+    }
+
+    #[test]
+    fn with_commit_on_an_applied_result_is_committed_once_it_is_applied() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        // Off by default: nothing about git.
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(true, None)) });
+        assert!(!actions.iter().any(|a| matches!(a, Action::Commit { .. })), "{actions:?}");
+
+        type_in(&mut app, "/commit on");
+        assert_eq!(app.flash.as_deref(), Some("commit: on (next task)"));
+        // Applied by the run itself: committed at once.
+        let actions = type_in(&mut app, "implement more");
+        let [Action::PrepareCommit { trace }, Action::Run { trace: run, .. }] = actions.as_slice() else {
+            panic!("{actions:?}")
+        };
+        assert_eq!(trace, run);
+        let trace = trace.clone();
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(true, None)) });
+        let Some(Action::Commit { trace: committed, task, resp }) = actions.first() else { panic!("{actions:?}") };
+        assert_eq!((committed, task.as_str(), resp.changes.len()), (&trace, "implement more", 1));
+        let made = crate::git::Committed {
+            sha: "0123456789abcdef".into(),
+            subject: "Trailing commas parse.".into(),
+            branch: Some("main".into()),
+            ignored: vec![],
+        };
+        app.update(Msg::Committed(Ok(Some(made))));
+        assert!(log(&app).ends_with("  committed 0123456789ab on main: Trailing commas parse."), "{}", log(&app));
+        app.update(Msg::Committed(Err("a.txt had changes of yours".into())));
+        assert!(log(&app).contains("not committed; the result is applied"), "{}", log(&app));
+
+        // Applied after the user's look: committed only once the apply succeeds.
+        app.rules.always_ask = true;
+        let actions = type_in(&mut app, "and more");
+        let [Action::PrepareCommit { trace }, Action::Run { .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/fork-3"))) });
+        assert!(!actions.iter().any(|a| matches!(a, Action::Commit { .. })), "{actions:?}");
+        assert_eq!(app.update(key(KeyCode::Enter)), [Action::Apply { fork: "/d/fork-3".into() }]);
+        let actions = app.update(Msg::Applied(Ok(())));
+        assert!(matches!(actions.as_slice(), [Action::Commit { trace: t, .. }] if *t == trace), "{actions:?}");
+
+        // A result the user keeps in its fork, or that fails to apply, is not committed.
+        let actions = type_in(&mut app, "once more");
+        let [Action::PrepareCommit { trace }, ..] = actions.as_slice() else { panic!("{actions:?}") };
+        app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/fork-4"))) });
+        app.update(key(KeyCode::Enter));
+        assert!(app.update(Msg::Applied(Err("conflict".into()))).is_empty());
+        type_in(&mut app, "/commit off");
+        assert_eq!(type_in(&mut app, "last one").len(), 1);
+    }
+
+    #[test]
+    fn the_check_designs_calls_count_until_its_reply_settles_them() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        app.update(finished(&app, None, "d", Some(0.04)));
+        assert_eq!(app.task.as_ref().unwrap().spend().label(), "$0.04");
+        app.update(Msg::Designed { trace, result: Ok(design()), existing: vec![] });
+        let task = app.task.as_ref().unwrap();
+        assert_eq!(task.spend().label(), format!("${:.2}", design().cost_usd));
+    }
+
+    #[test]
+    fn narrow_lanes_keep_their_status_on_one_row() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        app.settings.attempts = Some(4);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        for attempt in 0..4 {
+            app.update(Msg::Progress(Progress::AttemptStarted { run: trace.to_string(), attempt, fork: None }));
+            app.update(Msg::Progress(Progress::ToolCall {
+                run: trace.to_string(),
+                attempt,
+                turn: 12,
+                tool: "read_file".into(),
+                detail: "read".into(),
+            }));
+            app.update(finished(&app, Some(attempt), &format!("call {attempt}"), Some(0.25)));
+        }
+        let rows = frame_rows(&mut app, 79);
+        let titles = rows.iter().find(|r| r.contains("turn 12")).expect("the lane titles");
+        assert_eq!(titles.matches("turn 12").count(), 4, "{titles}");
+        let wide = frame_rows(&mut app, 200);
+        let titles = wide.iter().find(|r| r.contains("turn 12")).expect("the lane titles");
+        assert_eq!(titles.matches("turn 12 · 0s · $0.25").count(), 4, "{titles}");
+        assert_eq!(titles.matches("attempt").count(), 4, "{titles}");
+    }
+
+    /// Lets more than the looking window pass since the last key.
+    fn look_away(app: &mut App) {
+        for _ in 0..=LOOKING_TICKS {
+            app.update(Msg::Tick);
+        }
+    }
+
+    fn alerts(actions: &[Action]) -> Vec<&str> {
+        actions.iter().filter_map(|a| if let Action::Alert { text } = a { Some(text.as_str()) } else { None }).collect()
+    }
+
+    #[test]
+    fn the_user_is_called_once_for_each_stop_and_the_title_says_what_waits() {
+        let mut app = App::new("/work/project", None);
+        assert_eq!(app.title(), "molt · idle");
+        up(&mut app);
+        app.rules.always_ask = true;
+        let actions = type_in(&mut app, "accept trailing commas");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        assert_eq!(app.title(), "molt · designing the check");
+        look_away(&mut app);
+        let actions = app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
+        assert_eq!(alerts(&actions), ["molt: check ready"]);
+        assert_eq!(app.title(), "molt · waiting: check");
+        look_away(&mut app);
+        assert!(alerts(&app.update(Msg::Tick)).is_empty(), "the same stop calls once");
+
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.title(), "molt · running 0/2");
+        app.update(Msg::Progress(Progress::AttemptStarted { run: trace.to_string(), attempt: 0, fork: None }));
+        assert_eq!(app.title(), "molt · running 1/2");
+        look_away(&mut app);
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/fork"))) });
+        assert_eq!(alerts(&actions), ["molt: result ready"], "by default an ended task does not ring");
+        assert_eq!(app.title(), "molt · waiting: apply");
+
+        app.update(key(KeyCode::Char('n')));
+        assert_eq!(app.title(), "molt · idle");
+        look_away(&mut app);
+        assert_eq!(alerts(&app.update(Msg::SessionFailed("gone".into()))), ["molt: services down"]);
+        assert_eq!(app.title(), "molt · services down");
+    }
+
+    #[test]
+    fn alerts_wait_for_the_user_to_look_away_and_can_be_turned_off_or_up() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let run = |app: &mut App, outcome: Result<RunResponse, String>| {
+            let actions = type_in(app, "task");
+            let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+            let trace = trace.clone();
+            look_away(app);
+            let actions = app.update(Msg::Ran { trace, result: outcome });
+            app.prompt = None;
+            app.task = None;
+            alerts(&actions).into_iter().map(str::to_owned).collect::<Vec<_>>()
+        };
+        app.mode = Mode::Plan;
+        assert!(run(&mut app, Ok(passed(false, Some("/d/a")))).is_empty());
+        type_in(&mut app, "/notify all");
+        assert_eq!(run(&mut app, Ok(passed(false, Some("/d/b")))), ["molt: passed · 1 file"]);
+        assert_eq!(run(&mut app, Ok(failed(vec![]))), ["molt: failed"]);
+        assert_eq!(run(&mut app, Err("boom".into())), ["molt: run failed"]);
+        // Not while the user is at the terminal: just typed, or it has focus.
+        let actions = type_in(&mut app, "task");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert!(alerts(&app.update(Msg::Ran { trace: trace.clone(), result: Err("x".into()) })).is_empty());
+        app.update(Msg::Focus(true));
+        assert!(run(&mut app, Err("boom".into())).is_empty());
+        app.update(Msg::Focus(false));
+        type_in(&mut app, "/notify off");
+        assert!(run(&mut app, Err("boom".into())).is_empty());
     }
 
     #[test]
@@ -2419,10 +3190,59 @@ mod tests {
         assert!(app.task.is_none() && app.prompt.is_none());
     }
 
+    #[test]
+    fn project_commands_set_one_request_and_confirm_their_check() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".molt/commands");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("fix-issue.md"),
+            "---\ncheck: cargo test\nattempts: 3\nbudget: 2.5\n---\nFix issue $ARGUMENTS",
+        )
+        .unwrap();
+        std::fs::write(dir.join("help.md"), "wrong").unwrap();
+        let mut app = App::new(root.path().to_str().unwrap(), None);
+        app.load_commands(root.path());
+        up(&mut app);
+        app.settings.budget_usd = Some(1.0);
+        assert_eq!(app.command_candidates("fix-"), ["fix-issue"]);
+        assert!(type_in(&mut app, "/fix-issue 12").is_empty());
+        let task = app.task.as_ref().unwrap();
+        assert_eq!(task.req.task, "Fix issue 12");
+        assert_eq!(task.req.attempts, 3);
+        assert_eq!(task.req.budget_usd, Some(1.0));
+        assert_eq!(task.phase, Phase::Confirming);
+        assert_eq!(app.settings.check, None);
+        let actions = app.update(key(KeyCode::Enter));
+        assert!(matches!(&actions[0], Action::Run { req, .. } if req.check.as_deref() == Some("cargo test")));
+        app.task = None;
+        type_in(&mut app, "/help");
+        let viewer = app.viewer.as_ref().unwrap();
+        assert_eq!(viewer.title, "help");
+        assert!(plain(&viewer.lines).iter().any(|l| l.contains("/fix-issue")));
+    }
+
+    #[test]
+    fn terminal_controls_work_over_a_viewer_and_leave_the_task_running() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "fix it");
+        type_in(&mut app, "/help");
+        assert_eq!(app.update(ctrl_key('l')), [Action::Redraw]);
+        assert_eq!(app.update(ctrl_key('z')), [Action::Suspend]);
+        assert!(app.task.is_some());
+        app.viewer = None;
+        assert_eq!(type_in(&mut app, "/theme light"), [Action::SaveTheme(text::Theme::Light), Action::Redraw]);
+        assert_eq!(app.theme, text::Theme::Light);
+        assert!(app.task.is_some());
+    }
+
     fn design() -> DesignResponse {
         DesignResponse {
             command: Some("cargo test --test commas".into()),
             files: vec![CheckFile { path: "tests/commas.rs".into(), content: "#[test]\nfn t() {}\n".into() }],
+            suite: None,
+            rubric: vec![],
             rationale: "the parser has tests".into(),
             baseline: Some(Baseline { passed: false, exit_code: Some(101), tail: String::new() }),
             usage: Usage::default(),
@@ -2437,7 +3257,7 @@ mod tests {
     fn passed(apply: bool, fork: Option<&str>) -> RunResponse {
         RunResponse {
             outcome: Outcome::Passed,
-            check: Some(CheckSpec { command: "cargo test".into(), files: vec![], designed: true }),
+            check: Some(CheckSpec { command: "cargo test".into(), files: vec![], designed: true, suite: None }),
             winner: Some(1),
             summary: "Trailing commas parse.".into(),
             changes: vec![Change { path: "src/parser.rs".into(), kind: ChangeKind::Modified }],
@@ -2473,6 +3293,9 @@ mod tests {
             uncounted_calls: 0,
             checkpoint: None,
             requirements: vec![],
+            selection: None,
+            rubric: vec![],
+            judgement: vec![],
         }
     }
 
@@ -2519,6 +3342,7 @@ mod tests {
             passed: true,
             exit_code: Some(0),
             tail: String::new(),
+            judged: false,
         }));
         // Another run's events are not this task's.
         app.update(Msg::Progress(Progress::AttemptStarted { run: "other".into(), attempt: 5, fork: None }));
@@ -2561,6 +3385,7 @@ mod tests {
             command: Some("make test".into()),
             files: vec![],
             designed: true,
+            rubric: vec![],
         }));
         app.update(Msg::Ran { trace, result: Ok(passed(true, None)) });
         assert!(app.prompt.is_none() && app.task.is_none());
@@ -2814,6 +3639,7 @@ mod tests {
             reinforced: vec![],
             contradicted: vec![],
             skipped: Some("the episode held nothing worth keeping".into()),
+            proposed: vec![],
             usage: Usage::default(),
             cost_usd: 0.01,
         };
@@ -2844,6 +3670,48 @@ mod tests {
     }
 
     #[test]
+    fn notes_for_every_project_are_remembered_and_promoted_by_hand() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        assert_eq!(
+            type_in(&mut app, "/remember Answer in Chinese."),
+            [Action::Remember { text: "Answer in Chinese.".into() }]
+        );
+        assert!(type_in(&mut app, "/remember").is_empty(), "nothing to remember");
+        app.update(Msg::Remembered(Ok("note_u".into())));
+        assert_eq!(app.flash.as_deref(), Some("remembered note_u for every project"));
+
+        type_in(&mut app, "/memory");
+        let note = |id: &str, layer: Layer| Recalled {
+            note: serde_json::from_value(serde_json::json!({
+                "id": id, "kind": "fact", "text": "t", "confidence": 0.5, "created_ms": 0, "updated_ms": 0,
+                "provenance": { "trace": "tr", "service": "memory", "version": "v" }, "rev": 1
+            }))
+            .unwrap(),
+            score: 1.0,
+            reason: Default::default(),
+            details: Default::default(),
+            layer,
+        };
+        app.update(Msg::Notes(Ok(vec![note("note_u", Layer::User), note("note_p", Layer::Project)])));
+        app.update(key(KeyCode::Char('p')));
+        assert_eq!(app.flash.as_deref(), Some("that note holds everywhere already"));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Char('p')));
+        assert!(app.update(key(KeyCode::Enter)).is_empty(), "a reason is required");
+        app.update(Msg::Paste("all my projects use make".into()));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Action::Promote { id: "note_p".into(), reason: "all my projects use make".into() }]
+        );
+        assert_eq!(
+            app.update(Msg::Promoted { id: "note_p".into(), result: Ok("note_c".into()) }),
+            [Action::LoadNotes { query: String::new() }]
+        );
+        assert_eq!(app.flash.as_deref(), Some("note_p now holds in every project as note_c"));
+    }
+
+    #[test]
     fn the_memory_screen_lists_filters_and_forgets() {
         let mut app = App::new("/w", None);
         up(&mut app);
@@ -2857,6 +3725,7 @@ mod tests {
             score: 1.0,
             reason: Default::default(),
             details: Default::default(),
+            layer: Default::default(),
         };
         app.update(Msg::Notes(Ok(vec![note("note_a"), note("note_b")])));
         app.update(key(KeyCode::Down));
@@ -3259,6 +4128,7 @@ mod tests {
             passed: false,
             exit_code: Some(101),
             tail: "stdout:\nrunning 1 test\nkey sk-ant-secret-1234\nassertion failed: commas\n".into(),
+            judged: false,
         }));
         assert_eq!(
             plain(&app.task.as_ref().unwrap().lanes[0].lines),
@@ -3318,7 +4188,9 @@ mod tests {
         app.update(ctrl_key('u'));
         type_in(&mut app, "/lanes");
         let viewer = app.viewer.take().expect("the last task's attempts");
-        assert_eq!(plain(&viewer.lines)[..2], ["attempt 1 · tool calls", " 1 read Makefile"]);
+        let lines = plain(&viewer.lines);
+        assert!(lines[0].starts_with("attempt 1 · tool calls · 0s · $0.10"), "{}", lines[0]);
+        assert_eq!(lines[1], " 1 read Makefile");
     }
 
     #[test]
@@ -3426,6 +4298,11 @@ mod tests {
         assert_eq!(
             check_stop(DesignResponse { command: None, files: vec![], ..design() }, &[]),
             ["no automated check"]
+        );
+        let rubric = vec![molt_api::planner::Criterion { text: "Cites sources.".into(), command: None }];
+        assert_eq!(
+            check_stop(DesignResponse { command: None, files: vec![], rubric, ..design() }, &[]),
+            ["criteria judged by a model"]
         );
         let passing = Baseline { passed: true, exit_code: Some(0), tail: String::new() };
         assert_eq!(check_stop(DesignResponse { baseline: Some(passing), ..design() }, &[]), ["baseline passes"]);

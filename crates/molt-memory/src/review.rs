@@ -9,7 +9,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path};
 
 use molt_api::memory::{
-    FileDependency, NoteDetails, Provenance, RecallRequest, RecallSnapshot, Recalled, ReviewRequest, ReviewResponse,
+    FileDependency, Layer, Note, NoteDetails, PromoteRequest, Provenance, RecallRequest, RecallSnapshot, Recalled,
+    ReviewRequest, ReviewResponse,
 };
 use molt_proto::RemoteError;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -102,7 +103,7 @@ struct Changed {
 
 /// Hash off the database lock. The revision lease below prevents an older
 /// check from overwriting a user review that happened during the file read.
-fn changed(db: &Db, workspace: &str) -> Result<Vec<Changed>, RemoteError> {
+fn changed(db: &Db, workspace: &str, path: &Path) -> Result<Vec<Changed>, RemoteError> {
     let candidates: Vec<(String, i64, String)> = db.with(|conn| {
         let mut stmt = conn.prepare("SELECT n.id, n.rev, d.details FROM notes n JOIN note_details d ON d.note = n.id WHERE n.workspace = ?1 AND n.forgotten_ms IS NULL")?;
         let rows = stmt.query_map([workspace], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>();
@@ -114,7 +115,7 @@ fn changed(db: &Db, workspace: &str) -> Result<Vec<Changed>, RemoteError> {
         let before = details.needs_review.len();
         for dep in &details.dependencies {
             if !details.needs_review.contains(&dep.path)
-                && fingerprint(Path::new(workspace), &dep.path).as_deref() != Ok(dep.sha256.as_str())
+                && fingerprint(path, &dep.path).as_deref() != Ok(dep.sha256.as_str())
             {
                 details.needs_review.push(dep.path.clone());
             }
@@ -126,7 +127,7 @@ fn changed(db: &Db, workspace: &str) -> Result<Vec<Changed>, RemoteError> {
     Ok(out)
 }
 
-fn save(
+pub(crate) fn save(
     conn: &Connection,
     id: &str,
     details: &NoteDetails,
@@ -154,8 +155,9 @@ fn apply(conn: &Connection, changes: Vec<Changed>, trace: &str, now: u64) -> rus
     Ok(())
 }
 
-pub(crate) fn refresh(db: &Db, workspace: &str, trace: &str, now: u64) -> Result<(), RemoteError> {
-    let changes = changed(db, workspace)?;
+/// Mark the notes kept under `workspace` whose dependency files in `path` changed.
+pub(crate) fn refresh(db: &Db, workspace: &str, path: &Path, trace: &str, now: u64) -> Result<(), RemoteError> {
+    let changes = changed(db, workspace, path)?;
     db.with(|conn| {
         let tx = conn.transaction()?;
         apply(&tx, changes, trace, now)?;
@@ -167,6 +169,8 @@ pub(crate) fn refresh(db: &Db, workspace: &str, trace: &str, now: u64) -> Result
 pub(crate) fn recall(
     db: &Db,
     req: &RecallRequest,
+    path: Option<&Path>,
+    user: Option<&Db>,
     identity: Option<(&str, &str)>,
     now: u64,
 ) -> Result<Vec<Recalled>, RemoteError> {
@@ -174,11 +178,33 @@ pub(crate) fn recall(
     if req.capture.is_some() && identity.is_none() {
         return Err(invalid("captured recall requires an authenticated request"));
     }
-    let changes = req.workspace.as_deref().map(|ws| changed(db, ws)).transpose()?.unwrap_or_default();
+    // The user layer holds only notes for every project, so it is asked as if for none.
+    let theirs = match user {
+        Some(user) => {
+            let everywhere = RecallRequest { workspace: None, capture: None, ..req.clone() };
+            let mut found =
+                user.with(|conn| notes::select(conn, &everywhere, Scope::WithGlobal, now)).map_err(error::db)?;
+            for r in &mut found {
+                r.layer = Layer::User;
+            }
+            found
+        }
+        None => Vec::new(),
+    };
+    let changes = match (req.workspace.as_deref(), path) {
+        (Some(ws), Some(path)) => changed(db, ws, path)?,
+        (Some(ws), None) => changed(db, ws, Path::new(ws))?,
+        (None, _) => Vec::new(),
+    };
     db.with(|conn| -> rusqlite::Result<_> {
         let tx = conn.transaction()?;
         apply(&tx, changes, identity.map_or("inspection", |i| i.0), now)?;
-        let found = notes::select(&tx, req, Scope::WithGlobal, now)?;
+        let mut found = notes::select(&tx, req, Scope::WithGlobal, now)?;
+        if !theirs.is_empty() {
+            found.extend(theirs);
+            found.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.note.id.cmp(&b.note.id)));
+            found.truncate(req.k.unwrap_or(notes::DEFAULT_K).clamp(1, notes::MAX_K) as usize);
+        }
         if let (Some(purpose), Some((run, call))) = (&req.capture, identity) {
             let snapshot = RecallSnapshot {
                 run: run.into(),
@@ -238,6 +264,8 @@ pub(crate) fn snapshots(db: &Db, workspace: &str, run: &str) -> Result<Vec<Recal
 pub(crate) fn review(
     db: &Db,
     req: &ReviewRequest,
+    path: &Path,
+    global: bool,
     correction: Option<&str>,
     provenance: Provenance,
     now: u64,
@@ -245,11 +273,13 @@ pub(crate) fn review(
     if req.reason.trim().is_empty() || req.reason.len() > 2000 || req.depends_on.len() > 16 {
         return Err(invalid("give a reason of at most 2000 bytes and at most 16 dependency files"));
     }
+    if global && !req.depends_on.is_empty() {
+        return Err(invalid("a note for every project cannot depend on one project's files"));
+    }
     let mut dependencies = Vec::new();
-    for path in &req.depends_on {
-        if !dependencies.iter().any(|d: &FileDependency| &d.path == path) {
-            dependencies
-                .push(FileDependency { path: path.clone(), sha256: fingerprint(Path::new(&req.workspace), path)? });
+    for dep in &req.depends_on {
+        if !dependencies.iter().any(|d: &FileDependency| &d.path == dep) {
+            dependencies.push(FileDependency { path: dep.clone(), sha256: fingerprint(path, dep)? });
         }
     }
     let new_text = correction
@@ -257,7 +287,7 @@ pub(crate) fn review(
             NewNote {
                 kind: molt_api::memory::NoteKind::Fact,
                 text: text.into(),
-                workspace: Some(req.workspace.clone()),
+                workspace: (!global).then(|| req.workspace.clone()),
                 confidence: 0.95,
                 provenance: provenance.clone(),
             }
@@ -268,8 +298,11 @@ pub(crate) fn review(
         let tx = conn.transaction().map_err(error::db)?;
         let old =
             notes::get(&tx, &req.id).map_err(error::db)?.ok_or_else(|| invalid("the note is missing or withdrawn"))?;
-        if old.workspace.as_deref() != Some(&req.workspace) {
-            return Err(invalid("the note belongs to another project (global notes cannot be edited here)"));
+        if global && old.workspace.is_some() {
+            return Err(invalid("the note belongs to a project, not to every project"));
+        }
+        if !global && old.workspace.as_deref() != Some(&req.workspace) {
+            return Err(invalid("the note belongs to another project"));
         }
         if old.rev != req.expected_rev {
             return Err(invalid(format!(
@@ -277,12 +310,23 @@ pub(crate) fn review(
                 req.expected_rev, old.rev
             )));
         }
+        let previous: Option<NoteDetails> = tx
+            .query_row("SELECT details FROM note_details WHERE note = ?1", [&old.id], |r| r.get::<_, String>(0))
+            .optional()
+            .map_err(error::db)?
+            .map(|text| decode(&text))
+            .transpose()
+            .map_err(error::db)?;
+        let previous = previous.unwrap_or_default();
         let mut details = NoteDetails {
             dependencies,
             needs_review: Vec::new(),
             temporary: req.temporary,
             reason: req.reason.clone(),
             supersedes: None,
+            // A correction of a promoted note is still the user's.
+            promoted_from: previous.promoted_from.clone(),
+            ..NoteDetails::default()
         };
         let id = if let Some(mut new) = new_text {
             if notes::norm(&new.text) == notes::norm(&old.text) {
@@ -297,13 +341,9 @@ pub(crate) fn review(
             notes::settle_partners(&tx, &old.id).map_err(error::db)?;
             notes::store(&tx, &new, now).map_err(error::db)?.0
         } else {
-            let previous: Option<String> = tx
-                .query_row("SELECT details FROM note_details WHERE note = ?1", [&old.id], |r| r.get(0))
-                .optional()
-                .map_err(error::db)?;
-            if let Some(previous) = previous {
-                details.supersedes = decode::<NoteDetails>(&previous).map_err(error::db)?.supersedes;
-            }
+            details.supersedes = previous.supersedes;
+            details.everywhere = previous.everywhere;
+            details.promoted_to = previous.promoted_to;
             tx.execute("UPDATE notes SET rev = rev + 1 WHERE id = ?1", [&old.id]).map_err(error::db)?;
             old.id
         };
@@ -312,6 +352,91 @@ pub(crate) fn review(
         tx.commit().map_err(error::db)?;
         Ok(ReviewResponse { note, details })
     })
+}
+
+/// Mark the project note `id` as proposed for every project, unless it was
+/// promoted already. Only a person's promotion acts on the mark.
+pub(crate) fn propose_everywhere(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    let previous: Option<String> =
+        conn.query_row("SELECT details FROM note_details WHERE note = ?1", [id], |r| r.get(0)).optional()?;
+    let mut details: NoteDetails = previous.map(|t| decode(&t)).transpose()?.unwrap_or_default();
+    if details.promoted_to.is_some() {
+        return Ok(false);
+    }
+    details.everywhere = true;
+    let text = serde_json::to_string(&details).expect("note details serialize");
+    conn.execute(
+        "INSERT INTO note_details (note, details) VALUES (?1, ?2) ON CONFLICT(note) DO UPDATE SET details = excluded.details",
+        params![id, text],
+    )?;
+    Ok(true)
+}
+
+/// Copy the live project note `req.id`, kept under `key`, to the `user`
+/// layer with its kind, confidence and provenance, so that rolling back the
+/// version that learned it retracts the copy too. The project note stays,
+/// marked with where it went. Doing it twice changes nothing more.
+pub(crate) fn promote(
+    project: &Db,
+    user: &Db,
+    key: &str,
+    req: &PromoteRequest,
+    by: &Provenance,
+    now: u64,
+) -> Result<Note, RemoteError> {
+    if req.reason.trim().is_empty() || req.reason.len() > 2000 {
+        return Err(invalid("say in at most 2000 bytes why the note holds in every project"));
+    }
+    let (old, mut details) = project
+        .with(|conn| -> rusqlite::Result<_> {
+            let Some(old) = notes::get(conn, &req.id)? else { return Ok(None) };
+            let details: Option<String> = conn
+                .query_row("SELECT details FROM note_details WHERE note = ?1", [&old.id], |r| r.get(0))
+                .optional()?;
+            Ok(Some((old, details.map(|t| decode::<NoteDetails>(&t)).transpose()?.unwrap_or_default())))
+        })
+        .map_err(error::db)?
+        .ok_or_else(|| invalid("the note is missing or withdrawn"))?;
+    if old.workspace.as_deref() != Some(key) {
+        return Err(invalid("the note belongs to another project, or to every project already"));
+    }
+    if !details.needs_review.is_empty() {
+        return Err(invalid("the note awaits review; review it before promoting it"));
+    }
+    let new = NewNote {
+        kind: old.kind,
+        text: old.text.clone(),
+        workspace: None,
+        confidence: old.confidence,
+        provenance: old.provenance.clone(),
+    };
+    let note = user.with(|conn| -> Result<Note, RemoteError> {
+        let tx = conn.transaction().map_err(error::db)?;
+        if notes::withdrawn(&tx, &new).map_err(error::db)? {
+            return Err(invalid("this text was forgotten from the user layer; it is not put back automatically"));
+        }
+        let (id, _) = notes::store(&tx, &new, now).map_err(error::db)?;
+        let theirs = NoteDetails {
+            reason: req.reason.clone(),
+            promoted_from: Some(format!("{} in {key}", old.id)),
+            ..NoteDetails::default()
+        };
+        save(&tx, &id, &theirs, &by.trace, &by.service, &req.reason, now).map_err(error::db)?;
+        let note = notes::get(&tx, &id).map_err(error::db)?.expect("stored live note");
+        tx.commit().map_err(error::db)?;
+        Ok(note)
+    })?;
+    details.everywhere = false;
+    details.promoted_to = Some(note.id.clone());
+    project
+        .with(|conn| -> rusqlite::Result<()> {
+            let tx = conn.transaction()?;
+            tx.execute("UPDATE notes SET rev = rev + 1 WHERE id = ?1", [&old.id])?;
+            save(&tx, &old.id, &details, &by.trace, &by.service, &req.reason, now)?;
+            tx.commit()
+        })
+        .map_err(error::db)?;
+    Ok(note)
 }
 
 #[cfg(test)]
@@ -369,34 +494,37 @@ mod tests {
         let old = note(&db, ws, "Tests run with cargo test.");
         let unrelated = note(&db, ws, "Use snake case for functions.");
         let req = ReviewRequest { depends_on: vec!["Cargo.toml".into()], temporary: true, ..request(ws, &old) };
-        let reviewed = review(&db, &req, None, author(), 2).unwrap();
+        let reviewed = review(&db, &req, Path::new(&req.workspace), false, None, author(), 2).unwrap();
         let q = RecallRequest { query: "tests".into(), capture: Some("context".into()), ..query(ws) };
-        let found = recall(&db, &q, Some(("run_a", "call_a")), 3).unwrap();
+        let found = recall(&db, &q, None, None, Some(("run_a", "call_a")), 3).unwrap();
         assert_eq!(found[0].note, reviewed.note);
         assert!(found[0].details.temporary && found[0].reason.keywords.is_some());
         assert_eq!(found[0].reason.relevance, Some(1.0));
         let snapshot = snapshots(&db, ws, "run_a").unwrap();
         std::fs::write(root.path().join("unrelated.rs"), "fn other() {}").unwrap();
-        assert_eq!(recall(&db, &query(ws), None, 4).unwrap().len(), 2);
+        assert_eq!(recall(&db, &query(ws), None, None, None, 4).unwrap().len(), 2);
         std::fs::write(root.path().join("Cargo.toml"), "new config").unwrap();
-        assert_eq!(recall(&db, &query(ws), None, 5).unwrap()[0].note.id, unrelated.id);
+        assert_eq!(recall(&db, &query(ws), None, None, None, 5).unwrap()[0].note.id, unrelated.id);
         let inspect = RecallRequest { include_review: true, query: "tests".into(), ..query(ws) };
-        let stale = recall(&db, &inspect, None, 6).unwrap().remove(0);
+        let stale = recall(&db, &inspect, None, None, None, 6).unwrap().remove(0);
         assert_eq!(stale.details.needs_review, ["Cargo.toml"]);
         std::fs::write(root.path().join("Cargo.toml"), "old config").unwrap();
         assert_eq!(
-            recall(&db, &query(ws), None, 7).unwrap().len(),
+            recall(&db, &query(ws), None, None, None, 7).unwrap().len(),
             1,
             "restoring a file cannot automatically reactivate a note"
         );
-        assert!(review(&db, &req, None, author(), 8).unwrap_err().message.contains("revision"));
+        assert!(review(&db, &req, Path::new(&req.workspace), false, None, author(), 8)
+            .unwrap_err()
+            .message
+            .contains("revision"));
         let req = ReviewRequest { expected_rev: stale.note.rev, ..req };
-        let rechecked = review(&db, &req, None, author(), 9).unwrap();
-        assert_eq!(recall(&db, &query(ws), None, 10).unwrap().len(), 2);
+        let rechecked = review(&db, &req, Path::new(&req.workspace), false, None, author(), 9).unwrap();
+        assert_eq!(recall(&db, &query(ws), None, None, None, 10).unwrap().len(), 2);
         notes::forget(&db, &rechecked.note.id, "removed by user", "forget_run", 11).unwrap();
         assert_eq!(snapshots(&db, ws, "run_a").unwrap(), snapshot);
         assert_eq!(
-            recall(&db, &q, Some(("run_a", "call_a")), 12).unwrap(),
+            recall(&db, &q, None, None, Some(("run_a", "call_a")), 12).unwrap(),
             snapshot[0].notes,
             "same envelope cannot rewrite a snapshot"
         );
@@ -409,9 +537,10 @@ mod tests {
         let ws = root.path().to_str().unwrap();
         let db = Db::in_memory().unwrap();
         let old = note(&db, ws, "Build with npm.");
-        let corrected = review(&db, &request(ws, &old), Some("Build with pnpm."), author(), 2).unwrap();
+        let corrected =
+            review(&db, &request(ws, &old), Path::new(ws), false, Some("Build with pnpm."), author(), 2).unwrap();
         assert_eq!(corrected.details.supersedes.as_deref(), Some(old.id.as_str()));
-        assert_eq!(recall(&db, &query(ws), None, 3).unwrap()[0].note.id, corrected.note.id);
+        assert_eq!(recall(&db, &query(ws), None, None, None, 3).unwrap()[0].note.id, corrected.note.id);
         let new = NewNote {
             kind: old.kind,
             text: "build with NPM".into(),
@@ -428,8 +557,8 @@ mod tests {
             db.with(|c| c.query_row("SELECT forget_reason FROM notes WHERE id = ?1", [&old.id], |r| r.get(0))).unwrap();
         assert_eq!(reason, "verified against configuration");
         notes::retract(&db, "cli", "user", "rollback", "rollback_run", 5).unwrap();
-        assert!(recall(&db, &query(ws), None, 6).unwrap().is_empty());
-        assert!(review(&db, &request(ws, &old), None, author(), 7).is_err());
+        assert!(recall(&db, &query(ws), None, None, None, 6).unwrap().is_empty());
+        assert!(review(&db, &request(ws, &old), Path::new(ws), false, None, author(), 7).is_err());
     }
 
     #[test]
@@ -462,13 +591,13 @@ mod tests {
         let db = Db::in_memory().unwrap();
         let old = note(&db, ws, "Use the configured command.");
         let req = ReviewRequest { depends_on: vec!["config".into()], ..request(ws, &old) };
-        let first = review(&db, &req, None, author(), 2).unwrap();
+        let first = review(&db, &req, Path::new(&req.workspace), false, None, author(), 2).unwrap();
         std::fs::write(root.path().join("config"), "two").unwrap();
-        let pending = changed(&db, ws).unwrap();
+        let pending = changed(&db, ws, Path::new(ws)).unwrap();
         let req = ReviewRequest { expected_rev: first.note.rev, ..req };
-        let newest = review(&db, &req, None, author(), 3).unwrap();
+        let newest = review(&db, &req, Path::new(&req.workspace), false, None, author(), 3).unwrap();
         db.with(|c| apply(c, pending, "older_check", 4)).unwrap();
-        let found = recall(&db, &query(ws), None, 5).unwrap();
+        let found = recall(&db, &query(ws), None, None, None, 5).unwrap();
         assert_eq!(found[0].note.rev, newest.note.rev);
         assert!(found[0].details.needs_review.is_empty());
     }
@@ -481,18 +610,19 @@ mod tests {
         let old = note(&db, &ws, "Build the application.");
         let mut req = request(&ws, &old);
         req.reason = "2".into();
-        let first = review(&db, &req, None, author(), 2).unwrap();
+        let first = review(&db, &req, Path::new(&req.workspace), false, None, author(), 2).unwrap();
         let writer_db = db.clone();
         let writer = std::thread::spawn(move || {
             req.expected_rev = first.note.rev;
             for _ in 0..30 {
                 req.reason = (req.expected_rev + 1).to_string();
-                req.expected_rev = review(&writer_db, &req, None, author(), 3).unwrap().note.rev;
+                req.expected_rev =
+                    review(&writer_db, &req, Path::new(&req.workspace), false, None, author(), 3).unwrap().note.rev;
             }
         });
         for i in 0..30 {
             let q = RecallRequest { capture: Some("tool".into()), ..query(&ws) };
-            let found = recall(&db, &q, Some(("parallel_run", &format!("call_{i}"))), 3).unwrap();
+            let found = recall(&db, &q, None, None, Some(("parallel_run", &format!("call_{i}"))), 3).unwrap();
             assert_eq!(found[0].details.reason, found[0].note.rev.to_string());
         }
         writer.join().unwrap();

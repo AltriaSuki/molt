@@ -435,6 +435,8 @@ fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) ->
         .args(args)
         .arg("--data-dir")
         .arg(data)
+        // The project registry, kept out of the developer's own.
+        .env("XDG_DATA_HOME", data.join("user-data"))
         // `--workspace` defaults to the current directory.
         .current_dir(workspace)
         .env("ANTHROPIC_BASE_URL", server.uri())
@@ -460,6 +462,7 @@ fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) ->
         "MOLT_MAP_TOKENS",
         "MOLT_CONTEXT_TOKENS",
         "MOLT_INSTRUCTION_FILES",
+        "MOLT_SYNTAX_CHECK",
         "MOLT_MEMORY_MODEL",
         "MOLT_MEMORY_EFFORT",
         "MOLT_MEMORY_MAX_TOKENS",
@@ -477,7 +480,7 @@ async fn a_given_check_passes_and_the_result_is_applied() {
     let (resp, events) = setup.run(setup.request(Some(CHECK), 2)).await;
 
     assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
-    assert_eq!(resp.check, Some(CheckSpec { command: CHECK.into(), files: vec![], designed: false }));
+    assert_eq!(resp.check, Some(CheckSpec { command: CHECK.into(), files: vec![], designed: false, suite: None }));
     assert!(resp.applied);
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
     assert_eq!(resp.changes.len(), 1, "{resp:#?}");
@@ -589,6 +592,7 @@ async fn a_second_run_starts_with_what_the_first_learned_and_a_map_of_the_code()
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
         .args(["memory", "used", &run, "--json", "--data-dir"])
         .arg(setup.data.path())
+        .env("XDG_DATA_HOME", setup.data.path().join("user-data"))
         .current_dir(setup.workspace.path())
         .output()
         .unwrap();
@@ -611,7 +615,7 @@ async fn without_a_check_the_designer_writes_one_and_it_is_merged_too() {
     assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
     assert_eq!(
         resp.check,
-        Some(CheckSpec { command: "sh check.sh".into(), files: vec!["check.sh".into()], designed: true })
+        Some(CheckSpec { command: "sh check.sh".into(), files: vec!["check.sh".into()], designed: true, suite: None })
     );
     assert!(resp.applied);
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
@@ -758,6 +762,115 @@ async fn a_service_that_cannot_start_ends_the_run_at_once_and_says_why() {
 }
 
 #[tokio::test]
+async fn a_project_keeps_its_notes_without_a_folder_and_after_a_move() {
+    let server = fake_api(Fake::Greets).await;
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let molt = |args: &[&str], dir: &Path| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+            .args(args)
+            .env("XDG_DATA_HOME", data.path().join("user-data"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "molt {args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        stdout.into_owned()
+    };
+    let run = |args: &[&str], dir: &Path| {
+        let mut all = vec!["--check", CHECK, "--attempts", "1"];
+        all.extend(args);
+        let cmd = molt_do(&server, dir, data.path(), &all).output();
+        async move {
+            let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "{stderr}");
+            assert!(stderr.contains("memory: learned 1 note"), "{stderr}");
+        }
+    };
+    let show = |args: &[&str], dir: &Path| {
+        let mut all = vec!["memory", "show", "--data-dir", data.path().to_str().unwrap()];
+        all.extend(args);
+        molt(&all, dir)
+    };
+
+    // A project with no folder works in a private one, and learns there.
+    let listed = molt(&["project", "new", "Japan trip"], home.path());
+    assert!(listed.contains("Japan trip  no folder"), "{listed}");
+    let id = listed.split_whitespace().next().unwrap().to_owned();
+    run(&["--project", "Japan trip"], home.path()).await;
+    let files = data.path().join(format!("user-data/molt/projects/{id}/files"));
+    assert_eq!(std::fs::read_to_string(files.join("greeting.txt")).unwrap(), "hello\n");
+    assert!(show(&["--project", &id], home.path()).contains(LEARNED_TEXT));
+
+    // A directory becomes a project the first time molt runs in it, and
+    // keeps its notes when it moves and molt is told.
+    let old = home.path().join("site");
+    std::fs::create_dir(&old).unwrap();
+    run(&[], &old).await;
+    let new = home.path().join("site-renamed");
+    std::fs::rename(&old, &new).unwrap();
+    let moved = molt(&["project", "move", "site", new.to_str().unwrap()], home.path());
+    assert!(moved.contains(new.canonicalize().unwrap().to_str().unwrap()), "{moved}");
+    assert!(show(&[], &new).contains(LEARNED_TEXT));
+    // Nothing in a project's directory says which project it is.
+    assert_eq!(std::fs::read_dir(&new).unwrap().count(), 1, "only the greeting");
+}
+
+#[tokio::test]
+async fn a_note_remembered_for_every_project_is_recalled_in_another() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let molt = |args: &[&str], dir: &Path| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+            .args(args)
+            .env("XDG_DATA_HOME", home.path().join("user-data"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env_remove("ANTHROPIC_API_KEY")
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "molt {args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        stdout.into_owned()
+    };
+    // Two projects, each with its own data dir and so its own notes.
+    let mut at = Vec::new();
+    for name in ["a", "b"] {
+        let dir = home.path().join(name);
+        let data = home.path().join(format!("data-{name}"));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        molt(&["project", "new", name, "--path", dir.to_str().unwrap()], home.path());
+        at.push((dir, data.to_str().unwrap().to_owned()));
+    }
+    let memory = |args: &[&str], (dir, data): &(PathBuf, String)| {
+        let mut all = vec!["memory"];
+        all.extend(args);
+        all.extend(["--data-dir", data.as_str()]);
+        molt(&all, dir)
+    };
+
+    let kept = memory(&["remember", "Build with make."], &at[0]);
+    assert!(kept.contains("for this project"), "{kept}");
+    let kept = memory(&["remember", "--global", "Answer in Chinese."], &at[0]);
+    assert!(kept.contains("for every project"), "{kept}");
+    let shown = memory(&["show"], &at[1]);
+    assert!(shown.contains("Answer in Chinese."), "{shown}");
+    assert!(shown.contains("yours, for every project"), "{shown}");
+    assert!(!shown.contains("Build with make."), "{shown}");
+
+    // A project note goes everywhere only when promoted.
+    let id = memory(&["show", "build"], &at[0]).split_whitespace().next().unwrap().to_owned();
+    memory(&["promote", &id, "--reason", "every project here builds with make"], &at[0]);
+    assert!(memory(&["show"], &at[1]).contains("Build with make."));
+    assert!(memory(&["show", "build"], &at[0]).contains("promoted as"));
+}
+
+#[tokio::test]
 async fn the_cli_carries_out_a_task() {
     let server = fake_api(Fake::Greets).await;
     let workspace = tempfile::tempdir().unwrap();
@@ -788,6 +901,7 @@ async fn the_cli_carries_out_a_task() {
             .args(args)
             .arg("--data-dir")
             .arg(data.path())
+            .env("XDG_DATA_HOME", data.path().join("user-data"))
             .current_dir(workspace.path())
             .output()
             .unwrap();
@@ -842,6 +956,122 @@ async fn the_cli_carries_out_a_task() {
     assert!(data.path().join("audit.jsonl").exists());
     assert_requests_valid(&server).await;
     assert_forks_dropped(data.path());
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn a_committed_run_can_be_undone_and_memory_stops_counting_it() {
+    let server = fake_api(Fake::Greets).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let w = workspace.path();
+    git(w, &["init", "-q", "-b", "main"]);
+    for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")] {
+        git(w, &["config", key, value]);
+    }
+    std::fs::write(w.join("notes.txt"), "draft\n").unwrap();
+    git(w, &["add", "."]);
+    git(w, &["commit", "-q", "-m", "start"]);
+    // The user's own change, staged before the run, stays out of its commit.
+    std::fs::write(w.join("notes.txt"), "mine\n").unwrap();
+    git(w, &["add", "notes.txt"]);
+
+    let args = ["--check", CHECK, "--attempts", "1", "--commit"];
+    let out = tokio::time::timeout(RUN_LIMIT, molt_do(&server, w, data.path(), &args).output())
+        .await
+        .expect("molt do hung")
+        .unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}", out.status);
+    assert!(stderr.contains("committed ") && stderr.contains("on branch main"), "{stderr}");
+    assert_eq!(git(w, &["show", "--name-only", "--format=", "HEAD"]), "greeting.txt\n");
+    let run = git(w, &["log", "-1", "--format=%(trailers:key=Molt-Run,valueonly)"]).trim().to_owned();
+    assert!(run.starts_with("trace_"), "{run}");
+    assert!(git(w, &["log", "-1", "--format=%B"]).contains(&format!("Molt-Check: {CHECK}")));
+    assert_eq!(git(w, &["diff", "--cached", "--name-only"]), "notes.txt\n");
+    let memory = || {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+            .args(["memory", "show", "--data-dir"])
+            .arg(data.path())
+            .env("XDG_DATA_HOME", data.path().join("user-data"))
+            .current_dir(w)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "memory show: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
+    };
+    assert!(memory().contains(LEARNED_TEXT));
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+        .args(["undo", "--data-dir"])
+        .arg(data.path())
+        .env("XDG_DATA_HOME", data.path().join("user-data"))
+        .current_dir(w)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.starts_with(&format!("undid run {run}: reverted ")), "{stdout}");
+    assert!(stderr.contains("memory no longer counts the run: 1 notes only it showed forgotten"), "{stderr}");
+    assert!(!w.join("greeting.txt").exists());
+    assert!(git(w, &["log", "-1", "--format=%B"]).contains(&format!("Molt-Undo: {run}")));
+    assert_eq!(git(w, &["diff", "--cached", "--name-only"]), "notes.txt\n");
+    assert_eq!(memory(), "no notes\n");
+    // The memory service did the undo, so the audit log has it.
+    let audit = molt_kernel::audit::read_all(&data.path().join("audit.jsonl")).await.unwrap();
+    assert!(audit.iter().any(|e| matches!(&e.event, AuditEvent::Message { envelope }
+        if envelope.to.to_string() == "memory.undo" && envelope.payload["run"] == run.as_str())));
+}
+
+#[tokio::test]
+async fn commit_outside_git_still_applies_and_exits_4() {
+    let server = fake_api(Fake::Greets).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let args = ["--check", CHECK, "--attempts", "1", "--commit", "--no-learn"];
+    let out = tokio::time::timeout(RUN_LIMIT, molt_do(&server, workspace.path(), data.path(), &args).output())
+        .await
+        .expect("molt do hung")
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert!(stderr.contains("is not in a git work tree; the result will be applied but not committed"), "{stderr}");
+    assert!(stderr.contains("not committed: --commit: "), "{stderr}");
+    assert_eq!(std::fs::read_to_string(workspace.path().join("greeting.txt")).unwrap(), "hello\n");
+}
+
+#[tokio::test]
+async fn allowed_web_hosts_start_the_web_service_and_offer_fetch_url_only_then() {
+    let server = fake_api(Fake::Greets).await;
+    let fetch_offered =
+        |body: &Value| body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == "fetch_url"));
+    for allow in [None, Some("docs.rs")] {
+        let workspace = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut args = vec!["--check", CHECK, "--attempts", "1", "--no-memory", "--no-review"];
+        args.extend(allow.iter().flat_map(|host| ["--allow-web", *host]));
+        let before = bodies(&server).await.len();
+        let cmd = molt_do(&server, workspace.path(), data.path(), &args).output();
+        let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}", out.status);
+        let sent = bodies(&server).await;
+        assert!(sent[before..].iter().all(|b| fetch_offered(b) == allow.is_some()), "{allow:?}");
+        let audit = molt_kernel::audit::read_all(&data.path().join("audit.jsonl")).await.unwrap();
+        let web_started = audit
+            .iter()
+            .any(|e| matches!(&e.event, AuditEvent::ServiceStarted { service, .. } if service.as_str() == "web"));
+        assert_eq!(web_started, allow.is_some());
+    }
+    assert_requests_valid(&server).await;
 }
 
 #[tokio::test]
@@ -1069,9 +1299,11 @@ async fn a_task_runs_over_nats_with_provisioned_secrets() {
 fn the_cli_refuses_a_bad_setup_before_starting_anything() {
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
+    let user_data = tempfile::tempdir().unwrap();
     let molt_do = |data_dir: &Path, key: Option<&str>, args: &[&str]| {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_molt"));
         cmd.args(["do", "anything", "--data-dir"]).arg(data_dir).args(args).current_dir(workspace.path());
+        cmd.env("XDG_DATA_HOME", user_data.path());
         cmd.env_remove("OPENAI_API_KEY").env_remove("MOLT_PROVIDER");
         match key {
             Some(key) => cmd.env("ANTHROPIC_API_KEY", key),
@@ -1098,6 +1330,8 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
         let err = molt_do(data.path(), Some("test"), &args);
         assert!(err.contains(args[0]), "{err}");
     }
+    let err = molt_do(data.path(), Some("test"), &["--allow-web", "https://docs.rs/serde"]);
+    assert!(err.contains("not a host to allow"), "{err}");
     assert!(std::fs::read_dir(data.path()).unwrap().next().is_none(), "nothing was started");
 }
 
@@ -1140,7 +1374,7 @@ async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
     assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
     assert_eq!(
         resp.check,
-        Some(CheckSpec { command: "sh check.sh".into(), files: vec!["check.sh".into()], designed: true })
+        Some(CheckSpec { command: "sh check.sh".into(), files: vec!["check.sh".into()], designed: true, suite: None })
     );
     assert!(!resp.applied);
     // Only the run's own designer: the accepted check was not designed again.
@@ -1232,4 +1466,159 @@ async fn a_checkpointed_run_that_runs_out_of_budget_is_resumed_with_its_fork() {
     assert!(resumed.cost_usd > stopped.cost_usd, "the cost goes on: {} then {}", stopped.cost_usd, resumed.cost_usd);
     assert!(molt_planner::checkpoint::load(&runs, trace.as_str()).is_err(), "a finished run keeps no checkpoint");
     assert!(!std::path::Path::new(&fork).exists());
+}
+
+#[tokio::test]
+async fn lifecycle_formatting_is_rechecked_and_cannot_weaken_the_protected_check() {
+    use molt_planner::hooks::{Event, Hook};
+    for (command, should_apply) in [
+        ("printf '\\n' >> greeting.txt", true),
+        ("printf goodbye > greeting.txt", false),
+        ("printf 'exit 0\\n' > check.sh; printf goodbye > greeting.txt", false),
+        ("sleep 10", false),
+    ] {
+        let server = fake_api(Fake::DesignsThenGreets).await;
+        let mut setup = Setup::new(&server);
+        let hooks = vec![
+            Hook {
+                event: Event::BeforeApply,
+                command: command.into(),
+                blocking: true,
+                timeout_ms: if command == "sleep 10" { 20 } else { 5000 },
+            },
+            Hook {
+                event: Event::AfterApply,
+                command: "printf notification > notification.txt".into(),
+                blocking: false,
+                timeout_ms: 5000,
+            },
+        ];
+        setup
+            .cfg
+            .service_mut("planner")
+            .unwrap()
+            .env
+            .insert("MOLT_HOOKS_JSON".into(), serde_json::to_string(&hooks).unwrap());
+        let (response, events) = setup.run(setup.request(None, 1)).await;
+        assert_eq!(response.applied, should_apply, "{command}: {}", response.summary);
+        if should_apply {
+            assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n\n"));
+            assert_eq!(setup.file("check.sh").as_deref(), Some(&format!("{CHECK}\n")[..]));
+        } else {
+            assert_eq!(response.outcome, Outcome::Failed);
+            assert!(response.fork.is_some());
+            assert!(setup.file("greeting.txt").is_none());
+            assert!(response.summary.contains("Not applied"));
+        }
+        assert!(setup.file("notification.txt").is_none(), "notifications only write in a disposable fork");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Progress::Note { message, .. } if message.contains("hook BeforeApply"))));
+        let audit = std::fs::read_to_string(setup.data.path().join("audit.jsonl")).unwrap();
+        assert!(audit.contains("duration_ms") && audit.contains("shell.run"));
+    }
+}
+
+#[tokio::test]
+async fn a_comparison_suite_cannot_mutate_the_checked_candidate() {
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let mut req = setup.request(Some(CHECK), 2);
+    req.select = molt_api::planner::Select::All;
+    req.suite = Some("printf 'broken\\n' > greeting.txt".into());
+    let (resp, _) = setup.run(req).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
+    assert_eq!(resp.selection.as_ref().unwrap().candidates.len(), 2);
+    assert!(resp.applied);
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+}
+
+#[tokio::test]
+async fn all_candidates_are_formatted_and_rechecked_before_selection() {
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    let hooks = serde_json::json!([{"event":"before_apply", "command":"printf '\\n' >> greeting.txt", "blocking":true, "timeout_ms":5000}]);
+    setup.cfg.service_mut("planner").unwrap().env.insert("MOLT_HOOKS_JSON".into(), hooks.to_string());
+    let mut req = setup.request(Some(CHECK), 2);
+    req.select = molt_api::planner::Select::All;
+    let (resp, _) = setup.run(req).await;
+    assert!(resp.applied, "{resp:#?}");
+    assert_eq!(resp.selection.as_ref().unwrap().candidates.len(), 2);
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n\n"));
+}
+
+#[tokio::test]
+async fn the_ui_backend_finishes_without_terminal_reads_and_exits_when_the_pipe_closes() {
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    async fn send(out: &mut (impl AsyncWrite + Unpin), value: Value) {
+        let bytes = serde_json::to_vec(&value).unwrap();
+        out.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
+        out.write_all(&bytes).await.unwrap();
+        out.flush().await.unwrap();
+    }
+    async fn recv(input: &mut (impl AsyncRead + Unpin)) -> Value {
+        let mut size = [0; 4];
+        input.read_exact(&mut size).await.unwrap();
+        let mut bytes = vec![0; u32::from_be_bytes(size) as usize];
+        input.read_exact(&mut bytes).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    let mut noise = molt::ServiceSection::new(
+        ServiceId::new("noise").unwrap(),
+        molt_proto::Tier::Mutable,
+        molt_proto::Exec {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf untrusted-service-stdout".into()],
+        },
+        Vec::new(),
+    );
+    noise.max_restarts = 0;
+    setup.cfg.services.push(noise);
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+        .arg("ui-backend")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
+    send(
+        &mut input,
+        json!({"cfg":setup.cfg,"workspace":setup.workspace.path().canonicalize().unwrap().to_str().unwrap()}),
+    )
+    .await;
+    send(&mut input, json!("StartSession")).await;
+    let up = tokio::time::timeout(Duration::from_secs(20), recv(&mut output)).await.unwrap();
+    assert!(up.get("SessionUp").is_some(), "{up}");
+    let req = setup.request(Some(CHECK), 1);
+    send(&mut input, json!({"Run":{"req":req,"trace":molt_proto::TraceId::random()}})).await;
+    // With no frontend reading messages, both model turns and review still run.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if server.received_requests().await.unwrap_or_default().len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let msg = recv(&mut output).await;
+            if msg.get("Ran").is_some() {
+                break msg;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(result["Ran"]["result"]["Ok"]["applied"], true, "{result}");
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    drop(input);
+    assert!(tokio::time::timeout(Duration::from_secs(15), child.wait()).await.unwrap().unwrap().success());
 }

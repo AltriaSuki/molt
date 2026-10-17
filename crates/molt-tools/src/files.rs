@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use globset::GlobBuilder;
 use molt_api::fs::{
     EditRequest, EditResponse, Entry, EntryKind, FilesChanged, ListRequest, ListResponse, Match, ReadRequest,
-    ReadResponse, SearchRequest, SearchResponse, WriteRequest, WriteResponse,
+    ReadResponse, SearchRequest, SearchResponse, SyntaxCheck, SyntaxError, SyntaxReport, WriteRequest, WriteResponse,
 };
 use molt_proto::RemoteError;
 use regex::RegexBuilder;
@@ -29,6 +29,8 @@ const MAX_SEARCH_RESULTS: u32 = 1000;
 const MAX_SEARCH_FILE: u64 = 4 * 1024 * 1024;
 const MAX_MATCH_CHARS: usize = 500;
 const REGEX_SIZE_LIMIT: usize = 4 * 1024 * 1024;
+/// Syntax errors a write or edit reports; the rest are counted.
+const MAX_SYNTAX_ERRORS: usize = 5;
 /// A NUL byte in this many leading bytes marks a file as binary.
 pub(crate) const SNIFF_BYTES: usize = 8 * 1024;
 
@@ -128,8 +130,43 @@ pub(crate) fn write(roots: &Roots, req: WriteRequest) -> Result<WriteResponse, R
         paths::confine(&ws, &parent.canonicalize().map_err(io)?, name)?;
     }
     let created = mode.is_none();
+    // Only a file the check can parse is worth reading first.
+    let syntax = (!req.syntax.is_off() && molt_syntax::Lang::of(&req.path).is_some())
+        .then(|| {
+            let before = if created { None } else { fs::read(&dest).ok().and_then(|b| String::from_utf8(b).ok()) };
+            syntax_report(req.syntax, &req.path, before.as_deref(), &req.content)
+        })
+        .flatten();
+    let bytes = req.content.len() as u64;
+    if rejected(&syntax) {
+        return Ok(WriteResponse { bytes, created, syntax });
+    }
     atomic_write(&dest, req.content.as_bytes(), mode).map_err(io)?;
-    Ok(WriteResponse { bytes: req.content.len() as u64, created })
+    Ok(WriteResponse { bytes, created, syntax })
+}
+
+/// What `check` makes of the syntax errors that changing `path` from
+/// `before` to `after` introduces: `None` when there are none.
+fn syntax_report(check: SyntaxCheck, path: &str, before: Option<&str>, after: &str) -> Option<SyntaxReport> {
+    if check == SyntaxCheck::Off {
+        return None;
+    }
+    let found = molt_syntax::introduced(path, before, after);
+    if found.is_empty() {
+        return None;
+    }
+    let more = u32::try_from(found.len().saturating_sub(MAX_SYNTAX_ERRORS)).unwrap_or(u32::MAX);
+    let errors = found
+        .into_iter()
+        .take(MAX_SYNTAX_ERRORS)
+        .map(|p| SyntaxError { line: p.line, message: p.message, context: p.context })
+        .collect();
+    Some(SyntaxReport { errors, more, rejected: check == SyntaxCheck::Reject })
+}
+
+/// Whether a write or edit reply says the change was not made.
+pub(crate) fn rejected(syntax: &Option<SyntaxReport>) -> bool {
+    syntax.as_ref().is_some_and(|s| s.rejected)
 }
 
 /// The file a successful write or edit of `path` in `workspace` changed,
@@ -182,8 +219,11 @@ pub(crate) fn edit(roots: &Roots, req: EditRequest) -> Result<EditResponse, Remo
         return Err(invalid(format!("the edited {name} would be {size} bytes; the limit is {MAX_WRITE_BYTES}")));
     }
     let new = if req.replace_all { old.replace(&req.old, &req.new) } else { old.replacen(&req.old, &req.new, 1) };
-    atomic_write(&path, new.as_bytes(), Some(meta.permissions())).map_err(io)?;
-    Ok(EditResponse { replacements: count as u64 })
+    let syntax = syntax_report(req.syntax, &req.path, Some(&old), &new);
+    if !rejected(&syntax) {
+        atomic_write(&path, new.as_bytes(), Some(meta.permissions())).map_err(io)?;
+    }
+    Ok(EditResponse { replacements: count as u64, syntax })
 }
 
 /// Replace `dest` with `data`: write a temporary file next to it, then

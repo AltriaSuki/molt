@@ -6,7 +6,10 @@ use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use molt_api::fs::{ChangeKind, DiffResponse, FilesChanged, ForkResponse, ListResponse, ReadResponse, SearchResponse};
+use molt_api::fs::{
+    ChangeKind, DiffResponse, EditResponse, FilesChanged, ForkResponse, ListResponse, ReadResponse, SearchResponse,
+    WriteResponse,
+};
 use molt_proto::{ErrorCode, RemoteError};
 use molt_tools::{Fs, Roots};
 use serde_json::{json, Value};
@@ -289,6 +292,49 @@ async fn edit_needs_one_match_unless_replace_all() {
 
     assert_eq!(env.ok("edit", edit("= 1;", "= 2;", true)).await, json!({ "replacements": 3 }));
     assert_eq!(fs::read_to_string(env.ws.join("f.rs")).unwrap(), "let a = 2;\nlet bee = 2;\nlet c = 2;\n");
+}
+
+#[tokio::test]
+async fn writes_and_edits_report_the_syntax_errors_they_introduce_and_reject_mode_keeps_the_file() {
+    let env = Env::new();
+    let good = "fn main() {\n    let x = (1 + 2);\n}\n";
+    Env::put(&env.ws, &[("src/main.rs", good), ("app.py", "def f(x):\n    return x\n"), ("notes.txt", "(")]);
+    let edit = |path: &str, old: &str, new: &str, syntax: &str| json!({ "workspace": "ws", "path": path, "old": old, "new": new, "syntax": syntax });
+    let reply = |v: Value| serde_json::from_value::<EditResponse>(v).unwrap();
+
+    // Reported, and the edit is made.
+    let r = reply(env.ok("edit", edit("src/main.rs", "(1 + 2);", "(1 + 2;", "report")).await);
+    let syntax = r.syntax.expect("a new error is reported");
+    assert!(!syntax.rejected);
+    assert_eq!((syntax.errors[0].line, syntax.errors[0].message.as_str()), (2, "missing `)`"));
+    assert!(syntax.errors[0].context.contains("2 |     let x = (1 + 2;"), "{}", syntax.errors[0].context);
+    assert!(fs::read_to_string(env.ws.join("src/main.rs")).unwrap().contains("(1 + 2;"));
+
+    // The file is broken already: an unrelated edit reports nothing.
+    let r = reply(env.ok("edit", edit("src/main.rs", "fn main", "fn start", "report")).await);
+    assert_eq!(r.syntax, None);
+
+    // Rejected: the error comes back and the file stays as it was.
+    let r = reply(env.ok("edit", edit("app.py", "def f(x):", "def f(x:", "reject")).await);
+    assert!(r.syntax.as_ref().is_some_and(|s| s.rejected && s.errors[0].line == 1), "{r:?}");
+    assert_eq!(fs::read_to_string(env.ws.join("app.py")).unwrap(), "def f(x):\n    return x\n");
+    let w = json!({ "workspace": "ws", "path": "app.py", "content": "def f(:\n", "syntax": "reject" });
+    let r: WriteResponse = serde_json::from_value(env.ok("write", w).await).unwrap();
+    assert!(r.syntax.is_some_and(|s| s.rejected) && !r.created);
+    assert_eq!(fs::read_to_string(env.ws.join("app.py")).unwrap(), "def f(x):\n    return x\n");
+    let (r, changed) = env.fs.handle_reporting("edit", edit("app.py", "def f(x):", "def f(x:", "reject")).await;
+    assert!(r.is_ok() && changed.is_none(), "a rejected change reports no changed file");
+    let w = json!({ "workspace": "ws", "path": "new.ts", "content": "const x = f(;\n", "syntax": "reject" });
+    let r: WriteResponse = serde_json::from_value(env.ok("write", w).await).unwrap();
+    assert!(r.syntax.is_some_and(|s| s.rejected) && r.created);
+    assert!(!env.ws.join("new.ts").exists());
+
+    // Languages the service cannot parse, and requests that do not ask, are not checked.
+    let r = reply(env.ok("edit", edit("notes.txt", "(", "((", "reject")).await);
+    assert_eq!(r.syntax, None);
+    assert_eq!(fs::read_to_string(env.ws.join("notes.txt")).unwrap(), "((");
+    let off = json!({ "workspace": "ws", "path": "app.py", "old": "return x", "new": "return (x" });
+    assert_eq!(env.ok("edit", off).await, json!({ "replacements": 1 }));
 }
 
 /// The process's peak resident memory, in bytes.
