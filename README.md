@@ -201,6 +201,17 @@ says why. `/help` lists the keys. The services'
 log goes to `tui.log` in the data dir, and colors are left out under
 `NO_COLOR`.
 
+When the interface stops for you (a check or a result to confirm) or the
+services go down, it rings the terminal bell and, in terminals that show
+them (iTerm2, WezTerm, Ghostty with OSC 9; VTE terminals, foot and urxvt
+with OSC 777), sends a desktop notification with a short label such as
+`molt: check ready`, never the task's text. It stays quiet while the
+terminal has focus or a key was pressed in the last five seconds, and calls
+once per stop. `/notify all` also calls when a task ends
+(`molt: passed · 3 files`), and `/notify off` turns calling off. The window
+title follows what it is doing (`molt · running 2/4`, `molt · waiting:
+apply`, `molt · idle`), and the terminal's own title is put back on exit.
+
 The interface shows model text previews by default, including while designing
 the check. `/stream off` disables previews for subsequent tasks; `/stream on`
 enables them again. Each attempt keeps only the latest 2,048 characters, with
