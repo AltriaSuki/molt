@@ -903,6 +903,7 @@ async fn execute(
     };
     if args.json {
         let mut out = serde_json::to_value(&resp)?;
+        out["run"] = serde_json::json!(run);
         if let Some(committed) = &committed {
             out["commit"] = match committed {
                 Ok(Some(c)) => serde_json::json!({ "sha": c.sha, "branch": c.branch, "ignored": c.ignored }),

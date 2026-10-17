@@ -75,6 +75,7 @@ sender from that.
 | `molt do --commit` commits exactly the files the run merged and leaves what the user staged alone; `molt undo` takes it back with a new commit, never touching later changes, and the undone run no longer lends any note confidence | `crates/molt/src/git.rs` (`a_run_commit_holds_only_the_merged_files…`, `undo_refuses_files_that_changed_since_the_run`), `crates/molt/tests/agent.rs` (`a_committed_run_can_be_undone_and_memory_stops_counting_it`), `crates/molt-memory/src/notes.rs` (`an_undone_run_lends_no_note_confidence…`) |
 | The agent reads the web only when the user allows hosts: over https, from those hosts after every redirect, never from a loopback, private or link-local address; commands stay offline, and every page read is in the audit log | `crates/molt-web/src/allow.rs` (`only_https_urls_on_allowed_hosts_pass`, `only_public_addresses_are_public`), `crates/molt-web/tests/web.rs` (`hosts_off_the_list_are_refused_before_any_request_and_on_every_redirect`), `crates/molt/tests/agent.rs` (`allowed_web_hosts_start_the_web_service_and_offer_fetch_url_only_then`), `crates/molt-planner/tests/planner.rs` (`fetch_url_is_offered_only_to_a_planner_that_may_read_the_web`) |
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
+| Issue CI rejects PR triggers and probes the sandbox before model spend | `scripts/ci/test_issue_to_pr.py::test_only_labelled_open_issues_are_eligible`, `test_sandbox_failure_posts_a_summary_and_never_starts_a_model` |
 | A skill source cannot approve itself; only the CLI manages activation and withdrawal preserves evidence | `skills::tests::drafts_need_independent_evidence_and_disable_cannot_be_undone_by_learning`, `tests/service.rs::an_agent_cannot_manage_or_promote_its_own_skills` |
 | Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
 | Offline embedding models are hash-pinned and cannot reintroduce forgotten or cross-project notes | `semantic::tests::pinned_models_retrieve_synonyms_and_reject_changed_files`, `semantic::tests::synonyms_are_recalled_with_scores_and_snapshots_survive_forgetting` |
@@ -1025,6 +1026,14 @@ Dependencies mount at their canonical absolute paths. `--pass-env NAME` explicit
 Limits are inherited per process: address space, CPU time, file size, open files and process count, plus the existing command wall timeout. These are not aggregate cgroup quotas; RLIMIT_NPROC has the operating system's per-user semantics and does not limit root. TERM reaches the sandbox session group with 500 ms grace; KILL then tears down its PID namespace, including descendants that called setsid. Normal completion, cancelled handlers and service exit also tear down the namespace. Temporary mounts disappear with the last process. Future executable skills must use this shell path to share the policy.
 
 CI installs bubblewrap and requires namespace tests to run. A constrained local executor may skip only those integration tests after a failed capability probe; production startup still fails closed. Tests cover host paths, symlinks, read-only dependencies, network policy, host sockets, limits, C builds, cancellation and descendants with new sessions.
+
+## From an issue to a PR in CI
+
+An opt-in composite GitHub Action runs a maintainer-labelled issue with a fixed
+budget, then creates a PR containing check and baseline evidence, known cost
+and run ID. It requires a trusted installed Molt build and a working sandbox;
+fork PR events cannot start a secret-bearing run. See
+[scripts/ci/README.md](scripts/ci/README.md) for setup, permissions and limits.
 
 ## Declarative project skills
 
