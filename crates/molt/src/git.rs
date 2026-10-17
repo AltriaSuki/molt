@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, ensure, Context};
+use molt_api::planner::{Outcome, RunResponse};
 
 /// Names the run a commit holds the result of.
 pub const RUN_TRAILER: &str = "Molt-Run";
@@ -53,7 +54,7 @@ pub struct RunCommit<'a> {
 }
 
 /// A commit made for a run.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Committed {
     pub sha: String,
     pub subject: String,
@@ -80,6 +81,54 @@ pub enum Undo {
     Reverted { run: String, commit: String, sha: String },
     /// A commit marked with [`UNDO_TRAILER`] took the run back already.
     Already { run: String, sha: String },
+}
+
+/// A work tree as it was before a run: what `molt do --commit` and the
+/// interface's `/commit on` commit the run's result in.
+#[derive(Debug)]
+pub struct Before {
+    repo: Repo,
+    /// Paths, relative to the workspace, with changes not committed then.
+    dirty: BTreeSet<String>,
+}
+
+impl Before {
+    /// Look at the work tree `workspace` is in, or say why there is none.
+    pub fn look(workspace: &Path) -> anyhow::Result<Self> {
+        let repo = Repo::open(workspace)?;
+        let dirty = repo.dirty()?;
+        Ok(Self { repo, dirty })
+    }
+
+    pub fn repo(&self) -> &Repo {
+        &self.repo
+    }
+
+    /// Commit what the run `run` of `task` merged, as `resp` reports it.
+    /// Refused when one of its files had changes not committed before the
+    /// run: the commit would take them in, and undoing the run would take
+    /// them back too.
+    pub fn commit(
+        &self,
+        resp: &RunResponse,
+        run: &str,
+        task: &str,
+        branch: Option<&str>,
+    ) -> anyhow::Result<Option<Committed>> {
+        let paths: Vec<String> = resp.changes.iter().map(|c| c.path.clone()).collect();
+        let mixed: Vec<&str> = paths.iter().filter(|p| self.dirty.contains(*p)).map(String::as_str).collect();
+        ensure!(
+            mixed.is_empty(),
+            "{} had changes of yours not committed before the run, which the commit would take in",
+            mixed.join(", ")
+        );
+        let check = match resp.outcome {
+            Outcome::Passed => resp.check.as_ref().map(|c| c.command.as_str()),
+            _ => None,
+        };
+        let summary = resp.summary.as_str();
+        self.repo.commit_run(&RunCommit { run, summary, task, check, paths, branch })
+    }
 }
 
 impl Repo {

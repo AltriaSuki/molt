@@ -134,8 +134,16 @@ pub(super) async fn serve() -> anyhow::Result<()> {
         }
     });
     let (sessions, mut started) = mpsc::unbounded_channel();
-    let mut rt =
-        Runtime { cfg: Arc::new(cfg), workspace, tx, sessions, session: None, starting: false, work: Vec::new() };
+    let mut rt = Runtime {
+        cfg: Arc::new(cfg),
+        workspace,
+        tx,
+        sessions,
+        session: None,
+        starting: false,
+        work: Vec::new(),
+        before: None,
+    };
     let mut keep = Vec::new();
     let result = loop {
         tokio::select! {

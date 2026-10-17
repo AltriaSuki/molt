@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -805,7 +804,7 @@ async fn execute(
     let resp = done.run;
     let committed = match target {
         Some(target) if resp.applied => {
-            Some(target.and_then(|(repo, dirty)| commit_run(&repo, &dirty, &resp, &run, &task, args.branch.as_deref())))
+            Some(target.and_then(|before| before.commit(&resp, &run, &task, args.branch.as_deref())))
         }
         _ => None,
     };
@@ -862,49 +861,19 @@ async fn execute(
     })
 }
 
-/// Where `molt do --commit` commits.
-type CommitTarget = anyhow::Result<(git::Repo, BTreeSet<String>)>;
-
-/// The git work tree `molt do --commit` commits in, with the paths that had
-/// changes not committed before the run; an inner error when the workspace
-/// is in none (the run still goes ahead and is applied). A `--branch` git
-/// would refuse is an error before anything starts.
-fn commit_target(workspace: &str, branch: Option<&str>) -> anyhow::Result<CommitTarget> {
-    let repo = match git::Repo::open(Path::new(workspace)) {
-        Ok(repo) => repo,
+/// The work tree `molt do --commit` commits in, looked at before the run;
+/// an inner error when the workspace is in none (the run still goes ahead
+/// and is applied). A `--branch` git would refuse is an error before
+/// anything starts.
+fn commit_target(workspace: &str, branch: Option<&str>) -> anyhow::Result<anyhow::Result<git::Before>> {
+    let before = match git::Before::look(Path::new(workspace)) {
+        Ok(before) => before,
         Err(e) => return Ok(Err(e.context("--commit"))),
     };
     if let Some(name) = branch {
-        repo.check_new_branch(name)?;
+        before.repo().check_new_branch(name)?;
     }
-    let dirty = repo.dirty()?;
-    Ok(Ok((repo, dirty)))
-}
-
-/// Commit what the run merged. Refused when one of its files had changes
-/// not committed before the run: the commit would take them in, and
-/// undoing the run would take them back too.
-fn commit_run(
-    repo: &git::Repo,
-    dirty: &BTreeSet<String>,
-    resp: &molt_api::planner::RunResponse,
-    run: &str,
-    task: &str,
-    branch: Option<&str>,
-) -> anyhow::Result<Option<git::Committed>> {
-    let paths: Vec<String> = resp.changes.iter().map(|c| c.path.clone()).collect();
-    let mixed: Vec<&str> = paths.iter().filter(|p| dirty.contains(*p)).map(String::as_str).collect();
-    anyhow::ensure!(
-        mixed.is_empty(),
-        "{} had changes of yours not committed before the run, which the commit would take in",
-        mixed.join(", ")
-    );
-    let check = match resp.outcome {
-        Outcome::Passed => resp.check.as_ref().map(|c| c.command.as_str()),
-        _ => None,
-    };
-    let summary = resp.summary.as_str();
-    repo.commit_run(&git::RunCommit { run, summary, task, check, paths, branch })
+    Ok(Ok(before))
 }
 
 async fn undo_cmd(config: Option<&Path>, args: UndoArgs) -> anyhow::Result<ExitCode> {
