@@ -2346,6 +2346,9 @@ impl App {
                 if !r.contradicted.is_empty() {
                     parts.push(format!("disputed {}", count(r.contradicted.len())));
                 }
+                if !r.skill_drafts.is_empty() {
+                    parts.push(format!("drafted {} project skills; molt skill evaluates them", r.skill_drafts.len()));
+                }
                 if !r.proposed.is_empty() {
                     parts.push(format!("proposed {} for every project (/memory, p)", count(r.proposed.len())));
                 }
@@ -2536,6 +2539,15 @@ pub fn memory_lines(r: &Recalled) -> Vec<Line<'static>> {
         fields.push(format!("needs review: {}", r.details.needs_review.join(", ")));
     }
     fields.push(format!("review reason: {}", if r.details.reason.is_empty() { "none" } else { &r.details.reason }));
+    if let Some(similarity) = r.reason.similarity {
+        fields.push(format!("cosine similarity: {similarity:.3}"));
+    }
+    if let Some(hash) = &r.reason.model_sha256 {
+        fields.push(format!("embedding model SHA-256: {hash}"));
+    }
+    if let Some(weight) = r.reason.semantic_weight {
+        fields.push(format!("semantic weight: {weight:.3}"));
+    }
     for d in &r.details.dependencies {
         fields.push(format!("depends on: {} · sha256 {}", d.path, d.sha256));
     }
@@ -3631,6 +3643,7 @@ mod tests {
     fn learning_that_was_skipped_says_why() {
         let mut app = App::new("/w", None);
         let skipped = ConsolidateResponse {
+            skill_drafts: Vec::new(),
             added: vec![],
             reinforced: vec![],
             contradicted: vec![],
