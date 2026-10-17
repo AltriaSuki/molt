@@ -40,6 +40,30 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let shown: Vec<Line> = lines.into_iter().skip(viewer.scroll).take(usize::from(inner.height)).collect();
         frame.render_widget(Paragraph::new(shown), inner);
     }
+    if let Some(view) = &mut app.transcript {
+        let r = centered(area, 92, 88);
+        frame.render_widget(Clear, r);
+        let title = match view.only {
+            Some(a) => format!(" transcript · attempt {} ", a + 1),
+            None => " transcript ".to_owned(),
+        };
+        let fold = if view.unfold { "e fold" } else { "e unfold" };
+        let keys = format!(" j/k scroll · {{/}} turns · {fold} · v editor · esc close ");
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(style(Tone::Dim))
+            .title(Line::from(span(title, Tone::Shell)))
+            .title_bottom(Line::from(span(keys, Tone::Dim)).right_aligned());
+        let inner = block.inner(r);
+        frame.render_widget(block, r);
+        // Scrolled by whole lines, so a turn's first line is where `{` and `}` land.
+        view.scroll = view.scroll.min(view.lines.len().saturating_sub(1));
+        let height = usize::from(inner.height);
+        let rest: Vec<Line> = view.lines.iter().skip(view.scroll).take(height).cloned().collect();
+        let shown: Vec<Line> = wrap_all(&rest, inner.width).into_iter().take(height).collect();
+        frame.render_widget(Paragraph::new(shown), inner);
+    }
     app.theme.paint(frame.buffer_mut());
 }
 
@@ -386,7 +410,9 @@ fn task_spend(task: &Task) -> (String, Tone) {
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
-    let waiting = matches!(app.prompt, Some(Prompt::Check(_) | Prompt::Apply { .. })) || app.viewer.is_some();
+    let waiting = matches!(app.prompt, Some(Prompt::Check(_) | Prompt::Apply { .. }))
+        || app.viewer.is_some()
+        || app.transcript.is_some();
     let editing_check = matches!(app.prompt, Some(Prompt::EditCheck(_)));
     let mut block = Block::new()
         .borders(Borders::ALL)

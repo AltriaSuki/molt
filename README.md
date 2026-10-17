@@ -223,6 +223,14 @@ too large is named with its size for the model to read itself. A path outside
 the workspace, or one that is not a file in it, is refused before the task
 starts.
 
+Ctrl+O opens the run's transcript: each model turn's text, the tools it
+called with their arguments, and what they returned, read from the audit log
+as the run goes and still there after it ends. With one attempt drawn large
+(Tab), `o` opens that attempt's turns alone. `j`/`k` scroll, `{`/`}` jump
+between turns, `e` unfolds long text and `v` opens the whole transcript in
+`$VISUAL` or `$EDITOR`. Where the audit log cannot be read, the tool calls the
+run published show instead.
+
 The interface shows model text previews by default, including while designing
 the check. `/stream off` disables previews for subsequent tasks; `/stream on`
 enables them again. Each attempt keeps only the latest 2,048 characters, with
