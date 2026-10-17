@@ -1536,6 +1536,7 @@ impl App {
                                     files: Vec::new(),
                                     suite: None,
                                     rationale: "Check from the project command; baseline not run yet.".into(),
+                                    rubric: Vec::new(),
                                     baseline: None,
                                     usage: Default::default(),
                                     cost_usd: 0.0,
@@ -1636,7 +1637,7 @@ impl App {
             return;
         }
         match event {
-            Progress::CheckReady { command, files, designed, .. } => {
+            Progress::CheckReady { command, files, designed, rubric, .. } => {
                 if task.check_shown {
                     return;
                 }
@@ -1644,6 +1645,7 @@ impl App {
                 let mut lines = vec![check_head(designed)];
                 match command {
                     Some(c) => lines.push(Line::from(vec![span("  $ ", Tone::Dim), span(clean_line(&c), Tone::Plain)])),
+                    None if !rubric.is_empty() => lines.extend(rubric_lines(&rubric)),
                     None => {
                         lines.push(Line::from(span("  no automated check fits; the result is unverified", Tone::Dim)))
                     }
@@ -1743,10 +1745,12 @@ impl App {
                     ]));
                 }
             }
-            Progress::CheckRan { attempt, passed, exit_code, tail, .. } => {
+            Progress::CheckRan { attempt, passed, exit_code, tail, judged, .. } => {
                 let tail = scrub(&tail, &self.secrets);
                 if let Some(lane) = lane(task, attempt) {
                     let line = match (passed, exit_code) {
+                        (true, _) if judged => span("   judge: criteria met", Tone::Ok),
+                        (false, _) if judged => span("   judge: criteria not met", Tone::Bad),
                         (true, _) => span("   check passed", Tone::Ok),
                         (false, Some(code)) => span(format!("   check failed (exit {code})"), Tone::Bad),
                         (false, None) => span("   check failed (killed or timed out)", Tone::Bad),
@@ -1889,6 +1893,11 @@ impl App {
                 task.req.check_files = d.files;
                 task.req.suite = d.suite;
             }
+            (None, true) if !d.rubric.is_empty() => {
+                lines.push(check_head(true));
+                lines.extend(rubric_lines(&d.rubric.iter().map(|c| c.text.clone()).collect::<Vec<_>>()));
+                task.req.rubric = d.rubric;
+            }
             _ => {
                 lines.push(Line::from(vec![
                     span("◆ check", Tone::Shell),
@@ -2000,7 +2009,7 @@ impl App {
                 self.log.extend(block(summary, "  ", Tone::Dim));
                 self.log.extend(cut_note);
             }
-            Outcome::Passed | Outcome::Unverified => {
+            Outcome::Passed | Outcome::Unverified | Outcome::Judged => {
                 let tone = if resp.outcome == Outcome::Passed { Tone::Ok } else { Tone::Warn };
                 let mut head = vec![span(format!("✓ {}", outcome_name(resp.outcome)), tone)];
                 if !resp.changes.is_empty() {
@@ -2016,6 +2025,13 @@ impl App {
                         ChangeKind::Deleted => "deleted ",
                     };
                     self.push(Line::from(span(format!("  {kind} {}", clean_line(&c.path)), Tone::Dim)));
+                }
+                for f in &resp.judgement {
+                    let (mark, tone) = if f.met { ("✓", Tone::Ok) } else { ("✗", Tone::Bad) };
+                    self.push(Line::from(vec![
+                        span(format!("  {mark} "), tone),
+                        span(clean_line(&f.criterion), Tone::Dim),
+                    ]));
                 }
             }
         }
@@ -2469,8 +2485,20 @@ fn diff_viewer(patch: &str, truncated: bool) -> Viewer {
     Viewer { title: "diff".into(), lines, scroll: 0 }
 }
 
+/// A rubric's criteria, one line each, for the log.
+fn rubric_lines(rubric: &[String]) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(span("  judged by a model against these criteria:", Tone::Warn))];
+    for (i, c) in rubric.iter().enumerate() {
+        lines.push(Line::from(span(format!("  {}. {}", i + 1, clean_line(c)), Tone::Plain)));
+    }
+    lines
+}
+
 /// Why a designed check needs the user's look before the attempts start.
 fn check_stops(d: &DesignResponse, existing: &[String]) -> Vec<String> {
+    if d.command.is_none() && !d.rubric.is_empty() {
+        return vec!["criteria judged by a model".into()];
+    }
     if d.command.is_none() {
         return vec!["no automated check".into()];
     }
@@ -3004,6 +3032,7 @@ mod tests {
             command: Some("cargo test --test commas".into()),
             files: vec![CheckFile { path: "tests/commas.rs".into(), content: "#[test]\nfn t() {}\n".into() }],
             suite: None,
+            rubric: vec![],
             rationale: "the parser has tests".into(),
             baseline: Some(Baseline { passed: false, exit_code: Some(101), tail: String::new() }),
             usage: Usage::default(),
@@ -3055,6 +3084,8 @@ mod tests {
             checkpoint: None,
             requirements: vec![],
             selection: None,
+            rubric: vec![],
+            judgement: vec![],
         }
     }
 
@@ -3101,6 +3132,7 @@ mod tests {
             passed: true,
             exit_code: Some(0),
             tail: String::new(),
+            judged: false,
         }));
         // Another run's events are not this task's.
         app.update(Msg::Progress(Progress::AttemptStarted { run: "other".into(), attempt: 5, fork: None }));
@@ -3143,6 +3175,7 @@ mod tests {
             command: Some("make test".into()),
             files: vec![],
             designed: true,
+            rubric: vec![],
         }));
         app.update(Msg::Ran { trace, result: Ok(passed(true, None)) });
         assert!(app.prompt.is_none() && app.task.is_none());
@@ -3884,6 +3917,7 @@ mod tests {
             passed: false,
             exit_code: Some(101),
             tail: "stdout:\nrunning 1 test\nkey sk-ant-secret-1234\nassertion failed: commas\n".into(),
+            judged: false,
         }));
         assert_eq!(
             plain(&app.task.as_ref().unwrap().lanes[0].lines),
@@ -4053,6 +4087,11 @@ mod tests {
         assert_eq!(
             check_stop(DesignResponse { command: None, files: vec![], ..design() }, &[]),
             ["no automated check"]
+        );
+        let rubric = vec![molt_api::planner::Criterion { text: "Cites sources.".into(), command: None }];
+        assert_eq!(
+            check_stop(DesignResponse { command: None, files: vec![], rubric, ..design() }, &[]),
+            ["criteria judged by a model"]
         );
         let passing = Baseline { passed: true, exit_code: Some(0), tail: String::new() };
         assert_eq!(check_stop(DesignResponse { baseline: Some(passing), ..design() }, &[]), ["baseline passes"]);

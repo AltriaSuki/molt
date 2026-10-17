@@ -42,12 +42,15 @@ pub enum Progress {
         cost_usd: Option<f64>,
         error: Option<String>,
     },
-    /// The done-check is settled. `command` is `None` for an unverified run.
+    /// The done-check is settled. `command` is `None` for an unverified run,
+    /// or one judged by its `rubric` (the criteria's words).
     CheckReady {
         run: String,
         command: Option<String>,
         files: Vec<String>,
         designed: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rubric: Vec<String>,
     },
     AttemptStarted {
         run: String,
@@ -71,9 +74,13 @@ pub enum Progress {
         passed: bool,
         exit_code: Option<i32>,
         /// The end of a failed check's output, a few hundred bytes at most;
-        /// empty when it passed or from an older planner.
+        /// empty when it passed or from an older planner. For a judged
+        /// result, the criteria not met.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         tail: String,
+        /// A judge decided it against the run's rubric; no check command ran.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        judged: bool,
     },
     AttemptFinished {
         run: String,
@@ -160,7 +167,14 @@ mod tests {
         let event: Progress = serde_json::from_str(old).unwrap();
         assert_eq!(
             event,
-            Progress::CheckRan { run: "r".into(), attempt: 1, passed: false, exit_code: Some(2), tail: String::new() }
+            Progress::CheckRan {
+                run: "r".into(),
+                attempt: 1,
+                passed: false,
+                exit_code: Some(2),
+                tail: String::new(),
+                judged: false
+            }
         );
         // An empty tail is left out, so older subscribers see what they always saw.
         assert_eq!(serde_json::to_string(&event).unwrap(), old);

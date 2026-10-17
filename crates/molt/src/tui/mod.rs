@@ -568,6 +568,8 @@ mod tests {
             checkpoint: None,
             requirements: vec![],
             selection: Default::default(),
+            rubric: vec![],
+            judgement: vec![],
         };
         let trace = TraceId::random();
         rt.exec(Action::PrepareCommit { trace: trace.clone() });

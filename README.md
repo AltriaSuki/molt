@@ -222,7 +222,7 @@ the same project is refused until it closes.
 molt do TASK [--check CMD | --no-check] [--attempts N] [--select MODE] [--model M] [--effort E] [--max-turns N]
         [--budget-usd X] [--no-apply | --commit [--branch NAME]] [--no-review] [--json] [--stream]
         [--workspace DIR] [--data-dir DIR] [--pass-env NAME]... [--no-memory] [--no-learn]
-        [--memory-model MODEL] [--checkpoint] [--config FILE]
+        [--memory-model MODEL] [--judge-model MODEL] [--checkpoint] [--config FILE]
 molt resume [RUN] [--retry] [--list] [--budget-usd X] [--no-apply] [--commit] [--json] [--workspace DIR] ...
 molt undo [RUN] [--workspace DIR] [--data-dir DIR]
 ```
@@ -247,6 +247,7 @@ molt undo [RUN] [--workspace DIR] [--data-dir DIR]
 | `--no-memory` | Run without memory: no map or notes for the model, nothing learned. |
 | `--no-learn` | Use memory, but do not learn from this run (learning is one more model call after it). |
 | `--memory-model MODEL` | The model memory learns from this run with; `same` uses the attempts' model. Default: `MOLT_MEMORY_MODEL`, else `sonnet`. Useful when that model is not on your endpoint. |
+| `--judge-model MODEL` | The model that judges a task no command can check against its criteria (below). Default: the attempts' model. |
 | `--checkpoint` | Save a checkpoint as the run goes, so a run that stops before it finishes can go on with `molt resume` (below). |
 | `--config FILE` | Run your own service setup (see `molt.example.toml`) instead of the default one. |
 
@@ -273,6 +274,29 @@ candidate with its scores, and the choice is noted in the audit log. When
 less budget is left than the first passing attempt cost, the run takes it
 without waiting, as `first` would. To compare the modes on the benchmark, add
 an arm: `molt bench --arm molt --arm select-all="--select all"`.
+
+### Tasks no command can check
+
+Some tasks have no command that can tell when they are done: write a design
+note, reword the error messages, explain a module in its docs. For those the
+designer sets a rubric instead of a check: a few concrete criteria the result
+must meet, each with a command where one can check that part (a file exists,
+a word is gone) and without one where only reading can tell. When the attempt
+finishes, the criteria with a command are run in its fork, and a separate
+judge model, which never saw the attempt work, reads the task, the criteria,
+the attempt's final reply and the diff, with read-only tools, and answers each
+remaining criterion met or not with a reason. Unmet criteria go back to the
+attempt, as a failed check would, up to the same number of rounds; a result
+that still misses one fails the run and is not applied. With more than one
+passing attempt, the one that meets more criteria ranks first (see above).
+
+A result accepted this way is reported as passed (judged by a model), not
+passed, and the report and `--json` (`rubric`, `judgement`) list each
+criterion with what the judge said and whether a command decided it. A rubric
+works without any network access beyond the model API. Memory learns less
+from a judged run than from a checked one. `planner.design` returns the
+rubric in place of a check when it designs one, and a run given a rubric
+designs nothing.
 
 ### Commits and `molt undo`
 
@@ -887,6 +911,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - Reading one trace back from the audit log scans the log from the start: there is no index yet. One read looks through at most 256 MiB and keeps to its deadline, and two run at once.
 - The kernel drops a message nested more than 100 levels deep, so every logged message can be read back.
 - After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none. A run with `--checkpoint` that stops keeps its forks for `molt resume`.
+- A rubric's model-judged criteria are a model's reading, not a proof: the judge can be wrong, and nothing but the criteria with a command checks the result. In the interface, a constraint that adds a check is refused while a run is being judged by a rubric.
 - Only `molt do --commit`, `molt resume --commit` and the interface's `/commit on` commit a result, always on the current branch (`--branch` is for `molt do` only). `molt undo` takes back only those commits, and refuses a file changed after the run rather than merging the revert into it (use `git revert` then).
 - A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.

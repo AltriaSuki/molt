@@ -121,6 +121,11 @@ struct DoArgs {
     /// Default: the planner's (report).
     #[arg(long, value_name = "MODE", value_parser = syntax_check)]
     syntax_check: Option<SyntaxCheck>,
+    /// Model for the judge of a task no command can check, which decides
+    /// the result against criteria the planner sets: opus, sonnet, haiku or a
+    /// model id. Default: the attempts' model.
+    #[arg(long, value_name = "MODEL")]
+    judge_model: Option<String>,
     /// Save a checkpoint as the run goes, so that a run stopped before it
     /// finishes (interrupted, out of budget, killed) can go on with `molt resume`.
     #[arg(long)]
@@ -689,6 +694,7 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     req.effort = args.effort;
     req.max_turns = args.max_turns;
     req.syntax_check = args.syntax_check;
+    req.judge_model = args.judge_model;
     req.budget_usd = args.common.budget_usd;
     req.apply = !args.common.no_apply;
     req.stream = args.common.stream;
@@ -855,9 +861,11 @@ async fn execute(
     Ok(match resp.outcome {
         Outcome::Failed => ExitCode::FAILURE,
         // It passed, but the workspace does not have it: a script must not go on as if it did.
-        Outcome::Passed | Outcome::Unverified if apply && !resp.applied && resp.fork.is_some() => ExitCode::from(3),
-        Outcome::Passed | Outcome::Unverified if not_committed => ExitCode::from(4),
-        Outcome::Passed | Outcome::Unverified => ExitCode::SUCCESS,
+        Outcome::Passed | Outcome::Unverified | Outcome::Judged if apply && !resp.applied && resp.fork.is_some() => {
+            ExitCode::from(3)
+        }
+        Outcome::Passed | Outcome::Unverified | Outcome::Judged if not_committed => ExitCode::from(4),
+        Outcome::Passed | Outcome::Unverified | Outcome::Judged => ExitCode::SUCCESS,
     })
 }
 
