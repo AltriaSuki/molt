@@ -13,6 +13,7 @@ mod designer;
 mod fit;
 pub mod hooks;
 mod instructions;
+mod judge;
 mod memory;
 mod prompts;
 mod review;

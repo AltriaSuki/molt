@@ -5,7 +5,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use molt_api::model::{tool_result, user_blocks, user_text, STOP_MAX_TOKENS};
-use molt_api::planner::{AttemptReport, AttemptStatus};
+use molt_api::planner::{AttemptReport, AttemptStatus, Criterion, Finding};
 use molt_api::progress::Progress;
 use molt_api::shell;
 use serde_json::Value;
@@ -15,8 +15,8 @@ use crate::agent::{self, Meter, Stop};
 use crate::checkpoint::{SavedAttempt, SavedEnd};
 use crate::control;
 use crate::ctx::{Conversation, Ctx, Spend};
-use crate::prompts;
 use crate::tools::{self, Actor};
+use crate::{judge, prompts};
 
 /// Bytes of check output kept in a failed attempt's note.
 const NOTE_TAIL: usize = 2000;
@@ -46,6 +46,8 @@ pub(crate) struct Finished {
     pub fork: Option<String>,
     /// The model's final reply, when it said it was done.
     pub summary: String,
+    /// How a passing result did on the run's rubric, when it has one.
+    pub findings: Vec<Finding>,
 }
 
 impl Finished {
@@ -61,7 +63,7 @@ impl Finished {
             note: end.note.clone(),
             requirements: saved.requirements,
         };
-        Self { report, fork: saved.fork.clone(), summary: end.summary.clone() }
+        Self { report, fork: saved.fork.clone(), summary: end.summary.clone(), findings: end.findings.clone() }
     }
 
     /// The report for an attempt whose task died without returning one.
@@ -76,7 +78,7 @@ impl Finished {
             note,
             requirements: 0,
         };
-        Self { report, fork: None, summary: String::new() }
+        Self { report, fork: None, summary: String::new(), findings: Vec::new() }
     }
 }
 
@@ -112,11 +114,13 @@ impl From<Stop> for End {
 }
 
 /// Run attempt `index` to its end, or on from where `resume` left it.
-/// `check` is `None` for an unverified run.
+/// `check` is `None` for a run judged by its `rubric`, or, without one, an
+/// unverified run.
 pub(crate) async fn run(
     ctx: Arc<Ctx>,
     index: u32,
     check: Option<Arc<Check>>,
+    rubric: Arc<Vec<Criterion>>,
     cancel: CancellationToken,
     resume: Option<SavedAttempt>,
 ) -> Finished {
@@ -124,6 +128,8 @@ pub(crate) async fn run(
         ctx: ctx.clone(),
         index,
         check,
+        rubric,
+        findings: Vec::new(),
         cancel,
         meter: Meter::default(),
         check_runs: 0,
@@ -151,6 +157,7 @@ pub(crate) async fn run(
     // Stopped with the run, it can go on when the run is resumed.
     let resumable = status == AttemptStatus::Cancelled && ctx.run_cancel.is_cancelled();
     let (meter, check_runs, version) = (attempt.meter, attempt.check_runs, attempt.version);
+    let findings = if status == AttemptStatus::Passed { std::mem::take(&mut attempt.findings) } else { Vec::new() };
     ctx.save(|s| {
         let saved = s.attempt(index);
         saved.requirements = version;
@@ -159,7 +166,8 @@ pub(crate) async fn run(
         saved.usage = meter.spend.usage;
         saved.cost_usd = meter.spend.cost_usd;
         if !resumable {
-            saved.end = Some(SavedEnd { status, note: note.clone(), summary: summary.clone() });
+            saved.end =
+                Some(SavedEnd { status, note: note.clone(), summary: summary.clone(), findings: findings.clone() });
         }
     });
     tracing::info!(run = %ctx.trace, attempt = index, ?status, turns = attempt.meter.turns, %note, "attempt finished");
@@ -174,13 +182,17 @@ pub(crate) async fn run(
         note,
         requirements: attempt.version,
     };
-    Finished { report, fork: attempt.fork, summary }
+    Finished { report, fork: attempt.fork, summary, findings }
 }
 
 struct Attempt {
     ctx: Arc<Ctx>,
     index: u32,
     check: Option<Arc<Check>>,
+    /// The criteria a run without a check is judged by; empty for an unverified run.
+    rubric: Arc<Vec<Criterion>>,
+    /// The judge's findings on the result it last judged.
+    findings: Vec<Finding>,
     cancel: CancellationToken,
     meter: Meter,
     check_runs: u32,
@@ -261,7 +273,11 @@ impl Attempt {
     /// The final reply once the attempt is done (and, when there is a check, passed it).
     async fn work(&mut self, resume: Option<SavedAttempt>) -> Result<String, End> {
         let ctx = self.ctx.clone();
-        let system = if self.check.is_some() { prompts::ATTEMPT_SYSTEM } else { prompts::UNVERIFIED_SYSTEM };
+        let system = match (&self.check, self.rubric.is_empty()) {
+            (Some(_), _) => prompts::ATTEMPT_SYSTEM,
+            (None, false) => prompts::RUBRIC_SYSTEM,
+            (None, true) => prompts::UNVERIFIED_SYSTEM,
+        };
         let tools = Arc::new(prompts::attempt_tools(self.memory_tools, self.web_tools));
         // A final reply the model gave before the run stopped, still to be checked.
         let mut given = None;
@@ -301,6 +317,7 @@ impl Attempt {
                 let first = prompts::attempt_first_message(
                     &ctx.task,
                     self.check.as_ref().map(|c| (c.command.as_str(), paths.as_slice())),
+                    &self.rubric,
                     self.index,
                     &ctx.preamble(),
                     &ctx.control.upto(self.version),
@@ -374,6 +391,21 @@ impl Attempt {
                 continue;
             }
             let Some(check) = self.check.clone() else {
+                if !self.rubric.is_empty() {
+                    let met = self.judged(&fork, &summary).await?;
+                    if !met {
+                        if self.check_runs >= ctx.max_check_rounds {
+                            let unmet: Vec<&str> =
+                                self.findings.iter().filter(|f| !f.met).map(|f| f.criterion.as_str()).collect();
+                            let note = format!("the judge still found criteria not met: {}", unmet.join("; "));
+                            return Err(End::new(AttemptStatus::Failed, note));
+                        }
+                        asked = false;
+                        conv.push(user_text(prompts::criteria_unmet(&self.findings)));
+                        self.save(&conv);
+                        continue;
+                    }
+                }
                 if ctx.control.claim(self.version) {
                     return Ok(summary);
                 }
@@ -390,6 +422,7 @@ impl Attempt {
                 passed,
                 exit_code: ran.exit_code,
                 tail: if passed { String::new() } else { prompts::output_tail(&ran, PROGRESS_TAIL) },
+                judged: false,
             })
             .await;
             if passed {
@@ -413,6 +446,35 @@ impl Attempt {
             conv.push(user_text(prompts::check_failed(&check.command, &ran)));
             self.save(&conv);
         }
+    }
+
+    /// Have the judge decide the result against the rubric, and say how it
+    /// went: whether every criterion is met. Counts as a check run.
+    async fn judged(&mut self, fork: &str, summary: &str) -> Result<bool, End> {
+        let ctx = self.ctx.clone();
+        let judged = judge::judge(&ctx, fork, &self.rubric, summary, self.version, &self.cancel).await;
+        let findings = judged.map_err(|why| match why {
+            judge::Unjudged::Stopped(stop) => End::from(stop),
+            judge::Unjudged::Failed(why) => End::error(format!("the judge did not finish: {why}")),
+        })?;
+        self.check_runs += 1;
+        let met = findings.iter().all(|f| f.met);
+        let unmet: Vec<&str> = findings.iter().filter(|f| !f.met).map(|f| f.criterion.as_str()).collect();
+        ctx.progress(Progress::CheckRan {
+            run: ctx.run_id(),
+            attempt: self.index,
+            passed: met,
+            exit_code: None,
+            tail: if met {
+                String::new()
+            } else {
+                format!("{} of {} criteria not met: {}", unmet.len(), findings.len(), unmet.join("; "))
+            },
+            judged: true,
+        })
+        .await;
+        self.findings = findings;
+        Ok(met)
     }
 
     /// Where a resumed conversation goes on. One that ends on the model's
