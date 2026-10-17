@@ -18,6 +18,7 @@ use molt_api::shell;
 use molt_planner::{Bus, Config};
 use molt_proto::{Budget, ErrorCode, RemoteError, TraceId};
 use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
 
 const WORKSPACE: &str = "/work/project";
 
@@ -62,6 +63,9 @@ struct State {
     memory_hangs: bool,
     /// The planner holds `web.fetch`, which answers every URL with one page.
     web: bool,
+    /// Model calls stop when cancelled, as the gateway's do: the reply is a
+    /// settlement whose usage and cost are unknown.
+    cancels_models: bool,
     calls: Vec<Call>,
     requests: Vec<CompleteRequest>,
     events: Vec<Progress>,
@@ -134,6 +138,7 @@ impl Fake {
             memory: false,
             memory_hangs: false,
             web: false,
+            cancels_models: false,
             calls: Vec::new(),
             requests: Vec::new(),
             events: Vec::new(),
@@ -428,6 +433,27 @@ impl Bus for Fake {
                 }))
             }
             _ => self.fs(target, payload),
+        }
+    }
+
+    async fn call_cancellable(
+        &self,
+        target: &str,
+        payload: Value,
+        budget: Budget,
+        trace: &TraceId,
+        cancel: &CancellationToken,
+    ) -> Result<Value, RemoteError> {
+        if target != "model.complete" || !self.state.lock().unwrap().cancels_models {
+            return self.call(target, payload, budget, trace).await;
+        }
+        tokio::select! {
+            biased;
+            reply = self.call(target, payload, budget, trace) => reply,
+            _ = cancel.cancelled() => Ok(json!({
+                "error": { "code": "cancelled", "message": "local request stopped" },
+                "settlement": { "local_stopped": true, "may_have_started": true, "usage": null, "cost_usd": null },
+            })),
         }
     }
 
@@ -2364,6 +2390,32 @@ fn one_fast_one_stuck() -> Arc<Fake> {
         },
         hello_check,
     )
+}
+
+#[tokio::test]
+async fn a_loser_cancelled_in_a_model_call_does_not_hold_back_the_winner() {
+    let fake = Fake::new(
+        |req| {
+            if is_reviewer(req) {
+                return submit_review(req, "approve", &[]);
+            }
+            match (attempt_of(req), turn(req)) {
+                (0, 1) => write_hello(req, "hi\n"),
+                (0, _) => done("Mine passed."),
+                _ => Reply { delay: Duration::from_secs(60), ..done("Too late.") },
+            }
+        },
+        hello_check,
+    );
+    fake.set(|s| s.cancels_models = true);
+    let resp = run(&fake, RunRequest { review: true, ..request(Some("check"), 2) }).await;
+
+    assert_eq!((resp.outcome, resp.winner, resp.applied), (Outcome::Passed, Some(0), true), "{}", resp.summary);
+    assert_eq!(resp.review.as_ref().map(|r| r.verdict), Some(Verdict::Approve));
+    assert_eq!(resp.attempts[1].status, AttemptStatus::Cancelled);
+    assert_eq!(fake.workspace()["hello.txt"], "hi\n");
+    // What the cancelled call cost is unknown, so it is reported rather than counted as free.
+    assert_eq!(resp.uncounted_calls, 1);
 }
 
 #[tokio::test]
