@@ -8,7 +8,7 @@ use std::sync::Arc;
 use molt_api::fs::ChangeKind;
 use molt_api::model::{tool_result, user_blocks, user_text, ToolUse, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{SubmitCheck, SUBMIT_CHECK};
-use molt_api::planner::Baseline;
+use molt_api::planner::{Baseline, Criterion};
 use molt_proto::RemoteError;
 use serde_json::Value;
 
@@ -20,6 +20,8 @@ use crate::tools::{self, Actor};
 /// The designer's turn limit. The run's `max_turns` counts an attempt's
 /// turns; a small one must not starve the designer.
 const MAX_TURNS: u32 = 25;
+/// Most criteria in a rubric: each one is judged on every check round.
+pub(crate) const MAX_CRITERIA: usize = 12;
 /// Bytes of the baseline check's output kept.
 const BASELINE_TAIL: usize = 2000;
 
@@ -35,6 +37,9 @@ pub(crate) enum Design {
         /// only when asked for, and `None` when it could not be run.
         baseline: Option<Baseline>,
     },
+    /// No command checks the task; an independent judge decides these
+    /// criteria instead.
+    Rubric { criteria: Vec<Criterion>, rationale: String },
     /// No automated check fits the task: the designer submitted none.
     Unverified(String),
     /// The designer could not do its work (model error, refusal, budget), or
@@ -141,7 +146,12 @@ async fn work(ctx: &Arc<Ctx>, fork: &str) -> Design {
 async fn submitted(ctx: &Ctx, fork: &str, call: &ToolUse) -> Result<Design, String> {
     let submit: SubmitCheck = serde_json::from_value(call.input.clone())
         .map_err(|e| format!("Invalid input for submit_check: {e}. Check the tool's input schema and try again."))?;
-    let Some(command) = submit.command else { return Ok(Design::Unverified(submit.rationale)) };
+    let Some(command) = submit.command else {
+        return match rubric(submit.rubric)? {
+            criteria if criteria.is_empty() => Ok(Design::Unverified(submit.rationale)),
+            criteria => Ok(Design::Rubric { criteria, rationale: submit.rationale }),
+        };
+    };
     if command.trim().is_empty() {
         return Err("The command is empty. Give the done-check command, or null if no automated check fits.".into());
     }
@@ -183,4 +193,26 @@ async fn submitted(ctx: &Ctx, fork: &str, call: &ToolUse) -> Result<Design, Stri
     }
     let suite = submit.suite.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
     Ok(Design::Check { command, files, suite, rationale: submit.rationale, baseline: None })
+}
+
+/// The criteria a designer submitted, trimmed, or what is wrong with them.
+fn rubric(criteria: Vec<Criterion>) -> Result<Vec<Criterion>, String> {
+    let mut out: Vec<Criterion> = Vec::new();
+    for c in criteria {
+        let text = c.text.trim().to_owned();
+        let command = c.command.map(|c| c.trim().to_owned()).filter(|c| !c.is_empty());
+        if text.is_empty() {
+            return Err("A criterion has no text. Say in one sentence what the result must satisfy.".into());
+        }
+        if !out.iter().any(|o| o.text == text) {
+            out.push(Criterion { text, command });
+        }
+    }
+    if out.len() > MAX_CRITERIA {
+        return Err(format!(
+            "The rubric has {} criteria; give at most {MAX_CRITERIA}, the ones that matter most.",
+            out.len()
+        ));
+    }
+    Ok(out)
 }

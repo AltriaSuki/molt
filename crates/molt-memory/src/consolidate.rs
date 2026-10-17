@@ -45,6 +45,9 @@ const MAX_NEW: usize = 8;
 const FALLBACK_CONFIDENCE: f64 = 0.5;
 /// The highest confidence a note learned from one episode starts at.
 const MAX_LEARNED: f64 = 0.9;
+/// The highest for an episode whose result only a model judged (a rubric,
+/// not a check): the judge may have been wrong.
+const MAX_JUDGED: f64 = 0.6;
 
 /// Replies that only show what a step looked at; the digest needs nothing
 /// from them unless they are errors, so their payloads are dropped as the
@@ -135,13 +138,13 @@ fn answer_schema() -> Value {
 
 /// Both fields are required, as the schema says: an answer that names
 /// neither is not an answer, and must not mark the episode learned from.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct Answer {
     notes: Vec<Learned>,
     supports: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct Learned {
     kind: NoteKind,
     text: String,
@@ -376,6 +379,7 @@ fn resolve(
     episode: &str,
     workspace: &str,
     writer: &Writer,
+    most: f64,
 ) -> Changes {
     let handle = |h: &str| -> Option<String> {
         let n: usize = h.trim().trim_start_matches(['N', 'n']).parse().ok()?;
@@ -419,7 +423,7 @@ fn resolve(
             kind: learned.kind,
             text: learned.text,
             workspace: Some(workspace.to_owned()),
-            confidence: confidence.min(MAX_LEARNED),
+            confidence: confidence.min(most),
             provenance: Provenance {
                 trace: episode.to_owned(),
                 events,
@@ -607,7 +611,8 @@ pub(crate) async fn consolidate(
         Err(e) => return Ok(skipped(format!("the model's answer did not parse: {e}"), usage, cost)),
     };
 
-    let changes = resolve(answer, &digest.steps, &known, episode.as_str(), &ws, writer);
+    let most = if digest.judged { MAX_JUDGED } else { MAX_LEARNED };
+    let changes = resolve(answer, &digest.steps, &known, episode.as_str(), &ws, writer, most);
     let (id, w) = (episode.as_str().to_owned(), writer.clone());
     let now = crate::now_ms();
     let applied = blocking(db, move |db| apply(db, &id, &w, &changes, now)).await?;
@@ -1008,7 +1013,9 @@ mod tests {
             "supports": ["N1", "bogus"]
         }))
         .unwrap();
-        let changes = resolve(answer, &steps, &known, "trace_x", WS, &writer());
+        let judged = resolve(answer.clone(), &steps, &known, "trace_x", WS, &writer(), MAX_JUDGED);
+        assert_eq!(judged.new[0].0.confidence, MAX_JUDGED, "a result only a model judged teaches less surely");
+        let changes = resolve(answer, &steps, &known, "trace_x", WS, &writer(), MAX_LEARNED);
         assert!(changes.supports.is_empty());
         assert_eq!(changes.new.len(), 1, "an empty note is dropped");
         let (note, corrects, _) = &changes.new[0];

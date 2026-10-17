@@ -159,6 +159,19 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             }
             match &d.command {
                 Some(c) => lines.push(Line::from(vec![span("  $ ", Tone::Dim), span(clean_line(c), Tone::Plain)])),
+                None if !d.rubric.is_empty() => {
+                    lines.push(Line::from(span(
+                        "  no command checks this task; a model judges these criteria:",
+                        Tone::Warn,
+                    )));
+                    for (i, c) in d.rubric.iter().enumerate() {
+                        let by = if c.command.is_some() { "  (by its command)" } else { "" };
+                        lines.push(Line::from(span(
+                            format!("  {}. {}{by}", i + 1, text::clean_line(&c.text)),
+                            Tone::Plain,
+                        )));
+                    }
+                }
                 None => lines.push(Line::from(span("  no automated check fits this task", Tone::Warn))),
             }
             for l in text::clean(d.rationale.trim()) {
