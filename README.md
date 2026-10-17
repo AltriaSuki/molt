@@ -42,6 +42,7 @@ that starts with milestone 5.
 | File and shell services | `fs.*` and `shell.*`: files, forks, diffs, merges and commands, confined to a root | `molt-tools` |
 | Planner | `planner.run`: check first, parallel attempts, verify, apply; `planner.control` steers a run that is going | `molt-planner` |
 | Memory | `memory.*`: notes with provenance, learned from finished runs; the project model (definitions, references, repo map) | `molt-memory` |
+| Web service | `web.fetch`: pages from the hosts the user allows, over https, as text; off unless allowed | `molt-web` |
 
 The kernel never trusts the sender named in a message. The transport
 authenticates each service's endpoint (a per-service secret on Unix sockets,
@@ -61,6 +62,7 @@ sender from that.
 | A failing service never takes the kernel down | `a_service_that_never_replies…`, `a_crashed_and_reconnected…`, `a_flooding_service…`, `garbage_on_the_wire_is_ignored`, `crates/molt/tests/e2e.rs` |
 | Both transports behave the same: ordering, at-most-once, sender stamping, isolation, bounded inboxes | `crates/molt-transport/src/testkit.rs`, run by `conformance_unix.rs` and `conformance_nats.rs` |
 | `molt do` never runs a config the project ships, and the API key never reaches the commands it runs | `crates/molt/tests/agent.rs` (`the_cli_carries_out_a_task`) |
+| Only trusted external configuration installs hooks; formatting cannot bypass a protected done-check | `agent::tests::only_configuration_outside_the_project_can_install_hooks`, `tests/agent.rs::lifecycle_formatting_is_rechecked_and_cannot_weaken_the_protected_check` |
 | A conversation sent whole every turn grows the log by its new messages, and reads back byte for byte; a changed or missing referenced value fails verification | `a_conversation_sent_whole_every_turn_is_logged_once_and_read_back_exactly`, `a_changed_or_missing_blob_is_found` |
 | Reading the audit log takes a capability, and a read is recorded without a second copy of what it returned | `reading_the_log_takes_a_capability_and_is_recorded_without_a_second_copy` |
 | Every learned note cites the messages behind it, and a run is learned from once | `crates/molt/tests/agent.rs` (`a_second_run_starts_with_what_the_first_learned…`), `crates/molt-memory/src/consolidate.rs` |
@@ -70,8 +72,11 @@ sender from that.
 | Attempt symbol queries verify fork ownership and content freshness, isolate parallel views, and never update the durable project model | `crates/molt-memory/tests/forks.rs` (`rename_add_move_delete_and_shell_edits_stay_inside_the_attempt`, `unverified_wrong_workspace_and_symlink_forks_are_refused_without_widening_roots`, `an_edit_during_refresh_returns_no_stale_symbols`) |
 | A benchmark starts a run only while what it spent, plus the whole `--task-usd` of that run and of each run in flight, fits in `--max-usd`; it refuses models it has no price for | `crates/molt-bench/src/run.rs` (`runs_stop_before_they_could_pass_the_budget`, `a_run_of_unknown_cost_stops_the_benchmark`), `crates/molt-bench/src/cli.rs` (`a_model_without_a_price_is_refused`) |
 | A model with no price stays of unknown cost and stops the run; prices come only from the user's environment or data directory, never from a project, and a download that does not validate replaces nothing | `crates/molt-gateway/src/prices.rs` (`the_data_directory_holds_the_snapshot_and_nothing_else_is_read`, `a_download_that_does_not_validate_is_refused`, `malformed_declared_prices_stop_startup_and_name_the_item`), `crates/molt-gateway/tests/gateway.rs` (`a_snapshot_prices_a_third_party_model…`) |
+| `molt do --commit` commits exactly the files the run merged and leaves what the user staged alone; `molt undo` takes it back with a new commit, never touching later changes, and the undone run no longer lends any note confidence | `crates/molt/src/git.rs` (`a_run_commit_holds_only_the_merged_files…`, `undo_refuses_files_that_changed_since_the_run`), `crates/molt/tests/agent.rs` (`a_committed_run_can_be_undone_and_memory_stops_counting_it`), `crates/molt-memory/src/notes.rs` (`an_undone_run_lends_no_note_confidence…`) |
+| The agent reads the web only when the user allows hosts: over https, from those hosts after every redirect, never from a loopback, private or link-local address; commands stay offline, and every page read is in the audit log | `crates/molt-web/src/allow.rs` (`only_https_urls_on_allowed_hosts_pass`, `only_public_addresses_are_public`), `crates/molt-web/tests/web.rs` (`hosts_off_the_list_are_refused_before_any_request_and_on_every_redirect`), `crates/molt/tests/agent.rs` (`allowed_web_hosts_start_the_web_service_and_offer_fetch_url_only_then`), `crates/molt-planner/tests/planner.rs` (`fetch_url_is_offered_only_to_a_planner_that_may_read_the_web`) |
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
 | Issue CI rejects PR triggers and probes the sandbox before model spend | `scripts/ci/test_issue_to_pr.py::test_only_labelled_open_issues_are_eligible`, `test_sandbox_failure_posts_a_summary_and_never_starts_a_model` |
+| Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
 
 ## Quick start
 
@@ -128,8 +133,12 @@ with `--config` can change these in a `[confirm]` section (`max_lines`,
    with it; `e` edits the command, `v` shows the files, `n` runs without a
    check.
 2. The attempts run side by side, one box each, with their tool calls and
-   check runs as they happen (Tab shows one large). When one passes, you see
-   its message, the files it changed and, with `d`, the diff. Enter applies
+   check runs as they happen (Tab shows one large). Each box's title shows
+   its turn, how long it has run and what its finished model calls cost
+   (`turn 7 · 2m14s · $0.18`), and the status bar shows the task's spending
+   against its budget (`task $0.52 / $2.00`, in yellow from 80%). A call of
+   unknown cost makes the figure a lower bound (`≥ $0.18`). When one passes,
+   you see its message, the files it changed and, with `d`, the diff. Enter applies
    it; `k` keeps it in its fork, `n` discards it. `/last` opens the diff of
    the last finished task again, whatever was done with it. When no attempt
    passes, each one shows the end of why it stopped, and a failed check shows
@@ -169,7 +178,8 @@ start and end.
 `/memory [words]` lists the notes about the project, strongest first, with
 where each came from: the run, the service version that wrote it and the
 messages in the audit log it rests on. `f` forgets one, with a reason, as
-`molt memory forget` does. The screen includes quarantined notes for inspection,
+`molt memory forget` does, and `p` promotes one to every project, as
+`molt memory promote` does. The screen includes quarantined notes for inspection,
 marked `[review]`, and temporary experience marked `[temporary]`. The detail
 pane shows recall scores, keywords, revision, dependencies and source evidence;
 `v` opens the full scrollable record. `a` reviews a note and `c` corrects it:
@@ -182,7 +192,8 @@ Ordinary planner recall still excludes notes awaiting review.
 `/memory-used [run]` opens the immutable recall snapshots for that run in this
 project, defaulting to the latest task. The task's memory log shows this command;
 `u` in the memory screen opens the latest task's context. Later corrections do
-not alter those recorded notes. `/attempts`, `/model`, `/effort`, `/budget` and
+not alter those recorded notes. `/remember TEXT` keeps a preference of yours
+for every project. `/attempts`, `/model`, `/effort`, `/budget` and
 `/check` set the next tasks' options (`/check` while a task runs changes only
 that task); `/memory-model NAME` sets the model
 memory learns with (`same` for the attempts' model, `default` for
@@ -190,6 +201,17 @@ memory learns with (`same` for the attempts' model, `default` for
 says why. `/help` lists the keys. The services'
 log goes to `tui.log` in the data dir, and colors are left out under
 `NO_COLOR`.
+
+When the interface stops for you (a check or a result to confirm) or the
+services go down, it rings the terminal bell and, in terminals that show
+them (iTerm2, WezTerm, Ghostty with OSC 9; VTE terminals, foot and urxvt
+with OSC 777), sends a desktop notification with a short label such as
+`molt: check ready`, never the task's text. It stays quiet while the
+terminal has focus or a key was pressed in the last five seconds, and calls
+once per stop. `/notify all` also calls when a task ends
+(`molt: passed · 3 files`), and `/notify off` turns calling off. The window
+title follows what it is doing (`molt · running 2/4`, `molt · waiting:
+apply`, `molt · idle`), and the terminal's own title is put back on exit.
 
 The interface shows model text previews by default, including while designing
 the check. `/stream off` disables previews for subsequent tasks; `/stream on`
@@ -199,26 +221,37 @@ ends. Missing events are labeled as gaps; the interface never reconstructs
 them. Previews are provisional: the complete reply and check determine the
 result, and cancelled or late events cannot make a result appear.
 
+`/commit on` commits each result once it is applied, as `molt do --commit`
+does (see "Commits and `molt undo`" below): the work tree is looked at when
+the task starts, and the commit is made after the run applies the result, or
+after you accept it in confirm mode. A result kept in its fork, or one that
+fails to apply, is not committed. `/commit off` (the default) stops it.
+
 The interface holds the data dir's lock while it is open, so a `molt do` in
 the same project is refused until it closes.
 
 ## `molt do`
 
 ```
-molt do TASK [--check CMD | --no-check] [--attempts N] [--model M] [--effort E] [--max-turns N]
-        [--budget-usd X] [--no-apply] [--no-review] [--json] [--stream] [--workspace DIR] [--data-dir DIR]
-        [--pass-env NAME]... [--no-memory] [--no-learn] [--memory-model MODEL] [--checkpoint] [--config FILE]
-molt resume [RUN] [--retry] [--list] [--budget-usd X] [--no-apply] [--json] [--workspace DIR] ...
+molt do TASK [--check CMD | --no-check] [--attempts N] [--select MODE] [--model M] [--effort E] [--max-turns N]
+        [--budget-usd X] [--no-apply | --commit [--branch NAME]] [--no-review] [--json] [--stream]
+        [--workspace DIR] [--data-dir DIR] [--pass-env NAME]... [--no-memory] [--no-learn]
+        [--memory-model MODEL] [--judge-model MODEL] [--checkpoint] [--config FILE]
+molt resume [RUN] [--retry] [--list] [--budget-usd X] [--no-apply] [--commit] [--json] [--workspace DIR] ...
+molt undo [RUN] [--workspace DIR] [--data-dir DIR]
 ```
 
 | Flag | Meaning |
 | --- | --- |
 | `--check CMD` | Shell command that exits 0 once the task is done, run in each attempt's fork. Default: the planner designs one. |
 | `--no-check` | Design no check: one attempt does the task and its result is applied unverified. This is the plain agent loop `molt bench` compares Molt with. |
-| `--attempts N` | Parallel attempts, 1 to 8 (default 2). The first to pass wins and the others are cancelled. |
+| `--attempts N` | Parallel attempts, 1 to 8 (default 2). The first to pass wins and the others are cancelled, unless `--select` says otherwise. |
+| `--select MODE` | How to pick among attempts that pass: `first` (default) takes the first; `wait:<seconds>` gives the others that long after the first passes; `all` lets every attempt finish. Then the passing ones are compared (see below). |
 | `--model`, `--effort` | Model for the attempts (`opus`, `sonnet`, `haiku` or an id) and how hard it thinks. |
 | `--max-turns`, `--budget-usd` | Model turns per attempt, and the spending limit for the whole run. |
 | `--no-apply` | Keep the result in its fork and print its path instead of merging it. |
+| `--commit` | Commit the applied result to git (see below). |
+| `--branch NAME` | With `--commit`, commit on a new branch made from the current commit and switched to. |
 | `--no-review` | Skip the review of a passing result (see below). |
 | `--json` | Print the full result (`planner.run`'s reply in `molt-api`) as JSON. |
 | `--stream` | Show model text previews on stderr while the designer and attempts work. The final result still goes to stdout, including with `--json`. |
@@ -228,6 +261,7 @@ molt resume [RUN] [--retry] [--list] [--budget-usd X] [--no-apply] [--json] [--w
 | `--no-memory` | Run without memory: no map or notes for the model, nothing learned. |
 | `--no-learn` | Use memory, but do not learn from this run (learning is one more model call after it). |
 | `--memory-model MODEL` | The model memory learns from this run with; `same` uses the attempts' model. Default: `MOLT_MEMORY_MODEL`, else `sonnet`. Useful when that model is not on your endpoint. |
+| `--judge-model MODEL` | The model that judges a task no command can check against its criteria (below). Default: the attempts' model. |
 | `--checkpoint` | Save a checkpoint as the run goes, so a run that stops before it finishes can go on with `molt resume` (below). |
 | `--config FILE` | Run your own service setup (see `molt.example.toml`) instead of the default one. |
 
@@ -241,6 +275,76 @@ the task, the check and the diff with read-only tools and answers approve,
 concern or reject. Only an approved result is merged; otherwise it is kept in
 its fork and the findings are printed. Unverified results (`--no-check`) and
 empty changes are not reviewed.
+
+With `--select wait:<seconds>` or `--select all`, attempts go on after the
+first one passes, and when more than one passes they are compared on what can
+be audited, never on a model's opinion of its own work: first whether the
+project's own test suite still passes in each one's fork (the designer names
+the suite when it finds one), then fewer changed lines, then fewer changed
+files, then which passed first. With review on, the candidates are reviewed in
+that order and the first one approved wins, so a result that games the check
+gives way to the next. The report and `--json` (`selection`) list every
+candidate with its scores, and the choice is noted in the audit log. When
+less budget is left than the first passing attempt cost, the run takes it
+without waiting, as `first` would. To compare the modes on the benchmark, add
+an arm: `molt bench --arm molt --arm select-all="--select all"`.
+
+### Tasks no command can check
+
+Some tasks have no command that can tell when they are done: write a design
+note, reword the error messages, explain a module in its docs. For those the
+designer sets a rubric instead of a check: a few concrete criteria the result
+must meet, each with a command where one can check that part (a file exists,
+a word is gone) and without one where only reading can tell. When the attempt
+finishes, the criteria with a command are run in its fork, and a separate
+judge model, which never saw the attempt work, reads the task, the criteria,
+the attempt's final reply and the diff, with read-only tools, and answers each
+remaining criterion met or not with a reason. Unmet criteria go back to the
+attempt, as a failed check would, up to the same number of rounds; a result
+that still misses one fails the run and is not applied. With more than one
+passing attempt, the one that meets more criteria ranks first (see above).
+
+A result accepted this way is reported as passed (judged by a model), not
+passed, and the report and `--json` (`rubric`, `judgement`) list each
+criterion with what the judge said and whether a command decided it. A rubric
+works without any network access beyond the model API. Memory learns less
+from a judged run than from a checked one. `planner.design` returns the
+rubric in place of a check when it designs one, and a run given a rubric
+designs nothing.
+
+### Commits and `molt undo`
+
+With `--commit`, an applied result is committed to git. The commit holds
+exactly the files the run merged, as the workspace has them: it is built in a
+scratch index from the current commit, so what you staged stays staged and
+out of it. Its subject is the first line of the winning attempt's summary, the
+rest of the summary is its body, and it ends with trailers:
+
+```
+Molt-Run: trace_…
+Molt-Check: cargo test
+```
+
+`Molt-Run` is the run id, so `git log` leads back to the run's audit trace and
+to `molt memory used RUN` for the notes it recalled. `Molt-Check` is the check
+the result passed, or `none (unverified)`. Git runs on your side, after the
+run; attempts never run it. A file git ignores is left out and named. Nothing
+is committed when a file the run changed had changes of yours not committed
+before it (the commit would take them in), or when the workspace is not in a
+git work tree; the result is still applied, the reason is printed, and the
+exit status is 4. A `--branch` name git refuses, or one that exists, stops the
+run before it starts.
+
+`molt undo [RUN]` takes back the commit of a run, by default the newest on the
+current branch not taken back yet. It makes a new commit that puts the run's
+files back as they were before it, with a `Molt-Undo: RUN` trailer; history is
+not rewritten, and what you have staged elsewhere stays staged. It refuses
+when one of those files changed after the run, or has changes not committed,
+and says so rather than overwriting them. Memory is then told: the evidence
+the run gave is voided, so it no longer lends any note confidence. Notes only
+it showed are forgotten, the notes it bore out or disputed are worked out
+again without it, and it is not learned from again. If memory cannot be
+reached, `molt undo RUN` again tells it without a second revert.
 
 ### Checkpoints and `molt resume`
 
@@ -302,6 +406,7 @@ through its progress callback, with previews enabled by default.
 | 1 | No attempt passed, or molt failed. |
 | 2 | The command line was wrong (an unknown flag, `--attempts 9`, ...); nothing started. |
 | 3 | Passed (or finished unverified), but the changes could not be merged, e.g. because the workspace changed under them; they are kept in the fork the report names. |
+| 4 | Passed and applied, but `--commit` could not commit the changes; the reason is printed. |
 | 128+N | Stopped by signal N: 130 for Ctrl-C, 129 for SIGHUP, 143 for SIGTERM. The services are stopped and the run's forks removed. |
 
 ### Config and secrets
@@ -356,6 +461,7 @@ Defaults come from the environment:
 | `MOLT_MAP_TOKENS` | planner | `3000` (the project map a run starts with; at most `32000`) |
 | `MOLT_CONTEXT_TOKENS` | planner | the model's context window: `200000` for Claude models, `128000` for others |
 | `MOLT_INSTRUCTION_FILES` | planner | `AGENTS.md,CLAUDE.md` (the project's instruction files; `none` reads none) |
+| `MOLT_SYNTAX_CHECK` | planner | `report` (see [Syntax errors after an edit](#syntax-errors-after-an-edit)); `reject` or `off` |
 | `MOLT_MEMORY_MODEL`, `MOLT_MEMORY_EFFORT`, `MOLT_MEMORY_MAX_TOKENS`, `MOLT_MEMORY_MODEL_TIMEOUT_S` | memory | `sonnet`, `low`, `8000`, `300` |
 
 The planner reads `MOLT_MAX_TOKENS` and `MOLT_MODEL_TIMEOUT_S` too: a model
@@ -392,6 +498,117 @@ that they win over notes. They are read with `fs.read`, so the audit log
 records what each run saw, and the run's progress lists the files.
 `--no-memory` does not turn them off; `MOLT_INSTRUCTION_FILES` names other
 files, or `none`.
+
+### Syntax errors after an edit
+
+When an attempt writes or edits a file in a language the project model
+parses (below), the `fs` service parses the file before and after the change
+with the same tree-sitter grammars and returns the syntax errors the change
+added, with the lines around each, in the tool's result. An error the file
+already had is not reported again, wherever the edit moved it, so a project
+that was broken before, or a construct a grammar does not know, does not get
+in the way. Nothing outside the service runs and nothing is fetched; a
+version that takes over 2 seconds to parse is not checked. By default the
+change is still made (`report`); `--syntax-check reject` (or
+`MOLT_SYNTAX_CHECK=reject`) leaves the file as it was and returns the errors
+as a failed call, as SWE-agent's edit guard does, and `off` does not look.
+The check files a run writes into forks are never checked. To compare the
+modes, run them as benchmark arms, such as
+`--arm reject="--syntax-check reject" --arm unchecked="--syntax-check off"`.
+
+## Trusted lifecycle hooks
+
+An explicitly selected `--config /outside/project/molt.toml` may contain
+`[[hooks]]` entries. Files inside the workspace never supply hooks, even with
+`--config`; no project file is discovered automatically.
+
+```toml
+[[hooks]]
+event = "before_apply"
+command = "cargo fmt"
+blocking = true
+timeout_ms = 30000
+
+[[hooks]]
+event = "run_finished"
+command = "printf 'Molt finished\\n'"
+```
+
+Supported events are `before_apply`, `after_apply`, `run_finished`, and
+`attempt_failed`. Only `before_apply` may block. Its commands run sequentially
+in each passing candidate's isolated fork after acceptance, before ranking, diff, review
+and application. The authoritative check files are restored, protected paths
+are checked, and acceptance runs again even if a nonblocking formatter failed.
+A failing check or blocking hook keeps the result in its fork and applies
+nothing. Retained results (including the TUI's confirm mode) are prepared the
+same way before they are shown, so the diff/review covers the formatted result.
+
+Notification hooks run in a separate disposable fork and cannot change the
+applied workspace. `after_apply` is also sent when the TUI user applies a kept
+result; `run_finished` means the planner finished, not that the user accepted a
+kept result. All commands use the existing shell sandbox, environment scrubbing,
+process-tree cleanup and bounded output. They do not gain host network or
+notification access. Shell requests/results record output, exit status and
+elapsed time in the audit; planner notes identify the lifecycle event. Timeouts
+are 1–600000 ms, commands at most 8192 bytes, and at most 32 hooks are accepted.
+An interrupted or resumed run may deliver notifications again; use idempotent
+notification commands. Hooks are not part of the model-editable RunRequest.
+
+## Projects
+
+A project is what molt keeps memory for. Each has a stable id and a name in
+the user's registry (`$XDG_DATA_HOME/molt/projects.json`, else
+`~/.local/share/molt/projects.json`), and any number of directories: one
+usually, several for clones, or none. The first run in a directory registers
+it under the directory's name, keeping the data dir it had before, so nothing
+is lost on upgrade. Notes about any of a project's directories are kept under
+its id, so clones share them and a moved directory keeps them once molt is
+told where it went; the data dir, with the audit log and stopped runs, stays
+with the project too. Nothing in a project's directory decides which project
+it is.
+
+```sh
+molt project list                         # ids, names, directories, data dirs
+molt project new "Japan trip"             # a project with no folder
+molt project new site --path ~/src/site   # a directory under a name of your own
+molt project add site ~/src/site-2        # another clone, with the same notes
+molt project move site ~/code/site        # the directory moved (--from DIR for one of several)
+molt do "plan five days in Kyoto" --project "Japan trip" --no-check
+```
+
+`--project ID|NAME` stands in for `--workspace` in `molt do`, `molt resume`,
+`molt ui` and `molt memory`. A project with no folder works in a private one
+of its own, `<registry dir>/projects/<id>/files`, which is where its
+research and writing end up. With `--config`, the registry is left out and
+notes are kept by the workspace's path, as before.
+### Reading the web
+
+Commands have no network, so an attempt cannot look up an unfamiliar API.
+`--allow-web HOST` (repeatable, for `molt do`, `molt resume` and the
+interface) lets it read pages from those hosts: `docs.rs` is that host,
+`*.python.org` any host below python.org. It starts a `web` service of its
+own and gives the planner the capability to call it; attempts and the check
+designer are then offered `fetch_url`, and without the flag they are not.
+The service fetches over https on the default port only, checks every
+redirect against the list, resolves names itself and never connects to a
+loopback, private, link-local or other non-public address, and uses no
+proxy. It reads at most 2 MiB of a page and returns at most 100 KB of text,
+with HTML turned into plain text and links kept; other content that is not
+text is refused. The model is told the page is data, not instructions. Each
+URL and the text read from it go through the kernel, so the audit log has
+them for replaying a run without the network. In a config file, the
+same is a protected service:
+
+```toml
+[[service]]
+name = "web"
+tier = "protected"
+exec = { command = "molt-web", args = ["--allow", "docs.rs", "--allow", "*.python.org"] }
+provides = ["web.*"]
+```
+
+with `{ target = "web.fetch", budget = { calls = 1000000 } }` in the
+planner's `requests`.
 
 ## Memory
 
@@ -461,7 +678,7 @@ as a tombstone with its reason.
 `review` and `correct` go through the kernel too, require a reason and the
 revision printed by `show`, and reject concurrent changes. Corrections keep
 the original note and evidence as a tombstone and link the replacement to it.
-Forgotten, corrected and retracted text cannot be automatically relearned.
+Forgotten, corrected, retracted and undone text cannot be automatically relearned.
 
 Use repeatable `--depends-on` arguments to attach project-relative files,
 including build configuration or a symbol's source file. These are explicit
@@ -474,6 +691,29 @@ index. Restoring a file does not reactivate a note: confirm it with `review`
 using its current revision and dependency list. Unrelated changes leave it
 alone. Files are limited to 1 MiB, at most 16 per note; symlinks, paths outside
 the project and Molt's own data are refused.
+
+### Your notes, for every project
+
+Notes about you, such as "Answer in Chinese.", belong to no project. They
+live in your own layer, `user.db` next to the project registry
+(`$XDG_DATA_HOME/molt`, else `~/.local/share/molt`), and every project's
+recall merges them with its own, best first. Each recalled note says which
+layer it came from, in `show`, on the memory screen and in a run's snapshot.
+
+```sh
+molt memory remember --global "Answer in Chinese."    # yours, everywhere
+molt memory remember "Deploy with make release."      # this project's
+molt memory promote NOTE_ID --reason "every project of mine builds with make"
+```
+
+Writing one goes through the kernel and is audited. Learning never writes
+there: a run's record holds text the project chose. When the model thinks a
+learned note holds everywhere, it only proposes it (`proposed for every
+project` in `show`, and in what a run reports learning); `promote` copies it
+once you say why. The project note stays, marked with where it went, and the
+copy keeps its evidence, so rolling back the version that learned it retracts
+the copy too. `forget` and `correct` work on your notes from any project.
+Project databases from before need no migration.
 
 `review --temporary` marks a workaround as temporary experience, and the
 model is explicitly told to verify it before reuse. Review metadata does not
@@ -713,15 +953,17 @@ needed. Deleting an unfinished record loses its recovery material.
 - Reading one trace back from the audit log scans the log from the start: there is no index yet. One read looks through at most 256 MiB and keeps to its deadline, and two run at once.
 - The kernel drops a message nested more than 100 levels deep, so every logged message can be read back.
 - After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none. A run with `--checkpoint` that stops keeps its forks for `molt resume`.
+- A rubric's model-judged criteria are a model's reading, not a proof: the judge can be wrong, and nothing but the criteria with a command checks the result. In the interface, a constraint that adds a check is refused while a run is being judged by a rubric.
+- Only `molt do --commit`, `molt resume --commit` and the interface's `/commit on` commit a result, always on the current branch (`--branch` is for `molt do` only). `molt undo` takes back only those commits, and refuses a file changed after the run rather than merging the revert into it (use `git revert` then).
 - A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.
 - Recall matches keywords (with stemming), not meaning: there is no vector index, since the Anthropic API has no embeddings endpoint. A note worded differently from the task can be missed; the strongest notes about the project are always shown.
-- Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. With the default setup, memory lives in the project's data dir, so nothing is shared between projects yet.
+- Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. Only notes you write or promote yourself are shared between projects. Clones of one project share its data dir, so molt runs in one of them at a time.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.
 - Model prices are as current as the last `molt prices update` (or the release's snapshot) and as right as the community list they came from; a price that changes mid-run is not picked up until the next run. Models that LiteLLM lists only with tiered or regional prices, such as some Qwen models, have no price until declared in `MOLT_MODEL_PRICES`.
-- No license has been chosen yet.
+- The web service has no search: an attempt reads pages whose URL it knows or finds in pages it read. It does not use a proxy, so a network that only reaches the web through one cannot use it, and it reads pages as served, without running their scripts.
 
 ### Cancellation and model settlement
 
@@ -790,3 +1032,56 @@ budget, then creates a PR containing check and baseline evidence, known cost
 and run ID. It requires a trusted installed Molt build and a working sandbox;
 fork PR events cannot start a secret-bearing run. See
 [scripts/ci/README.md](scripts/ci/README.md) for setup, permissions and limits.
+
+## Project task commands
+
+Place Markdown templates in `.molt/commands/NAME.md`, then type `/NAME arguments`
+in the interface. `$ARGUMENTS` inserts the complete argument text; `$1`, `$2`,
+and later positions insert whitespace-separated words (missing words are empty).
+Expansion is one pass and does not execute a shell. Optional frontmatter uses
+flat, single-line YAML scalars:
+
+```markdown
+---
+description: Fix an issue and add a regression test
+argument-hint: ISSUE_NUMBER
+check: cargo test
+attempts: 2
+budget: 2.5
+---
+Fix issue $ARGUMENTS and add a regression test.
+```
+
+These defaults affect only that task. Explicit interface settings take precedence,
+and a template budget cannot raise an existing limit. Confirm mode shows a
+template's check before starting; auto and plan modes retain their existing rules.
+Templates cannot set modes, permissions or protected paths. `/help` lists project
+commands and Tab completes unique command prefixes (or lists matches). Built-ins
+win name conflicts. Invalid, oversized and out-of-workspace files are skipped
+with a startup warning; restart the interface after editing templates. Discovery
+is bounded to 128 directory entries and 64 KiB per file. Nested YAML structures
+and multiline frontmatter scalars are not supported.
+
+## Terminal colors and controls
+
+`/theme dark`, `/theme light`, and `/theme ansi` change all interface colors,
+including earlier log entries. Dark and light set their own background; ANSI
+uses only the terminal's 16 colors and follows its background. Without a saved
+choice, `COLORTERM=truecolor` or `24bit` selects dark and other terminals select
+ANSI. Light's eight text colors meet WCAG AA (4.5:1) against its white background.
+`NO_COLOR` keeps colors disabled. The choice is saved privately in
+`<data dir>/tui-theme.json`; other interface settings are not saved yet.
+
+Ctrl+L clears and redraws the interface. On Unix, Ctrl+Z restores the terminal
+and suspends just the interface process; use the shell's `fg` to return. Its
+kernel and services run in an independent backend process group, so bus
+dispatch and later tool/model turns continue while the interface is stopped.
+Private pipes carry bounded frames; service stdout goes to the log, and output
+backpressure can drop progress previews while preserving final RPC settlement.
+Queued results are shown after resuming. This requires a shell with job control and a foreground
+process group (an orphaned process group can ignore SIGTSTP). Background color
+probing with OSC 11 is not implemented.
+
+## License
+
+Molt is dual-licensed under the [MIT license](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option. Contributions are accepted under the same terms; see [CONTRIBUTING.md](CONTRIBUTING.md#license).

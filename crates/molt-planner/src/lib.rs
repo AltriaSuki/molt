@@ -11,11 +11,14 @@ mod control;
 mod ctx;
 mod designer;
 mod fit;
+pub mod hooks;
 mod instructions;
+mod judge;
 mod memory;
 mod prompts;
 mod review;
 mod runner;
+mod select;
 mod tools;
 
 use std::sync::Arc;
@@ -33,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 /// Planner settings. [`Config::from_env`] documents the variables.
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub hooks: Vec<hooks::Hook>,
     /// Model for runs that name none; `None` leaves the choice to the gateway.
     pub default_model: Option<String>,
     pub max_turns: u32,
@@ -63,11 +67,15 @@ pub struct Config {
     /// Names of the project's instruction files, looked for in the
     /// workspace root and the directories the task names.
     pub instruction_files: Vec<String>,
+    /// What the model's file writes and edits do about syntax errors they
+    /// introduce, for runs that do not say.
+    pub syntax_check: molt_api::fs::SyntaxCheck,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
+            hooks: Vec::new(),
             default_model: None,
             max_turns: 50,
             max_check_rounds: 3,
@@ -82,6 +90,7 @@ impl Default for Config {
             frame_bytes: molt_transport::MAX_FRAME,
             state_dir: None,
             instruction_files: vec!["AGENTS.md".into(), "CLAUDE.md".into()],
+            syntax_check: molt_api::fs::SyntaxCheck::Report,
         }
     }
 }
@@ -90,7 +99,8 @@ impl Config {
     /// [`Config::default`] overridden by `MOLT_PLANNER_MODEL`,
     /// `MOLT_MAX_TURNS`, `MOLT_MAX_CHECK_ROUNDS`, `MOLT_BUDGET_USD`,
     /// `MOLT_MAX_TOKENS`, `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
-    /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS` and `MOLT_INSTRUCTION_FILES`.
+    /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES` and
+    /// `MOLT_SYNTAX_CHECK`.
     ///
     /// | Variable | Default |
     /// |---|---|
@@ -104,6 +114,7 @@ impl Config {
     /// | `MOLT_MAP_TOKENS` | `3000` (at most 32000) |
     /// | `MOLT_CONTEXT_TOKENS` | unset: 200000 for Claude models, 128000 for others |
     /// | `MOLT_INSTRUCTION_FILES` | `AGENTS.md,CLAUDE.md`; `none` reads none |
+    /// | `MOLT_SYNTAX_CHECK` | `report`; or `reject`, or `off` |
     ///
     /// An empty variable counts as unset. A value that does not parse is an
     /// error, and so is a zero: none of these limits has a "no limit" value.
@@ -131,7 +142,13 @@ impl Config {
             }
             None => d.budget_usd,
         };
+        let hooks = get("MOLT_HOOKS_JSON")
+            .map(|s| serde_json::from_str::<Vec<hooks::Hook>>(&s))
+            .transpose()?
+            .unwrap_or_default();
+        hooks::validate(&hooks)?;
         Ok(Self {
+            hooks,
             default_model: get("MOLT_PLANNER_MODEL"),
             max_turns: small("MOLT_MAX_TURNS", d.max_turns)?,
             max_check_rounds: small("MOLT_MAX_CHECK_ROUNDS", d.max_check_rounds)?,
@@ -159,6 +176,11 @@ impl Config {
                     names
                 }
             },
+            syntax_check: match get("MOLT_SYNTAX_CHECK") {
+                None => d.syntax_check,
+                Some(v) => serde_json::from_value(Value::String(v.clone()))
+                    .map_err(|_| anyhow::anyhow!("MOLT_SYNTAX_CHECK={v:?}: use report, reject or off"))?,
+            },
         })
     }
 }
@@ -182,6 +204,11 @@ pub trait Bus: Send + Sync + 'static {
     }
     /// Publish an event; failures are ignored.
     async fn publish(&self, topic: &str, payload: Value);
+    /// Whether this planner may call `target` at all. A bus that cannot
+    /// tell says no, so that no tool is offered that would only be refused.
+    fn holds(&self, _target: &str) -> bool {
+        false
+    }
 }
 
 /// [`Bus`] over a real service link.
@@ -189,6 +216,10 @@ pub struct ServiceBus(pub Arc<Service>);
 
 #[async_trait]
 impl Bus for ServiceBus {
+    fn holds(&self, target: &str) -> bool {
+        target.parse::<Target>().ok().and_then(|t| self.0.cap_for(&t)).is_some()
+    }
+
     async fn call(&self, target: &str, payload: Value, budget: Budget, trace: &TraceId) -> Result<Value, RemoteError> {
         let opts = CallOpts { cap: None, budget, trace: Some(trace.clone()) };
         self.0.call(target, payload, opts).await.map_err(|e| match e {
@@ -388,6 +419,7 @@ mod tests {
         assert_eq!(cfg.max_concurrent_runs, d.max_concurrent_runs);
         assert_eq!(cfg.map_tokens, 3_000);
         assert_eq!(cfg.instruction_files, ["AGENTS.md", "CLAUDE.md"]);
+        assert_eq!(cfg.syntax_check, molt_api::fs::SyntaxCheck::Report);
     }
 
     #[test]
@@ -414,6 +446,9 @@ mod tests {
         let files = |v: &str| from(&[("MOLT_INSTRUCTION_FILES", v)]).unwrap().instruction_files;
         assert_eq!(files("AGENTS.md, .cursorrules,"), ["AGENTS.md", ".cursorrules"]);
         assert!(files("none").is_empty());
+        let syntax = |v: &str| from(&[("MOLT_SYNTAX_CHECK", v)]).unwrap().syntax_check;
+        assert_eq!(syntax("reject"), molt_api::fs::SyntaxCheck::Reject);
+        assert_eq!(syntax(" off "), molt_api::fs::SyntaxCheck::Off);
     }
 
     #[test]
@@ -438,6 +473,7 @@ mod tests {
         assert!(from(&[("MOLT_CHECK_TIMEOUT_S", "1.5")]).is_err());
         assert!(from(&[("MOLT_INSTRUCTION_FILES", "docs/AGENTS.md")]).is_err());
         assert!(from(&[("MOLT_INSTRUCTION_FILES", "..")]).is_err());
+        assert!(from(&[("MOLT_SYNTAX_CHECK", "strict")]).unwrap_err().to_string().contains("report, reject or off"));
         // Empty means unset.
         assert_eq!(from(&[("MOLT_PLANNER_MODEL", " ")]).unwrap().default_model, None);
     }

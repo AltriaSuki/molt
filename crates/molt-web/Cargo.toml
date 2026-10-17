@@ -1,0 +1,17 @@
+[package]
+name = "molt-web"
+description = "Molt's web service: pages from the hosts the user allowed, over HTTPS, for attempts whose commands have no network"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+molt-api.workspace = true
+molt-proto.workspace = true
+molt-sdk.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

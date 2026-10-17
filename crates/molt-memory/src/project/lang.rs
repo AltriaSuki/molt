@@ -3,7 +3,7 @@
 //! Symbols come from each grammar's tags query: a `definition.*` capture is
 //! a definition and a `reference.*` capture a reference, its kind being the
 //! part after the dot. Some grammars' queries leave out what the ranking
-//! needs, so a few supplements are appended (see [`Lang::query`]); a
+//! needs, so a few supplements are appended (see [`query`]); a
 //! supplement only ever adds patterns after the grammar's own, and a node
 //! keeps the tag of the earliest pattern that names it, so a definition is
 //! never demoted to a reference.
@@ -38,22 +38,10 @@ const MAX_FILE_TIME: Duration = Duration::from_secs(2);
 /// nesting keeps one alive per level at every step. Editors use the same.
 const MATCH_LIMIT: u32 = 256;
 /// Bump when extraction changes in a way the queries and grammars do not
-/// show (see [`Lang::fingerprint`]), so that every file is parsed again.
+/// show (see [`Tags::fingerprint`]), so that every file is parsed again.
 const REVISION: u32 = 1;
 
-/// A language Molt can parse symbols from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Lang {
-    Rust,
-    Python,
-    JavaScript,
-    TypeScript,
-    Tsx,
-    Go,
-    Java,
-    C,
-    Cpp,
-}
+pub(crate) use molt_syntax::Lang;
 
 /// Trait method signatures and constants; calls through a path
 /// (`Db::open(..)`), with a turbofish, and macros by path; the type named by a
@@ -107,109 +95,53 @@ const JAVA_EXTRA: &str = r#"
 (type_identifier) @name @reference.type
 "#;
 
-impl Lang {
-    pub(crate) const ALL: [Lang; 9] = [
-        Lang::Rust,
-        Lang::Python,
-        Lang::JavaScript,
-        Lang::TypeScript,
-        Lang::Tsx,
-        Lang::Go,
-        Lang::Java,
-        Lang::C,
-        Lang::Cpp,
-    ];
-
-    /// The language of a file, by its extension.
-    pub(crate) fn of(path: &str) -> Option<Lang> {
-        let name = path.rsplit('/').next().unwrap_or(path);
-        let (_, ext) = name.rsplit_once('.')?;
-        Some(match ext {
-            "rs" => Lang::Rust,
-            "py" | "pyi" => Lang::Python,
-            "js" | "mjs" | "cjs" | "jsx" => Lang::JavaScript,
-            "ts" | "mts" | "cts" => Lang::TypeScript,
-            "tsx" => Lang::Tsx,
-            "go" => Lang::Go,
-            "java" => Lang::Java,
-            "c" | "h" => Lang::C,
-            "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Lang::Cpp,
-            _ => return None,
-        })
-    }
-
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Lang::Rust => "rust",
-            Lang::Python => "python",
-            Lang::JavaScript => "javascript",
-            Lang::TypeScript => "typescript",
-            Lang::Tsx => "tsx",
-            Lang::Go => "go",
-            Lang::Java => "java",
-            Lang::C => "c",
-            Lang::Cpp => "cpp",
-        }
-    }
-
-    fn language(self) -> Language {
-        match self {
-            Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
-            Lang::Python => tree_sitter_python::LANGUAGE.into(),
-            Lang::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-            Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
-            Lang::Go => tree_sitter_go::LANGUAGE.into(),
-            Lang::Java => tree_sitter_java::LANGUAGE.into(),
-            Lang::C => tree_sitter_c::LANGUAGE.into(),
-            Lang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-        }
-    }
-
-    /// The tags query. TypeScript's own only covers what JavaScript lacks
-    /// (interfaces, signatures, modules), so it is appended to JavaScript's:
-    /// the TypeScript grammars extend the JavaScript one, so its patterns
-    /// apply as they are. JavaScript also ships a locals query, which would
-    /// drop references to local variables; none of its tags patterns asks for
-    /// that, and tracking scopes costs time quadratic in their number.
-    fn query(self) -> String {
-        match self {
-            Lang::Rust => format!("{}\n{RUST_EXTRA}", tree_sitter_rust::TAGS_QUERY),
-            Lang::Python => tree_sitter_python::TAGS_QUERY.to_owned(),
-            Lang::JavaScript => tree_sitter_javascript::TAGS_QUERY.to_owned(),
-            Lang::TypeScript | Lang::Tsx => {
-                let (js, ts) = (tree_sitter_javascript::TAGS_QUERY, tree_sitter_typescript::TAGS_QUERY);
-                format!("{js}\n{ts}\n{TS_EXTRA}")
-            }
-            Lang::Go => tree_sitter_go::TAGS_QUERY.to_owned(),
-            Lang::Java => format!("{}\n{JAVA_EXTRA}", tree_sitter_java::TAGS_QUERY),
-            Lang::C => format!("{}\n{C_EXTRA}", tree_sitter_c::TAGS_QUERY),
-            Lang::Cpp => format!("{}\n{CPP_EXTRA}", tree_sitter_cpp::TAGS_QUERY),
-        }
-    }
-
-    fn index(self) -> usize {
-        Self::ALL.iter().position(|l| *l == self).unwrap_or(0)
-    }
-
+/// What the symbol index needs of a language beyond its grammar.
+pub(crate) trait Tags: Sized {
     /// The language's compiled query, built on first use and shared by every
     /// thread (only the parser and cursor are per thread). `None` if it does
     /// not build, which the tests rule out.
-    pub(crate) fn tagger(self) -> Option<&'static Tagger> {
-        static TAGGERS: [OnceLock<Option<Tagger>>; Lang::ALL.len()] = [const { OnceLock::new() }; Lang::ALL.len()];
-        TAGGERS[self.index()]
-            .get_or_init(|| {
-                Tagger::new(self).inspect_err(|e| tracing::warn!("cannot parse {} symbols: {e}", self.name())).ok()
-            })
-            .as_ref()
-    }
+    fn tagger(self) -> Option<&'static Tagger>;
 
     /// What files in this language are parsed with: the grammar, the query
     /// and the limits. A file stored under another fingerprint is parsed
     /// again, so a new grammar or query applies to every file. `None` when
     /// the language cannot be parsed: its files are then tried each time.
-    pub(crate) fn fingerprint(self) -> Option<&'static str> {
+    fn fingerprint(self) -> Option<&'static str> {
         self.tagger().map(|t| t.fingerprint.as_str())
+    }
+}
+
+impl Tags for Lang {
+    fn tagger(self) -> Option<&'static Tagger> {
+        static TAGGERS: [OnceLock<Option<Tagger>>; Lang::ALL.len()] = [const { OnceLock::new() }; Lang::ALL.len()];
+        let index = Lang::ALL.iter().position(|l| *l == self).unwrap_or(0);
+        TAGGERS[index]
+            .get_or_init(|| {
+                Tagger::new(self).inspect_err(|e| tracing::warn!("cannot parse {} symbols: {e}", self.name())).ok()
+            })
+            .as_ref()
+    }
+}
+
+/// The tags query. TypeScript's own only covers what JavaScript lacks
+/// (interfaces, signatures, modules), so it is appended to JavaScript's:
+/// the TypeScript grammars extend the JavaScript one, so its patterns
+/// apply as they are. JavaScript also ships a locals query, which would
+/// drop references to local variables; none of its tags patterns asks for
+/// that, and tracking scopes costs time quadratic in their number.
+fn query(lang: Lang) -> String {
+    match lang {
+        Lang::Rust => format!("{}\n{RUST_EXTRA}", tree_sitter_rust::TAGS_QUERY),
+        Lang::Python => tree_sitter_python::TAGS_QUERY.to_owned(),
+        Lang::JavaScript => tree_sitter_javascript::TAGS_QUERY.to_owned(),
+        Lang::TypeScript | Lang::Tsx => {
+            let (js, ts) = (tree_sitter_javascript::TAGS_QUERY, tree_sitter_typescript::TAGS_QUERY);
+            format!("{js}\n{ts}\n{TS_EXTRA}")
+        }
+        Lang::Go => tree_sitter_go::TAGS_QUERY.to_owned(),
+        Lang::Java => format!("{}\n{JAVA_EXTRA}", tree_sitter_java::TAGS_QUERY),
+        Lang::C => format!("{}\n{C_EXTRA}", tree_sitter_c::TAGS_QUERY),
+        Lang::Cpp => format!("{}\n{CPP_EXTRA}", tree_sitter_cpp::TAGS_QUERY),
     }
 }
 
@@ -229,7 +161,7 @@ pub(crate) struct Tagger {
 impl Tagger {
     fn new(lang: Lang) -> Result<Self, String> {
         let language = lang.language();
-        let text = lang.query();
+        let text = query(lang);
         let query = Query::new(&language, &text).map_err(|e| e.to_string())?;
         let names = query.capture_names();
         let name = names.iter().position(|n| *n == "name").ok_or("the query has no @name")? as u32;
@@ -452,20 +384,6 @@ mod tests {
             let fingerprint = lang.fingerprint().unwrap_or_else(|| panic!("{lang:?} has no query"));
             assert!(seen.insert(fingerprint), "{lang:?}");
         }
-    }
-
-    #[test]
-    fn languages_are_chosen_by_extension() {
-        assert_eq!(Lang::of("src/main.rs"), Some(Lang::Rust));
-        assert_eq!(Lang::of("a/b.pyi"), Some(Lang::Python));
-        assert_eq!(Lang::of("web/app.mjs"), Some(Lang::JavaScript));
-        assert_eq!(Lang::of("web/app.cts"), Some(Lang::TypeScript));
-        assert_eq!(Lang::of("web/App.tsx"), Some(Lang::Tsx));
-        assert_eq!(Lang::of("inc/x.h"), Some(Lang::C));
-        assert_eq!(Lang::of("inc/x.hpp"), Some(Lang::Cpp));
-        assert_eq!(Lang::of("README.md"), None);
-        assert_eq!(Lang::of("Makefile"), None);
-        assert_eq!(Lang::of("dir.rs/Makefile"), None);
     }
 
     #[test]

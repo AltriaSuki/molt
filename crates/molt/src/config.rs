@@ -30,7 +30,7 @@ use molt_proto::{Budget, CapRequest, Exec, Manifest, ServiceId, Target, Tier};
 use molt_transport::Secret;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportKind {
     #[default]
@@ -54,7 +54,7 @@ fn five() -> u32 {
     5
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelSection {
     #[serde(default = "default_data_dir")]
@@ -73,7 +73,7 @@ impl Default for KernelSection {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceSection {
     pub name: ServiceId,
@@ -149,7 +149,7 @@ impl ServiceSection {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -158,11 +158,13 @@ pub struct Config {
     pub services: Vec<ServiceSection>,
     #[serde(default)]
     pub confirm: ConfirmSection,
+    #[serde(default)]
+    pub hooks: Vec<molt_planner::hooks::Hook>,
 }
 
 /// When the interface's confirm mode stops for the user. It goes on by
 /// itself when nothing here calls for a look.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfirmSection {
     /// Stop before applying a result that adds and removes more lines than this.
@@ -236,11 +238,15 @@ const PLANNER_ENV: &[&str] = &[
     "MOLT_MAP_TOKENS",
     "MOLT_CONTEXT_TOKENS",
     "MOLT_INSTRUCTION_FILES",
+    "MOLT_SYNTAX_CHECK",
 ];
 
 /// What the memory service reads from its environment (see `molt_memory::Config::from_env`).
 const MEMORY_ENV: &[&str] =
     &["MOLT_MEMORY_MODEL", "MOLT_MEMORY_EFFORT", "MOLT_MEMORY_MAX_TOKENS", "MOLT_MEMORY_MODEL_TIMEOUT_S"];
+
+/// The web service's name.
+pub const WEB: &str = "web";
 
 /// The memory database in a data dir.
 pub const MEMORY_DB: &str = "memory.db";
@@ -340,7 +346,62 @@ impl Config {
             kernel: KernelSection { data_dir: data_dir.to_path_buf(), ..KernelSection::default() },
             services: vec![model, fs, shell, memory, planner],
             confirm: ConfirmSection::default(),
+            hooks: Vec::new(),
         })
+    }
+
+    /// Have the memory service keep the notes about `paths` under the
+    /// project id `id` (see `molt_memory::Project`).
+    pub fn for_project(&mut self, id: &str, paths: &[PathBuf]) -> anyhow::Result<()> {
+        let Some(exec) = self.service_mut("memory").and_then(|s| s.exec.as_mut()) else { return Ok(()) };
+        if paths.is_empty() {
+            return Ok(());
+        }
+        exec.args.extend(["--project".into(), id.to_owned()]);
+        for path in paths {
+            let path = path.to_str().with_context(|| format!("{} is not UTF-8", path.display()))?;
+            exec.args.extend(["--project-path".into(), path.to_owned()]);
+        }
+        Ok(())
+    }
+
+    /// Have the memory service keep the user's notes for every project in
+    /// the database at `path`, shared by all of them.
+    pub fn with_user_db(&mut self, path: &Path) -> anyhow::Result<()> {
+        let Some(exec) = self.service_mut("memory").and_then(|s| s.exec.as_mut()) else { return Ok(()) };
+        let path = path.to_str().with_context(|| format!("{} is not UTF-8", path.display()))?;
+        exec.args.extend(["--user-db".into(), path.to_owned()]);
+        Ok(())
+    }
+
+    /// Add the web service, reading pages from `hosts` (see
+    /// `molt_web::Allow`), with its executable in `bin_dir`, and let the
+    /// planner call it. The service is protected: what the agent may read
+    /// from the network is the user's choice. Nothing changes when `hosts`
+    /// is empty.
+    pub fn allow_web(&mut self, hosts: &[String], bin_dir: &Path) -> anyhow::Result<()> {
+        if hosts.is_empty() {
+            return Ok(());
+        }
+        molt_web::Allow::parse(hosts).map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            self.service(WEB).is_none(),
+            "this config already has a web service: list the hosts in its --allow arguments instead"
+        );
+        let command = bin_dir.join("molt-web").to_str().context("the molt-web path is not UTF-8")?.to_owned();
+        let args = hosts.iter().flat_map(|h| ["--allow".to_owned(), h.clone()]).collect();
+        let web = ServiceSection::new(
+            ServiceId::new(WEB)?,
+            Tier::Protected,
+            Exec { command, args },
+            vec![format!("{WEB}.*").parse()?],
+        );
+        let planner = self.service_mut("planner").context("there is no planner to read the web for")?;
+        planner
+            .requests
+            .push(CapRequest { target: molt_api::web::FETCH.parse()?, budget: Budget::new(0, 0, 1_000_000) });
+        self.services.push(web);
+        Ok(())
     }
 
     pub fn service(&self, name: &str) -> Option<&ServiceSection> {
@@ -574,5 +635,32 @@ mod tests {
         }
         // One run of 8 attempts x 50 turns at 32k tokens each fits many times over.
         assert!(planner.requests[0].budget.tokens >= 8 * 50 * 32_000 * 100);
+    }
+
+    #[test]
+    fn allowing_web_hosts_adds_a_protected_web_service_the_planner_may_call() {
+        let bin = Path::new("/opt/molt/bin");
+        let mut cfg = Config::agent(Path::new("/w"), Path::new("/d"), bin).unwrap();
+        cfg.allow_web(&[], bin).unwrap();
+        assert!(cfg.service(WEB).is_none(), "no hosts, no service");
+
+        let hosts = ["docs.rs".to_owned(), "*.python.org".to_owned()];
+        cfg.allow_web(&hosts, bin).unwrap();
+        let web = cfg.service(WEB).unwrap();
+        assert_eq!(web.tier, Tier::Protected);
+        let exec = web.exec.as_ref().unwrap();
+        assert_eq!(exec.command, "/opt/molt/bin/molt-web");
+        assert_eq!(exec.args, ["--allow", "docs.rs", "--allow", "*.python.org"]);
+        assert_eq!(web.provides, ["web.*".parse::<Target>().unwrap()]);
+        assert!(web.requests.is_empty() && web.pass_env.is_empty(), "it holds no capability and no secret");
+        let planner = cfg.service("planner").unwrap();
+        assert!(planner.requests.iter().any(|r| r.target.to_string() == molt_api::web::FETCH));
+
+        let err = cfg.allow_web(&hosts, bin).unwrap_err().to_string();
+        assert!(err.contains("already has a web service"), "{err}");
+        let mut fresh = Config::agent(Path::new("/w"), Path::new("/d"), bin).unwrap();
+        let err = fresh.allow_web(&["http://docs.rs".to_owned()], bin).unwrap_err().to_string();
+        assert!(err.contains("not a host to allow"), "{err}");
+        assert!(fresh.service(WEB).is_none());
     }
 }

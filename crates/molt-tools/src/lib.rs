@@ -139,7 +139,9 @@ impl Fs {
                 blocking(method, payload, move |req: api::WriteRequest| {
                     let (workspace, path) = (req.workspace.clone(), req.path.clone());
                     let reply = files::write(&roots, req)?;
-                    Ok((reply, files::changed(&roots, &workspace, &path)))
+                    let changed =
+                        if files::rejected(&reply.syntax) { None } else { files::changed(&roots, &workspace, &path) };
+                    Ok((reply, changed))
                 })
                 .await
             }
@@ -147,7 +149,9 @@ impl Fs {
                 blocking(method, payload, move |req: api::EditRequest| {
                     let (workspace, path) = (req.workspace.clone(), req.path.clone());
                     let reply = files::edit(&roots, req)?;
-                    Ok((reply, files::changed(&roots, &workspace, &path)))
+                    let changed =
+                        if files::rejected(&reply.syntax) { None } else { files::changed(&roots, &workspace, &path) };
+                    Ok((reply, changed))
                 })
                 .await
             }

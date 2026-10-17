@@ -11,6 +11,13 @@
 //! that disagrees with an existing one is kept next to it, both at lower
 //! confidence, until more evidence settles it.
 //!
+//! Notes live in two layers. **Project** notes are kept with the project:
+//! everything learning writes is one. **User** notes hold in every project,
+//! such as how the user wants answers; they are kept in a user-level
+//! database, and only a person puts them there: by remembering one without
+//! a workspace, or by promoting a project note ([`PROMOTE`]) that learning
+//! proposed. Recall returns both, each marked with its [`Layer`].
+//!
 //! **The project model** is the symbol and dependency graph of a workspace's
 //! source files: where each function, type and method is defined and where it
 //! is used. [`INDEX`] brings it up to date incrementally (only files whose
@@ -28,6 +35,7 @@ pub const REMEMBER: &str = "memory.remember";
 pub const RECALL: &str = "memory.recall";
 pub const FORGET: &str = "memory.forget";
 pub const RETRACT: &str = "memory.retract";
+pub const UNDO: &str = "memory.undo";
 pub const CONSOLIDATE: &str = "memory.consolidate";
 pub const INDEX: &str = "memory.index";
 pub const MAP: &str = "memory.map";
@@ -35,6 +43,7 @@ pub const SYMBOLS: &str = "memory.symbols";
 pub const FORK_SYMBOLS: &str = "memory.fork_symbols";
 pub const REVIEW: &str = "memory.review";
 pub const CORRECT: &str = "memory.correct";
+pub const PROMOTE: &str = "memory.promote";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -187,6 +196,35 @@ pub struct NoteDetails {
     /// The user's explanation for the latest review or correction.
     #[serde(default)]
     pub reason: String,
+    /// Learning thought this project note may hold in every project. It is
+    /// only a proposal: nothing reaches the user layer until a person
+    /// promotes it (see [`PROMOTE`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub everywhere: bool,
+    /// The user-layer note this project note was promoted to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_to: Option<String>,
+    /// The project note this user-layer note was promoted from, as
+    /// `NOTE_ID in PROJECT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_from: Option<String>,
+}
+
+/// Where a recalled note is kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Layer {
+    /// With the project, in its own database.
+    #[default]
+    Project,
+    /// With the user, in every project: the user-level database.
+    User,
+}
+
+impl Layer {
+    pub fn is_project(&self) -> bool {
+        *self == Self::Project
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +252,25 @@ pub struct Recalled {
     pub reason: RecallReason,
     #[serde(default)]
     pub details: NoteDetails,
+    #[serde(default, skip_serializing_if = "Layer::is_project")]
+    pub layer: Layer,
+}
+
+/// Copy a project note to the user layer, where every project recalls it.
+/// Only a person does this, through the CLI: learning can only propose it.
+/// The project note and its evidence stay as they are.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromoteRequest {
+    pub workspace: String,
+    pub id: String,
+    /// Why it holds everywhere.
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PromoteResponse {
+    /// The user-layer note.
+    pub note: Note,
 }
 
 /// Immutable notes returned for one planner context or tool call.
@@ -295,6 +352,18 @@ pub struct RetractResponse {
     pub adjusted: u64,
 }
 
+/// Take back what a run's episode did to the notes, because the user undid
+/// its result: the notes only it bore out are forgotten, and the notes it
+/// reinforced or contradicted are worked out again without it. The run is
+/// not learned from again. Only the CLI may ask. Answered with a
+/// [`RetractResponse`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndoRequest {
+    /// The run's trace id.
+    pub run: String,
+    pub reason: String,
+}
+
 /// Learn from a finished episode: read it from the audit log, have the model
 /// extract what will help later tasks in `workspace`, and merge that into
 /// the notes.
@@ -319,6 +388,10 @@ pub struct ConsolidateResponse {
     /// Why nothing was learned, when nothing was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped: Option<String>,
+    /// Ids of project notes learning proposes for every project, waiting
+    /// for a person to promote them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposed: Vec<String>,
     pub usage: Usage,
     pub cost_usd: f64,
 }

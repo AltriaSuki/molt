@@ -4,13 +4,15 @@ use std::process::ExitCode;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use molt::agent::{self, Interrupted};
-use molt::{Config, Secrets};
+use molt::{git, Config, Secrets};
+use molt_api::fs::SyntaxCheck;
 use molt_api::memory::{
-    self, CorrectRequest, ForgetRequest, ForgetResponse, MapRequest, RecallRequest, RecallResponse, ReviewRequest,
-    ReviewResponse,
+    self, CorrectRequest, ForgetRequest, ForgetResponse, Layer, MapRequest, NoteKind, PromoteRequest, PromoteResponse,
+    RecallRequest, RecallResponse, RememberRequest, RememberResponse, RetractResponse, ReviewRequest, ReviewResponse,
+    UndoRequest,
 };
 use molt_api::model::Effort;
-use molt_api::planner::{Outcome, Resume, RunRequest};
+use molt_api::planner::{Outcome, Resume, RunRequest, Select};
 use molt_planner::checkpoint;
 use molt_proto::{ServiceId, TraceId};
 
@@ -33,6 +35,8 @@ enum Cmd {
     /// Open the interface: tasks one after another in a workspace, the
     /// check shown before the attempts start, and what memory holds.
     Ui(UiArgs),
+    #[command(hide = true)]
+    UiBackend,
     /// Start the kernel and the configured services; stop on Ctrl-C, SIGTERM or SIGHUP.
     Run,
     /// Carry out a task in a workspace with the agent services, verified by a done-check.
@@ -40,17 +44,28 @@ enum Cmd {
         after_help = "Exit status: 0 when the run passed (or finished unverified) and its changes are applied, \
                             or kept as --no-apply asks; 1 when no attempt passed, or on an error; 2 for a usage error; \
                             3 when the run passed but its changes could not be applied and are kept in the fork the \
-                            report names; 128+N when stopped by signal N (130 for Ctrl-C, 129 for SIGHUP, 143 for SIGTERM)."
+                            report names; 4 when they are applied but --commit could not commit them; 128+N when \
+                            stopped by signal N (130 for Ctrl-C, 129 for SIGHUP, 143 for SIGTERM)."
     )]
     Do(DoArgs),
     /// Go on with a run of `molt do --checkpoint` that stopped before it
     /// finished, from its last checkpoint. Its attempts keep their forks and
     /// conversations, and the cost so far counts against its budget.
     Resume(ResumeArgs),
+    /// Take back the commit `molt do --commit` made for a run, with a new
+    /// commit that puts its files back, and have memory no longer count
+    /// what the run showed.
+    Undo(UndoArgs),
     /// See and correct what memory holds about a project.
     Memory {
         #[command(subcommand)]
         cmd: MemoryCmd,
+    },
+    /// The projects molt knows: each keeps its notes under a stable id,
+    /// whatever directories it has, or none.
+    Project {
+        #[command(subcommand)]
+        cmd: ProjectCmd,
     },
     /// Benchmark Molt against a plain agent loop on coding tasks graded by hidden tests.
     Bench {
@@ -86,6 +101,12 @@ struct DoArgs {
     /// Parallel attempts.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=8))]
     attempts: u32,
+    /// How to pick among attempts that pass: `first` takes the first and
+    /// cancels the rest; `wait:<seconds>` gives the others that long to pass
+    /// too, and `all` lets every attempt finish, then the passing ones are
+    /// compared (project suite, diff size, review).
+    #[arg(long, default_value = "first", value_name = "first|wait:<seconds>|all")]
+    select: Select,
     /// Model for the attempts: opus, sonnet, haiku or a model id.
     #[arg(long)]
     model: Option<String>,
@@ -95,6 +116,16 @@ struct DoArgs {
     /// Model turns per attempt.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     max_turns: Option<u32>,
+    /// What the model's file writes and edits do about syntax errors they
+    /// introduce: report them with the result, reject the change, or off.
+    /// Default: the planner's (report).
+    #[arg(long, value_name = "MODE", value_parser = syntax_check)]
+    syntax_check: Option<SyntaxCheck>,
+    /// Model for the judge of a task no command can check, which decides
+    /// the result against criteria the planner sets: opus, sonnet, haiku or a
+    /// model id. Default: the attempts' model.
+    #[arg(long, value_name = "MODEL")]
+    judge_model: Option<String>,
     /// Save a checkpoint as the run goes, so that a run stopped before it
     /// finishes (interrupted, out of budget, killed) can go on with `molt resume`.
     #[arg(long)]
@@ -109,6 +140,10 @@ struct RunArgs {
     /// The project to work on.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    /// A project of `molt project list`, by id or name, in place of
+    /// --workspace: its directory, or its own private one when it has none.
+    #[arg(long, conflicts_with = "workspace")]
+    project: Option<String>,
     /// Spending limit for the whole run, learning included, in US dollars.
     /// It is checked before each model call, so the last one can go past it.
     /// For `molt resume`, it replaces the stopped run's, which counts what
@@ -118,6 +153,15 @@ struct RunArgs {
     /// Keep the result in its fork instead of applying it to the workspace.
     #[arg(long)]
     no_apply: bool,
+    /// Commit the applied result to git: exactly the files the run merged,
+    /// with a `Molt-Run:` trailer naming the run. What you have staged stays
+    /// staged and out of the commit. `molt undo` takes it back.
+    #[arg(long, conflicts_with = "no_apply")]
+    commit: bool,
+    /// With --commit, commit on a new branch NAME, made from the current
+    /// commit and switched to.
+    #[arg(long, value_name = "NAME", requires = "commit")]
+    branch: Option<String>,
     /// Print the result as JSON.
     #[arg(long)]
     json: bool,
@@ -138,6 +182,12 @@ struct RunArgs {
     /// Trusted shell sandbox JSON policy outside the project and scratch.
     #[arg(long)]
     sandbox_policy: Option<PathBuf>,
+    /// Let the agent read web pages from this host (repeatable): `docs.rs`,
+    /// or `*.python.org` for the hosts below it. Pages are fetched over
+    /// https by a service of their own and recorded in the audit log;
+    /// commands still have no network.
+    #[arg(long, value_name = "HOST")]
+    allow_web: Vec<String>,
     /// Run without memory: no project map or notes for the model, and
     /// nothing learned from the run.
     #[arg(long)]
@@ -178,6 +228,9 @@ struct UiArgs {
     /// The project to work on.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    /// A project of `molt project list`, by id or name, in place of --workspace.
+    #[arg(long, conflicts_with = "workspace")]
+    project: Option<String>,
     /// Where kernel state and forks go. Default: ~/.cache/molt/<project>-<hash>.
     #[arg(long)]
     data_dir: Option<PathBuf>,
@@ -185,6 +238,19 @@ struct UiArgs {
     /// runs (repeatable).
     #[arg(long, value_name = "NAME", value_parser = env_name)]
     pass_env: Vec<String>,
+    /// Let the agent read web pages from this host (repeatable): `docs.rs`,
+    /// or `*.python.org` for the hosts below it.
+    #[arg(long, value_name = "HOST")]
+    allow_web: Vec<String>,
+}
+
+#[derive(Args)]
+struct UndoArgs {
+    /// The run to take back, as its commit's `Molt-Run:` trailer names it.
+    /// Default: the newest run on the current branch not taken back yet.
+    run: Option<String>,
+    #[command(flatten)]
+    at: MemoryAt,
 }
 
 /// Where a project's memory is.
@@ -193,6 +259,9 @@ struct MemoryAt {
     /// The project.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    /// A project of `molt project list`, by id or name, in place of --workspace.
+    #[arg(long, conflicts_with = "workspace")]
+    project: Option<String>,
     /// The data dir `molt do` used there. Default: ~/.cache/molt/<project>-<hash>.
     #[arg(long)]
     data_dir: Option<PathBuf>,
@@ -227,6 +296,31 @@ enum MemoryCmd {
         /// Print the notes as JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Write a note down yourself: about the project, or with --global
+    /// about you, for every project.
+    Remember {
+        #[command(flatten)]
+        at: MemoryAt,
+        /// One self-contained sentence, such as "Answer in Chinese."
+        text: String,
+        /// Keep it in your own layer, recalled in every project.
+        #[arg(long)]
+        global: bool,
+        /// fact, convention, decision, preference or lesson.
+        #[arg(long, default_value = "preference")]
+        kind: NoteKind,
+    },
+    /// Copy a project note to your own layer, recalled in every project.
+    /// Learning only proposes this ("proposed for every project" in show).
+    Promote {
+        #[command(flatten)]
+        at: MemoryAt,
+        /// The note's id, as `molt memory show` prints it.
+        id: String,
+        /// Why it holds in every project.
+        #[arg(long)]
+        reason: String,
     },
     /// Forget a note. It is kept as a tombstone with the reason, and the
     /// forget is recorded in the audit log.
@@ -278,6 +372,15 @@ fn usd(text: &str) -> Result<f64, String> {
     }
 }
 
+fn syntax_check(text: &str) -> Result<SyntaxCheck, String> {
+    match text {
+        "report" => Ok(SyntaxCheck::Report),
+        "reject" => Ok(SyntaxCheck::Reject),
+        "off" => Ok(SyntaxCheck::Off),
+        _ => Err(format!("{text:?} is not a mode: use report, reject or off")),
+    }
+}
+
 /// A variable `--pass-env` may name. The shell service keeps MOLT_* and
 /// ANTHROPIC_* variables from its commands, so passing one would only put a
 /// secret in its process.
@@ -289,6 +392,36 @@ fn env_name(name: &str) -> Result<String, String> {
         return Err("commands never see MOLT_*, ANTHROPIC_* or OPENAI_* variables".into());
     }
     Ok(name.to_owned())
+}
+
+#[derive(Subcommand)]
+enum ProjectCmd {
+    /// Register a project called NAME, for the directory --path or, without
+    /// one, for work with no folder (it works in a private one of its own).
+    New {
+        name: String,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// List the projects, with their ids, directories and data dirs.
+    List,
+    /// Tell molt a project's directory moved to NEW_DIR. Its notes, audit
+    /// log and stopped runs stay with it.
+    Move {
+        /// The project's id or name.
+        project: String,
+        new_dir: PathBuf,
+        /// The directory that moved, when the project has several.
+        #[arg(long)]
+        from: Option<PathBuf>,
+    },
+    /// Add DIR, such as another clone, to a project: it shares the project's
+    /// notes and data dir.
+    Add {
+        /// The project's id or name.
+        project: String,
+        dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -334,7 +467,13 @@ async fn main() -> anyhow::Result<ExitCode> {
     molt::init_tracing(
         if matches!(
             cmd,
-            Cmd::Do(_) | Cmd::Resume(_) | Cmd::Memory { .. } | Cmd::Bench { .. } | Cmd::Prices { .. } | Cmd::Ui(_)
+            Cmd::Do(_)
+                | Cmd::Resume(_)
+                | Cmd::Undo(_)
+                | Cmd::Memory { .. }
+                | Cmd::Bench { .. }
+                | Cmd::Prices { .. }
+                | Cmd::Ui(_)
         ) {
             "warn"
         } else {
@@ -353,13 +492,16 @@ async fn main() -> anyhow::Result<ExitCode> {
             let opts = molt::tui::Options {
                 config: cli.config,
                 workspace: args.workspace,
+                project: args.project,
                 data_dir: args.data_dir,
                 pass_env: args.pass_env,
+                allow_web: args.allow_web,
             };
             for fork in molt::tui::run(opts).await? {
                 eprintln!("kept: {}", agent::printable(&fork));
             }
         }
+        Cmd::UiBackend => molt::tui::serve_backend().await?,
         Cmd::Run => {
             let stop = molt::stop_signal()?;
             let cfg = config()?;
@@ -371,7 +513,9 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
         Cmd::Do(args) => return do_task(cli.config.as_deref(), args).await,
         Cmd::Resume(args) => return resume_task(cli.config.as_deref(), args).await,
+        Cmd::Undo(args) => return undo_cmd(cli.config.as_deref(), args).await,
         Cmd::Memory { cmd } => memory_cmd(cli.config.as_deref(), cmd).await?,
+        Cmd::Project { cmd } => project_cmd(cmd)?,
         Cmd::Bench { cmd } => return molt_bench::cli::main(cmd).await,
         Cmd::Prices { cmd } => return prices_cmd(cmd).await,
         Cmd::Audit { cmd: AuditCmd::Verify { path } } => {
@@ -506,9 +650,8 @@ fn cfg_scratch(args: &[String]) -> anyhow::Result<PathBuf> {
 
 /// The config and canonical workspace a run of `molt do` or `molt resume` uses.
 fn prepare(config: Option<&Path>, args: &RunArgs) -> anyhow::Result<(Config, String)> {
-    let workspace = args.workspace.canonicalize().with_context(|| format!("workspace {}", args.workspace.display()))?;
-    anyhow::ensure!(workspace.is_dir(), "the workspace {} is not a directory", workspace.display());
-    let mut cfg = agent::resolve_config(config, &workspace, args.data_dir.as_deref())?;
+    let (workspace, project) = agent::locate(args.project.as_deref(), &args.workspace, config.is_some())?;
+    let mut cfg = agent::resolve_config(config, &workspace, args.data_dir.as_deref(), project.as_ref())?;
     if let Some(path) = config {
         eprintln!("config: {}", agent::printable(&path.display().to_string()));
     }
@@ -540,6 +683,7 @@ fn prepare(config: Option<&Path>, args: &RunArgs) -> anyhow::Result<(Config, Str
     if args.no_memory {
         cfg.services.retain(|s| s.name.as_str() != agent::MEMORY);
     }
+    agent::allow_web(&mut cfg, &args.allow_web)?;
     if std::env::var_os("RUST_LOG").is_none() {
         for svc in &mut cfg.services {
             svc.env.entry("RUST_LOG".into()).or_insert_with(|| "warn".into());
@@ -557,9 +701,12 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     req.check = args.check;
     req.verify = !args.no_check;
     req.attempts = args.attempts;
+    req.select = args.select;
     req.model = args.model;
     req.effort = args.effort;
     req.max_turns = args.max_turns;
+    req.syntax_check = args.syntax_check;
+    req.judge_model = args.judge_model;
     req.budget_usd = args.common.budget_usd;
     req.apply = !args.common.no_apply;
     req.stream = args.common.stream;
@@ -645,6 +792,15 @@ async fn execute(
     let apply = req.apply;
     let checkpointed = req.checkpoint;
     let run = trace.to_string();
+    let task = req.task.clone();
+    // Looked at before the run, so that its own changes are told apart from the user's.
+    let target = match args.commit.then(|| commit_target(&req.workspace, args.branch.as_deref())).transpose()? {
+        Some(Err(e)) => {
+            eprintln!("{}", agent::printable(&format!("note: {e:#}; the result will be applied but not committed")));
+            Some(Err(e))
+        }
+        other => other,
+    };
     let mut signal = None;
     let stopped = async { signal = Some(stop.await) };
     let progress = |event: &_| eprintln!("{}", agent::describe(event));
@@ -664,9 +820,22 @@ async fn execute(
         Err(e) => return Err(e),
     };
     let resp = done.run;
+    let committed = match target {
+        Some(target) if resp.applied => {
+            Some(target.and_then(|before| before.commit(&resp, &run, &task, args.branch.as_deref())))
+        }
+        _ => None,
+    };
     if args.json {
         let mut out = serde_json::to_value(&resp)?;
         out["run"] = serde_json::json!(run);
+        if let Some(committed) = &committed {
+            out["commit"] = match committed {
+                Ok(Some(c)) => serde_json::json!({ "sha": c.sha, "branch": c.branch, "ignored": c.ignored }),
+                Ok(None) => serde_json::Value::Null,
+                Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+            };
+        }
         // What learning did and cost, next to the run's own spend.
         out["learning"] = done.learned.as_ref().map_or(serde_json::Value::Null, agent::learning_json);
         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -676,6 +845,28 @@ async fn execute(
     if let Some(learned) = &done.learned {
         eprintln!("{}", agent::learned(learned));
     }
+    let not_committed = match &committed {
+        None => false,
+        Some(Ok(None)) => {
+            eprintln!("nothing to commit: the workspace's commit has these files as they are");
+            false
+        }
+        Some(Ok(Some(c))) => {
+            let on = c.branch.as_deref().map_or_else(|| "a detached HEAD".to_owned(), |b| format!("branch {b}"));
+            eprintln!("{}", agent::printable(&format!("committed {} on {on}: {}", &c.sha[..12], c.subject)));
+            if !c.ignored.is_empty() {
+                eprintln!("{}", agent::printable(&format!("left out, as git ignores them: {}", c.ignored.join(", "))));
+            }
+            false
+        }
+        Some(Err(e)) => {
+            eprintln!(
+                "{}",
+                agent::printable(&format!("not committed: {e:#}. The result is applied; commit it yourself"))
+            );
+            true
+        }
+    };
     // A signal while memory learned from the run still ends it as stopped.
     if let Some(n) = signal {
         return Ok(ExitCode::from(u8::try_from(128 + n).unwrap_or(130)));
@@ -683,39 +874,104 @@ async fn execute(
     Ok(match resp.outcome {
         Outcome::Failed => ExitCode::FAILURE,
         // It passed, but the workspace does not have it: a script must not go on as if it did.
-        Outcome::Passed | Outcome::Unverified if apply && !resp.applied && resp.fork.is_some() => ExitCode::from(3),
-        Outcome::Passed | Outcome::Unverified => ExitCode::SUCCESS,
+        Outcome::Passed | Outcome::Unverified | Outcome::Judged if apply && !resp.applied && resp.fork.is_some() => {
+            ExitCode::from(3)
+        }
+        Outcome::Passed | Outcome::Unverified | Outcome::Judged if not_committed => ExitCode::from(4),
+        Outcome::Passed | Outcome::Unverified | Outcome::Judged => ExitCode::SUCCESS,
     })
+}
+
+/// The work tree `molt do --commit` commits in, looked at before the run;
+/// an inner error when the workspace is in none (the run still goes ahead
+/// and is applied). A `--branch` git would refuse is an error before
+/// anything starts.
+fn commit_target(workspace: &str, branch: Option<&str>) -> anyhow::Result<anyhow::Result<git::Before>> {
+    let before = match git::Before::look(Path::new(workspace)) {
+        Ok(before) => before,
+        Err(e) => return Ok(Err(e.context("--commit"))),
+    };
+    if let Some(name) = branch {
+        before.repo().check_new_branch(name)?;
+    }
+    Ok(Ok(before))
+}
+
+async fn undo_cmd(config: Option<&Path>, args: UndoArgs) -> anyhow::Result<ExitCode> {
+    let (workspace, project) = agent::locate(args.at.project.as_deref(), &args.at.workspace, config.is_some())?;
+    let repo = git::Repo::open(&workspace)?;
+    let run = match repo.undo(args.run.as_deref())? {
+        git::Undo::Reverted { run, commit, sha } => {
+            println!("undid run {run}: reverted {} in {}", &commit[..12], &sha[..12]);
+            run
+        }
+        git::Undo::Already { run, sha } => {
+            println!("run {run} was undone already, in {}", &sha[..12]);
+            run
+        }
+    };
+    let cfg = agent::memory_config(config, &workspace, args.at.data_dir.as_deref(), project.as_ref())?;
+    if !agent::memory_db(&cfg).is_some_and(|db| db.is_file()) {
+        eprintln!("memory has nothing about this project, so nothing to take back there");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let req = UndoRequest { run: run.clone(), reason: "the user undid the run with `molt undo`".into() };
+    match agent::call_memory(&cfg, memory::UNDO, serde_json::to_value(req)?).await {
+        Ok(reply) => {
+            let reply: RetractResponse = serde_json::from_value(reply)?;
+            eprintln!(
+                "memory no longer counts the run: {} notes only it showed forgotten, {} more worked out again",
+                reply.retracted, reply.adjusted
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            eprintln!("the commit is taken back, but memory could not be told: {e:#}. Run `molt undo {run}` again");
+            Ok(ExitCode::FAILURE)
+        }
+    }
 }
 
 async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()> {
     let at = match &cmd {
         MemoryCmd::Show { at, .. }
         | MemoryCmd::Forget { at, .. }
+        | MemoryCmd::Remember { at, .. }
+        | MemoryCmd::Promote { at, .. }
         | MemoryCmd::Map { at, .. }
         | MemoryCmd::Used { at, .. } => at,
         MemoryCmd::Review(r) | MemoryCmd::Correct { review: r, .. } => &r.at,
     };
-    let workspace = at.workspace.canonicalize().with_context(|| format!("workspace {}", at.workspace.display()))?;
-    let key = workspace.to_str().context("the workspace path is not UTF-8")?.to_owned();
-    let cfg = agent::memory_config(config, &workspace, at.data_dir.as_deref())?;
+    let (workspace, project) = agent::locate(at.project.as_deref(), &at.workspace, config.is_some())?;
+    let path = workspace.to_str().context("the workspace path is not UTF-8")?.to_owned();
+    // Notes about a project are kept under its id; the service maps the path to it.
+    let key = project.as_ref().map_or_else(|| path.clone(), |p| p.id.clone());
+    let cfg = agent::memory_config(config, &workspace, at.data_dir.as_deref(), project.as_ref())?;
     let open = || -> anyhow::Result<molt_memory::Db> {
         let db = agent::memory_db(&cfg).context("the memory service has no --db")?;
         anyhow::ensure!(db.is_file(), "memory has nothing yet ({} does not exist)", db.display());
-        molt_memory::Db::open(&db)
+        let db = molt_memory::Db::open(&db)?;
+        if let Some(project) = &project {
+            let paths = if project.paths.is_empty() { vec![workspace.clone()] } else { project.paths.clone() };
+            molt_memory::adopt(&db, &molt_memory::Project { id: project.id.clone(), paths })?;
+        }
+        Ok(db)
     };
     match cmd {
         MemoryCmd::Show { words, n, json, .. } => {
             let req = RecallRequest {
                 query: words.join(" "),
-                workspace: Some(key),
+                workspace: Some(path),
                 k: Some(n),
                 include_review: true,
                 ..Default::default()
             };
             // Dependency checks can change note state: keep those checks
             // on the audited service path too, rather than editing offline.
-            drop(open()?);
+            // A project with no notes of its own yet still has the user's.
+            if project.is_none() || agent::memory_db(&cfg).is_some_and(|db| db.is_file()) {
+                drop(open()?);
+            }
             let response: RecallResponse =
                 serde_json::from_value(agent::call_memory(&cfg, memory::RECALL, serde_json::to_value(req)?).await?)?;
             let notes = response.notes;
@@ -749,8 +1005,29 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
                 }
             }
         }
-        MemoryCmd::Review(r) => change_note(&cfg, key, r, None).await?,
-        MemoryCmd::Correct { review, text } => change_note(&cfg, key, review, Some(text)).await?,
+        MemoryCmd::Review(r) => change_note(&cfg, path, r, None).await?,
+        MemoryCmd::Correct { review, text } => change_note(&cfg, path, review, Some(text)).await?,
+        MemoryCmd::Remember { text, global, kind, .. } => {
+            let req = RememberRequest {
+                kind,
+                text,
+                workspace: (!global).then_some(path),
+                confidence: Some(0.95),
+                trace: TraceId::random().to_string(),
+                events: Vec::new(),
+                version: "user".into(),
+            };
+            let reply: RememberResponse =
+                serde_json::from_value(agent::call_memory(&cfg, memory::REMEMBER, serde_json::to_value(req)?).await?)?;
+            let layer = if reply.note.workspace.is_none() { "for every project" } else { "for this project" };
+            let verb = if reply.reinforced { "already knew" } else { "remembered" };
+            println!("{}", agent::printable(&format!("{verb} {} {layer}: {}", reply.note.id, reply.note.text)));
+        }
+        MemoryCmd::Promote { id, reason, .. } => {
+            let req = serde_json::to_value(PromoteRequest { workspace: path, id, reason })?;
+            let reply: PromoteResponse = serde_json::from_value(agent::call_memory(&cfg, memory::PROMOTE, req).await?)?;
+            println!("{}", agent::printable(&format!("{} for every project: {}", reply.note.id, reply.note.text)));
+        }
         MemoryCmd::Forget { id, reason, .. } => {
             let req = serde_json::to_value(ForgetRequest { id: id.clone(), reason })?;
             let reply: ForgetResponse = serde_json::from_value(agent::call_memory(&cfg, memory::FORGET, req).await?)?;
@@ -762,11 +1039,46 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
             let skip = agent::memory_skips(&cfg);
             molt_memory::project::index_skipping(&db, &workspace, None, &skip)
                 .map_err(|e| anyhow::anyhow!(e.message))?;
-            let req = MapRequest { workspace: key, query: words.join(" "), max_tokens: Some(tokens) };
+            let req = MapRequest { workspace: path, query: words.join(" "), max_tokens: Some(tokens) };
             let map = molt_memory::project::map(&db, &workspace, &req).map_err(|e| anyhow::anyhow!(e.message))?;
             print!("{}", agent::printable(&map.map));
             eprintln!("{} files, {} definitions, about {} tokens", map.files, map.symbols, map.tokens);
         }
+    }
+    Ok(())
+}
+
+fn project_cmd(cmd: ProjectCmd) -> anyhow::Result<()> {
+    let registry = molt::project::Registry::user()?;
+    let dir = |d: &Path| -> anyhow::Result<PathBuf> {
+        let d = d.canonicalize().with_context(|| format!("{}", d.display()))?;
+        anyhow::ensure!(d.is_dir(), "{} is not a directory", d.display());
+        Ok(d)
+    };
+    let show = |p: &molt::project::Project| {
+        let dirs = if p.paths.is_empty() {
+            "no folder".to_owned()
+        } else {
+            p.paths.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
+        };
+        println!("{}", agent::printable(&format!("{}  {}  {dirs}\n    data: {}", p.id, p.name, p.data_dir.display())));
+    };
+    match cmd {
+        ProjectCmd::New { name, path } => {
+            let path = path.as_deref().map(dir).transpose()?;
+            show(&registry.create(&name, path.as_deref(), |id| agent::project_data_dir(&name, id))?);
+        }
+        ProjectCmd::List => {
+            let projects = registry.list()?;
+            if projects.is_empty() {
+                eprintln!("no projects yet; one is registered the first time molt runs in a directory");
+            }
+            projects.iter().for_each(show);
+        }
+        ProjectCmd::Move { project, new_dir, from } => {
+            show(&registry.move_path(&project, &dir(&new_dir)?, from.as_deref())?);
+        }
+        ProjectCmd::Add { project, dir: d } => show(&registry.add_path(&project, &dir(&d)?)?),
     }
     Ok(())
 }
@@ -801,6 +1113,15 @@ fn show_notes(notes: &[molt_api::memory::Recalled]) -> String {
         }
         if !n.conflicts.is_empty() {
             extra.push(format!("disputed by {}", n.conflicts.join(", ")));
+        }
+        if r.layer == Layer::User {
+            extra.push("yours, for every project".into());
+        }
+        if r.details.everywhere {
+            extra.push("proposed for every project; `molt memory promote` it if so".into());
+        }
+        if let Some(to) = &r.details.promoted_to {
+            extra.push(format!("promoted as {to}"));
         }
         if r.details.temporary {
             extra.push("temporary experience; verify before reuse".into());

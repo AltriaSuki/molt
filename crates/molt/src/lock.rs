@@ -94,7 +94,14 @@ mod tests {
         assert!(err.contains("already running"), "{err}");
         assert!(err.contains(&format!("pid {}", std::process::id())), "{err}");
         drop(first);
-        DataDirLock::acquire(&data).unwrap();
+        // A process another test spawns at this moment holds a copy of the
+        // lock's descriptor from fork until exec closes it, so the lock is
+        // free again only once that exec is done: a moment, not never.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while let Err(e) = DataDirLock::acquire(&data) {
+            assert!(std::time::Instant::now() < deadline, "{e}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
