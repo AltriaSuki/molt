@@ -59,6 +59,9 @@ pub(crate) struct Digest {
     pub text: String,
     /// The message ids behind step `n` (1-based), at index `n - 1`.
     pub steps: Vec<Vec<String>>,
+    /// The run's result was accepted by a model judging it against a rubric,
+    /// not by a check: what is learned from it is less sure.
+    pub judged: bool,
 }
 
 impl Digest {
@@ -178,6 +181,7 @@ pub(crate) fn build(entries: &[Logged], workspace: &Path, cut_short: bool) -> Di
     let mut foot: Vec<String> = Vec::new();
     let mut task = String::new();
     let mut designed = false;
+    let mut judged = false;
     let mut steps: Vec<Step> = Vec::new();
     // Requests waiting for their reply: the step they made, if any, and their target.
     let mut open: HashMap<String, (Option<usize>, String)> = HashMap::new();
@@ -348,6 +352,7 @@ pub(crate) fn build(entries: &[Logged], workspace: &Path, cut_short: bool) -> Di
                     }
                     planner::RUN => {
                         if let Some(run) = parse::<RunResponse>(p) {
+                            judged = run.outcome == Outcome::Judged;
                             foot.extend(conclusion(&run));
                         }
                     }
@@ -373,7 +378,7 @@ pub(crate) fn build(entries: &[Logged], workspace: &Path, cut_short: bool) -> Di
     }
     legend.push(':');
     let (text, kept) = render(&head, &legend, &steps, &foot);
-    Digest { task, text, steps: kept }
+    Digest { task, text, steps: kept, judged }
 }
 
 /// How the run ended, from the planner's reply.
@@ -384,6 +389,9 @@ fn conclusion(run: &RunResponse) -> Vec<String> {
         (Outcome::Passed, None) => "passed".to_owned(),
         (Outcome::Failed, _) => "failed: no attempt passed the done-check".to_owned(),
         (Outcome::Unverified, _) => "finished without a done-check (unverified)".to_owned(),
+        (Outcome::Judged, _) => {
+            "judged: a model found that the result met every criterion of its rubric (no command checked it)".to_owned()
+        }
     };
     lines.push(format!("Outcome: {outcome}"));
     if let Some(check) = &run.check {
@@ -400,6 +408,10 @@ fn conclusion(run: &RunResponse) -> Vec<String> {
             line.push(')');
         }
         lines.push(line);
+    }
+    for f in run.judgement.iter().take(MAX_CHECK_FILES) {
+        let mark = if f.met { "met" } else { "not met" };
+        lines.push(format!("Criterion ({mark}): {}", clip(&f.criterion, MAX_FIELD)));
     }
     for a in &run.attempts {
         let mut line = format!("Attempt {}: {} after {} turns", a.index, status_name(a.status), a.turns);
@@ -583,6 +595,8 @@ mod tests {
             checkpoint: None,
             requirements: vec![],
             selection: None,
+            rubric: vec![],
+            judgement: vec![],
         }
     }
 

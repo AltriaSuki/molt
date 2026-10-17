@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use molt_api::planner::{
-    AttemptStatus, Candidate, CheckFile, CheckSpec, DesignResponse, Outcome, Resume, Review, RunRequest, RunResponse,
-    Select, Selection, Verdict,
+    AttemptStatus, Candidate, CheckFile, CheckSpec, Criterion, DesignResponse, Outcome, Resume, Review, RunRequest,
+    RunResponse, Select, Selection, Verdict,
 };
 use molt_api::progress::Progress;
 use molt_proto::{ErrorCode, RemoteError, TraceId};
@@ -66,17 +66,16 @@ pub(crate) async fn run_cancellable(
     }
     tracing::info!(run = %ctx.trace, workspace = %ctx.workspace, attempts = req.attempts, "run started");
 
-    // A check with files came from planner.design.
-    let designed = req.verify && (req.check.is_none() || !req.check_files.is_empty());
-    let check = match settle_check(&ctx, &req).await? {
-        Ok(check) => check,
+    let designed = designed_here(&req);
+    let settled = match settle_check(&ctx, &req).await? {
+        Ok(settled) => settled,
         Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason)).await),
     };
-    save_check(&ctx, check.as_ref(), designed);
-    // Without a check there is nothing to pick a winner by, so one attempt is enough.
-    let count = if check.is_some() { req.attempts } else { 1 };
+    save_check(&ctx, &settled, designed);
+    // Without a check or a rubric there is nothing to pick a winner by, so one attempt is enough.
+    let count = if settled.verified() { req.attempts } else { 1 };
     let slots = (0..count).map(|index| Slot::Run { index, saved: None }).collect();
-    Ok(finish(&ctx, &req, check, designed, slots).await)
+    Ok(finish(&ctx, &req, settled, designed, slots).await)
 }
 
 /// Go on with the checkpointed run `resume.run`.
@@ -131,26 +130,27 @@ async fn resume_run(
         ctx.note(format!("the checkpoint was saved by planner {}", saved.planner)).await;
     }
 
-    let (check, designed) = if saved.settled {
+    let (settled, designed) = if saved.settled {
         let check = saved.check.as_ref().map(|c| Check {
             command: c.command.clone(),
             files: c.files.iter().map(|f| (f.path.clone(), f.content.clone())).collect(),
             suite: c.suite.clone(),
         });
-        (check, saved.check.as_ref().is_some_and(|c| c.designed))
+        let designed = saved.check.as_ref().is_some_and(|c| c.designed);
+        (Settled { check, rubric: saved.rubric.clone() }, designed)
     } else {
         // Stopped while the check was being designed: design it again.
-        let designed = run_req.verify && (run_req.check.is_none() || !run_req.check_files.is_empty());
+        let designed = designed_here(&run_req);
         match settle_check(&ctx, &run_req).await? {
-            Ok(check) => {
-                save_check(&ctx, check.as_ref(), designed);
-                (check, designed)
+            Ok(settled) => {
+                save_check(&ctx, &settled, designed);
+                (settled, designed)
             }
             Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason)).await),
         }
     };
 
-    let count = if check.is_some() { run_req.attempts } else { 1 };
+    let count = if settled.verified() { run_req.attempts } else { 1 };
     let passed = saved.attempts.iter().any(|a| a.end.as_ref().is_some_and(|e| e.status == AttemptStatus::Passed));
     let mut slots = Vec::new();
     for attempt in &saved.attempts {
@@ -162,7 +162,12 @@ async fn resume_run(
             // A winner is in already: nothing else needs to go on.
             None if passed || resume.retry => {
                 let why = if passed { "another attempt had passed" } else { "left as it was for a retry" };
-                let end = SavedEnd { status: AttemptStatus::Cancelled, note: why.into(), summary: String::new() };
+                let end = SavedEnd {
+                    status: AttemptStatus::Cancelled,
+                    note: why.into(),
+                    summary: String::new(),
+                    findings: Vec::new(),
+                };
                 ctx.save(|s| s.attempt(attempt.index).end = Some(end.clone()));
                 slots.push(Slot::Done(Finished::saved(attempt, &end)));
             }
@@ -179,7 +184,7 @@ async fn resume_run(
     if !passed && !slots.iter().any(|s| matches!(s, Slot::Run { .. })) {
         ctx.note("every attempt of this run had ended; resume with retry to start new ones").await;
     }
-    Ok(finish(&ctx, &run_req, check, designed, slots).await)
+    Ok(finish(&ctx, &run_req, settled, designed, slots).await)
 }
 
 /// Make the run steerable with `planner.control` and report its state, until
@@ -204,31 +209,63 @@ fn failed(message: impl Into<String>) -> RemoteError {
     RemoteError { code: ErrorCode::Failed, message: message.into() }
 }
 
-/// The check the run goes by: given, designed, or none (`Ok(None)`). An
-/// `Err` inside says why the designer could not produce one.
-async fn settle_check(ctx: &Arc<Ctx>, req: &RunRequest) -> Result<Result<Option<Check>, String>, RemoteError> {
+/// Whether this run designs its check: it is given none (a check with files
+/// came from `planner.design`, and so did a rubric).
+fn designed_here(req: &RunRequest) -> bool {
+    req.verify && ((req.check.is_none() && req.rubric.is_empty()) || !req.check_files.is_empty())
+}
+
+/// How a run accepts a result: by its done-check, by a rubric an
+/// independent judge decides, or, with neither, not at all (unverified).
+struct Settled {
+    check: Option<Check>,
+    rubric: Vec<Criterion>,
+}
+
+impl Settled {
+    fn verified(&self) -> bool {
+        self.check.is_some() || !self.rubric.is_empty()
+    }
+}
+
+/// What the run goes by: a check or a rubric, given or designed, or
+/// neither. An `Err` inside says why the designer could not produce one.
+async fn settle_check(ctx: &Arc<Ctx>, req: &RunRequest) -> Result<Result<Settled, String>, RemoteError> {
+    let none = Settled { check: None, rubric: Vec::new() };
     Ok(Ok(match &req.check {
-        Some(command) => Some(Check {
-            command: command.clone(),
-            files: req.check_files.iter().map(|f| (f.path.clone(), f.content.clone())).collect(),
-            suite: req.suite.clone(),
-        }),
+        Some(command) => Settled {
+            check: Some(Check {
+                command: command.clone(),
+                files: req.check_files.iter().map(|f| (f.path.clone(), f.content.clone())).collect(),
+                suite: req.suite.clone(),
+            }),
+            rubric: Vec::new(),
+        },
+        None if !req.rubric.is_empty() => Settled { check: None, rubric: req.rubric.clone() },
         None if !req.verify => {
             ctx.note("running without a done-check, as asked").await;
-            None
+            none
         }
         None => match designer::design(ctx, false).await? {
-            Design::Check { command, files, suite, .. } => Some(Check { command, files, suite }),
+            Design::Check { command, files, suite, .. } => {
+                Settled { check: Some(Check { command, files, suite }), rubric: Vec::new() }
+            }
+            Design::Rubric { criteria, .. } => {
+                ctx.note(format!("no done-check command fits; a judge decides {} criteria", criteria.len())).await;
+                Settled { check: None, rubric: criteria }
+            }
             Design::Unverified(reason) => {
                 ctx.note(format!("no automated done-check: {reason}")).await;
-                None
+                none
             }
             Design::Failed(reason) => return Ok(Err(reason)),
         },
     }))
 }
 
-fn save_check(ctx: &Ctx, check: Option<&Check>, designed: bool) {
+fn save_check(ctx: &Ctx, settled: &Settled, designed: bool) {
+    let check = settled.check.as_ref();
+    let rubric = settled.rubric.clone();
     let saved = check.map(|c| SavedCheck {
         command: c.command.clone(),
         files: c
@@ -242,6 +279,7 @@ fn save_check(ctx: &Ctx, check: Option<&Check>, designed: bool) {
     ctx.save(|s| {
         s.settled = true;
         s.check = saved;
+        s.rubric = rubric;
     });
     ctx.control.settle(check.is_some(), check.map(Check::paths).unwrap_or_default());
 }
@@ -268,13 +306,8 @@ enum Slot {
 
 /// Race the attempts, apply the winner and total up. A checkpointed run
 /// stopped before it finished keeps its checkpoint and forks.
-async fn finish(
-    ctx: &Arc<Ctx>,
-    req: &RunRequest,
-    check: Option<Check>,
-    designed: bool,
-    slots: Vec<Slot>,
-) -> RunResponse {
+async fn finish(ctx: &Arc<Ctx>, req: &RunRequest, settled: Settled, designed: bool, slots: Vec<Slot>) -> RunResponse {
+    let Settled { check, rubric } = settled;
     let spec = check.as_ref().map(|c| CheckSpec {
         command: c.command.clone(),
         files: c.paths(),
@@ -286,16 +319,20 @@ async fn finish(
         command: spec.as_ref().map(|s| s.command.clone()),
         files: spec.as_ref().map(|s| s.files.clone()).unwrap_or_default(),
         designed,
+        rubric: rubric.iter().map(|c| c.text.clone()).collect(),
     })
     .await;
     let check = check.map(Arc::new);
-    let (finished, passed) = race(ctx, slots, check.clone(), req.select).await;
+    let rubric = Arc::new(rubric);
+    let (finished, passed) = race(ctx, slots, check.clone(), rubric.clone(), req.select).await;
     ctx.control.freeze("the run is finishing");
     let stopped = ctx.checkpoint.is_some() && ctx.run_cancel.is_cancelled();
     // Cancelled attempts may have left model calls running, which are billed: give their replies a moment
     // to land and be counted, while the winner is applied.
-    let (mut resp, tally) =
-        tokio::join!(conclude(ctx, req, (spec, check), finished, passed, stopped), ctx.settle(ctx.cfg.late_reply_wait));
+    let (mut resp, tally) = tokio::join!(
+        conclude(ctx, req, (spec, check), &rubric, finished, passed, stopped),
+        ctx.settle(ctx.cfg.late_reply_wait)
+    );
     resp.usage = tally.spend.usage;
     resp.cost_usd = tally.spend.cost_usd;
     resp.uncounted_calls = tally.uncounted_calls() + ctx.carried_uncounted;
@@ -357,8 +394,8 @@ pub(crate) async fn design_cancellable(
     cancel: CancellationToken,
 ) -> Result<DesignResponse, RemoteError> {
     validate(&req)?;
-    if req.check.is_some() || !req.verify {
-        let message = "planner.design designs a check: leave out check, and keep verify".to_owned();
+    if req.check.is_some() || !req.rubric.is_empty() || !req.verify {
+        let message = "planner.design designs a check: leave out check and rubric, and keep verify".to_owned();
         return Err(RemoteError { code: ErrorCode::Invalid, message });
     }
     let mut ctx = Ctx::new(bus, cfg, trace, &req);
@@ -375,6 +412,7 @@ pub(crate) async fn design_cancellable(
         command: None,
         files: Vec::new(),
         suite: None,
+        rubric: Vec::new(),
         rationale: String::new(),
         baseline: None,
         usage: tally.spend.usage,
@@ -392,6 +430,10 @@ pub(crate) async fn design_cancellable(
             resp.rationale = rationale;
             resp.baseline = baseline;
         }
+        Ok(Design::Rubric { criteria, rationale }) => {
+            resp.rubric = criteria;
+            resp.rationale = rationale;
+        }
         Ok(Design::Unverified(reason)) => resp.rationale = reason,
         Ok(Design::Failed(reason)) => {
             let message = format!("could not design a done-check: {reason}");
@@ -403,6 +445,7 @@ pub(crate) async fn design_cancellable(
         resp.command = None;
         resp.files.clear();
         resp.suite = None;
+        resp.rubric.clear();
         resp.cancelled = true;
         resp.error = Some("design stopped; remote settlement may remain incomplete".into());
     }
@@ -430,6 +473,14 @@ fn validate(req: &RunRequest) -> Result<(), RemoteError> {
         "suite is empty: leave it out when the project has none".to_owned()
     } else if req.check.is_some() && !req.verify {
         "a check with verify off: leave out one or the other".to_owned()
+    } else if !req.rubric.is_empty() && req.check.is_some() {
+        "a check and a rubric: give one, the rubric only for a task no command can check".to_owned()
+    } else if !req.rubric.is_empty() && !req.verify {
+        "a rubric with verify off: leave out one or the other".to_owned()
+    } else if req.rubric.iter().any(|c| c.text.trim().is_empty()) {
+        "a criterion of the rubric has no text".to_owned()
+    } else if req.rubric.len() > designer::MAX_CRITERIA {
+        format!("the rubric has {} criteria; give at most {}", req.rubric.len(), designer::MAX_CRITERIA)
     } else if req.check_files.iter().any(|f| f.path.trim().is_empty()) {
         "a check file has no path".to_owned()
     } else if req.max_turns == Some(0) {
@@ -453,6 +504,7 @@ async fn race(
     ctx: &Arc<Ctx>,
     slots: Vec<Slot>,
     check: Option<Arc<Check>>,
+    rubric: Arc<Vec<Criterion>>,
     select: Select,
 ) -> (Vec<Finished>, Vec<u32>) {
     let cancel = ctx.cancel.child_token();
@@ -470,7 +522,9 @@ async fn race(
             }
             Slot::Run { index, saved } => {
                 let token = cancel.child_token();
-                let handle = tasks.spawn(attempt::run(ctx.scoped(token.clone()), index, check.clone(), token, saved));
+                let attempt =
+                    attempt::run(ctx.scoped(token.clone()), index, check.clone(), rubric.clone(), token, saved);
+                let handle = tasks.spawn(attempt);
                 indices.insert(handle.id(), index);
             }
         }
@@ -548,6 +602,7 @@ async fn conclude(
     ctx: &Arc<Ctx>,
     req: &RunRequest,
     checks: (Option<CheckSpec>, Option<Arc<Check>>),
+    rubric: &[Criterion],
     finished: Vec<Finished>,
     passed: Vec<u32>,
     stopped: bool,
@@ -577,9 +632,16 @@ async fn conclude(
         checkpoint: None,
         requirements: ctx.control.all(),
         selection: None,
+        rubric: rubric.to_vec(),
+        judgement: Vec::new(),
+    };
+    let outcome = match (&spec, rubric.is_empty()) {
+        (Some(_), _) => Outcome::Passed,
+        (None, false) => Outcome::Judged,
+        (None, true) => Outcome::Unverified,
     };
     let Some((first, _)) = candidates.first() else {
-        resp.summary = failure_summary(spec.as_ref(), &finished);
+        resp.summary = failure_summary(spec.as_ref(), rubric, &finished);
         // A stopped run's forks are its checkpoint's: kept for the resume.
         if !stopped {
             ctx.drop_forks_except(None).await;
@@ -618,15 +680,15 @@ async fn conclude(
             Ok(diff) => review_of(ctx, req, resp.check.as_ref(), done, fork, diff).await,
             Err(_) => None,
         };
-        deliver(ctx, req, spec.is_some(), &mut resp, done, fork.clone(), diff, review).await;
+        deliver(ctx, req, outcome, &mut resp, done, fork.clone(), diff, review).await;
         return resp;
     }
-    let check = resp.check.clone().expect("only a run with a check has more than one candidate");
-    let picked = compare(ctx, req, &check, &candidates).await;
+    let check = resp.check.clone();
+    let picked = compare(ctx, req, check.as_ref(), !rubric.is_empty(), &candidates).await;
     let (done, fork) = &candidates[picked.position];
     ctx.drop_forks_except(Some(fork)).await;
     resp.selection = Some(picked.selection);
-    deliver(ctx, req, true, &mut resp, done, fork.clone(), picked.diff, picked.review).await;
+    deliver(ctx, req, outcome, &mut resp, done, fork.clone(), picked.diff, picked.review).await;
     resp
 }
 
@@ -654,13 +716,12 @@ async fn review_of(
 }
 
 /// Fill in `resp` from the winner `done`, and apply its changes when the run
-/// asks for it and its review does not hold them back. `verified`: the run
-/// has a done-check.
+/// asks for it and its review does not hold them back.
 #[allow(clippy::too_many_arguments)] // The winner, its fork, diff and review, and where they go.
 async fn deliver(
     ctx: &Arc<Ctx>,
     req: &RunRequest,
-    verified: bool,
+    outcome: Outcome,
     resp: &mut RunResponse,
     done: &Finished,
     fork: String,
@@ -668,7 +729,8 @@ async fn deliver(
     review: Option<Review>,
 ) {
     resp.winner = Some(done.report.index);
-    resp.outcome = if verified { Outcome::Passed } else { Outcome::Unverified };
+    resp.outcome = outcome;
+    resp.judgement = done.findings.clone();
     resp.summary = if done.summary.is_empty() {
         "The attempt finished without a summary.".to_owned()
     } else {
@@ -682,13 +744,13 @@ async fn deliver(
             resp.patch_truncated = diff.truncated;
             resp.review = review;
             let held = resp.review.as_ref().filter(|r| r.verdict != Verdict::Approve);
-            // An unverified attempt that changed nothing (it answered a question) has nothing to merge.
+            // An attempt without a check that changed nothing (it answered a question) has nothing to merge.
             if let (true, Some(review)) = (req.apply, held) {
                 let what = if review.verdict == Verdict::Reject { "rejected" } else { "questioned" };
                 resp.summary
                     .push_str(&format!("\n\nNot applied: the review {what} the changes. They are kept in {fork}."));
                 keep = true;
-            } else if req.apply && (verified || !resp.changes.is_empty()) {
+            } else if req.apply && (outcome == Outcome::Passed || !resp.changes.is_empty()) {
                 match ctx.merge(&fork).await {
                     Ok(_) => {
                         resp.applied = true;
@@ -734,20 +796,34 @@ struct Picked {
 }
 
 /// Rank the passing candidates on what can be audited, and pick the best
-/// one the review approves (see [`select::RULE`]).
-async fn compare(ctx: &Arc<Ctx>, req: &RunRequest, check: &CheckSpec, candidates: &[(&Finished, String)]) -> Picked {
+/// one the review approves (see [`select::RULE`]). `judged`: the run has a
+/// rubric, whose criteria met count first.
+async fn compare(
+    ctx: &Arc<Ctx>,
+    req: &RunRequest,
+    check: Option<&CheckSpec>,
+    judged: bool,
+    candidates: &[(&Finished, String)],
+) -> Picked {
     let mut diffs = Vec::new();
     for (_, fork) in candidates {
         diffs.push(ctx.diff(fork).await);
     }
-    let suites = match &check.suite {
+    let suites = match check.and_then(|c| c.suite.as_ref()) {
         Some(suite) => run_suites(ctx, suite, candidates).await,
         None => vec![None; candidates.len()],
     };
     let mut scored: Vec<(usize, Candidate)> = Vec::new();
     for (position, ((done, _), diff)) in candidates.iter().zip(&diffs).enumerate() {
         match diff {
-            Ok(diff) => scored.push((position, select::candidate(done.report.index, suites[position], diff))),
+            Ok(diff) => {
+                let mut candidate = select::candidate(done.report.index, suites[position], diff);
+                if judged {
+                    let met = done.findings.iter().filter(|f| f.met).count();
+                    candidate.criteria_met = Some(u32::try_from(met).unwrap_or(u32::MAX));
+                }
+                scored.push((position, candidate));
+            }
             Err(e) => {
                 ctx.note(format!(
                     "attempt {} is left out of the comparison: its changes could not be listed: {}",
@@ -764,7 +840,7 @@ async fn compare(ctx: &Arc<Ctx>, req: &RunRequest, check: &CheckSpec, candidates
     for (position, candidate) in &mut scored {
         let (done, fork) = &candidates[*position];
         let Ok(diff) = &diffs[*position] else { continue };
-        let review = review_of(ctx, req, Some(check), done, fork, diff).await;
+        let review = review_of(ctx, req, check, done, fork, diff).await;
         candidate.verdict = review.as_ref().map(|r| r.verdict);
         let approved = review.as_ref().is_none_or(|r| r.verdict == Verdict::Approve);
         reviews[*position] = review;
@@ -825,9 +901,10 @@ async fn run_suites(ctx: &Arc<Ctx>, suite: &str, candidates: &[(&Finished, Strin
     passed
 }
 
-fn failure_summary(spec: Option<&CheckSpec>, finished: &[Finished]) -> String {
+fn failure_summary(spec: Option<&CheckSpec>, rubric: &[Criterion], finished: &[Finished]) -> String {
     let mut summary = match spec {
         Some(check) => format!("No attempt passed the done-check `{}`.", check.command),
+        None if !rubric.is_empty() => "No attempt met every criterion of the rubric.".to_owned(),
         None => "The attempt did not finish.".to_owned(),
     };
     for f in finished {
@@ -869,6 +946,8 @@ fn not_designed(ctx: &Ctx, reason: &str) -> RunResponse {
         checkpoint: None,
         requirements: ctx.control.all(),
         selection: None,
+        rubric: Vec::new(),
+        judgement: Vec::new(),
     }
 }
 
