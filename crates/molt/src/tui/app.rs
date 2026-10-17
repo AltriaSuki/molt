@@ -39,6 +39,28 @@ const CHECK_TAIL_LINES: usize = 2;
 const EARLIER_TASKS: usize = 5;
 /// Bytes of an earlier task's summary kept for the tasks after it.
 const EARLIER_SUMMARY_BYTES: usize = 4000;
+/// Ticks after a key within which the user is taken to be looking: about
+/// five seconds.
+const LOOKING_TICKS: u64 = 33;
+
+/// When the interface calls the user from outside the terminal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Notify {
+    Off,
+    /// When it stops for the user, or the services go down.
+    #[default]
+    Waiting,
+    /// Also when a task ends.
+    All,
+}
+
+/// What the interface is waiting on the user for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Attention {
+    Check,
+    Apply,
+    Down,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -81,6 +103,7 @@ pub struct Settings {
     /// `None` for memory's default.
     pub memory_model: Option<String>,
     pub stream: bool,
+    pub notify: Notify,
 }
 
 impl Default for Settings {
@@ -93,6 +116,7 @@ impl Default for Settings {
             check: None,
             stream: true,
             memory_model: None,
+            notify: Notify::default(),
         }
     }
 }
@@ -166,6 +190,12 @@ pub enum Action {
     Edit {
         text: String,
     },
+    /// Call the user from outside the terminal: a bell, and a desktop
+    /// notification where the terminal shows one. `text` is a short label,
+    /// never the task or its output.
+    Alert {
+        text: String,
+    },
 }
 
 /// What happened.
@@ -174,6 +204,8 @@ pub enum Msg {
     #[serde(skip)]
     Key(KeyEvent),
     Paste(String),
+    /// The terminal gained or lost focus, where it reports that.
+    Focus(bool),
     Tick,
     /// SIGTERM or SIGHUP.
     Signal,
@@ -726,6 +758,12 @@ pub struct App {
     /// The tick of a first Ctrl+C or Ctrl+D; a second soon after quits.
     quit_armed: Option<u64>,
     pub quit: bool,
+    /// The tick of the last key or paste.
+    last_key: Option<u64>,
+    /// Whether the terminal has focus; `None` until it says.
+    focused: Option<bool>,
+    /// How the last task ended, for an alert: a short label.
+    ended: Option<String>,
 }
 
 fn key_is(key: &KeyEvent, code: KeyCode) -> bool {
@@ -774,6 +812,9 @@ impl App {
             tick: 0,
             quit_armed: None,
             quit: false,
+            last_key: None,
+            focused: None,
+            ended: None,
         }
     }
 
@@ -839,13 +880,73 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
+        let before = self.attention();
+        let mut actions = self.handle(msg);
+        let now = self.attention();
+        let text = match (now, self.ended.take()) {
+            (Some(now), _) if Some(now) != before && self.settings.notify != Notify::Off => Some(match now {
+                Attention::Check => "molt: check ready".to_owned(),
+                Attention::Apply => "molt: result ready".to_owned(),
+                Attention::Down => "molt: services down".to_owned(),
+            }),
+            (_, Some(ended)) if self.settings.notify == Notify::All => Some(ended),
+            _ => None,
+        };
+        if let Some(text) = text.filter(|_| !self.looking()) {
+            actions.push(Action::Alert { text });
+        }
+        actions
+    }
+
+    fn attention(&self) -> Option<Attention> {
+        match (&self.session, &self.prompt) {
+            (SessionState::Down(_), _) => Some(Attention::Down),
+            (_, Some(Prompt::Check(_))) => Some(Attention::Check),
+            (_, Some(Prompt::Apply { .. })) => Some(Attention::Apply),
+            _ => None,
+        }
+    }
+
+    /// The user is at the terminal: it has focus, or a key came just now.
+    fn looking(&self) -> bool {
+        self.focused == Some(true) || self.last_key.is_some_and(|at| self.tick.wrapping_sub(at) <= LOOKING_TICKS)
+    }
+
+    /// The terminal window's title: what the interface is doing or waits for.
+    pub fn title(&self) -> String {
+        let state = match (self.attention(), &self.task) {
+            (Some(Attention::Down), _) => "services down".to_owned(),
+            (Some(Attention::Check), _) => "waiting: check".to_owned(),
+            (Some(Attention::Apply), _) => "waiting: apply".to_owned(),
+            (None, Some(task)) => match task.phase {
+                Phase::Designing => "designing the check".to_owned(),
+                Phase::Running if task.state == RunState::Paused => "paused".to_owned(),
+                Phase::Running => {
+                    let running = task.lanes.iter().filter(|l| l.status.is_none()).count();
+                    format!("running {running}/{}", task.req.attempts)
+                }
+                Phase::Applying => "applying".to_owned(),
+                Phase::Confirming | Phase::Deciding => "waiting".to_owned(),
+            },
+            (None, None) => "idle".to_owned(),
+        };
+        format!("molt · {state}")
+    }
+
+    fn handle(&mut self, msg: Msg) -> Vec<Action> {
         match msg {
             Msg::Key(key) if key.kind == KeyEventKind::Release => Vec::new(),
             Msg::Key(key) => {
                 self.flash = None;
+                self.last_key = Some(self.tick);
                 self.key(key)
             }
+            Msg::Focus(focused) => {
+                self.focused = Some(focused);
+                Vec::new()
+            }
             Msg::Paste(text) => {
+                self.last_key = Some(self.tick);
                 match &mut self.screen {
                     Screen::Memory(view) => match &mut view.edit {
                         Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input) | MemoryEdit::Promote(input)) => {
@@ -1388,6 +1489,25 @@ impl App {
                 }
                 self.flash = Some(format!("stream: {} (next task)", if self.settings.stream { "on" } else { "off" }));
             }
+            "notify" => {
+                self.settings.notify = match arg {
+                    "on" | "default" | "" => Notify::Waiting,
+                    "all" => Notify::All,
+                    "off" => Notify::Off,
+                    _ => {
+                        self.flash = Some("notify: on, all or off".into());
+                        return Vec::new();
+                    }
+                };
+                self.flash = Some(
+                    match self.settings.notify {
+                        Notify::Off => "notify: off",
+                        Notify::Waiting => "notify: when waiting for you",
+                        Notify::All => "notify: when waiting for you and when a task ends",
+                    }
+                    .into(),
+                );
+            }
             "model" => {
                 self.settings.model = (!arg.is_empty() && arg != "default").then(|| arg.to_owned());
                 self.flash = Some(set("model", self.settings.model.as_deref().unwrap_or("default")));
@@ -1858,6 +1978,7 @@ impl App {
         let resp = match result {
             Ok(resp) => resp,
             Err(e) => {
+                self.ended = Some("molt: run failed".to_owned());
                 self.error("the run failed", &e);
                 return Vec::new();
             }
@@ -1873,6 +1994,14 @@ impl App {
             }
         }
         self.spent_usd += resp.cost_usd;
+        self.ended = Some(match resp.outcome {
+            Outcome::Passed => match resp.changes.len() {
+                1 => "molt: passed · 1 file".to_owned(),
+                n => format!("molt: passed · {n} files"),
+            },
+            Outcome::Unverified => "molt: done, unverified".to_owned(),
+            Outcome::Failed => "molt: failed".to_owned(),
+        });
         self.remember(&task.req.task, &resp);
         self.uncounted_calls = self.uncounted_calls.saturating_add(resp.uncounted_calls);
         let mut actions = Vec::new();
@@ -2556,6 +2685,7 @@ fn help() -> Vec<Line<'static>> {
         row("/new", "a new conversation: later tasks forget the earlier ones"),
         row("/attempts N", "attempts at once, 1 to 8"),
         row("/stream on|off", "model text previews for the next task"),
+        row("/notify on|all|off", "bell and desktop notice when waiting (all: also when a task ends)"),
         row("/model NAME", "opus, sonnet, haiku or a model id"),
         row("/memory-model NAME", "model memory learns with; same: the attempts'"),
         row("/effort LEVEL", "low, medium, high, xhigh or max"),
@@ -2776,6 +2906,82 @@ mod tests {
         let titles = wide.iter().find(|r| r.contains("turn 12")).expect("the lane titles");
         assert_eq!(titles.matches("turn 12 · 0s · $0.25").count(), 4, "{titles}");
         assert_eq!(titles.matches("attempt").count(), 4, "{titles}");
+    }
+
+    /// Lets more than the looking window pass since the last key.
+    fn look_away(app: &mut App) {
+        for _ in 0..=LOOKING_TICKS {
+            app.update(Msg::Tick);
+        }
+    }
+
+    fn alerts(actions: &[Action]) -> Vec<&str> {
+        actions.iter().filter_map(|a| if let Action::Alert { text } = a { Some(text.as_str()) } else { None }).collect()
+    }
+
+    #[test]
+    fn the_user_is_called_once_for_each_stop_and_the_title_says_what_waits() {
+        let mut app = App::new("/work/project", None);
+        assert_eq!(app.title(), "molt · idle");
+        up(&mut app);
+        app.rules.always_ask = true;
+        let actions = type_in(&mut app, "accept trailing commas");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        assert_eq!(app.title(), "molt · designing the check");
+        look_away(&mut app);
+        let actions = app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
+        assert_eq!(alerts(&actions), ["molt: check ready"]);
+        assert_eq!(app.title(), "molt · waiting: check");
+        look_away(&mut app);
+        assert!(alerts(&app.update(Msg::Tick)).is_empty(), "the same stop calls once");
+
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.title(), "molt · running 0/2");
+        app.update(Msg::Progress(Progress::AttemptStarted { run: trace.to_string(), attempt: 0, fork: None }));
+        assert_eq!(app.title(), "molt · running 1/2");
+        look_away(&mut app);
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/fork"))) });
+        assert_eq!(alerts(&actions), ["molt: result ready"], "by default an ended task does not ring");
+        assert_eq!(app.title(), "molt · waiting: apply");
+
+        app.update(key(KeyCode::Char('n')));
+        assert_eq!(app.title(), "molt · idle");
+        look_away(&mut app);
+        assert_eq!(alerts(&app.update(Msg::SessionFailed("gone".into()))), ["molt: services down"]);
+        assert_eq!(app.title(), "molt · services down");
+    }
+
+    #[test]
+    fn alerts_wait_for_the_user_to_look_away_and_can_be_turned_off_or_up() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let run = |app: &mut App, outcome: Result<RunResponse, String>| {
+            let actions = type_in(app, "task");
+            let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+            let trace = trace.clone();
+            look_away(app);
+            let actions = app.update(Msg::Ran { trace, result: outcome });
+            app.prompt = None;
+            app.task = None;
+            alerts(&actions).into_iter().map(str::to_owned).collect::<Vec<_>>()
+        };
+        app.mode = Mode::Plan;
+        assert!(run(&mut app, Ok(passed(false, Some("/d/a")))).is_empty());
+        type_in(&mut app, "/notify all");
+        assert_eq!(run(&mut app, Ok(passed(false, Some("/d/b")))), ["molt: passed · 1 file"]);
+        assert_eq!(run(&mut app, Ok(failed(vec![]))), ["molt: failed"]);
+        assert_eq!(run(&mut app, Err("boom".into())), ["molt: run failed"]);
+        // Not while the user is at the terminal: just typed, or it has focus.
+        let actions = type_in(&mut app, "task");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert!(alerts(&app.update(Msg::Ran { trace: trace.clone(), result: Err("x".into()) })).is_empty());
+        app.update(Msg::Focus(true));
+        assert!(run(&mut app, Err("boom".into())).is_empty());
+        app.update(Msg::Focus(false));
+        type_in(&mut app, "/notify off");
+        assert!(run(&mut app, Err("boom".into())).is_empty());
     }
 
     #[test]

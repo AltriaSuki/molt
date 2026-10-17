@@ -8,6 +8,7 @@
 mod app;
 mod backend;
 mod commands;
+mod notice;
 mod preview;
 mod text;
 mod view;
@@ -22,7 +23,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::Context;
-use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen};
 use ratatui::DefaultTerminal;
@@ -30,6 +33,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use self::app::{Action, App, Msg};
+use self::notice::Notice;
 use crate::session::Session;
 use crate::{agent, Config};
 
@@ -76,12 +80,15 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
     std::panic::set_hook(Box::new(move |info| {
         // SAFETY: dup2 on descriptors this process owns.
         unsafe { libc::dup2(restore, libc::STDERR_FILENO) };
+        emit(notice::POP_TITLE);
         hook(info);
     }));
-    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableFocusChange);
+    emit(notice::PUSH_TITLE);
     let home = std::env::var("HOME").ok();
     let result = event_loop(&mut terminal, cfg, path, home.as_deref(), stop).await;
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    emit(notice::POP_TITLE);
+    let _ = execute!(std::io::stdout(), DisableFocusChange, DisableBracketedPaste);
     ratatui::restore();
     drop(stderr);
     let _ = std::panic::take_hook();
@@ -127,8 +134,14 @@ async fn event_loop(
     let data_dir = cfg.kernel.data_dir.clone();
     let mut backend = backend::Backend::start(cfg, workspace, tx).await?;
     backend.send(&Action::StartSession).await?;
+    let notice = Notice::from_env(|name| std::env::var(name).ok());
     let mut keep = Vec::new();
+    let mut title = String::new();
     loop {
+        if app.title() != title {
+            title = app.title();
+            emit(&notice::title(&title));
+        }
         terminal.draw(|frame| view::draw(frame, &mut app))?;
         let Some(msg) = rx.recv().await else { break };
         let mut actions = app.update(msg);
@@ -138,8 +151,13 @@ async fn event_loop(
         for action in actions {
             match action {
                 Action::Quit { keep: k } => keep = k,
+                Action::Alert { text } => emit(&notice.alert(&text)),
                 Action::Redraw => redraw(terminal)?,
-                Action::Suspend => suspend(terminal, &pause)?,
+                Action::Suspend => {
+                    suspend(terminal, &pause)?;
+                    // The shell had the window meanwhile: set the title again.
+                    title.clear();
+                }
                 Action::SaveTheme(theme) => {
                     if let Err(e) = save_theme(&data_dir, theme) {
                         app.flash = Some(format!("theme changed but could not be saved: {e}"));
@@ -196,6 +214,8 @@ fn read_terminal(tx: UnboundedSender<Msg>, pause: Arc<Pause>) {
             match event::read() {
                 Ok(Event::Key(key)) => Msg::Key(key),
                 Ok(Event::Paste(text)) => Msg::Paste(text),
+                Ok(Event::FocusGained) => Msg::Focus(true),
+                Ok(Event::FocusLost) => Msg::Focus(false),
                 Ok(Event::Resize(..)) => Msg::Tick,
                 Ok(_) => continue,
                 Err(_) => break,
@@ -348,7 +368,12 @@ impl Runtime {
                 }
             }
             // The loop handles these: they need the terminal.
-            Action::Quit { .. } | Action::Edit { .. } | Action::Redraw | Action::Suspend | Action::SaveTheme(_) => {}
+            Action::Quit { .. }
+            | Action::Edit { .. }
+            | Action::Redraw
+            | Action::Suspend
+            | Action::SaveTheme(_)
+            | Action::Alert { .. } => {}
         }
     }
 
@@ -391,7 +416,7 @@ fn edit_outside(terminal: &mut DefaultTerminal, pause: &Pause, dir: &Path, text:
 
     pause.paused.store(true, Ordering::SeqCst);
     let reading = pause.reading.lock().unwrap_or_else(PoisonError::into_inner);
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    let _ = execute!(std::io::stdout(), DisableFocusChange, DisableBracketedPaste);
     ratatui::restore();
     // `sh` splits the variable as a shell would, so `EDITOR="code --wait"` works.
     let status = tokio::task::block_in_place(|| {
@@ -400,7 +425,15 @@ fn edit_outside(terminal: &mut DefaultTerminal, pause: &Pause, dir: &Path, text:
     // Not `terminal.clear()`: it asks the terminal where the cursor is. An empty frame over the
     // cleared screen makes the next draw a full one.
     let back = terminal::enable_raw_mode()
-        .and_then(|()| execute!(std::io::stdout(), EnterAlternateScreen, Clear(ClearType::All), EnableBracketedPaste))
+        .and_then(|()| {
+            execute!(
+                std::io::stdout(),
+                EnterAlternateScreen,
+                Clear(ClearType::All),
+                EnableBracketedPaste,
+                EnableFocusChange
+            )
+        })
         .and_then(|()| terminal.draw(|_| {}).map(|_| ()));
     drop(reading);
     pause.paused.store(false, Ordering::SeqCst);
@@ -438,7 +471,8 @@ fn save_theme(dir: &Path, theme: text::Theme) -> anyhow::Result<()> {
 fn suspend(terminal: &mut DefaultTerminal, pause: &Pause) -> anyhow::Result<()> {
     pause.paused.store(true, Ordering::SeqCst);
     let reading = pause.reading.lock().unwrap_or_else(PoisonError::into_inner);
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    let _ = execute!(std::io::stdout(), DisableFocusChange, DisableBracketedPaste);
+    emit(notice::POP_TITLE);
     ratatui::restore();
     // Stop only the interface process. Its service children continue working.
     // SIGCONT resumes this call, before the terminal reader is unpaused.
@@ -447,13 +481,22 @@ fn suspend(terminal: &mut DefaultTerminal, pause: &Pause) -> anyhow::Result<()> 
         unsafe { libc::raise(libc::SIGTSTP) }
     });
     let restored = terminal::enable_raw_mode()
-        .and_then(|()| execute!(std::io::stdout(), EnterAlternateScreen, EnableBracketedPaste))
+        .and_then(|()| execute!(std::io::stdout(), EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange))
         .and_then(|()| redraw(terminal));
+    emit(notice::PUSH_TITLE);
     drop(reading);
     pause.paused.store(false, Ordering::SeqCst);
     restored.context("could not restore the terminal after suspension")?;
     anyhow::ensure!(stopped == 0, "could not suspend the interface");
     Ok(())
+}
+
+/// Escape sequences straight to the terminal, between frames; best effort.
+fn emit(bytes: &str) {
+    use std::io::Write;
+
+    let mut out = std::io::stdout();
+    let _ = out.write_all(bytes.as_bytes()).and_then(|()| out.flush());
 }
 
 /// Standard error sent to a file until dropped.
