@@ -129,6 +129,7 @@ pub(crate) async fn run(
         check_runs: 0,
         fork: None,
         memory_tools: ctx.memory.up,
+        web_tools: ctx.web,
         version: ctx.control.version(),
     };
     if let Some(saved) = &resume {
@@ -139,6 +140,7 @@ pub(crate) async fn run(
         attempt.check_runs = saved.check_runs;
         attempt.fork = saved.fork.clone();
         attempt.memory_tools = saved.memory_tools;
+        attempt.web_tools = saved.web_tools;
         attempt.version = saved.requirements;
     }
     attempt.check = attempt.check_at(attempt.version);
@@ -185,6 +187,8 @@ struct Attempt {
     fork: Option<String>,
     /// It is offered memory's tools.
     memory_tools: bool,
+    /// It is offered `fetch_url`.
+    web_tools: bool,
     /// The version of the run's requirements it works to.
     version: u32,
 }
@@ -258,7 +262,7 @@ impl Attempt {
     async fn work(&mut self, resume: Option<SavedAttempt>) -> Result<String, End> {
         let ctx = self.ctx.clone();
         let system = if self.check.is_some() { prompts::ATTEMPT_SYSTEM } else { prompts::UNVERIFIED_SYSTEM };
-        let tools = Arc::new(prompts::attempt_tools(self.memory_tools));
+        let tools = Arc::new(prompts::attempt_tools(self.memory_tools, self.web_tools));
         // A final reply the model gave before the run stopped, still to be checked.
         let mut given = None;
         let (fork, mut conv) = match resume {
@@ -445,13 +449,14 @@ impl Attempt {
 
     /// Save the attempt as it stands in the run's checkpoint.
     fn save(&self, conv: &Conversation) {
-        let (fork, memory_tools, meter, check_runs, version) =
-            (self.fork.clone(), self.memory_tools, self.meter, self.check_runs, self.version);
+        let (fork, memory_tools, web_tools, meter, check_runs, version) =
+            (self.fork.clone(), self.memory_tools, self.web_tools, self.meter, self.check_runs, self.version);
         self.ctx.save(|s| {
             let saved = s.attempt(self.index);
             saved.requirements = version;
             saved.fork = fork;
             saved.memory_tools = memory_tools;
+            saved.web_tools = web_tools;
             saved.messages = conv.messages.clone();
             saved.known = conv.known;
             saved.turns = meter.turns;

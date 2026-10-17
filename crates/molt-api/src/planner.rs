@@ -516,7 +516,8 @@ pub struct Candidate {
 /// Names and inputs of the tools the planner offers the model. Each maps to
 /// one `fs` or `shell` call in the attempt's fork, or, for [`FIND_SYMBOL`]
 /// and [`RECALL`] (offered when memory is up), one `memory` call about the
-/// workspace.
+/// workspace, or, for [`FETCH_URL`] (offered when the planner may call
+/// `web.fetch`), one `web` call.
 pub mod tools {
     use serde::{Deserialize, Serialize};
 
@@ -528,6 +529,7 @@ pub mod tools {
     pub const RUN: &str = "run";
     pub const FIND_SYMBOL: &str = "find_symbol";
     pub const RECALL: &str = "recall";
+    pub const FETCH_URL: &str = "fetch_url";
     /// Offered only to the check designer: the check it settled on.
     pub const SUBMIT_CHECK: &str = "submit_check";
     /// Offered only to the reviewer: its verdict.
@@ -594,6 +596,11 @@ pub mod tools {
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Recall {
         pub query: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct FetchUrl {
+        pub url: String,
     }
 
     /// `command` is `None` when no automated check fits the task (a

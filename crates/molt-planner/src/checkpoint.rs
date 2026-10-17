@@ -85,6 +85,9 @@ pub struct SavedAttempt {
     /// It was offered memory's tools.
     #[serde(default)]
     pub memory_tools: bool,
+    /// It was offered `fetch_url`.
+    #[serde(default)]
+    pub web_tools: bool,
     /// Its conversation, the first message included.
     #[serde(default)]
     pub messages: Vec<Value>,
@@ -141,6 +144,7 @@ impl Saved {
                     index,
                     fork: None,
                     memory_tools: false,
+                    web_tools: false,
                     messages: Vec::new(),
                     known: None,
                     turns: 0,

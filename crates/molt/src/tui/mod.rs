@@ -43,6 +43,8 @@ pub struct Options {
     pub project: Option<String>,
     pub data_dir: Option<PathBuf>,
     pub pass_env: Vec<String>,
+    /// Hosts the agent may read web pages from.
+    pub allow_web: Vec<String>,
 }
 
 /// Run the interface until the user quits. Returns the forks the user kept.
@@ -59,6 +61,7 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
     if let Some(shell) = cfg.service_mut("shell") {
         shell.pass_env.extend(opts.pass_env);
     }
+    agent::allow_web(&mut cfg, &opts.allow_web)?;
     if std::env::var_os("RUST_LOG").is_none() {
         for svc in &mut cfg.services {
             svc.env.entry("RUST_LOG".into()).or_insert_with(|| "warn".into());

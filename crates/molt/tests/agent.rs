@@ -1048,6 +1048,33 @@ async fn commit_outside_git_still_applies_and_exits_4() {
 }
 
 #[tokio::test]
+async fn allowed_web_hosts_start_the_web_service_and_offer_fetch_url_only_then() {
+    let server = fake_api(Fake::Greets).await;
+    let fetch_offered =
+        |body: &Value| body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == "fetch_url"));
+    for allow in [None, Some("docs.rs")] {
+        let workspace = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut args = vec!["--check", CHECK, "--attempts", "1", "--no-memory", "--no-review"];
+        args.extend(allow.iter().flat_map(|host| ["--allow-web", *host]));
+        let before = bodies(&server).await.len();
+        let cmd = molt_do(&server, workspace.path(), data.path(), &args).output();
+        let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}", out.status);
+        let sent = bodies(&server).await;
+        assert!(sent[before..].iter().all(|b| fetch_offered(b) == allow.is_some()), "{allow:?}");
+        let audit = molt_kernel::audit::read_all(&data.path().join("audit.jsonl")).await.unwrap();
+        let web_started = audit
+            .iter()
+            .any(|e| matches!(&e.event, AuditEvent::ServiceStarted { service, .. } if service.as_str() == "web"));
+        assert_eq!(web_started, allow.is_some());
+    }
+    assert_requests_valid(&server).await;
+}
+
+#[tokio::test]
 async fn streamed_calls_keep_tools_signatures_and_parallel_call_identity() {
     let server = fake_api(Fake::Greets).await;
     let setup = Setup::new(&server);
@@ -1303,6 +1330,8 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
         let err = molt_do(data.path(), Some("test"), &args);
         assert!(err.contains(args[0]), "{err}");
     }
+    let err = molt_do(data.path(), Some("test"), &["--allow-web", "https://docs.rs/serde"]);
+    assert!(err.contains("not a host to allow"), "{err}");
     assert!(std::fs::read_dir(data.path()).unwrap().next().is_none(), "nothing was started");
 }
 

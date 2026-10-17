@@ -163,6 +163,14 @@ pub fn project_data_dir(name: &str, id: &str) -> anyhow::Result<PathBuf> {
     default_data_dir(&Path::new("/").join(id).join(slug.trim_matches('_')))
 }
 
+/// [`Config::allow_web`] with the services next to this executable.
+pub fn allow_web(cfg: &mut Config, hosts: &[String]) -> anyhow::Result<()> {
+    if hosts.is_empty() {
+        return Ok(());
+    }
+    cfg.allow_web(hosts, &bin_dir()?)
+}
+
 /// The directory of the running executable, where the services are.
 fn bin_dir() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe().context("finding the molt executable")?;

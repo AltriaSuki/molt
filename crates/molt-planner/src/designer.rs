@@ -79,7 +79,7 @@ async fn run_baseline(ctx: &Arc<Ctx>, fork: &str, command: &str, files: &[(Strin
 }
 
 async fn work(ctx: &Arc<Ctx>, fork: &str) -> Design {
-    let tools = Arc::new(prompts::designer_tools(ctx.memory.up));
+    let tools = Arc::new(prompts::designer_tools(ctx.memory.up, ctx.web));
     let first = prompts::designer_first_message(&ctx.task, &ctx.preamble());
     let mut conv = Conversation::new(prompts::DESIGNER_SYSTEM, tools, first, None);
     let mut meter = Meter::default();
