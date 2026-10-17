@@ -4,6 +4,7 @@ description = "Molt's model gateway: the only service that holds the Anthropic A
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 molt-api.workspace = true

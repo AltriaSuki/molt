@@ -161,21 +161,21 @@ mod tests {
             capture: Some("context".into()),
             ..Default::default()
         };
-        assert!(crate::review::recall(&db, &req, Some(("before", "c0")), 2).unwrap().is_empty());
+        assert!(crate::review::recall(&db, &req, None, None, Some(("before", "c0")), 2).unwrap().is_empty());
         db.enable_semantic(Model::load(&path, &hash, 0.0, 0.4).unwrap()).unwrap();
-        assert!(crate::review::recall(&db, &req, Some(("zero", "zero")), 2).unwrap().is_empty());
+        assert!(crate::review::recall(&db, &req, None, None, Some(("zero", "zero")), 2).unwrap().is_empty());
         db.enable_semantic(Model::load(&path, &hash, 0.5, 0.4).unwrap()).unwrap();
-        let found = crate::review::recall(&db, &req, Some(("after", "c1")), 3).unwrap();
+        let found = crate::review::recall(&db, &req, None, None, Some(("after", "c1")), 3).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].note.id, note.id);
         assert!(found[0].reason.similarity.unwrap() > 0.99);
         assert_eq!(found[0].reason.model_sha256.as_deref(), Some(hash.as_str()));
         assert_eq!(found[0].reason.relevance, Some(0.0));
         let other = RecallRequest { workspace: Some("/another".into()), capture: None, ..req.clone() };
-        assert!(crate::recall(&db, &other).unwrap().is_empty());
+        assert!(crate::recall(&db, &other, None, None).unwrap().is_empty());
         let before = crate::recall_snapshots(&db, req.workspace.as_deref().unwrap(), "after").unwrap();
         notes::forget(&db, &note.id, "no longer true", "forget", 4).unwrap();
-        assert!(crate::review::recall(&db, &req, Some(("next", "c2")), 5).unwrap().is_empty());
+        assert!(crate::review::recall(&db, &req, None, None, Some(("next", "c2")), 5).unwrap().is_empty());
         assert_eq!(crate::recall_snapshots(&db, req.workspace.as_deref().unwrap(), "after").unwrap(), before);
     }
 

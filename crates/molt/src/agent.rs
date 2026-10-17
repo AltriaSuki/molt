@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context};
 use molt_api::fs::ChangeKind;
 use molt_api::memory::{self, ConsolidateRequest, ConsolidateResponse};
-use molt_api::planner::{self, AttemptStatus, Outcome, Requirement, RunRequest, RunResponse, RunState, Verdict};
+use molt_api::planner::{
+    self, AttemptStatus, Candidate, Outcome, Requirement, RunRequest, RunResponse, RunState, Verdict,
+};
 use molt_api::progress::{self, Progress};
 use molt_kernel::Kernel;
 use molt_proto::{Budget, CapId, Envelope, ErrorCode, Kind, ServiceId, Target, TraceId};
@@ -22,6 +24,7 @@ use molt_sdk::{CallOpts, SdkError, Service};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::project::{Project, Registry};
 use crate::{Config, Running};
 
 /// The identity `molt do` joins the bus with.
@@ -57,10 +60,28 @@ pub struct Interrupted;
 /// for the canonical `workspace`, with the service executables next to the
 /// running one. No file is ever picked up on its own: one in the project
 /// could run any command with the user's secrets. `data_dir` replaces the
-/// configured data dir; the default setup otherwise uses [`default_data_dir`].
-pub fn resolve_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&Path>) -> anyhow::Result<Config> {
+/// configured data dir; the default setup otherwise uses `project`'s, or
+/// [`default_data_dir`] without one, and has memory keep the notes about the
+/// project under its id and the user's notes for every project next to the
+/// registry ([`Registry::user_db`]).
+pub fn resolve_config(
+    path: Option<&Path>,
+    workspace: &Path,
+    data_dir: Option<&Path>,
+    project: Option<&Project>,
+) -> anyhow::Result<Config> {
     if let Some(path) = path {
         let mut cfg = Config::load(path)?;
+        let trusted = !path.canonicalize()?.starts_with(workspace);
+        if !trusted && !cfg.hooks.is_empty() {
+            eprintln!("lifecycle hooks in a project configuration are ignored; keep trusted hook configuration outside the project");
+            cfg.hooks.clear();
+        }
+        molt_planner::hooks::validate(&cfg.hooks)?;
+        let hooks = serde_json::to_string(&cfg.hooks)?;
+        if let Some(planner) = cfg.service_mut("planner") {
+            planner.env.insert("MOLT_HOOKS_JSON".into(), hooks);
+        }
         require_services(&cfg).with_context(|| format!("{} cannot run tasks", path.display()))?;
         if let Some(dir) = data_dir {
             cfg.kernel.data_dir = dir.to_path_buf();
@@ -75,9 +96,10 @@ pub fn resolve_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&P
             "ANTHROPIC_API_KEY or OPENAI_API_KEY is not set: export your provider API key, or pass --config with services of your own"
         );
     }
-    let data_dir = match data_dir {
-        Some(dir) => dir.to_path_buf(),
-        None => default_data_dir(workspace)?,
+    let data_dir = match (data_dir, project) {
+        (Some(dir), _) => dir.to_path_buf(),
+        (None, Some(project)) => project.data_dir.clone(),
+        (None, None) => default_data_dir(workspace)?,
     };
     // Checked before the directory is created, and again once it exists.
     let data_dir = resolved(&data_dir).with_context(|| format!("data dir {}", data_dir.display()))?;
@@ -85,7 +107,68 @@ pub fn resolve_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&P
     crate::lock::create_private_dir(&data_dir)?;
     let data_dir = data_dir.canonicalize().with_context(|| format!("data dir {}", data_dir.display()))?;
     outside(workspace, &data_dir)?;
-    Config::agent(workspace, &data_dir, &bin_dir()?)
+    let mut cfg = Config::agent(workspace, &data_dir, &bin_dir()?)?;
+    if let Some(project) = project {
+        cfg.for_project(&project.id, &project_paths(project, workspace))?;
+        cfg.with_user_db(&Registry::user()?.user_db())?;
+    }
+    Ok(cfg)
+}
+
+/// The workspace to work in and its project: the project `named` (by id or
+/// name) and its directory, or else the canonical `workspace` and the
+/// project it is a directory of, registered now if it is in none. A custom
+/// config, or a host without a registry, has no project.
+pub fn locate(
+    named: Option<&str>,
+    workspace: &Path,
+    custom_config: bool,
+) -> anyhow::Result<(PathBuf, Option<Project>)> {
+    if let Some(named) = named {
+        let registry = Registry::user()?;
+        let project = registry.find(named)?;
+        return Ok((registry.workspace(&project)?, Some(project)));
+    }
+    let workspace = workspace.canonicalize().with_context(|| format!("workspace {}", workspace.display()))?;
+    anyhow::ensure!(workspace.is_dir(), "the workspace {} is not a directory", workspace.display());
+    if custom_config {
+        return Ok((workspace, None));
+    }
+    let registry = match Registry::user() {
+        Ok(registry) => registry,
+        Err(e) => {
+            tracing::warn!("{e:#}; notes are kept by the workspace's path");
+            return Ok((workspace, None));
+        }
+    };
+    let project = registry.for_path(&workspace, || default_data_dir(&workspace))?;
+    Ok((workspace, Some(project)))
+}
+
+/// The directories memory keeps `project`'s notes for: its own, or the one it
+/// works in when it has none.
+fn project_paths(project: &Project, workspace: &Path) -> Vec<PathBuf> {
+    if project.paths.is_empty() {
+        vec![workspace.to_path_buf()]
+    } else {
+        project.paths.clone()
+    }
+}
+
+/// The data dir of a project made with `molt project new`, as
+/// [`default_data_dir`] names them, from its name and id.
+pub fn project_data_dir(name: &str, id: &str) -> anyhow::Result<PathBuf> {
+    let slug: String =
+        name.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
+    default_data_dir(&Path::new("/").join(id).join(slug.trim_matches('_')))
+}
+
+/// [`Config::allow_web`] with the services next to this executable.
+pub fn allow_web(cfg: &mut Config, hosts: &[String]) -> anyhow::Result<()> {
+    if hosts.is_empty() {
+        return Ok(());
+    }
+    cfg.allow_web(hosts, &bin_dir()?)
 }
 
 /// The directory of the running executable, where the services are.
@@ -98,7 +181,12 @@ fn bin_dir() -> anyhow::Result<PathBuf> {
 /// is given (with `data_dir` in place of its own, when given), otherwise the
 /// default setup of `molt do` for the canonical `workspace`, which must have
 /// run there before (nothing is created).
-pub fn memory_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&Path>) -> anyhow::Result<Config> {
+pub fn memory_config(
+    path: Option<&Path>,
+    workspace: &Path,
+    data_dir: Option<&Path>,
+    project: Option<&Project>,
+) -> anyhow::Result<Config> {
     let cfg = match path {
         Some(path) => {
             let mut cfg = Config::load(path)?;
@@ -108,9 +196,10 @@ pub fn memory_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&Pa
             cfg
         }
         None => {
-            let data_dir = match data_dir {
-                Some(dir) => dir.to_path_buf(),
-                None => default_data_dir(workspace)?,
+            let data_dir = match (data_dir, project) {
+                (Some(dir), _) => dir.to_path_buf(),
+                (None, Some(project)) => project.data_dir.clone(),
+                (None, None) => default_data_dir(workspace)?,
             };
             if !data_dir.is_dir() {
                 bail!(
@@ -120,7 +209,12 @@ pub fn memory_config(path: Option<&Path>, workspace: &Path, data_dir: Option<&Pa
                 );
             }
             let data_dir = data_dir.canonicalize().with_context(|| format!("data dir {}", data_dir.display()))?;
-            Config::agent(workspace, &data_dir, &bin_dir()?)?
+            let mut cfg = Config::agent(workspace, &data_dir, &bin_dir()?)?;
+            if let Some(project) = project {
+                cfg.for_project(&project.id, &project_paths(project, workspace))?;
+                cfg.with_user_db(&Registry::user()?.user_db())?;
+            }
+            cfg
         }
     };
     cfg.service(MEMORY).context("the config has no memory service")?;
@@ -343,6 +437,18 @@ pub async fn run_task_as(
         Err(e) => Err(e),
     };
     running.shutdown().await;
+    // A foreground-group signal can make a service exit before Tokio has
+    // delivered the same signal to our listener. Recheck after shutdown,
+    // while preserving successful runs and never polling a completed stop.
+    let done = if done.as_ref().is_err_and(|error| !error.is::<Interrupted>()) {
+        tokio::select! {
+            biased;
+            () = &mut stop => Err(Interrupted.into()),
+            () = std::future::ready(()) => done,
+        }
+    } else {
+        done
+    };
     let kept = checkpointed && done.as_ref().map_or(true, |d| d.run.checkpoint.is_some());
     if let Some(forks) = forks.filter(|_| !kept) {
         let keep = done.as_ref().ok().and_then(|d| d.run.fork.as_deref());
@@ -500,7 +606,12 @@ async fn consolidate(
 /// `molt memory forget` uses, so that the change is in the audit log.
 pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::Result<Value> {
     let service = cfg.service(MEMORY).context("the config has no memory service")?.clone();
-    let alone = Config { kernel: cfg.kernel.clone(), services: vec![service], confirm: cfg.confirm.clone() };
+    let alone = Config {
+        kernel: cfg.kernel.clone(),
+        services: vec![service],
+        confirm: cfg.confirm.clone(),
+        hooks: cfg.hooks.clone(),
+    };
     let running = crate::start(&alone).await?;
     let result = async {
         let kernel = running.kernel();
@@ -665,6 +776,10 @@ pub fn describe(event: &Progress) -> String {
             }
             line
         }
+        Progress::CheckReady { command: None, rubric, .. } if !rubric.is_empty() => {
+            let numbered: Vec<String> = rubric.iter().enumerate().map(|(i, c)| format!("{}. {c}", i + 1)).collect();
+            format!("no command checks this task; a model judges the result against: {}", numbered.join(" "))
+        }
         Progress::CheckReady { command: None, designed: true, .. } => {
             "no automated check fits this task; the result will be unverified".to_owned()
         }
@@ -673,6 +788,12 @@ pub fn describe(event: &Progress) -> String {
         }
         Progress::AttemptStarted { attempt, .. } => format!("attempt {attempt}: started"),
         Progress::ToolCall { attempt, detail, .. } => format!("attempt {attempt}: {detail}"),
+        Progress::CheckRan { attempt, passed: true, judged: true, .. } => {
+            format!("attempt {attempt}: the judge found every criterion met")
+        }
+        Progress::CheckRan { attempt, passed: false, judged: true, tail, .. } => {
+            format!("attempt {attempt}: judged: {tail}")
+        }
         Progress::CheckRan { attempt, passed: true, .. } => format!("attempt {attempt}: check passed"),
         Progress::CheckRan { attempt, passed: false, exit_code: Some(code), .. } => {
             format!("attempt {attempt}: check failed (exit code {code})")
@@ -738,6 +859,21 @@ pub fn report(resp: &RunResponse) -> String {
         let by = if check.designed { " (designed by the planner)" } else { "" };
         lines.push(format!("check: {}{by}", check.command));
     }
+    if !resp.rubric.is_empty() {
+        lines.push("criteria (judged by a model, no command checked them):".to_owned());
+        for (i, c) in resp.rubric.iter().enumerate() {
+            match resp.judgement.iter().find(|f| f.criterion == c.text) {
+                Some(f) => {
+                    let mark = if f.met { "met" } else { "NOT met" };
+                    lines.push(format!("  {}. [{mark}] {}", i + 1, c.text));
+                    if !f.reason.trim().is_empty() {
+                        lines.push(format!("     {}", f.reason.trim()));
+                    }
+                }
+                None => lines.push(format!("  {}. {}", i + 1, c.text)),
+            }
+        }
+    }
     if resp.changes.is_empty() {
         lines.push("changes: none".to_owned());
     } else {
@@ -745,14 +881,10 @@ pub fn report(resp: &RunResponse) -> String {
         lines.extend(resp.changes.iter().map(|c| format!("  {:<9}{}", change_name(c.kind), c.path)));
     }
     if let Some(review) = &resp.review {
-        let verdict = match review.verdict {
-            Verdict::Approve => "approve",
-            Verdict::Concern => "concern",
-            Verdict::Reject => "reject",
-        };
-        lines.push(format!("review: {verdict}"));
+        lines.push(format!("review: {}", verdict_name(review.verdict)));
         lines.extend(review.findings.iter().map(|f| format!("  - {f}")));
     }
+    lines.extend(selection_lines(resp));
     if resp.applied {
         lines.push("applied to the workspace".to_owned());
     } else if let Some(fork) = &resp.fork {
@@ -769,6 +901,45 @@ pub fn report(resp: &RunResponse) -> String {
         lines.push(summary.to_owned());
     }
     printable(&(lines.join("\n") + "\n"))
+}
+
+/// How the winner was picked among several passing attempts: one line per
+/// candidate, best ranked first. Empty when there was no comparison.
+pub fn selection_lines(resp: &RunResponse) -> Vec<String> {
+    let Some(selection) = &resp.selection else { return Vec::new() };
+    let mut lines = vec![format!("picked among {} passing attempts:", selection.candidates.len())];
+    for c in &selection.candidates {
+        let mark = if resp.winner == Some(c.attempt) { "*" } else { " " };
+        lines.push(format!(" {mark} attempt {}: {}", c.attempt, candidate_scores(c)));
+    }
+    lines
+}
+
+/// What a passing candidate was compared on, in a few words.
+pub fn candidate_scores(c: &Candidate) -> String {
+    let mut parts = Vec::new();
+    if let Some(met) = c.criteria_met {
+        parts.push(format!("{met} criteria met"));
+    }
+    match c.suite_passed {
+        Some(true) => parts.push("suite passed".to_owned()),
+        Some(false) => parts.push("suite failed".to_owned()),
+        None => {}
+    }
+    let at_least = if c.truncated { "≥" } else { "" };
+    parts.push(format!("{at_least}{} lines in {} files", c.lines_changed, c.files_changed));
+    if let Some(verdict) = c.verdict {
+        parts.push(format!("review: {}", verdict_name(verdict)));
+    }
+    parts.join(", ")
+}
+
+fn verdict_name(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Approve => "approve",
+        Verdict::Concern => "concern",
+        Verdict::Reject => "reject",
+    }
 }
 
 /// What memory learned from a run, as one line for the terminal, made
@@ -832,6 +1003,7 @@ pub fn outcome_name(outcome: Outcome) -> &'static str {
         Outcome::Passed => "passed",
         Outcome::Failed => "failed",
         Outcome::Unverified => "unverified",
+        Outcome::Judged => "passed (judged by a model)",
     }
 }
 
@@ -860,6 +1032,28 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn only_configuration_outside_the_project_can_install_hooks() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        std::fs::create_dir(&workspace).unwrap();
+        let services = SERVICES
+            .iter()
+            .map(|name| format!("[[service]]\nname = \"{name}\"\nexec = {{ command = \"/bin/true\" }}\n"))
+            .collect::<String>();
+        let config = format!("{services}\n[[hooks]]\nevent = \"before_apply\"\ncommand = \"true\"\nblocking = true\n");
+        let outside = root.path().join("config.toml");
+        std::fs::write(&outside, &config).unwrap();
+        let trusted = resolve_config(Some(&outside), &workspace, None, None).unwrap();
+        assert_eq!(trusted.hooks.len(), 1);
+        assert!(trusted.service("planner").unwrap().env["MOLT_HOOKS_JSON"].contains("before_apply"));
+        let inside = workspace.join("config.toml");
+        std::fs::write(&inside, config).unwrap();
+        let ignored = resolve_config(Some(&inside), &workspace, None, None).unwrap();
+        assert!(ignored.hooks.is_empty());
+        assert_eq!(ignored.service("planner").unwrap().env["MOLT_HOOKS_JSON"], "[]");
+    }
 
     #[test]
     fn memory_learns_with_the_model_asked_for_or_the_attempts_one() {
@@ -1116,9 +1310,10 @@ mod tests {
                 command: Some("sh check.sh".into()),
                 files: vec!["check.sh".into()],
                 designed: true,
+                rubric: vec![],
             },
-            Progress::CheckReady { run: run.clone(), command: None, files: vec![], designed: true },
-            Progress::CheckReady { run: run.clone(), command: None, files: vec![], designed: false },
+            Progress::CheckReady { run: run.clone(), command: None, files: vec![], designed: true, rubric: vec![] },
+            Progress::CheckReady { run: run.clone(), command: None, files: vec![], designed: false, rubric: vec![] },
             Progress::ToolCall {
                 run: run.clone(),
                 attempt: 1,
@@ -1126,7 +1321,14 @@ mod tests {
                 tool: "read_file".into(),
                 detail: "read a.rs".into(),
             },
-            Progress::CheckRan { run: run.clone(), attempt: 0, passed: false, exit_code: Some(1), tail: "boom".into() },
+            Progress::CheckRan {
+                run: run.clone(),
+                attempt: 0,
+                passed: false,
+                exit_code: Some(1),
+                tail: "boom".into(),
+                judged: false,
+            },
             Progress::AttemptFinished { run, attempt: 1, status: AttemptStatus::Cancelled },
         ]
         .iter()
@@ -1149,7 +1351,7 @@ mod tests {
     fn report_lines() {
         let mut resp = RunResponse {
             outcome: Outcome::Passed,
-            check: Some(CheckSpec { command: "cargo test".into(), files: vec![], designed: false }),
+            check: Some(CheckSpec { command: "cargo test".into(), files: vec![], designed: false, suite: None }),
             winner: Some(0),
             summary: "Fixed the parser.\n".into(),
             changes: vec![Change { path: "src/lib.rs".into(), kind: ChangeKind::Modified }],
@@ -1164,6 +1366,9 @@ mod tests {
             uncounted_calls: 0,
             checkpoint: None,
             requirements: vec![],
+            selection: None,
+            rubric: vec![],
+            judgement: vec![],
         };
         assert_eq!(
             report(&resp),
@@ -1185,6 +1390,59 @@ mod tests {
             report(&resp)
         );
         resp.review = None;
+        let candidate = |attempt, suite_passed, lines_changed, verdict| planner::Candidate {
+            attempt,
+            criteria_met: None,
+            suite_passed,
+            lines_changed,
+            files_changed: 1,
+            truncated: false,
+            verdict,
+        };
+        resp.selection = Some(planner::Selection {
+            rule: "fewer lines".into(),
+            candidates: vec![candidate(0, Some(true), 3, Some(Verdict::Approve)), candidate(1, Some(false), 1, None)],
+        });
+        assert!(
+            report(&resp).contains(
+                "picked among 2 passing attempts:\n * attempt 0: suite passed, 3 lines in 1 files, review: approve\n   \
+                 attempt 1: suite failed, 1 lines in 1 files\nnot applied"
+            ),
+            "{}",
+            report(&resp)
+        );
+        resp.selection = None;
+        resp.outcome = Outcome::Judged;
+        resp.rubric = vec![
+            planner::Criterion { text: "Cites sources.".into(), command: None },
+            planner::Criterion { text: "Under 500 words.".into(), command: Some("wc".into()) },
+        ];
+        resp.judgement = vec![
+            planner::Finding {
+                criterion: "Cites sources.".into(),
+                met: true,
+                reason: "Each claim links.".into(),
+                by_command: false,
+            },
+            planner::Finding {
+                criterion: "Under 500 words.".into(),
+                met: true,
+                reason: String::new(),
+                by_command: true,
+            },
+        ];
+        let shown = report(&resp);
+        assert!(shown.starts_with("outcome: passed (judged by a model)\n"), "{shown}");
+        assert!(
+            shown.contains(
+                "criteria (judged by a model, no command checked them):\n  1. [met] Cites sources.\n     Each claim \
+                 links.\n  2. [met] Under 500 words.\n"
+            ),
+            "{shown}"
+        );
+        resp.outcome = Outcome::Passed;
+        resp.rubric.clear();
+        resp.judgement.clear();
         resp.changes = vec![Change { path: "\x1b[1Aevil".into(), kind: ChangeKind::Added }];
         resp.summary = "Done.\x1b]0;title\x07\n".into();
         let shown = report(&resp);

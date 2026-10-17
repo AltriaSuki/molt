@@ -73,6 +73,9 @@ pub struct WriteRequest {
     pub workspace: String,
     pub path: String,
     pub content: String,
+    /// Whether to look for syntax errors the write introduces. Default: off.
+    #[serde(default, skip_serializing_if = "SyntaxCheck::is_off")]
+    pub syntax: SyntaxCheck,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +83,9 @@ pub struct WriteResponse {
     pub bytes: u64,
     /// The file did not exist before.
     pub created: bool,
+    /// Syntax errors the write introduced, when the request asked and there were any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syntax: Option<SyntaxReport>,
 }
 
 /// Replace exact text in a file. Without `replace_all`, `old` must occur
@@ -92,11 +98,66 @@ pub struct EditRequest {
     pub new: String,
     #[serde(default)]
     pub replace_all: bool,
+    /// Whether to look for syntax errors the edit introduces. Default: off.
+    #[serde(default, skip_serializing_if = "SyntaxCheck::is_off")]
+    pub syntax: SyntaxCheck,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditResponse {
     pub replacements: u64,
+    /// Syntax errors the edit introduced, when the request asked and there were any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syntax: Option<SyntaxReport>,
+}
+
+/// What a write or edit does about syntax errors it would introduce. Files
+/// in a language the service cannot parse are never checked, and neither is
+/// a version that takes too long to parse (two seconds); an error the file
+/// already had before the change is not counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyntaxCheck {
+    /// Do not look.
+    #[default]
+    Off,
+    /// Make the change and report the new errors.
+    Report,
+    /// Report the new errors and leave the file as it was.
+    Reject,
+}
+
+impl SyntaxCheck {
+    pub fn is_off(&self) -> bool {
+        *self == Self::Off
+    }
+}
+
+/// The syntax errors a write or edit introduced.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyntaxReport {
+    /// The first few, in file order.
+    pub errors: Vec<SyntaxError>,
+    /// How many more there were.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub more: u32,
+    /// The change was not made ([`SyntaxCheck::Reject`]): the file is as it was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rejected: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyntaxError {
+    /// 1-based, in the file as changed.
+    pub line: u32,
+    /// What is wrong, e.g. ``missing `)` ``.
+    pub message: String,
+    /// The lines around it, each as `NUMBER | text`.
+    pub context: String,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// List a directory tree, skipping ignored files and `.git`.

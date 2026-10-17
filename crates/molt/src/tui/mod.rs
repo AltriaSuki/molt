@@ -6,6 +6,9 @@
 //! comes back, with the keys, to the app.
 
 mod app;
+mod backend;
+mod commands;
+mod notice;
 mod preview;
 mod text;
 mod view;
@@ -20,7 +23,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::Context;
-use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen};
 use ratatui::DefaultTerminal;
@@ -28,6 +33,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use self::app::{Action, App, Msg};
+use self::notice::Notice;
 use crate::session::Session;
 use crate::{agent, Config};
 
@@ -37,8 +43,12 @@ const TICK: Duration = Duration::from_millis(150);
 pub struct Options {
     pub config: Option<PathBuf>,
     pub workspace: PathBuf,
+    /// A project of the registry, by id or name, in place of `workspace`.
+    pub project: Option<String>,
     pub data_dir: Option<PathBuf>,
     pub pass_env: Vec<String>,
+    /// Hosts the agent may read web pages from.
+    pub allow_web: Vec<String>,
 }
 
 /// Run the interface until the user quits. Returns the forks the user kept.
@@ -48,13 +58,14 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
         "molt needs a terminal for its interface; in scripts, use `molt do TASK`"
     );
     let stop = crate::stop_signal()?;
-    let workspace = opts.workspace.canonicalize().with_context(|| format!("workspace {}", opts.workspace.display()))?;
-    anyhow::ensure!(workspace.is_dir(), "the workspace {} is not a directory", workspace.display());
+    let (workspace, project) = agent::locate(opts.project.as_deref(), &opts.workspace, opts.config.is_some())?;
     let path = workspace.to_str().context("the workspace path is not UTF-8")?.to_owned();
-    let mut cfg = agent::resolve_config(opts.config.as_deref(), &workspace, opts.data_dir.as_deref())?;
+    let mut cfg =
+        agent::resolve_config(opts.config.as_deref(), &workspace, opts.data_dir.as_deref(), project.as_ref())?;
     if let Some(shell) = cfg.service_mut("shell") {
         shell.pass_env.extend(opts.pass_env);
     }
+    agent::allow_web(&mut cfg, &opts.allow_web)?;
     if std::env::var_os("RUST_LOG").is_none() {
         for svc in &mut cfg.services {
             svc.env.entry("RUST_LOG".into()).or_insert_with(|| "warn".into());
@@ -72,12 +83,15 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
     std::panic::set_hook(Box::new(move |info| {
         // SAFETY: dup2 on descriptors this process owns.
         unsafe { libc::dup2(restore, libc::STDERR_FILENO) };
+        emit(notice::POP_TITLE);
         hook(info);
     }));
-    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableFocusChange);
+    emit(notice::PUSH_TITLE);
     let home = std::env::var("HOME").ok();
     let result = event_loop(&mut terminal, cfg, path, home.as_deref(), stop).await;
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    emit(notice::POP_TITLE);
+    let _ = execute!(std::io::stdout(), DisableFocusChange, DisableBracketedPaste);
     ratatui::restore();
     drop(stderr);
     let _ = std::panic::take_hook();
@@ -92,7 +106,6 @@ async fn event_loop(
     stop: impl Future<Output = i32> + Send + 'static,
 ) -> anyhow::Result<Vec<String>> {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (sessions, mut started) = mpsc::unbounded_channel();
     let pause = Arc::new(Pause::default());
     read_terminal(tx.clone(), pause.clone());
     let ticks = tx.clone();
@@ -111,16 +124,29 @@ async fn event_loop(
     let mut app = App::new(&workspace, home);
     app.secrets = secrets_in_env();
     app.rules = cfg.confirm.clone();
-    let mut rt =
-        Runtime { cfg: Arc::new(cfg), workspace, tx, sessions, session: None, starting: false, work: Vec::new() };
-    rt.exec(Action::StartSession);
+    app.load_commands(Path::new(&workspace));
+    let theme_file = cfg.kernel.data_dir.join("tui-theme.json");
+    match std::fs::read(&theme_file) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(theme) => app.theme = theme,
+            Err(e) => app.flash = Some(format!("saved theme ignored: {e}")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => app.flash = Some(format!("could not load saved theme: {e}")),
+    }
+    let data_dir = cfg.kernel.data_dir.clone();
+    let mut backend = backend::Backend::start(cfg, workspace, tx).await?;
+    backend.send(&Action::StartSession).await?;
+    let notice = Notice::from_env(|name| std::env::var(name).ok());
     let mut keep = Vec::new();
+    let mut title = String::new();
     loop {
+        if app.title() != title {
+            title = app.title();
+            emit(&notice::title(&title));
+        }
         terminal.draw(|frame| view::draw(frame, &mut app))?;
-        let msg = tokio::select! {
-            Some(msg) = rx.recv() => msg,
-            Some(session) = started.recv() => rt.started(session),
-        };
+        let Some(msg) = rx.recv().await else { break };
         let mut actions = app.update(msg);
         while let Ok(msg) = rx.try_recv() {
             actions.extend(app.update(msg));
@@ -128,29 +154,37 @@ async fn event_loop(
         for action in actions {
             match action {
                 Action::Quit { keep: k } => keep = k,
-                Action::Edit { text } => {
-                    let edited = edit_outside(terminal, &pause, &rt.cfg.kernel.data_dir, &text);
-                    let _ = rt.tx.send(Msg::Edited(edited));
+                Action::Alert { text } => emit(&notice.alert(&text)),
+                Action::Redraw => redraw(terminal)?,
+                Action::Suspend => {
+                    suspend(terminal, &pause)?;
+                    // The shell had the window meanwhile: set the title again.
+                    title.clear();
                 }
-                action => rt.exec(action),
+                Action::SaveTheme(theme) => {
+                    if let Err(e) = save_theme(&data_dir, theme) {
+                        app.flash = Some(format!("theme changed but could not be saved: {e}"));
+                    }
+                }
+                Action::Edit { text } => {
+                    let edited = edit_outside(terminal, &pause, &data_dir, &text);
+                    app.update(Msg::Edited(edited));
+                }
+                action => backend.send(&action).await?,
             }
         }
         if app.quit {
             break;
         }
     }
-    for work in rt.work.drain(..) {
-        work.abort();
-    }
-    if rt.starting {
-        if let Some(Ok(session)) = started.recv().await {
-            rt.session = Some(session);
-        }
-    }
-    if let Some(session) = rt.session.take() {
-        session.shutdown(&keep).await;
-    }
+    backend.shutdown(&keep).await?;
     Ok(keep)
+}
+
+/// Internal child entry point. Standard input/output are private framed pipes,
+/// not a terminal or the capability bus.
+pub async fn serve_backend() -> anyhow::Result<()> {
+    backend::serve().await
 }
 
 /// Keeps the terminal reader off the terminal while another program has it.
@@ -183,6 +217,8 @@ fn read_terminal(tx: UnboundedSender<Msg>, pause: Arc<Pause>) {
             match event::read() {
                 Ok(Event::Key(key)) => Msg::Key(key),
                 Ok(Event::Paste(text)) => Msg::Paste(text),
+                Ok(Event::FocusGained) => Msg::Focus(true),
+                Ok(Event::FocusLost) => Msg::Focus(false),
                 Ok(Event::Resize(..)) => Msg::Tick,
                 Ok(_) => continue,
                 Err(_) => break,
@@ -215,6 +251,8 @@ struct Runtime {
     starting: bool,
     /// Calls in flight, stopped on an interrupt.
     work: Vec<JoinHandle<()>>,
+    /// The work tree as it was when the task `.0` started, for `/commit on`.
+    before: Option<(String, anyhow::Result<crate::git::Before>)>,
 }
 
 impl Runtime {
@@ -282,6 +320,27 @@ impl Runtime {
             Action::Apply { fork } => self.call(move |s| async move {
                 Msg::Applied(s.apply(&fork).await.map(|_| ()).map_err(|e| format!("{e:#}")))
             }),
+            Action::PrepareCommit { trace } => {
+                self.before = Some((trace.to_string(), crate::git::Before::look(Path::new(&self.workspace))));
+            }
+            Action::Commit { trace, task, resp } => {
+                let before = match self.before.take() {
+                    Some((run, before)) if run == trace.as_str() => before,
+                    other => {
+                        self.before = other;
+                        Err(anyhow::anyhow!("/commit was turned on after the task started"))
+                    }
+                };
+                let tx = self.tx.clone();
+                // Not among the interruptible work: a commit half made would leave the index behind.
+                tokio::spawn(async move {
+                    let made = tokio::task::spawn_blocking(move || before?.commit(&resp, trace.as_str(), &task, None))
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|made| made);
+                    let _ = tx.send(Msg::Committed(made.map_err(|e| format!("{e:#}"))));
+                });
+            }
             Action::Discard { fork } => {
                 self.call(move |s| async move { Msg::Discarded(s.discard(&fork).await.map_err(|e| format!("{e:#}"))) })
             }
@@ -290,6 +349,13 @@ impl Runtime {
             Action::Forget { id, reason } => self.call(move |s| async move {
                 let result = s.forget(&id, &reason).await.map_err(|e| format!("{e:#}"));
                 Msg::Forgot { id, result }
+            }),
+            Action::Remember { text } => self.call(move |s| async move {
+                Msg::Remembered(s.remember(&text).await.map(|r| r.note.id).map_err(|e| format!("{e:#}")))
+            }),
+            Action::Promote { id, reason } => self.call(move |s| async move {
+                let result = s.promote(&id, &reason).await.map(|n| n.id).map_err(|e| format!("{e:#}"));
+                Msg::Promoted { id, result }
             }),
             Action::ChangeNote { review, text } => self.call(move |s| async move {
                 Msg::ChangedNote(s.change_note(review, text).await.map_err(|e| format!("{e:#}")))
@@ -328,7 +394,12 @@ impl Runtime {
                 }
             }
             // The loop handles these: they need the terminal.
-            Action::Quit { .. } | Action::Edit { .. } => {}
+            Action::Quit { .. }
+            | Action::Edit { .. }
+            | Action::Redraw
+            | Action::Suspend
+            | Action::SaveTheme(_)
+            | Action::Alert { .. } => {}
         }
     }
 
@@ -371,7 +442,7 @@ fn edit_outside(terminal: &mut DefaultTerminal, pause: &Pause, dir: &Path, text:
 
     pause.paused.store(true, Ordering::SeqCst);
     let reading = pause.reading.lock().unwrap_or_else(PoisonError::into_inner);
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    let _ = execute!(std::io::stdout(), DisableFocusChange, DisableBracketedPaste);
     ratatui::restore();
     // `sh` splits the variable as a shell would, so `EDITOR="code --wait"` works.
     let status = tokio::task::block_in_place(|| {
@@ -380,7 +451,15 @@ fn edit_outside(terminal: &mut DefaultTerminal, pause: &Pause, dir: &Path, text:
     // Not `terminal.clear()`: it asks the terminal where the cursor is. An empty frame over the
     // cleared screen makes the next draw a full one.
     let back = terminal::enable_raw_mode()
-        .and_then(|()| execute!(std::io::stdout(), EnterAlternateScreen, Clear(ClearType::All), EnableBracketedPaste))
+        .and_then(|()| {
+            execute!(
+                std::io::stdout(),
+                EnterAlternateScreen,
+                Clear(ClearType::All),
+                EnableBracketedPaste,
+                EnableFocusChange
+            )
+        })
         .and_then(|()| terminal.draw(|_| {}).map(|_| ()));
     drop(reading);
     pause.paused.store(false, Ordering::SeqCst);
@@ -393,6 +472,57 @@ fn edit_outside(terminal: &mut DefaultTerminal, pause: &Pause, dir: &Path, text:
         Ok(s) => Err(format!("{editor} {s}")),
         Err(e) => Err(format!("could not start {editor}: {e}")),
     }
+}
+
+fn redraw(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+    execute!(std::io::stdout(), Clear(ClearType::All))?;
+    terminal.draw(|_| {}).map(|_| ())
+}
+
+fn save_theme(dir: &Path, theme: text::Theme) -> anyhow::Result<()> {
+    use std::io::Write;
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let temporary = dir.join(format!("tui-theme-{}-{nonce}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+    let result = (|| -> anyhow::Result<()> {
+        file.write_all(&serde_json::to_vec(&theme)?)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, dir.join("tui-theme.json"))?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(temporary);
+    result
+}
+
+fn suspend(terminal: &mut DefaultTerminal, pause: &Pause) -> anyhow::Result<()> {
+    pause.paused.store(true, Ordering::SeqCst);
+    let reading = pause.reading.lock().unwrap_or_else(PoisonError::into_inner);
+    let _ = execute!(std::io::stdout(), DisableFocusChange, DisableBracketedPaste);
+    emit(notice::POP_TITLE);
+    ratatui::restore();
+    // Stop only the interface process. Its service children continue working.
+    // SIGCONT resumes this call, before the terminal reader is unpaused.
+    let stopped = tokio::task::block_in_place(|| {
+        // SAFETY: raise sends a standard signal to the current process.
+        unsafe { libc::raise(libc::SIGTSTP) }
+    });
+    let restored = terminal::enable_raw_mode()
+        .and_then(|()| execute!(std::io::stdout(), EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange))
+        .and_then(|()| redraw(terminal));
+    emit(notice::PUSH_TITLE);
+    drop(reading);
+    pause.paused.store(false, Ordering::SeqCst);
+    restored.context("could not restore the terminal after suspension")?;
+    anyhow::ensure!(stopped == 0, "could not suspend the interface");
+    Ok(())
+}
+
+/// Escape sequences straight to the terminal, between frames; best effort.
+fn emit(bytes: &str) {
+    use std::io::Write;
+
+    let mut out = std::io::stdout();
+    let _ = out.write_all(bytes.as_bytes()).and_then(|()| out.flush());
 }
 
 /// Standard error sent to a file until dropped.
@@ -427,5 +557,89 @@ impl Drop for Redirect {
             libc::dup2(self.saved, libc::STDERR_FILENO);
             libc::close(self.saved);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_runtime_commits_what_the_task_merged_against_the_tree_it_started_from() {
+        use molt_api::fs::{Change, ChangeKind};
+        use molt_api::planner::{Outcome, RunResponse};
+        use molt_proto::TraceId;
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")] {
+            git(d, &["config", key, value]);
+        }
+        std::fs::write(d.join("a.txt"), "a\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-q", "-m", "start"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (sessions, _started) = mpsc::unbounded_channel();
+        let workspace = d.to_str().unwrap().to_owned();
+        let mut rt = Runtime {
+            cfg: Arc::new(Config::default()),
+            workspace,
+            tx,
+            sessions,
+            session: None,
+            starting: false,
+            work: Vec::new(),
+            before: None,
+        };
+        let resp = |path: &str| RunResponse {
+            outcome: Outcome::Unverified,
+            check: None,
+            winner: Some(0),
+            summary: "Write b".into(),
+            changes: vec![Change { path: path.into(), kind: ChangeKind::Added }],
+            patch: String::new(),
+            patch_truncated: false,
+            applied: true,
+            fork: None,
+            review: None,
+            attempts: vec![],
+            usage: Default::default(),
+            cost_usd: 0.0,
+            uncounted_calls: 0,
+            checkpoint: None,
+            requirements: vec![],
+            selection: Default::default(),
+            rubric: vec![],
+            judgement: vec![],
+        };
+        let trace = TraceId::random();
+        rt.exec(Action::PrepareCommit { trace: trace.clone() });
+        std::fs::write(d.join("b.txt"), "b\n").unwrap();
+        rt.exec(Action::Commit { trace: trace.clone(), task: "write b".into(), resp: Box::new(resp("b.txt")) });
+        let Some(Msg::Committed(Ok(Some(made)))) = rx.recv().await else { panic!("not committed") };
+        assert_eq!((made.subject.as_str(), made.branch.as_deref()), ("Write b", Some("main")));
+        assert_eq!(git(d, &["show", "--name-only", "--format=", "HEAD"]), "b.txt\n");
+        let trailer = git(d, &["log", "-1", "--format=%(trailers:key=Molt-Run,valueonly)"]);
+        assert_eq!(trailer.trim(), trace.as_str());
+        // Turned on after the task started: nothing was looked at for it.
+        rt.exec(Action::Commit { trace: TraceId::random(), task: "late".into(), resp: Box::new(resp("b.txt")) });
+        let Some(Msg::Committed(Err(e))) = rx.recv().await else { panic!("committed") };
+        assert!(e.contains("turned on after the task started"), "{e}");
+    }
+    #[test]
+    fn themes_are_saved_privately_and_replaced_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        save_theme(dir.path(), text::Theme::Light).unwrap();
+        save_theme(dir.path(), text::Theme::Ansi).unwrap();
+        let path = dir.path().join("tui-theme.json");
+        assert_eq!(serde_json::from_slice::<text::Theme>(&std::fs::read(&path).unwrap()).unwrap(), text::Theme::Ansi);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
