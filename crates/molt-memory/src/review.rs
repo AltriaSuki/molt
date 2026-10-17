@@ -52,7 +52,7 @@ pub(crate) fn decode<T: DeserializeOwned>(text: &str) -> rusqlite::Result<T> {
 
 /// Open each component relative to the last directory descriptor. No
 /// symlink (including one swapped in during traversal) can escape the root.
-fn fingerprint(workspace: &Path, path: &str) -> Result<String, RemoteError> {
+pub(crate) fn fingerprint(workspace: &Path, path: &str) -> Result<String, RemoteError> {
     let components: Vec<_> = Path::new(path).components().collect();
     if components.is_empty()
         || components.len() > 64
@@ -182,8 +182,9 @@ pub(crate) fn recall(
     let theirs = match user {
         Some(user) => {
             let everywhere = RecallRequest { workspace: None, capture: None, ..req.clone() };
-            let mut found =
-                user.with(|conn| notes::select(conn, &everywhere, Scope::WithGlobal, now)).map_err(error::db)?;
+            let mut found = user
+                .with(|conn| notes::select(conn, &everywhere, Scope::WithGlobal, now, user.semantic()))
+                .map_err(error::db)?;
             for r in &mut found {
                 r.layer = Layer::User;
             }
@@ -199,7 +200,7 @@ pub(crate) fn recall(
     db.with(|conn| -> rusqlite::Result<_> {
         let tx = conn.transaction()?;
         apply(&tx, changes, identity.map_or("inspection", |i| i.0), now)?;
-        let mut found = notes::select(&tx, req, Scope::WithGlobal, now)?;
+        let mut found = notes::select(&tx, req, Scope::WithGlobal, now, db.semantic())?;
         if !theirs.is_empty() {
             found.extend(theirs);
             found.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.note.id.cmp(&b.note.id)));

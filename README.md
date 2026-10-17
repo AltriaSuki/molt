@@ -42,6 +42,7 @@ that starts with milestone 5.
 | File and shell services | `fs.*` and `shell.*`: files, forks, diffs, merges and commands, confined to a root | `molt-tools` |
 | Planner | `planner.run`: check first, parallel attempts, verify, apply; `planner.control` steers a run that is going | `molt-planner` |
 | Memory | `memory.*`: notes with provenance, learned from finished runs; the project model (definitions, references, repo map) | `molt-memory` |
+| Web service | `web.fetch`: pages from the hosts the user allows, over https, as text; off unless allowed | `molt-web` |
 
 The kernel never trusts the sender named in a message. The transport
 authenticates each service's endpoint (a per-service secret on Unix sockets,
@@ -72,8 +73,12 @@ sender from that.
 | A benchmark starts a run only while what it spent, plus the whole `--task-usd` of that run and of each run in flight, fits in `--max-usd`; it refuses models it has no price for | `crates/molt-bench/src/run.rs` (`runs_stop_before_they_could_pass_the_budget`, `a_run_of_unknown_cost_stops_the_benchmark`), `crates/molt-bench/src/cli.rs` (`a_model_without_a_price_is_refused`) |
 | A model with no price stays of unknown cost and stops the run; prices come only from the user's environment or data directory, never from a project, and a download that does not validate replaces nothing | `crates/molt-gateway/src/prices.rs` (`the_data_directory_holds_the_snapshot_and_nothing_else_is_read`, `a_download_that_does_not_validate_is_refused`, `malformed_declared_prices_stop_startup_and_name_the_item`), `crates/molt-gateway/tests/gateway.rs` (`a_snapshot_prices_a_third_party_model…`) |
 | `molt do --commit` commits exactly the files the run merged and leaves what the user staged alone; `molt undo` takes it back with a new commit, never touching later changes, and the undone run no longer lends any note confidence | `crates/molt/src/git.rs` (`a_run_commit_holds_only_the_merged_files…`, `undo_refuses_files_that_changed_since_the_run`), `crates/molt/tests/agent.rs` (`a_committed_run_can_be_undone_and_memory_stops_counting_it`), `crates/molt-memory/src/notes.rs` (`an_undone_run_lends_no_note_confidence…`) |
+| The agent reads the web only when the user allows hosts: over https, from those hosts after every redirect, never from a loopback, private or link-local address; commands stay offline, and every page read is in the audit log | `crates/molt-web/src/allow.rs` (`only_https_urls_on_allowed_hosts_pass`, `only_public_addresses_are_public`), `crates/molt-web/tests/web.rs` (`hosts_off_the_list_are_refused_before_any_request_and_on_every_redirect`), `crates/molt/tests/agent.rs` (`allowed_web_hosts_start_the_web_service_and_offer_fetch_url_only_then`), `crates/molt-planner/tests/planner.rs` (`fetch_url_is_offered_only_to_a_planner_that_may_read_the_web`) |
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
+| Issue CI rejects PR triggers and probes the sandbox before model spend | `scripts/ci/test_issue_to_pr.py::test_only_labelled_open_issues_are_eligible`, `test_sandbox_failure_posts_a_summary_and_never_starts_a_model` |
+| A skill source cannot approve itself; only the CLI manages activation and withdrawal preserves evidence | `skills::tests::drafts_need_independent_evidence_and_disable_cannot_be_undone_by_learning`, `tests/service.rs::an_agent_cannot_manage_or_promote_its_own_skills` |
 | Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
+| Offline embedding models are hash-pinned and cannot reintroduce forgotten or cross-project notes | `semantic::tests::pinned_models_retrieve_synonyms_and_reject_changed_files`, `semantic::tests::synonyms_are_recalled_with_scores_and_snapshots_survive_forgetting` |
 
 ## Quick start
 
@@ -234,6 +239,12 @@ ends. Missing events are labeled as gaps; the interface never reconstructs
 them. Previews are provisional: the complete reply and check determine the
 result, and cancelled or late events cannot make a result appear.
 
+`/commit on` commits each result once it is applied, as `molt do --commit`
+does (see "Commits and `molt undo`" below): the work tree is looked at when
+the task starts, and the commit is made after the run applies the result, or
+after you accept it in confirm mode. A result kept in its fork, or one that
+fails to apply, is not committed. `/commit off` (the default) stops it.
+
 The interface holds the data dir's lock while it is open, so a `molt do` in
 the same project is refused until it closes.
 
@@ -243,7 +254,7 @@ the same project is refused until it closes.
 molt do TASK [--check CMD | --no-check] [--attempts N] [--select MODE] [--model M] [--effort E] [--max-turns N]
         [--budget-usd X] [--no-apply | --commit [--branch NAME]] [--no-review] [--json] [--stream]
         [--workspace DIR] [--data-dir DIR] [--pass-env NAME]... [--no-memory] [--no-learn]
-        [--memory-model MODEL] [--checkpoint] [--config FILE]
+        [--memory-model MODEL] [--judge-model MODEL] [--checkpoint] [--config FILE]
 molt resume [RUN] [--retry] [--list] [--budget-usd X] [--no-apply] [--commit] [--json] [--workspace DIR] ...
 molt undo [RUN] [--workspace DIR] [--data-dir DIR]
 ```
@@ -268,6 +279,7 @@ molt undo [RUN] [--workspace DIR] [--data-dir DIR]
 | `--no-memory` | Run without memory: no map or notes for the model, nothing learned. |
 | `--no-learn` | Use memory, but do not learn from this run (learning is one more model call after it). |
 | `--memory-model MODEL` | The model memory learns from this run with; `same` uses the attempts' model. Default: `MOLT_MEMORY_MODEL`, else `sonnet`. Useful when that model is not on your endpoint. |
+| `--judge-model MODEL` | The model that judges a task no command can check against its criteria (below). Default: the attempts' model. |
 | `--checkpoint` | Save a checkpoint as the run goes, so a run that stops before it finishes can go on with `molt resume` (below). |
 | `--config FILE` | Run your own service setup (see `molt.example.toml`) instead of the default one. |
 
@@ -294,6 +306,29 @@ candidate with its scores, and the choice is noted in the audit log. When
 less budget is left than the first passing attempt cost, the run takes it
 without waiting, as `first` would. To compare the modes on the benchmark, add
 an arm: `molt bench --arm molt --arm select-all="--select all"`.
+
+### Tasks no command can check
+
+Some tasks have no command that can tell when they are done: write a design
+note, reword the error messages, explain a module in its docs. For those the
+designer sets a rubric instead of a check: a few concrete criteria the result
+must meet, each with a command where one can check that part (a file exists,
+a word is gone) and without one where only reading can tell. When the attempt
+finishes, the criteria with a command are run in its fork, and a separate
+judge model, which never saw the attempt work, reads the task, the criteria,
+the attempt's final reply and the diff, with read-only tools, and answers each
+remaining criterion met or not with a reason. Unmet criteria go back to the
+attempt, as a failed check would, up to the same number of rounds; a result
+that still misses one fails the run and is not applied. With more than one
+passing attempt, the one that meets more criteria ranks first (see above).
+
+A result accepted this way is reported as passed (judged by a model), not
+passed, and the report and `--json` (`rubric`, `judgement`) list each
+criterion with what the judge said and whether a command decided it. A rubric
+works without any network access beyond the model API. Memory learns less
+from a judged run than from a checked one. `planner.design` returns the
+rubric in place of a check when it designs one, and a run given a rubric
+designs nothing.
 
 ### Commits and `molt undo`
 
@@ -564,6 +599,34 @@ molt do "plan five days in Kyoto" --project "Japan trip" --no-check
 of its own, `<registry dir>/projects/<id>/files`, which is where its
 research and writing end up. With `--config`, the registry is left out and
 notes are kept by the workspace's path, as before.
+### Reading the web
+
+Commands have no network, so an attempt cannot look up an unfamiliar API.
+`--allow-web HOST` (repeatable, for `molt do`, `molt resume` and the
+interface) lets it read pages from those hosts: `docs.rs` is that host,
+`*.python.org` any host below python.org. It starts a `web` service of its
+own and gives the planner the capability to call it; attempts and the check
+designer are then offered `fetch_url`, and without the flag they are not.
+The service fetches over https on the default port only, checks every
+redirect against the list, resolves names itself and never connects to a
+loopback, private, link-local or other non-public address, and uses no
+proxy. It reads at most 2 MiB of a page and returns at most 100 KB of text,
+with HTML turned into plain text and links kept; other content that is not
+text is refused. The model is told the page is data, not instructions. Each
+URL and the text read from it go through the kernel, so the audit log has
+them for replaying a run without the network. In a config file, the
+same is a protected service:
+
+```toml
+[[service]]
+name = "web"
+tier = "protected"
+exec = { command = "molt-web", args = ["--allow", "docs.rs", "--allow", "*.python.org"] }
+provides = ["web.*"]
+```
+
+with `{ target = "web.fetch", budget = { calls = 1000000 } }` in the
+planner's `requests`.
 
 ## Memory
 
@@ -908,15 +971,17 @@ needed. Deleting an unfinished record loses its recovery material.
 - Reading one trace back from the audit log scans the log from the start: there is no index yet. One read looks through at most 256 MiB and keeps to its deadline, and two run at once.
 - The kernel drops a message nested more than 100 levels deep, so every logged message can be read back.
 - After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none. A run with `--checkpoint` that stops keeps its forks for `molt resume`.
-- Only `molt do --commit` and `molt resume --commit` commit a result; the interface (`molt ui`) does not yet. `molt undo` takes back only those commits, and refuses a file changed after the run rather than merging the revert into it (use `git revert` then).
+- A rubric's model-judged criteria are a model's reading, not a proof: the judge can be wrong, and nothing but the criteria with a command checks the result. In the interface, a constraint that adds a check is refused while a run is being judged by a rubric.
+- Only `molt do --commit`, `molt resume --commit` and the interface's `/commit on` commit a result, always on the current branch (`--branch` is for `molt do` only). `molt undo` takes back only those commits, and refuses a file changed after the run rather than merging the revert into it (use `git revert` then).
 - A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.
-- Recall matches keywords (with stemming), not meaning: there is no vector index, since the Anthropic API has no embeddings endpoint. A note worded differently from the task can be missed; the strongest notes about the project are always shown.
+- Default recall matches keywords with stemming, so differently worded notes can be missed. Optional offline word-vector recall needs a reviewed hash-pinned local model; its mean-pooling backend does not understand word order or supply a pretrained vocabulary.
 - Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. Only notes you write or promote yourself are shared between projects. Clones of one project share its data dir, so molt runs in one of them at a time.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.
 - Model prices are as current as the last `molt prices update` (or the release's snapshot) and as right as the community list they came from; a price that changes mid-run is not picked up until the next run. Models that LiteLLM lists only with tiered or regional prices, such as some Qwen models, have no price until declared in `MOLT_MODEL_PRICES`.
+- The web service has no search: an attempt reads pages whose URL it knows or finds in pages it read. It does not use a proxy, so a network that only reaches the web through one cannot use it, and it reads pages as served, without running their scripts.
 
 ### Cancellation and model settlement
 
@@ -926,7 +991,7 @@ Link loss ends concurrent admission immediately, even if every slot is occupied.
 
 Dropping the SDK service itself closes every pending call's waiter and requests cancellation without awaiting a reply. Background cancellation after a drop is best effort and bounded to one second, so a stalled transport cannot retain the link forever. Remote cancellation and unsettled usage remain unconfirmed.
 
-The planner gives each attempt its own cancellation token. A winner stops competing attempts; budget exhaustion or unknown model cost stops new actions throughout the run. Shell cancellation and timeout send TERM to the process group, allow 500 ms for cleanup, then send KILL and reap the leader before replying. Service shutdown uses the same grace. Process groups alone cannot contain a program that deliberately creates a new session; OS isolation is tracked by #9.
+The planner gives each attempt its own cancellation token. A winner stops competing attempts; budget exhaustion or unknown model cost stops new actions throughout the run. The one exception is a call cancelled because its attempt was stopped while the run went on, such as one that lost the race: its cost is unknown too, and is reported in `uncounted_calls`, but it does not stop the winner's review and apply, so a run can pass its budget by up to one call for each attempt it stopped. Shell cancellation and timeout send TERM to the process group, allow 500 ms for cleanup, then send KILL and reap the leader before replying. Service shutdown uses the same grace. Process groups alone cannot contain a program that deliberately creates a new session; OS isolation is tracked by #9.
 
 The gateway closes its local HTTP request on cancellation and audits a correlated settlement record with `local_stopped`, `remote_cancel_confirmed`, `usage` and `cost_usd`. Anthropic Messages has no remote cancellation acknowledgement here, so remote cancellation and missing usage remain unknown. A completion already received wins the race and is counted once. After a kernel timeout, one authenticated late model reply can still be audited for up to one hour, without delivering a second run result; the late-settlement registry is bounded and temporary, while accepted records persist in the audit log. `molt audit --help` describes querying the log.
 
@@ -977,6 +1042,92 @@ Dependencies mount at their canonical absolute paths. `--pass-env NAME` explicit
 Limits are inherited per process: address space, CPU time, file size, open files and process count, plus the existing command wall timeout. These are not aggregate cgroup quotas; RLIMIT_NPROC has the operating system's per-user semantics and does not limit root. TERM reaches the sandbox session group with 500 ms grace; KILL then tears down its PID namespace, including descendants that called setsid. Normal completion, cancelled handlers and service exit also tear down the namespace. Temporary mounts disappear with the last process. Future executable skills must use this shell path to share the policy.
 
 CI installs bubblewrap and requires namespace tests to run. A constrained local executor may skip only those integration tests after a failed capability probe; production startup still fails closed. Tests cover host paths, symlinks, read-only dependencies, network policy, host sockets, limits, C builds, cancellation and descendants with new sessions.
+
+## From an issue to a PR in CI
+
+An opt-in composite GitHub Action runs a maintainer-labelled issue with a fixed
+budget, then creates a PR containing check and baseline evidence, known cost
+and run ID. It requires a trusted installed Molt build and a working sandbox;
+fork PR events cannot start a secret-bearing run. See
+[scripts/ci/README.md](scripts/ci/README.md) for setup, permissions and limits.
+
+## Declarative project skills
+
+Memory may propose a small declarative workflow while learning from a verified
+successful task. It saves a **draft**, with its source run, audit message IDs,
+writer/version, trigger words, prerequisite file hashes, steps and acceptance
+command. Drafts never enter a later task's context. A successful source task
+cannot approve its own workflow, and no skill text is executed as a script.
+
+Inspect and manage them through the kernel-identified CLI:
+
+```sh
+molt skill --workspace . list
+molt skill --workspace . draft skill.json --run SOURCE_RUN
+molt skill --workspace . evaluate SKILL_ID --revision 1 --run HELD_OUT_RUN_A
+molt skill --workspace . evaluate SKILL_ID --revision 1 --run HELD_OUT_RUN_B
+molt skill --workspace . promote SKILL_ID --revision 1
+molt skill --workspace . used RUN
+molt skill --workspace . disable SKILL_ID --reason 'No longer suitable'
+molt skill --workspace . rollback SKILL_ID --revision 1 --reason 'Revision 2 regressed'
+```
+
+A manual draft's JSON fields are `name`, `trigger_terms` (single words),
+`prerequisites` (map of relative paths to SHA-256), `steps` and `acceptance`
+(the check command). Evaluation reads authenticated request/reply pairs from
+the audit; a forged note, tool output or an evaluation payload cannot assert
+success. Promotion needs two distinct independent successful runs in the same
+project, with the stored acceptance command, besides the source. Failed
+independent evaluations remain attached to the draft. The human must select
+independent cases and their protected checks: this registry does not establish
+that arbitrary chosen runs constitute an adequate held-out task set.
+
+Recall selects at most four active skills for the current project, only when
+all trigger words and prerequisite hashes match. The planner treats their
+steps as data below the task, check and permissions. Captured offerings retain
+full revision snapshots and their evidence, accessible with `skill used` even
+after disabling or rollback. These are records of offered context, not proof
+that the model followed every step. New drafts cannot re-enable a disabled
+skill. Rollback selects an evaluated older revision but keeps it disabled until
+an explicit human promotion. Disabling or rollback voids learned-note evidence
+from runs that were offered the withdrawn active revision, re-settles confidence
+and leaves tombstones and original audit/snapshot evidence intact. Learning
+cannot automatically recreate those withdrawn notes.
+
+The first implementation does not run executable skill scripts or perform
+automatic promotion. Real task success, cost and latency comparisons with a
+no-skill baseline remain to be run under an explicit evaluation budget. Stored
+independent evidence records each run's wall duration, known cost subtotal and
+unknown calls; these alone do not prove a workflow's causal benefit.
+
+## Offline semantic notes (optional)
+
+Build with `cargo build --workspace --features molt/semantic`. In a trusted
+memory-service configuration, add `--embedding-model /outside/project/model.json`
+and `--embedding-sha256 HASH` to `molt-memory`'s arguments. No model is downloaded;
+its SHA-256 is required and checked before parsing. The model is a data-only JSON
+export of pretrained word vectors, with `format: "mean-word-vectors-v1"`,
+`dimensions` (1–1024), and a `vectors` map of lowercase words to finite arrays.
+Mean pooling and cosine similarity run locally on CPU. This first backend does
+not run MiniLM/ONNX, understand word order or supply a pretrained vocabulary.
+Use a licensed, reviewed vocabulary suitable for the project's languages.
+
+`--semantic-weight` (default 0.5) mixes normalized FTS5 relevance and cosine
+similarity; `--semantic-min-similarity` (default 0.4) admits non-keyword matches.
+Confidence and recency retain their weights. Empty/OOV queries keep lexical
+behavior. Without the feature/configuration, recall is unchanged. Snapshot
+reasons record lexical relevance, similarity, weight and model SHA-256, so old
+snapshots retain the exact evidence even after correction or forgetting.
+
+SQLite caches note vectors by model and text hashes. Writes/corrections refresh
+the derived cache, and recall retries invalid or stale entries. Forgotten,
+retracted and review-pending notes stay excluded before semantic selection.
+Model input is bounded to 64 MiB, 200000 vocabulary words and 1024 dimensions;
+semantic databases are limited to 10000 live notes. Changing the model hash
+keeps old snapshot evidence and reindexes the new model. No additional key or
+network access is used. The lightweight backend should be compared against
+keyword-only recall on real tasks before claiming a success-rate improvement;
+fixture synonym recall demonstrates functionality, not production quality.
 
 ## Project task commands
 

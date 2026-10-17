@@ -241,6 +241,12 @@ pub struct RecallReason {
     pub relevance: Option<f64>,
     pub confidence: f64,
     pub recency: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_weight: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -316,6 +322,8 @@ pub struct ReviewResponse {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecallResponse {
     pub notes: Vec<Recalled>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<crate::skills::Skill>,
 }
 
 /// Tombstone a note. It is no longer recalled; the tombstone and its reason
@@ -379,6 +387,8 @@ pub struct ConsolidateRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConsolidateResponse {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_drafts: Vec<String>,
     /// Notes created.
     pub added: Vec<Note>,
     /// Ids of existing notes the episode bore out.

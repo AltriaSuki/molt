@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -62,6 +61,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
+    /// Inspect, independently evaluate and manage declarative project skills.
+    Skill(SkillArgs),
     /// The projects molt knows: each keeps its notes under a stable id,
     /// whatever directories it has, or none.
     Project {
@@ -122,6 +123,11 @@ struct DoArgs {
     /// Default: the planner's (report).
     #[arg(long, value_name = "MODE", value_parser = syntax_check)]
     syntax_check: Option<SyntaxCheck>,
+    /// Model for the judge of a task no command can check, which decides
+    /// the result against criteria the planner sets: opus, sonnet, haiku or a
+    /// model id. Default: the attempts' model.
+    #[arg(long, value_name = "MODEL")]
+    judge_model: Option<String>,
     /// Save a checkpoint as the run goes, so that a run stopped before it
     /// finishes (interrupted, out of budget, killed) can go on with `molt resume`.
     #[arg(long)]
@@ -178,6 +184,12 @@ struct RunArgs {
     /// Trusted shell sandbox JSON policy outside the project and scratch.
     #[arg(long)]
     sandbox_policy: Option<PathBuf>,
+    /// Let the agent read web pages from this host (repeatable): `docs.rs`,
+    /// or `*.python.org` for the hosts below it. Pages are fetched over
+    /// https by a service of their own and recorded in the audit log;
+    /// commands still have no network.
+    #[arg(long, value_name = "HOST")]
+    allow_web: Vec<String>,
     /// Run without memory: no project map or notes for the model, and
     /// nothing learned from the run.
     #[arg(long)]
@@ -228,6 +240,10 @@ struct UiArgs {
     /// runs (repeatable).
     #[arg(long, value_name = "NAME", value_parser = env_name)]
     pass_env: Vec<String>,
+    /// Let the agent read web pages from this host (repeatable): `docs.rs`,
+    /// or `*.python.org` for the hosts below it.
+    #[arg(long, value_name = "HOST")]
+    allow_web: Vec<String>,
 }
 
 #[derive(Args)]
@@ -251,6 +267,55 @@ struct MemoryAt {
     /// The data dir `molt do` used there. Default: ~/.cache/molt/<project>-<hash>.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct SkillArgs {
+    #[command(flatten)]
+    at: MemoryAt,
+    #[command(subcommand)]
+    cmd: SkillCmd,
+}
+
+#[derive(Subcommand)]
+enum SkillCmd {
+    List,
+    /// Draft a workflow from a JSON spec and a verified source run.
+    Draft {
+        file: PathBuf,
+        #[arg(long)]
+        run: String,
+    },
+    /// Record an independent audited run; failures remain in the evidence.
+    Evaluate {
+        id: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        run: String,
+    },
+    /// Activate only after two successful independent audited evaluations.
+    Promote {
+        id: String,
+        #[arg(long)]
+        revision: u64,
+    },
+    Disable {
+        id: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Select an older evaluated revision, disabled until explicitly promoted.
+    Rollback {
+        id: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        reason: String,
+    },
+    Used {
+        run: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -481,10 +546,35 @@ async fn main() -> anyhow::Result<ExitCode> {
                 project: args.project,
                 data_dir: args.data_dir,
                 pass_env: args.pass_env,
+                allow_web: args.allow_web,
             };
             for fork in molt::tui::run(opts).await? {
                 eprintln!("kept: {}", agent::printable(&fork));
             }
+        }
+        Cmd::Skill(args) => {
+            use molt_api::skills::{Action, Request, MANAGE};
+            let config = cli.config.as_deref();
+            let (workspace, project) = agent::locate(args.at.project.as_deref(), &args.at.workspace, config.is_some())?;
+            let cfg = agent::memory_config(config, &workspace, args.at.data_dir.as_deref(), project.as_ref())?;
+            let action = match args.cmd {
+                SkillCmd::List => Action::List,
+                SkillCmd::Draft { file, run } => {
+                    use std::io::Read;
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(file)?.take(65537).read_to_end(&mut bytes)?;
+                    anyhow::ensure!(bytes.len() <= 65536, "skill specification exceeds 64 KiB");
+                    Action::Draft { spec: serde_json::from_slice(&bytes)?, run }
+                }
+                SkillCmd::Evaluate { id, revision, run } => Action::Evaluate { id, revision, run },
+                SkillCmd::Promote { id, revision } => Action::Promote { id, revision },
+                SkillCmd::Disable { id, reason } => Action::Disable { id, reason },
+                SkillCmd::Rollback { id, revision, reason } => Action::Rollback { id, revision, reason },
+                SkillCmd::Used { run } => Action::Used { run },
+            };
+            let request = Request { workspace: workspace.to_str().context("workspace is not UTF-8")?.into(), action };
+            let response = agent::call_memory(&cfg, MANAGE, serde_json::to_value(request)?).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
         }
         Cmd::UiBackend => molt::tui::serve_backend().await?,
         Cmd::Run => {
@@ -668,6 +758,7 @@ fn prepare(config: Option<&Path>, args: &RunArgs) -> anyhow::Result<(Config, Str
     if args.no_memory {
         cfg.services.retain(|s| s.name.as_str() != agent::MEMORY);
     }
+    agent::allow_web(&mut cfg, &args.allow_web)?;
     if std::env::var_os("RUST_LOG").is_none() {
         for svc in &mut cfg.services {
             svc.env.entry("RUST_LOG".into()).or_insert_with(|| "warn".into());
@@ -690,6 +781,7 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     req.effort = args.effort;
     req.max_turns = args.max_turns;
     req.syntax_check = args.syntax_check;
+    req.judge_model = args.judge_model;
     req.budget_usd = args.common.budget_usd;
     req.apply = !args.common.no_apply;
     req.stream = args.common.stream;
@@ -805,12 +897,13 @@ async fn execute(
     let resp = done.run;
     let committed = match target {
         Some(target) if resp.applied => {
-            Some(target.and_then(|(repo, dirty)| commit_run(&repo, &dirty, &resp, &run, &task, args.branch.as_deref())))
+            Some(target.and_then(|before| before.commit(&resp, &run, &task, args.branch.as_deref())))
         }
         _ => None,
     };
     if args.json {
         let mut out = serde_json::to_value(&resp)?;
+        out["run"] = serde_json::json!(run);
         if let Some(committed) = &committed {
             out["commit"] = match committed {
                 Ok(Some(c)) => serde_json::json!({ "sha": c.sha, "branch": c.branch, "ignored": c.ignored }),
@@ -856,55 +949,27 @@ async fn execute(
     Ok(match resp.outcome {
         Outcome::Failed => ExitCode::FAILURE,
         // It passed, but the workspace does not have it: a script must not go on as if it did.
-        Outcome::Passed | Outcome::Unverified if apply && !resp.applied && resp.fork.is_some() => ExitCode::from(3),
-        Outcome::Passed | Outcome::Unverified if not_committed => ExitCode::from(4),
-        Outcome::Passed | Outcome::Unverified => ExitCode::SUCCESS,
+        Outcome::Passed | Outcome::Unverified | Outcome::Judged if apply && !resp.applied && resp.fork.is_some() => {
+            ExitCode::from(3)
+        }
+        Outcome::Passed | Outcome::Unverified | Outcome::Judged if not_committed => ExitCode::from(4),
+        Outcome::Passed | Outcome::Unverified | Outcome::Judged => ExitCode::SUCCESS,
     })
 }
 
-/// Where `molt do --commit` commits.
-type CommitTarget = anyhow::Result<(git::Repo, BTreeSet<String>)>;
-
-/// The git work tree `molt do --commit` commits in, with the paths that had
-/// changes not committed before the run; an inner error when the workspace
-/// is in none (the run still goes ahead and is applied). A `--branch` git
-/// would refuse is an error before anything starts.
-fn commit_target(workspace: &str, branch: Option<&str>) -> anyhow::Result<CommitTarget> {
-    let repo = match git::Repo::open(Path::new(workspace)) {
-        Ok(repo) => repo,
+/// The work tree `molt do --commit` commits in, looked at before the run;
+/// an inner error when the workspace is in none (the run still goes ahead
+/// and is applied). A `--branch` git would refuse is an error before
+/// anything starts.
+fn commit_target(workspace: &str, branch: Option<&str>) -> anyhow::Result<anyhow::Result<git::Before>> {
+    let before = match git::Before::look(Path::new(workspace)) {
+        Ok(before) => before,
         Err(e) => return Ok(Err(e.context("--commit"))),
     };
     if let Some(name) = branch {
-        repo.check_new_branch(name)?;
+        before.repo().check_new_branch(name)?;
     }
-    let dirty = repo.dirty()?;
-    Ok(Ok((repo, dirty)))
-}
-
-/// Commit what the run merged. Refused when one of its files had changes
-/// not committed before the run: the commit would take them in, and
-/// undoing the run would take them back too.
-fn commit_run(
-    repo: &git::Repo,
-    dirty: &BTreeSet<String>,
-    resp: &molt_api::planner::RunResponse,
-    run: &str,
-    task: &str,
-    branch: Option<&str>,
-) -> anyhow::Result<Option<git::Committed>> {
-    let paths: Vec<String> = resp.changes.iter().map(|c| c.path.clone()).collect();
-    let mixed: Vec<&str> = paths.iter().filter(|p| dirty.contains(*p)).map(String::as_str).collect();
-    anyhow::ensure!(
-        mixed.is_empty(),
-        "{} had changes of yours not committed before the run, which the commit would take in",
-        mixed.join(", ")
-    );
-    let check = match resp.outcome {
-        Outcome::Passed => resp.check.as_ref().map(|c| c.command.as_str()),
-        _ => None,
-    };
-    let summary = resp.summary.as_str();
-    repo.commit_run(&git::RunCommit { run, summary, task, check, paths, branch })
+    Ok(Ok(before))
 }
 
 async fn undo_cmd(config: Option<&Path>, args: UndoArgs) -> anyhow::Result<ExitCode> {

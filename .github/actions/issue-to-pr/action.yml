@@ -1,0 +1,29 @@
+name: Molt issue to pull request
+description: Run an explicitly labelled issue with an installed, trusted Molt build
+inputs:
+  molt-bin:
+    description: Absolute path to the installed Molt binaries, outside the workspace
+    required: true
+  budget-usd:
+    description: Maximum task budget in USD
+    required: true
+  attempts:
+    description: Parallel attempts (1 to 8)
+    default: '2'
+  timeout-seconds:
+    description: Maximum wall time for the run
+    default: '1200'
+  label:
+    description: Issue label that explicitly authorizes the run
+    default: molt-run
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        MOLT_CI_BIN: ${{ inputs.molt-bin }}
+        MOLT_CI_BUDGET: ${{ inputs.budget-usd }}
+        MOLT_CI_ATTEMPTS: ${{ inputs.attempts }}
+        MOLT_CI_TIMEOUT: ${{ inputs.timeout-seconds }}
+        MOLT_CI_LABEL: ${{ inputs.label }}
+      run: python3 "$GITHUB_ACTION_PATH/../../../scripts/ci/issue_to_pr.py"

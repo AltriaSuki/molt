@@ -10,6 +10,7 @@
 //! | `shell`   | `run`                                      | [`shell`]     |
 //! | `memory`  | `remember recall forget retract consolidate index map symbols review correct` | [`memory`] |
 //! | `planner` | `run`                                      | [`planner`]   |
+//! | `web`     | `fetch`                                    | [`web`]       |
 //!
 //! The planner also publishes [`progress::Progress`] events on
 //! `topic:progress`, and the `fs` service [`fs::FilesChanged`] events on
@@ -21,3 +22,5 @@ pub mod model;
 pub mod planner;
 pub mod progress;
 pub mod shell;
+pub mod skills;
+pub mod web;
