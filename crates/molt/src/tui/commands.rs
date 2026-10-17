@@ -18,6 +18,7 @@ pub const BUILTINS: &[&str] = &[
     "new",
     "attempts",
     "stream",
+    "commit",
     "model",
     "memory-model",
     "effort",

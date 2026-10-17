@@ -207,6 +207,12 @@ ends. Missing events are labeled as gaps; the interface never reconstructs
 them. Previews are provisional: the complete reply and check determine the
 result, and cancelled or late events cannot make a result appear.
 
+`/commit on` commits each result once it is applied, as `molt do --commit`
+does (see "Commits and `molt undo`" below): the work tree is looked at when
+the task starts, and the commit is made after the run applies the result, or
+after you accept it in confirm mode. A result kept in its fork, or one that
+fails to apply, is not committed. `/commit off` (the default) stops it.
+
 The interface holds the data dir's lock while it is open, so a `molt do` in
 the same project is refused until it closes.
 
@@ -906,7 +912,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - The kernel drops a message nested more than 100 levels deep, so every logged message can be read back.
 - After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none. A run with `--checkpoint` that stops keeps its forks for `molt resume`.
 - A rubric's model-judged criteria are a model's reading, not a proof: the judge can be wrong, and nothing but the criteria with a command checks the result. In the interface, a constraint that adds a check is refused while a run is being judged by a rubric.
-- Only `molt do --commit` and `molt resume --commit` commit a result; the interface (`molt ui`) does not yet. `molt undo` takes back only those commits, and refuses a file changed after the run rather than merging the revert into it (use `git revert` then).
+- Only `molt do --commit`, `molt resume --commit` and the interface's `/commit on` commit a result, always on the current branch (`--branch` is for `molt do` only). `molt undo` takes back only those commits, and refuses a file changed after the run rather than merging the revert into it (use `git revert` then).
 - A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.

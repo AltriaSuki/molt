@@ -228,6 +228,8 @@ struct Runtime {
     starting: bool,
     /// Calls in flight, stopped on an interrupt.
     work: Vec<JoinHandle<()>>,
+    /// The work tree as it was when the task `.0` started, for `/commit on`.
+    before: Option<(String, anyhow::Result<crate::git::Before>)>,
 }
 
 impl Runtime {
@@ -295,6 +297,27 @@ impl Runtime {
             Action::Apply { fork } => self.call(move |s| async move {
                 Msg::Applied(s.apply(&fork).await.map(|_| ()).map_err(|e| format!("{e:#}")))
             }),
+            Action::PrepareCommit { trace } => {
+                self.before = Some((trace.to_string(), crate::git::Before::look(Path::new(&self.workspace))));
+            }
+            Action::Commit { trace, task, resp } => {
+                let before = match self.before.take() {
+                    Some((run, before)) if run == trace.as_str() => before,
+                    other => {
+                        self.before = other;
+                        Err(anyhow::anyhow!("/commit was turned on after the task started"))
+                    }
+                };
+                let tx = self.tx.clone();
+                // Not among the interruptible work: a commit half made would leave the index behind.
+                tokio::spawn(async move {
+                    let made = tokio::task::spawn_blocking(move || before?.commit(&resp, trace.as_str(), &task, None))
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|made| made);
+                    let _ = tx.send(Msg::Committed(made.map_err(|e| format!("{e:#}"))));
+                });
+            }
             Action::Discard { fork } => {
                 self.call(move |s| async move { Msg::Discarded(s.discard(&fork).await.map_err(|e| format!("{e:#}"))) })
             }
@@ -494,6 +517,74 @@ impl Drop for Redirect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_runtime_commits_what_the_task_merged_against_the_tree_it_started_from() {
+        use molt_api::fs::{Change, ChangeKind};
+        use molt_api::planner::{Outcome, RunResponse};
+        use molt_proto::TraceId;
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")] {
+            git(d, &["config", key, value]);
+        }
+        std::fs::write(d.join("a.txt"), "a\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-q", "-m", "start"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (sessions, _started) = mpsc::unbounded_channel();
+        let workspace = d.to_str().unwrap().to_owned();
+        let mut rt = Runtime {
+            cfg: Arc::new(Config::default()),
+            workspace,
+            tx,
+            sessions,
+            session: None,
+            starting: false,
+            work: Vec::new(),
+            before: None,
+        };
+        let resp = |path: &str| RunResponse {
+            outcome: Outcome::Unverified,
+            check: None,
+            winner: Some(0),
+            summary: "Write b".into(),
+            changes: vec![Change { path: path.into(), kind: ChangeKind::Added }],
+            patch: String::new(),
+            patch_truncated: false,
+            applied: true,
+            fork: None,
+            review: None,
+            attempts: vec![],
+            usage: Default::default(),
+            cost_usd: 0.0,
+            uncounted_calls: 0,
+            checkpoint: None,
+            requirements: vec![],
+            selection: Default::default(),
+            rubric: vec![],
+            judgement: vec![],
+        };
+        let trace = TraceId::random();
+        rt.exec(Action::PrepareCommit { trace: trace.clone() });
+        std::fs::write(d.join("b.txt"), "b\n").unwrap();
+        rt.exec(Action::Commit { trace: trace.clone(), task: "write b".into(), resp: Box::new(resp("b.txt")) });
+        let Some(Msg::Committed(Ok(Some(made)))) = rx.recv().await else { panic!("not committed") };
+        assert_eq!((made.subject.as_str(), made.branch.as_deref()), ("Write b", Some("main")));
+        assert_eq!(git(d, &["show", "--name-only", "--format=", "HEAD"]), "b.txt\n");
+        let trailer = git(d, &["log", "-1", "--format=%(trailers:key=Molt-Run,valueonly)"]);
+        assert_eq!(trailer.trim(), trace.as_str());
+        // Turned on after the task started: nothing was looked at for it.
+        rt.exec(Action::Commit { trace: TraceId::random(), task: "late".into(), resp: Box::new(resp("b.txt")) });
+        let Some(Msg::Committed(Err(e))) = rx.recv().await else { panic!("committed") };
+        assert!(e.contains("turned on after the task started"), "{e}");
+    }
     #[test]
     fn themes_are_saved_privately_and_replaced_atomically() {
         use std::os::unix::fs::PermissionsExt;
