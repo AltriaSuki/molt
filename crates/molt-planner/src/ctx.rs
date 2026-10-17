@@ -54,11 +54,19 @@ pub(crate) struct Tally {
     pub spend: Spend,
     pub pending: u32,
     pub unsettled: u32,
+    /// Unsettled calls of attempts the run itself stopped while the run went
+    /// on, such as the ones that lost the race. What each cost is unknown, so
+    /// they are reported, but they do not stop the rest of the run: a run can
+    /// pass its budget by up to one call for each attempt it stopped.
+    pub abandoned: u32,
 }
 
 impl Tally {
     pub fn uncounted_calls(&self) -> u32 {
-        self.pending.saturating_add(self.unsettled).saturating_add(self.spend.unknown_calls)
+        self.pending
+            .saturating_add(self.unsettled)
+            .saturating_add(self.abandoned)
+            .saturating_add(self.spend.unknown_calls)
     }
 }
 
@@ -197,7 +205,7 @@ impl Ctx {
         SavedSpend {
             usage: t.spend.usage,
             cost_usd: t.spend.cost_usd,
-            uncounted_calls: self.carried_uncounted + t.unsettled + t.spend.unknown_calls,
+            uncounted_calls: self.carried_uncounted + t.unsettled + t.abandoned + t.spend.unknown_calls,
         }
     }
 
@@ -330,6 +338,7 @@ impl Ctx {
                 t.pending -= 1;
                 match &resp {
                     Ok(resp) => t.spend.add(resp),
+                    Err(_) if ctx.cancel.is_cancelled() && !ctx.run_cancel.is_cancelled() => t.abandoned += 1,
                     Err(_) => t.unsettled += 1,
                 }
             });
