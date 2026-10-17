@@ -6,6 +6,10 @@ edition.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+default = []
+semantic = ["molt-memory/semantic"]
+
 [dependencies]
 molt-api.workspace = true
 molt-bench.workspace = true
