@@ -204,6 +204,11 @@ pub trait Bus: Send + Sync + 'static {
     }
     /// Publish an event; failures are ignored.
     async fn publish(&self, topic: &str, payload: Value);
+    /// Whether this planner may call `target` at all. A bus that cannot
+    /// tell says no, so that no tool is offered that would only be refused.
+    fn holds(&self, _target: &str) -> bool {
+        false
+    }
 }
 
 /// [`Bus`] over a real service link.
@@ -211,6 +216,10 @@ pub struct ServiceBus(pub Arc<Service>);
 
 #[async_trait]
 impl Bus for ServiceBus {
+    fn holds(&self, target: &str) -> bool {
+        target.parse::<Target>().ok().and_then(|t| self.0.cap_for(&t)).is_some()
+    }
+
     async fn call(&self, target: &str, payload: Value, budget: Budget, trace: &TraceId) -> Result<Value, RemoteError> {
         let opts = CallOpts { cap: None, budget, trace: Some(trace.clone()) };
         self.0.call(target, payload, opts).await.map_err(|e| match e {

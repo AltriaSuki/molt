@@ -1503,6 +1503,7 @@ dependencies = [
  "molt-sdk",
  "molt-tools",
  "molt-transport",
+ "molt-web",
  "rand 0.9.5",
  "ratatui",
  "serde",
@@ -1724,6 +1725,21 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "molt-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "molt-api",
+ "molt-proto",
+ "molt-sdk",
+ "reqwest",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 

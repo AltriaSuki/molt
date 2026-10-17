@@ -81,6 +81,9 @@ pub(crate) struct Ctx {
     pub stream: bool,
     /// What memory knows about the workspace; empty when memory is not up.
     pub memory: Memory,
+    /// The planner may read the web (it holds a capability for `web.fetch`):
+    /// attempts are offered `fetch_url`.
+    pub web: bool,
     /// The `<project_instructions>` block, when the project has instruction files.
     pub instructions: Option<String>,
     tally: watch::Sender<Tally>,
@@ -140,6 +143,7 @@ impl Ctx {
     /// Limits come from the request where it sets them and from `cfg` otherwise.
     pub fn new(bus: Arc<dyn Bus>, cfg: Arc<Config>, trace: TraceId, req: &RunRequest) -> Self {
         let model = req.model.clone().filter(|m| !m.trim().is_empty()).or_else(|| cfg.default_model.clone());
+        let web = bus.holds(molt_api::web::FETCH);
         Self {
             bus,
             trace,
@@ -154,6 +158,7 @@ impl Ctx {
             budget_usd: req.budget_usd.unwrap_or(cfg.budget_usd),
             stream: req.stream,
             memory: Memory::default(),
+            web,
             instructions: None,
             cfg,
             tally: watch::Sender::new(Tally::default()),
