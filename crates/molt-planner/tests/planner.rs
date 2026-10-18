@@ -63,6 +63,7 @@ struct State {
     memory_hangs: bool,
     /// The planner holds `web.fetch`, which answers every URL with one page.
     web: bool,
+    web_unavailable: bool,
     /// Model calls stop when cancelled, as the gateway's do: the reply is a
     /// settlement whose usage and cost are unknown.
     cancels_models: bool,
@@ -138,6 +139,7 @@ impl Fake {
             memory: false,
             memory_hangs: false,
             web: false,
+            web_unavailable: false,
             cancels_models: false,
             calls: Vec::new(),
             requests: Vec::new(),
@@ -423,6 +425,12 @@ impl Bus for Fake {
                 if !self.state.lock().unwrap().web {
                     // As the kernel refuses a call without a capability.
                     return Err(RemoteError { code: ErrorCode::Denied, message: "no capability".into() });
+                }
+                if self.state.lock().unwrap().web_unavailable {
+                    return Err(RemoteError {
+                        code: ErrorCode::Unavailable,
+                        message: format!("{}fake-IP DNS; do not retry", molt_api::web::ENVIRONMENT_UNAVAILABLE),
+                    });
                 }
                 let r: molt_api::web::FetchRequest = parse(payload);
                 Ok(json!(molt_api::web::FetchResponse {
@@ -1192,6 +1200,39 @@ async fn fetch_url_is_offered_only_to_a_planner_that_may_read_the_web() {
             assert_eq!(result["is_error"], json!(true), "{text}");
         }
     }
+}
+
+#[tokio::test]
+async fn repeated_host_dns_failures_remove_fetch_url_and_refuse_stale_calls() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 | 2 => {
+                assert!(req.tools.iter().any(|tool| tool["name"] == "fetch_url"));
+                use_tools(req, &[("fetch_url", json!({"url":"https://docs.rs/hello"}))])
+            }
+            3 => {
+                assert!(!req.tools.iter().any(|tool| tool["name"] == "fetch_url"));
+                use_tools(req, &[("fetch_url", json!({"url":"https://docs.rs/another"}))])
+            }
+            4 => {
+                assert!(last_text(req).contains("fetch_url is disabled"));
+                write_hello(req, "hi\n")
+            }
+            _ => done("Done offline."),
+        },
+        hello_check,
+    );
+    fake.set(|state| {
+        state.web = true;
+        state.web_unavailable = true;
+    });
+    let result = run(&fake, request(Some("check"), 1)).await;
+    assert_eq!(result.outcome, Outcome::Passed);
+    assert_eq!(fake.calls_to("web.fetch").len(), 2);
+    assert!(fake
+        .events()
+        .iter()
+        .any(|event| matches!(event, Progress::Note {message,..} if message.contains("fetch_url disabled"))));
 }
 
 #[tokio::test]

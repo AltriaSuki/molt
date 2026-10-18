@@ -78,6 +78,7 @@ sender from that.
 | Issue CI rejects PR triggers and probes the sandbox before model spend | `scripts/ci/test_issue_to_pr.py::test_only_labelled_open_issues_are_eligible`, `test_sandbox_failure_posts_a_summary_and_never_starts_a_model` |
 | A skill source cannot approve itself; only the CLI manages activation and withdrawal preserves evidence | `skills::tests::drafts_need_independent_evidence_and_disable_cannot_be_undone_by_learning`, `tests/service.rs::an_agent_cannot_manage_or_promote_its_own_skills` |
 | Queued tasks retain their submitted execution settings and wait for apply/discard/commit settlement | `tui::app::tests::queued_tasks_snapshot_execution_settings_and_plain_input_still_steers_the_current_task`, `tui::app::tests::a_queue_waits_for_apply_commit_and_discard_to_settle_before_starting_the_next_task` |
+| Explicit DoH avoids fake-IP bootstrap while keeping private-address refusal, bounded answers and per-redirect host checks | `molt_web::resolver::tests`, `repeated_host_dns_failures_remove_fetch_url_and_refuse_stale_calls` |
 | Idle TUI undo notifies the current memory service; locked CLI undo leaves Git untouched and incomplete notices stay retryable | `session_undo_notifies_memory_and_cli_undo_refuses_its_lock_before_changing_git`, `tui::app::tests::quitting_waits_for_an_uninterruptible_git_operation_to_settle` |
 | Kept results survive restart; conflicting applies leave user edits and the fork intact | `tui::app::tests::plan_results_are_browsable_and_remain_available_until_apply_or_discard_succeeds`, `a_kept_session_result_survives_restart_and_refuses_workspace_conflicts` |
 | Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
@@ -735,6 +736,23 @@ provides = ["web.*"]
 with `{ target = "web.fetch", budget = { calls = 1000000 } }` in the
 planner's `requests`.
 
+For host DNS that returns only private/reserved addresses (including Clash or
+mihomo fake-IP addresses in `198.18.0.0/15`), startup probes warn before any model
+work. To select a DNS JSON HTTPS resolver independently of host DNS, explicitly
+pass `--web-resolver doh:https://1.1.1.1/dns-query` alongside `--allow-web` to
+`do`, `resume` or `ui`. Custom configs use `--resolver` in the `molt-web` exec
+arguments. `system` keeps the default. Resolver endpoints must be HTTPS on port
+443 at a public literal IP, with no credentials, query, fragment or redirects.
+The endpoint must support `application/dns-json`; DNS replies are limited to
+64 KiB / 256 records. This option does not enable an HTTP proxy.
+
+Startup probes check at most 16 hosts in parallel (a wildcard uses its apex);
+every actual page and redirect still checks its own allowlisted host and public
+addresses. Page connections are pinned to the validated addresses with TLS name
+verification and no DNS fallback. Two authenticated host-network failures disable
+`fetch_url` for the run and reject stale calls, rather than repeatedly fetching
+other URLs. A page's text cannot trigger this signal.
+
 ## Memory
 
 Memory holds two things for each project.
@@ -1088,7 +1106,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.
 - Model prices are as current as the last `molt prices update` (or the release's snapshot) and as right as the community list they came from; a price that changes mid-run is not picked up until the next run. Models that LiteLLM lists only with tiered or regional prices, such as some Qwen models, have no price until declared in `MOLT_MODEL_PRICES`.
-- The web service has no search: an attempt reads pages whose URL it knows or finds in pages it read. It does not use a proxy, so a network that only reaches the web through one cannot use it, and it reads pages as served, without running their scripts.
+- The web service has no search: an attempt reads known URLs or links from pages it read, without running scripts. It does not use an HTTP proxy; an explicit public-IP DNS JSON resolver supports fake-IP DNS but still needs a route to that resolver and the public page addresses. Startup DNS probes sample at most 16 hosts, using wildcard apexes; every actual fetch validates its own destination.
 
 ### Cancellation and model settlement
 

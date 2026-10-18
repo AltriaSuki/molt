@@ -54,6 +54,7 @@ pub struct Options {
     pub pass_env: Vec<String>,
     /// Hosts the agent may read web pages from.
     pub allow_web: Vec<String>,
+    pub web_resolver: Option<String>,
 }
 
 /// Run the interface until the user quits. Returns the forks the user kept.
@@ -71,6 +72,9 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
         shell.pass_env.extend(opts.pass_env);
     }
     agent::allow_web(&mut cfg, &opts.allow_web)?;
+    if let Some(resolver) = &opts.web_resolver {
+        cfg.web_resolver(resolver)?;
+    }
     if std::env::var_os("RUST_LOG").is_none() {
         for svc in &mut cfg.services {
             svc.env.entry("RUST_LOG".into()).or_insert_with(|| "warn".into());
@@ -175,6 +179,15 @@ async fn event_loop(
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => app.flash = Some(format!("could not load saved theme: {e}")),
+    }
+    // Show startup state while DNS probes run; no backend or model has started yet.
+    terminal.draw(|frame| view::draw(frame, &mut app))?;
+    for warning in agent::web_warnings(&cfg).await? {
+        app.log.extend(text::block(
+            &app::scrub(&format!("web DNS preflight: {warning}"), &app.secrets),
+            "",
+            text::Tone::Warn,
+        ));
     }
     let data_dir = cfg.kernel.data_dir.clone();
     let (lister, root) = (tx.clone(), PathBuf::from(&workspace));
