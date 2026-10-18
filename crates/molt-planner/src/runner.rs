@@ -99,6 +99,7 @@ async fn resume_run(
     let mut run_req = saved.request.clone();
     run_req.apply = req.apply;
     run_req.stream = req.stream;
+    run_req.keep_cancelled_forks = req.keep_cancelled_forks;
     run_req.budget_usd = req.budget_usd.or(run_req.budget_usd);
     run_req.design_budget_usd = req.design_budget_usd.or(run_req.design_budget_usd);
     run_req.checkpoint = true;
@@ -376,10 +377,14 @@ async fn finish(ctx: &Arc<Ctx>, req: &RunRequest, settled: Settled, designed: bo
     let stopped = ctx.checkpoint.is_some() && ctx.run_cancel.is_cancelled();
     // Cancelled attempts may have left model calls running, which are billed: give their replies a moment
     // to land and be counted, while the winner is applied.
-    let (mut resp, tally) = tokio::join!(
+    let (mut resp, _) = tokio::join!(
         conclude(ctx, req, (spec, check), &rubric, finished, passed, stopped),
         ctx.settle(ctx.cfg.late_reply_wait)
     );
+    // That wait can end before `conclude` makes its own model calls (the review), so take the totals again
+    // once it is done: with nothing pending this returns at once, and a review call still unanswered after
+    // the wait stays uncounted rather than free.
+    let tally = ctx.settle(ctx.cfg.late_reply_wait).await;
     resp.usage = tally.spend.usage;
     resp.cost_usd = tally.spend.cost_usd;
     resp.uncounted_calls = tally.uncounted_calls() + ctx.carried_uncounted;
@@ -724,9 +729,14 @@ async fn conclude(
         if let Some(d) = &resp.dispute {
             resp.summary = format!("{}\n\n{}", dispute_summary(d), resp.summary);
         }
-        // A stopped run's forks are its checkpoint's: kept for the resume.
+        // A stopped run's forks are its checkpoint's: kept for the resume. A caller that stopped the run
+        // and asked for them decides which hold work; dropping them here would race it.
         if !stopped {
-            ctx.drop_forks_except(None).await;
+            if req.keep_cancelled_forks && ctx.run_cancel.is_cancelled() && !ctx.over_budget() {
+                ctx.hand_over_forks();
+            } else {
+                ctx.drop_forks_except(None).await;
+            }
         }
         return resp;
     };
@@ -1178,6 +1188,61 @@ mod tests {
             assert!(response.command.is_none() && response.files.is_empty());
             assert!(bus.dropped.load(Ordering::SeqCst));
         }
+    }
+
+    /// A bus whose attempts get a fork and then wait on a model call that never answers.
+    struct StuckBus {
+        started: Notify,
+        dropped: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Bus for StuckBus {
+        async fn call(&self, target: &str, payload: Value, _: Budget, _: &TraceId) -> Result<Value, RemoteError> {
+            match target {
+                "fs.fork" => Ok(json!({"fork":"/scratch/fork-a", "files":0})),
+                "fs.drop" => {
+                    self.dropped.lock().unwrap().push(payload["fork"].as_str().unwrap_or_default().to_owned());
+                    Ok(json!({"dropped":true}))
+                }
+                "model.complete" => {
+                    self.started.notify_one();
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Err(RemoteError { code: ErrorCode::Unavailable, message: "no reply".into() })
+                }
+                _ => Err(RemoteError { code: ErrorCode::Unavailable, message: format!("no {target}") }),
+            }
+        }
+        async fn publish(&self, _: &str, _: Value) {}
+    }
+
+    /// Run with an explicit check, cancel it once the attempt asks the model, and return the forks it dropped.
+    async fn cancelled_run_drops(keep_cancelled_forks: bool) -> Vec<String> {
+        let bus = Arc::new(StuckBus { started: Notify::new(), dropped: Default::default() });
+        let cancel = CancellationToken::new();
+        let cfg = Arc::new(Config { late_reply_wait: Duration::from_millis(20), ..Config::default() });
+        let req = RunRequest {
+            check: Some("true".into()),
+            attempts: 1,
+            review: false,
+            keep_cancelled_forks,
+            ..RunRequest::new("add a flag", "/w")
+        };
+        let run = tokio::spawn(run_cancellable(bus.clone(), cfg, req, TraceId::random(), cancel.clone()));
+        tokio::time::timeout(Duration::from_secs(5), bus.started.notified())
+            .await
+            .expect("the attempt asked the model");
+        cancel.cancel();
+        let resp = tokio::time::timeout(Duration::from_secs(5), run).await.unwrap().unwrap().unwrap();
+        assert_eq!(resp.attempts[0].status, AttemptStatus::Cancelled);
+        let dropped = bus.dropped.lock().unwrap();
+        dropped.clone()
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_leaves_its_attempts_forks_to_a_caller_that_asked_for_them() {
+        assert_eq!(cancelled_run_drops(false).await, ["/scratch/fork-a"], "by default a cancelled run cleans up");
+        assert!(cancelled_run_drops(true).await.is_empty(), "the caller decides which forks hold work");
     }
 
     #[test]
