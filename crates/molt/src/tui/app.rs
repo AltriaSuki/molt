@@ -53,11 +53,13 @@ pub const LISTED_FILES: usize = 50_000;
 const TRANSCRIPT_TICKS: u64 = 7;
 
 /// When the interface calls the user from outside the terminal.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Notify {
     Off,
     /// When it stops for the user, or the services go down.
     #[default]
+    #[serde(rename = "on", alias = "waiting")]
     Waiting,
     /// Also when a task ends.
     All,
@@ -71,7 +73,8 @@ enum Attention {
     Down,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Keep every result in its fork; never change the workspace.
     Plan,
@@ -100,7 +103,8 @@ impl Mode {
 }
 
 /// What the next task runs with.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub attempts: Option<u32>,
     pub model: Option<String>,
@@ -799,6 +803,9 @@ pub struct App {
     workspace_path: String,
     pub mode: Mode,
     pub settings: Settings,
+    preference_defaults: super::settings::Saved,
+    preference_changes: Vec<super::settings::Change>,
+    reset_preferences: bool,
     pub commands: std::collections::BTreeMap<String, super::commands::Command>,
     pub theme: text::Theme,
     pub session: SessionState,
@@ -887,6 +894,9 @@ impl App {
             workspace_path: workspace_path.to_owned(),
             mode: Mode::Confirm,
             settings: Settings::default(),
+            preference_defaults: super::settings::Saved::new(Mode::Confirm, Settings::default()),
+            preference_changes: Vec::new(),
+            reset_preferences: false,
             commands: Default::default(),
             theme: text::Theme::detect(std::env::var("COLORTERM").ok().as_deref()),
             session: SessionState::Starting,
@@ -960,6 +970,18 @@ impl App {
 
     pub fn memory_up(&self) -> bool {
         matches!(&self.session, SessionState::Up { memory_problem: None, .. })
+    }
+
+    pub fn configure_preferences(&mut self, defaults: super::settings::Saved, saved: Option<super::settings::Saved>) {
+        let active = saved.unwrap_or_else(|| defaults.clone());
+        self.mode = active.mode;
+        self.settings = active.settings;
+        self.preference_defaults = defaults;
+        self.preference_changes.clear();
+    }
+
+    pub fn take_preference_changes(&mut self) -> Vec<super::settings::Change> {
+        std::mem::take(&mut self.preference_changes)
     }
 
     pub fn restore_history(&mut self, entries: Vec<String>) {
@@ -1059,9 +1081,24 @@ impl App {
         if let (Msg::Ran { trace, .. }, Some(view)) = (&msg, &mut self.transcript) {
             view.stale |= view.trace == *trace;
         }
+        let preferences_before =
+            matches!(&msg, Msg::Key(_)).then(|| super::settings::Saved::new(self.mode, self.settings.clone()));
         let input_before = matches!(&msg, Msg::Key(_) | Msg::Paste(_) | Msg::Edited(_))
             .then(|| (self.input.text.clone(), self.input.cursor));
         let mut actions = self.handle(msg);
+        if self.reset_preferences {
+            self.preference_changes.clear();
+            self.preference_changes.push(super::settings::Change::Reset);
+            self.reset_preferences = false;
+        } else if preferences_before
+            .is_some_and(|before| before != super::settings::Saved::new(self.mode, self.settings.clone()))
+        {
+            let change = super::settings::Change::Save(super::settings::Saved::new(self.mode, self.settings.clone()));
+            if matches!(self.preference_changes.last(), Some(super::settings::Change::Save(_))) {
+                self.preference_changes.pop();
+            }
+            self.preference_changes.push(change);
+        }
         if input_before.is_some_and(|(text, cursor)| text != self.input.text || cursor != self.input.cursor) {
             self.command_pick = 0;
             self.command_hidden = None;
@@ -1767,6 +1804,13 @@ impl App {
         let set = |what: &str, value: &str| format!("{what}: {value}");
         use super::commands::{builtin, Builtin};
         match builtin(name).map(|c| c.kind) {
+            Some(Builtin::Reset) => {
+                self.mode = self.preference_defaults.mode;
+                self.settings = self.preference_defaults.settings.clone();
+                self.reset_preferences = true;
+                self.flash = Some("settings reset to the configured defaults".into());
+            }
+
             Some(Builtin::HistoryClear) => {
                 self.history.clear();
                 self.history_at = None;
@@ -3754,6 +3798,68 @@ mod tests {
         assert_eq!(app.input.text, "/effort medium ");
         app.update(key(KeyCode::Enter));
         assert_eq!(app.settings.effort, Some(Effort::Medium));
+    }
+
+    #[test]
+    fn saved_settings_override_config_until_reset_and_feed_the_next_request() {
+        let root = tempfile::tempdir().unwrap();
+        let store = super::super::state::Store::new(root.path(), root.path()).unwrap();
+        let config = crate::Config::parse("[tui]\nmode='auto'\nattempts=2\ncheck='cargo test'").unwrap();
+        let defaults = super::super::settings::Saved::defaults(&config.tui);
+        let mut app = App::new("/w", None);
+        app.configure_preferences(defaults.clone(), None);
+        for line in ["/attempts 4", "/check make test", "/model opus", "/effort high", "/budget 2.5"] {
+            type_in(&mut app, line);
+        }
+        for change in app.take_preference_changes() {
+            super::super::settings::persist(&store, &change, &[]).unwrap();
+        }
+        let mut restarted = App::new("/w", None);
+        restarted.configure_preferences(defaults.clone(), super::super::settings::load(&store, &[]).unwrap());
+        up(&mut restarted);
+        assert_eq!(restarted.mode, Mode::Auto);
+        assert!(frame_text(&mut restarted).contains("auto (shift+tab)"));
+        let actions = type_in(&mut restarted, "implement it");
+        assert!(
+            matches!(&actions[0], Action::Run { req, .. } if req.attempts == 4 && req.check.as_deref() == Some("make test")
+            && req.model.as_deref() == Some("opus") && req.effort == Some(Effort::High) && req.budget_usd == Some(2.5))
+        );
+        restarted.task = None;
+        type_in(&mut restarted, "/reset");
+        for change in restarted.take_preference_changes() {
+            super::super::settings::persist(&store, &change, &[]).unwrap();
+        }
+        assert_eq!(restarted.settings.attempts, Some(2));
+        assert_eq!(restarted.settings.check.as_deref(), Some("cargo test"));
+        assert!(super::super::settings::load(&store, &[]).unwrap().is_none());
+        let mut plain = App::new("/w", None);
+        type_in(&mut plain, "/attempts 3");
+        type_in(&mut plain, "/reset");
+        assert_eq!(plain.mode, Mode::Confirm);
+        assert_eq!(plain.settings, Settings::default());
+    }
+
+    #[test]
+    fn invalid_settings_and_project_template_overrides_do_not_get_saved() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        for line in ["/attempts 0", "/budget NaN", "/effort unknown"] {
+            type_in(&mut app, line);
+        }
+        assert!(app.take_preference_changes().is_empty());
+        app.commands.insert(
+            "local".into(),
+            super::super::commands::Command {
+                template: "fix it".into(),
+                attempts: Some(4),
+                check: Some("true".into()),
+                ..Default::default()
+            },
+        );
+        let before = app.settings.clone();
+        type_in(&mut app, "/local");
+        assert_eq!(app.settings, before);
+        assert!(app.take_preference_changes().is_empty());
     }
 
     #[test]

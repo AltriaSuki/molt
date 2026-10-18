@@ -610,6 +610,7 @@ pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::
         kernel: cfg.kernel.clone(),
         services: vec![service],
         confirm: cfg.confirm.clone(),
+        tui: cfg.tui.clone(),
         hooks: cfg.hooks.clone(),
     };
     let running = crate::start(&alone).await?;

@@ -10,6 +10,7 @@ use anyhow::{bail, ensure, Context};
 pub enum Builtin {
     Help,
     HistoryClear,
+    Reset,
     Remember,
     Theme,
     Memory,
@@ -62,6 +63,7 @@ macro_rules! definitions {
 definitions! {
     Help, "help", "", "commands and keyboard help", &[];
     HistoryClear, "history-clear", "", "clear saved input history for this workspace", &[];
+    Reset, "reset", "", "restore configured interface defaults and forget saved settings", &[];
     Remember, "remember", "TEXT", "a preference of yours, for every project", &[];
     Theme, "theme", "NAME", "dark, light or terminal ANSI colors; saved for next time", &["dark", "light", "ansi"];
     Memory, "memory", "[query]", "list, inspect and forget notes", &[];

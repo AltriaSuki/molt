@@ -125,6 +125,15 @@ impl Store {
         Ok(Some(bytes))
     }
 
+    pub fn remove(&self, name: &str) -> anyhow::Result<()> {
+        match std::fs::remove_file(self.dir.join(name)) {
+            Ok(()) => File::open(&self.dir)?.sync_all()?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+
     pub fn replace(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
         let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
         file.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
