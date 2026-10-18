@@ -1,0 +1,21 @@
+title = "Parse durations, in a Python package that does not ignore __pycache__"
+language = "python"
+kind = "feature"
+difficulty = "easy"
+split = "dev"
+tests = "python3 -m unittest -q tests.test_size"
+check = "python3 -m unittest -q tests.test_size tests.test_bench_hidden"
+prompt = """
+Add `parse_duration(text)` to `units/duration.py` (a new module): it turns a
+duration such as `"1h30m"`, `"45s"` or `"2h"` into a whole number of seconds.
+A duration is one or more parts, each a whole number followed by `h`, `m` or
+`s`, in that order and each at most once, with no spaces: `"1h30m"` is 5400
+and `"90s"` is 90. Anything else, the empty string included, raises
+`ValueError` with the message `bad duration: ` followed by the text in
+quotes as `repr` gives it, such as `bad duration: '1x'`. Export it from the
+`units` package as `parse_size` is.
+"""
+
+[smoke]
+learn = true
+verifier = "check"

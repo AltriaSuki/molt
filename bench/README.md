@@ -25,7 +25,7 @@ starting with the language (`py-`, `js-`, `rs-`, `go-`).
 ```toml
 title = "Round invoice totals to the cent with Decimal"
 language = "python"     # python | javascript | rust | go
-kind = "bugfix"         # bugfix | feature | refactor | build
+kind = "bugfix"         # bugfix | feature | refactor | build | docs
 difficulty = "medium"   # easy | medium | hard
 split = "dev"           # dev | heldout
 tests = "python3 -m unittest -q tests.test_invoice"  # the repo's own tests
@@ -104,6 +104,54 @@ split is for measuring whether what it learned generalizes.
 Changing a task's `task.toml`, `repo/` or `hidden/` changes its hash, so
 results recorded before the change are not mixed with results after it.
 
+## Smoke projects
+
+`smoke/` holds the smoke suite: small real projects that a real model works
+on in Molt's default configuration, to catch what tests with a fake model
+do not (a Go command that adds `os.Exit`, a crate with a crates.io
+dependency, a task and notes in Chinese, a task only a rubric can judge).
+They use the task format above, and each has a `[smoke]` table saying what
+is checked about a run beyond its hidden tests:
+
+```toml
+[smoke]
+applied = true          # the result is applied to the workspace (default); false: kept in a fork
+verifier = "check"      # how Molt must verify it: check, rubric or unverified
+learn = true            # let Molt learn from the run, and require a note learned
+remember = ["..."]      # notes written into memory first; one must be recalled during the run
+setup = "cargo build"   # run in the workspace first, as a developer's checkout would have it
+network = true          # the check and setup need the network (to fetch dependencies)
+```
+
+Every smoke run is also checked for hygiene and accounting: no file the
+run added or changed is build output or binary (`target*/`, `__pycache__/`,
+`node_modules/`, compiled files, anything with a NUL byte; what `setup` left
+does not count), the cost `molt do` reported (learning included) is the sum
+of the priced model replies in the audit log, and every model call without
+a priced reply is reported among the calls of unknown cost rather than as
+free. Each assertion is recorded with what it found, and `molt bench report`
+lists every one a run failed, by project.
+
+The smoke projects may break the rules above where that is what they test:
+`rs-smoke-deps` depends on a crate from crates.io, so its check fetches it.
+`cargo test -p molt-bench --test tasks` validates the others, and that one
+too with `MOLT_BENCH_NETWORK=1`.
+
+Run them with:
+
+```sh
+molt bench run --tasks bench/smoke --arm molt --results smoke.jsonl --max-usd 3 --task-usd 0.4
+molt bench report smoke.jsonl --require-pass
+```
+
+`--require-pass` exits with status 1 unless every run passed its hidden
+tests and assertions. The Smoke workflow (`.github/workflows/smoke.yml`)
+does the same with the `ANTHROPIC_API_KEY` secret: it runs when started by
+hand, with the spending limits, model and endpoint as inputs, or nightly
+once the repository variable `MOLT_SMOKE_NIGHTLY` is `true`. It validates
+the projects first, puts the report in the job summary and keeps the
+results and logs as an artifact.
+
 ## What a run records
 
 One JSON line per run in the results file, with the task, its hash, split
@@ -112,7 +160,7 @@ build, model, effort, turns, budget, time limit, the variables passed
 with `--env`, except secrets, and whether commands ran in the sandbox), whether the hidden tests passed, whether the
 agent said it was done, wall time, cost and tokens, model calls, Molt's
 verdict, any error and whose it was (the agent's, the model API's or the
-benchmark's), and the end of the check's output. A results file resumes
+benchmark's), the end of the check's output, and a smoke task's assertions. A results file resumes
 only with the same setup, so runs of different builds are never pooled. Beside the results file, a
 `.logs` directory keeps the sandbox policy the runs used, each run's stderr, Molt's JSON result, its changes
 as a diff, and the check's output (`--keep-audit` adds the audit log, which

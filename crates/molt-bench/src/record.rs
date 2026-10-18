@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::ErrorKind;
 use crate::grade::Grade;
+use crate::smoke::Assertion;
 use crate::task::{Difficulty, Kind, Language, Split};
 
 /// The version of [`Record`]'s format.
@@ -87,9 +88,17 @@ pub struct Record {
     #[serde(default)]
     pub error_kind: Option<ErrorKind>,
     pub grade: Grade,
+    /// What a smoke task checked about the run beyond its hidden tests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertions: Vec<Assertion>,
 }
 
 impl Record {
+    /// The assertions the run failed.
+    pub fn failed_assertions(&self) -> impl Iterator<Item = &Assertion> {
+        self.assertions.iter().filter(|a| !a.ok)
+    }
+
     /// Whether the run's error says nothing about the agent, so it may be
     /// run again ([`ErrorKind::retryable`]).
     pub fn retryable(&self) -> bool {
@@ -227,6 +236,7 @@ pub(crate) mod tests {
                 duration_ms: 5,
                 output: String::new(),
             },
+            assertions: vec![],
         }
     }
 

@@ -150,6 +150,10 @@ pub struct ReportArgs {
     /// Print the report as JSON.
     #[arg(long)]
     pub json: bool,
+    /// Exit with status 1 unless every run passed its hidden tests and, for
+    /// a smoke task, every assertion, as a smoke suite in CI needs.
+    #[arg(long)]
+    pub require_pass: bool,
 }
 
 fn usd(s: &str) -> Result<f64, String> {
@@ -187,6 +191,10 @@ pub async fn main(cmd: Cmd) -> anyhow::Result<ExitCode> {
                 println!("{}", serde_json::to_string_pretty(&r)?);
             } else {
                 print!("{}", report::markdown(&r));
+            }
+            if args.require_pass && !r.all_passed() {
+                eprintln!("not every run passed its hidden tests and assertions");
+                return Ok(ExitCode::FAILURE);
             }
             Ok(ExitCode::SUCCESS)
         }

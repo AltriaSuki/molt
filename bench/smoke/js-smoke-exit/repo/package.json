@@ -1,0 +1,7 @@
+{
+  "name": "count",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": { "count": "bin/count.js" },
+  "scripts": { "test": "node --test test/count.test.js" }
+}

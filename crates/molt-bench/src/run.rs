@@ -15,7 +15,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentRun, Arm, ErrorKind, Job};
 use crate::grade::{self, Grade};
+use crate::proc;
 use crate::record::{Record, Results, Setup, FORMAT};
+use crate::smoke::{self, Assertion, Evidence, Snapshot};
 use crate::task::{self, Task};
 
 /// Runs in a row that end in an error before reaching the model, after
@@ -349,10 +351,20 @@ impl One {
             Err(e) => {
                 let mut run = AgentRun::default();
                 run.set_error(ErrorKind::Harness, format!("preparing the run: {e:#}"));
-                return Finished::Recorded(Box::new(self.record(started_ms, 0, run, Grade::ungraded(String::new()))));
+                let grade = Grade::ungraded(String::new());
+                return Finished::Recorded(Box::new(self.record(started_ms, 0, run, grade, Vec::new())));
             }
         };
         let (workspace, data_dir, home) = (tmp.path().join("w"), tmp.path().join("d"), tmp.path().join("h"));
+        let before = match self.set_up(&workspace).await {
+            Ok(before) => before,
+            Err(e) => {
+                let mut run = AgentRun::default();
+                run.set_error(ErrorKind::Harness, format!("setting up the workspace: {e:#}"));
+                let grade = Grade::ungraded(String::new());
+                return Finished::Recorded(Box::new(self.record(started_ms, 0, run, grade, Vec::new())));
+            }
+        };
 
         let clock = Instant::now();
         let job = Job {
@@ -378,6 +390,11 @@ impl One {
         }
 
         save_diff(&self.task.repo(), &workspace, &logs.join("changes.diff")).await;
+        // Looked at before the hidden files are laid over the workspace, while the audit log is still there.
+        let audit = data_dir.join("audit.jsonl");
+        let evidence =
+            Evidence { task: &self.task, workspace: &workspace, before: &before, audit: &audit, logs: &logs };
+        let assertions = smoke::assess(&evidence);
         let mut run = run;
         let grade = match grade::grade(&self.task, &workspace).await {
             Ok(grade) => grade,
@@ -388,10 +405,21 @@ impl One {
         };
         let _ = fs::write(logs.join("grade.txt"), &grade.output);
         drop(tmp);
-        Finished::Recorded(Box::new(self.record(started_ms, wall_ms, run, grade)))
+        Finished::Recorded(Box::new(self.record(started_ms, wall_ms, run, grade, assertions)))
     }
 
-    fn record(&self, started_ms: u64, wall_ms: u64, run: AgentRun, grade: Grade) -> Record {
+    /// Run a smoke task's setup command in the workspace, and take the
+    /// snapshot its assertions compare the result with. Other tasks need neither.
+    async fn set_up(&self, workspace: &Path) -> anyhow::Result<Snapshot> {
+        let Some(smoke) = &self.task.spec.smoke else { return Ok(Snapshot::default()) };
+        if let Some(setup) = &smoke.setup {
+            let ran = proc::shell_in(workspace, setup, self.task.timeout(), smoke.network).await?;
+            ensure!(ran.success(), "{setup} ended with {}:\n{}", ran.ending(), proc::tail_of(&ran.output, 1500));
+        }
+        Ok(Snapshot::take(workspace)?)
+    }
+
+    fn record(&self, started_ms: u64, wall_ms: u64, run: AgentRun, grade: Grade, assertions: Vec<Assertion>) -> Record {
         let s = &self.task.spec;
         Record {
             format: FORMAT,
@@ -428,6 +456,7 @@ impl One {
             error: run.error,
             error_kind: run.error_kind,
             grade,
+            assertions,
         }
     }
 }

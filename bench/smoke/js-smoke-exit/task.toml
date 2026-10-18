@@ -1,0 +1,17 @@
+title = "Exit with status 1 on a missing file, in a Node command"
+language = "javascript"
+kind = "bugfix"
+difficulty = "easy"
+split = "dev"
+tests = "node --test test/count.test.js"
+check = "node --test test/count.test.js test/bench_hidden.test.js"
+prompt = """
+`bin/count.js FILE` crashes with a stack trace when FILE does not exist.
+Make it print `count: cannot read FILE` (with the path as given) and a newline
+to standard error, print nothing to standard output, and exit with status 1.
+When the file can be read it keeps printing the number of lines, as now.
+"""
+
+[smoke]
+# The fix adds `process.exit(1)`, which must not stop the result from being applied.
+verifier = "check"

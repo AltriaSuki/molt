@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use serde::Serialize;
 
 use crate::record::{Record, Setup};
+use crate::smoke::Assertion;
 use crate::stats::{mcnemar, mean, median, wilson};
 
 /// What a results file shows.
@@ -27,6 +28,37 @@ pub struct Report {
     /// Success counts per arm by split, language, kind and difficulty.
     pub groups: Vec<Group>,
     pub by_task: Vec<TaskRow>,
+    /// The runs of smoke tasks, with what each failed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub smoke: Vec<SmokeRow>,
+}
+
+impl Report {
+    /// Every run passed its hidden tests and every assertion.
+    pub fn all_passed(&self) -> bool {
+        self.arms.iter().all(|a| a.passed == a.runs) && self.smoke.iter().all(SmokeRow::ok)
+    }
+}
+
+/// One run of a smoke task.
+#[derive(Clone, Debug, Serialize)]
+pub struct SmokeRow {
+    pub task: String,
+    pub arm: String,
+    pub trial: u32,
+    /// The hidden tests passed.
+    pub passed: bool,
+    /// Why the run has no result of the agent's own, when it has none.
+    pub error: Option<String>,
+    pub assertions: u32,
+    /// The assertions it failed.
+    pub failed: Vec<Assertion>,
+}
+
+impl SmokeRow {
+    pub fn ok(&self) -> bool {
+        self.passed && self.failed.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -196,6 +228,19 @@ pub fn report(records: &[Record]) -> Report {
     let set = |f: fn(&Record) -> Option<String>| -> Vec<String> {
         records.iter().filter_map(|r| f(r)).collect::<BTreeSet<_>>().into_iter().collect()
     };
+    let smoke = records
+        .iter()
+        .filter(|r| !r.assertions.is_empty())
+        .map(|r| SmokeRow {
+            task: r.task.clone(),
+            arm: r.arm.clone(),
+            trial: r.trial,
+            passed: r.passed,
+            error: r.error.clone(),
+            assertions: r.assertions.len() as u32,
+            failed: r.failed_assertions().cloned().collect(),
+        })
+        .collect();
     let mut setups: Vec<Setup> = Vec::new();
     for r in &records {
         if !setups.contains(&r.setup) {
@@ -212,6 +257,7 @@ pub fn report(records: &[Record]) -> Report {
         pairs,
         groups,
         by_task,
+        smoke,
     }
 }
 
@@ -432,7 +478,39 @@ pub fn markdown(r: &Report) -> String {
         }
         out.push('\n');
     }
+    smoke_markdown(&mut out, &r.smoke);
     out
+}
+
+/// Which smoke runs failed, and on what: one row for each failed assertion,
+/// and for hidden tests that failed.
+fn smoke_markdown(out: &mut String, rows: &[SmokeRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    let ok = rows.iter().filter(|r| r.ok()).count();
+    let _ = writeln!(
+        out,
+        "\n## Smoke assertions\n\n{ok} of {} smoke runs passed their hidden tests and every assertion.",
+        rows.len()
+    );
+    if ok == rows.len() {
+        return;
+    }
+    out.push_str("\n| Task | Arm | Trial | Failed | Detail |\n|---|---|---|---|---|\n");
+    let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+    for r in rows.iter().filter(|r| !r.ok()) {
+        let mut failed: Vec<(&str, String)> = Vec::new();
+        if !r.passed {
+            let why =
+                r.error.as_deref().map_or_else(|| "the hidden tests failed".to_owned(), |e| format!("error: {e}"));
+            failed.push(("hidden tests", why));
+        }
+        failed.extend(r.failed.iter().map(|a| (a.name.as_str(), a.detail.clone())));
+        for (name, detail) in failed {
+            let _ = writeln!(out, "| {} | {} | {} | {name} | {} |", r.task, r.arm, r.trial + 1, cell(&detail));
+        }
+    }
 }
 
 fn pct(x: f64) -> String {
@@ -530,6 +608,41 @@ mod tests {
         let r = report(&[a, b]);
         assert_eq!(r.setups.len(), 2);
         assert!(markdown(&r).contains("made 2 different ways"));
+    }
+
+    #[test]
+    fn smoke_runs_name_the_task_and_the_assertion_they_failed() {
+        let assertion = |name: &str, ok: bool, detail: &str| Assertion { name: name.into(), ok, detail: detail.into() };
+        let mut clean = run("rs-smoke-std", "molt", 0, true, 60, 0.2);
+        clean.assertions = vec![assertion("clean", true, "2 files"), assertion("cost", true, "same")];
+        let mut dirty = run("rs-smoke-std", "molt", 1, true, 60, 0.2);
+        dirty.assertions = vec![
+            assertion(
+                "clean",
+                false,
+                "32 of 37 files added or changed are build output or binary: target-done-check/a",
+            ),
+            assertion("cost", true, "same"),
+        ];
+        let mut broken = run("rs-smoke-deps", "molt", 0, false, 60, 0.2);
+        broken.assertions = vec![assertion("applied", false, "the result was not applied (outcome failed)")];
+        // A run of a task without assertions is no smoke run.
+        let plain = run("py-a", "molt", 0, true, 60, 0.2);
+
+        let r = report(&[clean.clone(), dirty, broken, plain.clone()]);
+        assert_eq!(r.smoke.len(), 3);
+        assert!(!r.all_passed());
+        let md = markdown(&r);
+        assert!(md.contains("1 of 3 smoke runs passed their hidden tests and every assertion."), "{md}");
+        assert!(md.contains("| rs-smoke-std | molt | 2 | clean | 32 of 37 files"), "{md}");
+        assert!(md.contains("| rs-smoke-deps | molt | 1 | hidden tests | the hidden tests failed |"), "{md}");
+        assert!(md.contains("| rs-smoke-deps | molt | 1 | applied | the result was not applied"), "{md}");
+        assert!(!md.contains("| rs-smoke-std | molt | 1 |"), "{md}");
+
+        let r = report(&[clean, plain]);
+        assert!(r.all_passed());
+        assert!(markdown(&r).ends_with("1 of 1 smoke runs passed their hidden tests and every assertion.\n"));
+        assert!(!markdown(&report(&[run("py-a", "molt", 0, true, 1, 0.1)])).contains("Smoke"));
     }
 
     #[test]

@@ -63,9 +63,13 @@ names!(
 );
 names!(
     /// What kind of work a task asks for.
-    Kind { Bugfix = "bugfix", Feature = "feature", Refactor = "refactor", Build = "build" }
+    Kind { Bugfix = "bugfix", Feature = "feature", Refactor = "refactor", Build = "build", Docs = "docs" }
 );
 names!(Difficulty { Easy = "easy", Medium = "medium", Hard = "hard" });
+names!(
+    /// How Molt verified a result: by a done-check, by a rubric judge, or not at all.
+    Verifier { Check = "check", Rubric = "rubric", Unverified = "unverified" }
+);
 names!(
     /// Which set a task belongs to: `dev` tasks are what an improver may
     /// learn from, `heldout` tasks measure whether that generalizes.
@@ -90,6 +94,45 @@ pub struct Spec {
     pub timeout_s: u64,
     /// What the agent is asked to do.
     pub prompt: String,
+    /// What a smoke task asserts about a run beyond its hidden tests.
+    #[serde(default)]
+    pub smoke: Option<Smoke>,
+}
+
+/// A smoke task's `[smoke]` table. Every smoke run is also checked for
+/// result hygiene (no build output or binaries in its changes) and for
+/// cost accounting (what it reported matches its audit log, and calls whose
+/// cost never arrived are reported as such, not as free).
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Smoke {
+    /// The result is applied to the workspace (`true`) or kept in a fork.
+    #[serde(default = "yes")]
+    pub applied: bool,
+    /// How Molt must verify the result, when it matters.
+    #[serde(default)]
+    pub verifier: Option<Verifier>,
+    /// Let Molt learn from the run, and require at least one note learned.
+    #[serde(default)]
+    pub learn: bool,
+    /// Notes written into the run's memory before it starts, as
+    /// `molt memory remember` would. At least one must be recalled.
+    #[serde(default)]
+    pub remember: Vec<String>,
+    /// A command run in the workspace before the agent starts, so that it
+    /// holds what a developer's checkout would, such as the `target/` of a
+    /// build. What it leaves is not counted as the run's changes.
+    #[serde(default)]
+    pub setup: Option<String>,
+    /// The check and `setup` need the network, such as to fetch a crate
+    /// from crates.io: they get the proxy variables, and offline validation
+    /// skips the task.
+    #[serde(default)]
+    pub network: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn default_timeout() -> u64 {
@@ -117,6 +160,18 @@ impl Task {
             [("title", &spec.title), ("tests", &spec.tests), ("check", &spec.check), ("prompt", &spec.prompt)]
         {
             ensure!(!value.trim().is_empty(), "{}: {field} is empty", path.display());
+        }
+        if let Some(smoke) = &spec.smoke {
+            ensure!(
+                smoke.remember.iter().all(|n| !n.trim().is_empty()),
+                "{}: a note in smoke.remember is empty",
+                path.display()
+            );
+            ensure!(
+                smoke.setup.as_ref().is_none_or(|s| !s.trim().is_empty()),
+                "{}: smoke.setup is empty; leave it out to start from the repo as it is",
+                path.display()
+            );
         }
         ensure!(
             (1..=MAX_TIMEOUT_S).contains(&spec.timeout_s),
@@ -146,6 +201,11 @@ impl Task {
 
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(self.spec.timeout_s)
+    }
+
+    /// Its check needs the network ([`Smoke::network`]).
+    pub fn network(&self) -> bool {
+        self.spec.smoke.as_ref().is_some_and(|s| s.network)
     }
 }
 
