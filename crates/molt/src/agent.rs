@@ -854,6 +854,11 @@ fn model_label(context: &molt_api::progress::ModelCall) -> String {
 
 /// The result of a run as a few lines for the terminal, made [`printable`].
 pub fn report(resp: &RunResponse) -> String {
+    report_at(resp, None)
+}
+
+/// Report a result with the resolved output directory, including virtual projects.
+pub fn report_at(resp: &RunResponse, workspace: Option<&str>) -> String {
     let mut lines = vec![format!("outcome: {}", outcome_name(resp.outcome))];
     if let Some(check) = &resp.check {
         let by = if check.designed { " (designed by the planner)" } else { "" };
@@ -886,7 +891,7 @@ pub fn report(resp: &RunResponse) -> String {
     }
     lines.extend(selection_lines(resp));
     if resp.applied {
-        lines.push("applied to the workspace".to_owned());
+        lines.push(format!("applied to {}", workspace.unwrap_or("the workspace")));
     } else if let Some(fork) = &resp.fork {
         lines.push(format!("not applied; the result is in {fork}"));
     }
@@ -1378,6 +1383,8 @@ mod tests {
             "outcome: passed\ncheck: cargo test\nchanges:\n  modified src/lib.rs\napplied to the workspace\n\
              known cost: $0.0120 (1200 tokens)\n\nFixed the parser.\n"
         );
+        assert!(report_at(&resp, Some("/user-data/molt/projects/trip/files"))
+            .contains("applied to /user-data/molt/projects/trip/files\n"));
         resp.applied = false;
         resp.fork = Some("/cache/work/fork_1".into());
         resp.uncounted_calls = 2;
