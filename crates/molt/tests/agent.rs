@@ -788,6 +788,7 @@ async fn a_project_keeps_its_notes_without_a_folder_and_after_a_move() {
             let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
             assert!(out.status.success(), "{stderr}");
             assert!(stderr.contains("memory: learned 1 note"), "{stderr}");
+            String::from_utf8(out.stdout).unwrap()
         }
     };
     let show = |args: &[&str], dir: &Path| {
@@ -800,8 +801,13 @@ async fn a_project_keeps_its_notes_without_a_folder_and_after_a_move() {
     let listed = molt(&["project", "new", "Japan trip"], home.path());
     assert!(listed.contains("Japan trip  no folder"), "{listed}");
     let id = listed.split_whitespace().next().unwrap().to_owned();
-    run(&["--project", "Japan trip"], home.path()).await;
-    let files = data.path().join(format!("user-data/molt/projects/{id}/files"));
+    let files = data.path().join(format!("user-data/molt/projects/{id}/files")).canonicalize().unwrap();
+    assert!(listed.contains(&format!("files: {}", files.display())), "{listed}");
+    assert_eq!(molt(&["project", "path", "Japan trip"], home.path()), format!("{}\n", files.display()));
+    assert_eq!(molt(&["project", "path", &id], home.path()), format!("{}\n", files.display()));
+    assert!(molt(&["project", "list"], home.path()).contains(files.to_str().unwrap()));
+    let output = run(&["--project", "Japan trip"], home.path()).await;
+    assert!(output.contains(&format!("applied to {}", files.display())), "{output}");
     assert_eq!(std::fs::read_to_string(files.join("greeting.txt")).unwrap(), "hello\n");
     assert!(show(&["--project", &id], home.path()).contains(LEARNED_TEXT));
 
@@ -1130,6 +1136,7 @@ async fn streaming_keeps_json_stdout_complete_and_previews_on_stderr() {
     let result: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(result["outcome"], "passed");
     assert_eq!(result["summary"], "Wrote greeting.txt.");
+    assert_eq!(result["workspace"], workspace.path().canonicalize().unwrap().to_str().unwrap());
     assert!(stderr.contains("preview: Wrote greeting.txt."), "{stderr}");
     assert!(stderr.contains("model finished (cost $"), "{stderr}");
     assert_requests_valid(&server).await;
@@ -1156,7 +1163,7 @@ async fn the_cli_runs_the_example_config_when_given_one() {
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success(), "status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}", out.status);
     assert!(stderr.contains(&format!("config: {}\n", path.display())), "{stderr}");
-    assert!(stdout.contains("applied to the workspace"), "{stdout}");
+    assert!(stdout.contains(&format!("applied to {}", workspace.path().canonicalize().unwrap().display())), "{stdout}");
     assert!(stderr.contains("memory: learned 1 note"), "{stderr}");
     assert!(workspace.path().join(".molt/memory.db").is_file(), "where the example puts it");
     assert_eq!(std::fs::read_to_string(workspace.path().join("greeting.txt")).unwrap(), "hello\n");
