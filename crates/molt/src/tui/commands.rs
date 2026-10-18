@@ -28,6 +28,7 @@ pub enum Builtin {
     Stream,
     Notify,
     Commit,
+    Undo,
     Model,
     MemoryModel,
     Effort,
@@ -84,6 +85,7 @@ definitions! {
     Attempts, "attempts", "N", "attempts at once, 1 to 8", &["1", "2", "3", "4", "5", "6", "7", "8", "default"];
     Stream, "stream", "on|off", "model text previews for the next task", &["on", "off", "default"];
     Notify, "notify", "on|all|off", "bell and desktop notice when waiting (all: also when a task ends)", &["on", "all", "off", "default"];
+    Undo, "undo", "[RUN]", "take back a run's Git commit and notify this session's memory", &[];
     Commit, "commit", "on|off", "commit each applied result to git; molt undo takes it back", &["on", "off", "default"];
     Model, "model", "NAME", "opus, sonnet, haiku or a model id", &["opus", "sonnet", "haiku", "default"];
     MemoryModel, "memory-model", "NAME", "model memory learns with; same: the attempts'", &["opus", "sonnet", "haiku", "same", "default"];

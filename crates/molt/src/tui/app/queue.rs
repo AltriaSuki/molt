@@ -91,10 +91,11 @@ impl App {
         }
         if self.quit
             || self.quit_armed.is_some()
+            || self.quit_after_git
             || self.queue_paused
             || self.queue.is_empty()
             || self.task.is_some()
-            || self.committing
+            || self.git_busy
             || self.fork_operations > 0
             || self.kept_pending.is_some()
             || !matches!(self.session, SessionState::Up { .. })

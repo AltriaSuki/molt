@@ -19,7 +19,7 @@ use molt_api::fs::{self, DiffRequest, DiffResponse, DropRequest, DropResponse, M
 use molt_api::memory::{
     self, ConsolidateRequest, ConsolidateResponse, CorrectRequest, ForgetRequest, ForgetResponse, Note, NoteKind,
     PromoteRequest, PromoteResponse, RecallRequest, RecallResponse, RecallSnapshot, Recalled, RememberRequest,
-    RememberResponse, ReviewRequest, ReviewResponse,
+    RememberResponse, RetractResponse, ReviewRequest, ReviewResponse, UndoRequest,
 };
 use molt_api::planner::{self, Control, ControlRequest, ControlResponse, DesignResponse, RunRequest, RunResponse};
 use molt_api::progress::{self, Progress};
@@ -57,6 +57,13 @@ pub struct Session {
     forks: Mutex<Option<RunForks>>,
     versions: Vec<(String, String)>,
     hooks: Vec<molt_planner::hooks::Hook>,
+}
+
+/// Git settlement is retained even when memory could not be notified; retry by run id is safe.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct Undone {
+    pub git: crate::git::Undo,
+    pub memory: Option<Result<RetractResponse, String>>,
 }
 
 impl Session {
@@ -116,6 +123,7 @@ impl Session {
                 memory::CORRECT,
                 memory::REMEMBER,
                 memory::PROMOTE,
+                memory::UNDO,
             ]);
         }
         for target in targets {
@@ -241,6 +249,24 @@ impl Session {
         let workspace = Path::new(&self.workspace).canonicalize()?;
         anyhow::ensure!(Path::new(&view.workspace) == workspace, "the result belongs to another workspace");
         Ok(())
+    }
+
+    /// Undo as the person, using this session's memory service and audit log.
+    pub async fn undo(&self, run: Option<String>) -> anyhow::Result<Undone> {
+        let workspace = self.workspace.clone();
+        let git =
+            tokio::task::spawn_blocking(move || crate::git::Repo::open(Path::new(&workspace))?.undo(run.as_deref()))
+                .await??;
+        let run = git.run().to_owned();
+        let memory = if self.memory.is_none() {
+            None
+        } else if let Some(error) = self.memory_problem() {
+            Some(Err(error))
+        } else {
+            let req = UndoRequest { run, reason: "the user undid the run with TUI /undo".into() };
+            Some(self.call(memory::UNDO, req, NOTES_MS, None).await.map_err(|e| format!("{e:#}")))
+        };
+        Ok(Undone { git, memory })
     }
 
     /// The notes about the workspace that match `query`, best first.

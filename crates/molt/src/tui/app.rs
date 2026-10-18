@@ -187,6 +187,9 @@ pub enum Action {
         task: String,
         resp: Box<RunResponse>,
     },
+    Undo {
+        run: Option<String>,
+    },
     Discard {
         fork: String,
     },
@@ -320,6 +323,7 @@ pub enum Msg {
     Applied(Result<(), String>),
     /// `None`: the workspace's commit has the files as they are already.
     Committed(Result<Option<crate::git::Committed>, String>),
+    Undone(Result<crate::session::Undone, String>),
     Discarded(Result<(), String>),
     Notes(Result<Vec<Recalled>, String>),
     /// The input as the user's editor left it.
@@ -843,7 +847,8 @@ pub struct App {
     pub backend_generation: u64,
     startup_retries: usize,
     retry_at: Option<u64>,
-    committing: bool,
+    git_busy: bool,
+    quit_after_git: bool,
     pub log: Vec<Line<'static>>,
     /// Lines scrolled up from the end of the log; 0 follows it.
     pub scroll: usize,
@@ -948,7 +953,8 @@ impl App {
             backend_generation: 0,
             startup_retries: 0,
             retry_at: None,
-            committing: false,
+            git_busy: false,
+            quit_after_git: false,
             log: Vec::new(),
             scroll: 0,
             input: Input::default(),
@@ -1170,9 +1176,13 @@ impl App {
                 self.keep_entry(entry);
             }
         }
-        self.committing |= actions.iter().any(|a| matches!(a, Action::Commit { .. }));
+        self.git_busy |= actions.iter().any(|a| matches!(a, Action::Commit { .. } | Action::Undo { .. }));
         self.fork_operations +=
             actions.iter().filter(|a| matches!(a, Action::Apply { .. } | Action::Discard { .. })).count();
+        if self.quit_after_git && !self.git_busy {
+            self.quit = true;
+            actions.push(Action::Quit { keep: self.keep() });
+        }
         actions.extend(self.advance_queue());
         if self.reset_preferences {
             self.preference_changes.clear();
@@ -1371,6 +1381,11 @@ impl App {
                 }
                 Vec::new()
             }
+            Msg::Signal if self.git_busy => {
+                self.quit_after_git = true;
+                self.flash = Some("waiting for Git and memory before quitting".into());
+                Vec::new()
+            }
             Msg::Signal => {
                 self.quit = true;
                 vec![Action::Quit { keep: self.keep() }]
@@ -1519,7 +1534,7 @@ impl App {
                 commit.into_iter().collect()
             }
             Msg::Committed(result) => {
-                self.committing = false;
+                self.git_busy = false;
                 match result {
                     Ok(Some(c)) => {
                         let on =
@@ -1533,6 +1548,49 @@ impl App {
                     }
                     Ok(None) => self.push(Line::from(span("  nothing to commit", Tone::Dim))),
                     Err(e) => self.error("not committed; the result is applied", &e),
+                }
+                Vec::new()
+            }
+            Msg::Undone(result) => {
+                self.git_busy = false;
+                match result {
+                    Ok(undone) => {
+                        let run = undone.git.run().to_owned();
+                        let line = match undone.git {
+                            crate::git::Undo::Reverted { commit, sha, .. } => format!(
+                                "undid run {run}: reverted {} in {}",
+                                &commit[..12.min(commit.len())],
+                                &sha[..12.min(sha.len())]
+                            ),
+                            crate::git::Undo::Already { sha, .. } => {
+                                format!("run {run} was undone already, in {}", &sha[..12.min(sha.len())])
+                            }
+                        };
+                        self.push(Line::from(span(clean_line(&line), Tone::Ok)));
+                        self.earlier.clear();
+                        self.files_stale = true;
+                        match undone.memory {
+                            Some(Ok(response)) => self.push(Line::from(span(
+                                format!(
+                                    "  memory no longer counts the run: {} notes forgotten, {} adjusted",
+                                    response.retracted, response.adjusted
+                                ),
+                                Tone::Mem,
+                            ))),
+                            Some(Err(error)) => {
+                                self.error(
+                                    "Git is undone, but memory could not be told",
+                                    &scrub(&error, &self.secrets),
+                                );
+                                self.flash =
+                                    Some(format!("/undo {run} retries the memory notice without another revert"));
+                                self.queue_paused |= !self.queue.is_empty();
+                            }
+                            None => self
+                                .push(Line::from(span("  memory is not configured; no notification sent", Tone::Dim))),
+                        }
+                    }
+                    Err(error) => self.error("could not undo", &scrub(&error, &self.secrets)),
                 }
                 Vec::new()
             }
@@ -1657,6 +1715,10 @@ impl App {
         }
         if ctrl(&key, 'c') && self.queue_view.as_ref().is_some_and(|view| view.draft.is_some()) {
             return self.queue_key(&key);
+        }
+        if self.git_busy && (ctrl(&key, 'd') || (ctrl(&key, 'c') && self.input.text.is_empty())) {
+            self.flash = Some("wait for Git and memory before quitting".into());
+            return Vec::new();
         }
         if ctrl(&key, 'd') || (ctrl(&key, 'c') && self.task.is_none() && self.input.text.is_empty()) {
             if self.quit_armed.is_some_and(|at| self.tick.wrapping_sub(at) <= QUIT_TICKS) {
@@ -1965,7 +2027,7 @@ impl App {
     }
 
     fn submit_task(&mut self, line: String) -> Vec<Action> {
-        if self.fork_operations > 0 || self.committing {
+        if self.fork_operations > 0 || self.git_busy {
             self.flash = Some("wait for the current apply, discard or commit".into());
             self.input = Input::with(&line);
             return Vec::new();
@@ -2047,7 +2109,7 @@ impl App {
             Some(Builtin::Restart) => {
                 if self.task.is_some()
                     || !self.learning.is_empty()
-                    || self.committing
+                    || self.git_busy
                     || self.kept_pending.is_some()
                     || self.fork_operations > 0
                 {
@@ -2066,6 +2128,22 @@ impl App {
                 self.session = SessionState::Starting;
                 self.push(Line::from(span("restarting the services", Tone::Dim)));
                 return vec![Action::RestartSession { keep: self.kept.clone() }];
+            }
+            Some(Builtin::Undo) => {
+                if self.task.is_some()
+                    || !self.learning.is_empty()
+                    || self.git_busy
+                    || self.fork_operations > 0
+                    || !matches!(self.session, SessionState::Up { .. })
+                {
+                    self.flash = Some("finish the task and wait for idle services before /undo".into());
+                    return Vec::new();
+                }
+                if arg.split_whitespace().count() > 1 {
+                    self.flash = Some("/undo [RUN]: give one run id or leave it empty for the latest run".into());
+                    return Vec::new();
+                }
+                return vec![Action::Undo { run: (!arg.is_empty()).then(|| arg.to_owned()) }];
             }
             Some(Builtin::Queue) => return self.queue_command(arg),
             Some(Builtin::Kept) => {
@@ -2279,6 +2357,12 @@ impl App {
                 self.scroll = 0;
             }
             Some(Builtin::Quit) => {
+                if self.git_busy {
+                    self.quit_after_git = true;
+                    self.show_unexecuted();
+                    self.flash = Some("waiting for Git and memory before quitting".into());
+                    return Vec::new();
+                }
                 if !self.queue.is_empty() {
                     self.quit_armed = Some(self.tick);
                     self.show_unexecuted();
@@ -3121,7 +3205,7 @@ impl App {
                     || self.pending_result.is_some()
                     || self.fork_operations > 0
                     || !self.learning.is_empty()
-                    || self.committing
+                    || self.git_busy
                     || self.kept_pending.is_some()
                     || !matches!(self.session, SessionState::Up { .. })
                 {
@@ -4260,6 +4344,53 @@ mod tests {
     }
 
     #[test]
+    fn undo_waits_for_idle_services_and_keeps_partial_memory_settlement_retryable() {
+        let mut app = queue_app();
+        type_in(&mut app, "busy");
+        assert!(type_in(&mut app, "/undo").is_empty());
+        app.task = None;
+        app.learning.insert("trace_learn".into());
+        assert!(type_in(&mut app, "/undo").is_empty());
+        app.learning.clear();
+        assert_eq!(type_in(&mut app, "/undo"), [Action::Undo { run: None }]);
+        assert!(app.git_busy);
+        assert!(type_in(&mut app, "another task").is_empty());
+        app.input.take();
+        type_in(&mut app, "/queue add after undo");
+        let actions = app.update(Msg::Undone(Ok(crate::session::Undone {
+            git: crate::git::Undo::Reverted {
+                run: "trace_test".into(),
+                commit: "0123456789abcdef".into(),
+                sha: "fedcba9876543210".into(),
+            },
+            memory: Some(Err("memory unavailable".into())),
+        })));
+        assert!(actions.is_empty() && !app.git_busy && app.queue_paused);
+        assert!(log(&app).contains("Git is undone, but memory could not be told"));
+        assert_eq!(type_in(&mut app, "/undo trace_test"), [Action::Undo { run: Some("trace_test".into()) }]);
+        app.update(Msg::Undone(Ok(crate::session::Undone {
+            git: crate::git::Undo::Already { run: "trace_test".into(), sha: "fedcba9876543210".into() },
+            memory: Some(Ok(molt_api::memory::RetractResponse { retracted: 1, adjusted: 0 })),
+        })));
+        assert!(!app.git_busy && log(&app).contains("memory no longer counts the run"));
+        assert!(
+            matches!(type_in(&mut app, "/queue resume").as_slice(), [Action::Run { req, .. }] if req.task == "after undo")
+        );
+    }
+
+    #[test]
+    fn quitting_waits_for_an_uninterruptible_git_operation_to_settle() {
+        let mut app = queue_app();
+        type_in(&mut app, "/undo");
+        assert!(app.update(ctrl_key('d')).is_empty() && !app.quit);
+        assert!(app.update(Msg::Signal).is_empty() && !app.quit);
+        assert!(type_in(&mut app, "/queue add not executed").is_empty());
+        let actions = app.update(Msg::Undone(Err("no run to undo".into())));
+        assert!(actions.iter().any(|action| matches!(action, Action::Quit { .. })));
+        assert!(app.quit && app.unexecuted() == ["not executed"]);
+    }
+
+    #[test]
     fn confirmations_keep_log_navigation_and_explain_rules_separately_from_the_reviewer() {
         let mut app = App::new("/work/project", None);
         up(&mut app);
@@ -4788,7 +4919,7 @@ mod tests {
         up(&mut app);
         type_in(&mut app, "/attempts 4");
         app.kept = vec!["/fork/kept".into()];
-        app.committing = true;
+        app.git_busy = true;
         assert!(type_in(&mut app, "/restart").is_empty());
         app.update(Msg::Committed(Ok(None)));
         app.push(Line::from("existing log"));

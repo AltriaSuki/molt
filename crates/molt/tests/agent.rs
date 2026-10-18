@@ -1377,6 +1377,79 @@ async fn a_kept_session_result_survives_restart_and_refuses_workspace_conflicts(
     session.shutdown(&[]).await;
 }
 
+#[tokio::test]
+async fn session_undo_notifies_memory_and_cli_undo_refuses_its_lock_before_changing_git() {
+    use molt::session::Session;
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let w = setup.workspace.path();
+    git(w, &["init", "-q", "-b", "main"]);
+    for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")] {
+        git(w, &["config", key, value]);
+    }
+    git(w, &["add", "."]);
+    git(w, &["commit", "-q", "-m", "start"]);
+    let config = setup.data.path().join("config.toml");
+    std::fs::write(&config, toml::to_string(&setup.cfg).unwrap()).unwrap();
+    let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
+    let session = Session::start(&setup.cfg, w.to_str().unwrap(), events).await.unwrap();
+    for locked_cli in [false, true] {
+        let trace = molt_proto::TraceId::random();
+        let before = molt::git::Before::look(w).unwrap();
+        let response = session.run(&setup.request(Some(CHECK), 1), &trace).await.unwrap();
+        assert!(response.applied);
+        before.commit(&response, trace.as_str(), "write greeting", None).unwrap().unwrap();
+        session.learn(&trace, None).await.unwrap();
+        let head = git(w, &["rev-parse", "HEAD"]);
+        if locked_cli {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+                .args(["undo", trace.as_str(), "--config"])
+                .arg(&config)
+                .arg("--workspace")
+                .arg(w)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(4), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("use /undo"));
+            assert_eq!(git(w, &["rev-parse", "HEAD"]), head, "a locked CLI undo changed nothing");
+        }
+        let report = session.undo(if locked_cli { Some(trace.to_string()) } else { None }).await.unwrap();
+        assert!(matches!(report.git, molt::git::Undo::Reverted { .. }));
+        assert!(report.memory.unwrap().is_ok());
+        assert!(!w.join("greeting.txt").exists());
+        assert!(session.notes("").await.unwrap().is_empty());
+        let head = git(w, &["rev-parse", "HEAD"]);
+        let report = session.undo(Some(trace.to_string())).await.unwrap();
+        assert!(matches!(report.git, molt::git::Undo::Already { .. }));
+        assert!(report.memory.unwrap().is_ok());
+        assert_eq!(git(w, &["rev-parse", "HEAD"]), head);
+    }
+    // If Git succeeded but a fresh memory service cannot start, status 4
+    // still exposes the partial result and the exact retry id.
+    let trace = molt_proto::TraceId::random();
+    let before = molt::git::Before::look(w).unwrap();
+    let response = session.run(&setup.request(Some(CHECK), 1), &trace).await.unwrap();
+    before.commit(&response, trace.as_str(), "write greeting", None).unwrap().unwrap();
+    session.learn(&trace, None).await.unwrap();
+    session.shutdown(&[]).await;
+    let mut broken = setup.cfg.clone();
+    let memory = broken.service_mut("memory").unwrap();
+    memory.exec.as_mut().unwrap().command = setup.data.path().join("missing-memory").to_str().unwrap().into();
+    memory.max_restarts = 1;
+    std::fs::write(&config, toml::to_string(&broken).unwrap()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+        .args(["undo", trace.as_str(), "--config"])
+        .arg(&config)
+        .arg("--workspace")
+        .arg(w)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("undid run"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("memory could not be told"));
+    assert!(!w.join("greeting.txt").exists());
+}
+
 /// What the interface does with a task in its default mode, on one session:
 /// design the check and show it, run with the check as accepted, keep the
 /// result for the user to look at, apply it, learn, then list and forget
