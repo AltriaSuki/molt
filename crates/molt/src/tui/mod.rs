@@ -10,6 +10,7 @@ mod backend;
 mod commands;
 mod notice;
 mod preview;
+mod state;
 mod text;
 mod transcript;
 mod view;
@@ -126,6 +127,24 @@ async fn event_loop(
     app.secrets = secrets_in_env();
     app.rules = cfg.confirm.clone();
     app.load_commands(Path::new(&workspace));
+    let store = match state::Store::new(&cfg.kernel.data_dir, Path::new(&workspace)) {
+        Ok(store) => {
+            match store.history(&app.secrets) {
+                Ok((entries, damaged)) => {
+                    app.restore_history(entries);
+                    if damaged {
+                        app.flash = Some("some damaged input history entries were ignored".into());
+                    }
+                }
+                Err(e) => app.flash = Some(format!("saved input history ignored: {e}")),
+            }
+            Some(store)
+        }
+        Err(e) => {
+            app.flash = Some(format!("input history could not be opened: {e}"));
+            None
+        }
+    };
     let theme_file = cfg.kernel.data_dir.join("tui-theme.json");
     match std::fs::read(&theme_file) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -152,6 +171,13 @@ async fn event_loop(
         let mut actions = app.update(msg);
         while let Ok(msg) = rx.try_recv() {
             actions.extend(app.update(msg));
+        }
+        for change in app.take_history_changes() {
+            if let Some(store) = &store {
+                if let Err(e) = store.change_history(&change, &app.secrets) {
+                    app.flash = Some(format!("input history could not be saved: {e}"));
+                }
+            }
         }
         for action in actions {
             match action {

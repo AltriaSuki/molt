@@ -221,6 +221,17 @@ once per stop. `/notify all` also calls when a task ends
 title follows what it is doing (`molt · running 2/4`, `molt · waiting:
 apply`, `molt · idle`), and the terminal's own title is put back on exit.
 
+Input history is private to the workspace and survives restarts, even when two
+workspaces use the same data directory. ↑/↓ browses it; returning past the newest
+entry restores the unfinished draft. Ctrl+R searches newest first without duplicate
+matches, Ctrl+R again selects an older match, Enter submits it, Tab or Esc puts it
+back in the input for editing, and Ctrl+C cancels the search and restores the draft.
+`/clear` clears only the log; `/history-clear` removes this workspace's input history.
+History retains up to 1000 entries and 4 MiB; entries over 16 KiB, known environment
+credentials, common token prefixes, credential assignments and private keys are
+excluded. This filtering is heuristic. History files use mode 0600 under a private
+workspace directory; malformed records are ignored with a startup notice.
+
 Typing `@` starts a file path: the workspace's files (as `.gitignore` leaves
 them) are suggested as you type, ↑/↓ picks one and Tab puts it in. The files
 a task names this way go with it: the check designer and every attempt get

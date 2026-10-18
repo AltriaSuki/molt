@@ -54,6 +54,40 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(viewer) = &mut app.shortcuts {
         draw_viewer(frame, area, viewer, " j/k scroll · ? / esc close ");
     }
+    if let Some(search) = &app.history_search {
+        let r = centered(area, 92, 70);
+        frame.render_widget(Clear, r);
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(style(Tone::Dim))
+            .title(" history · Ctrl+R older ")
+            .title_bottom(" Enter run · Tab/Esc edit · Ctrl+C cancel ");
+        let inner = block.inner(r);
+        frame.render_widget(block, r);
+        let [query, matches] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+        draw_field(frame, query, &search.query, true);
+        let entries = app.history_matches();
+        let count = usize::from(matches.height).min(6);
+        let start = search.selected.saturating_sub(count.saturating_sub(1));
+        let mut lines: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(count)
+            .map(|(i, entry)| {
+                let mark = if i == search.selected { "› " } else { "  " };
+                Line::from(span(
+                    format!("{mark}{}", clean_line(entry)),
+                    if i == search.selected { Tone::Shell } else { Tone::Dim },
+                ))
+            })
+            .collect();
+        if entries.is_empty() {
+            lines.push(Line::from(span("no matching input", Tone::Dim)));
+        }
+        frame.render_widget(Paragraph::new(lines), matches);
+    }
     app.theme.paint(frame.buffer_mut());
 }
 
@@ -457,6 +491,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         || app.viewer.is_some()
         || app.transcript.is_some()
         || app.shortcuts.is_some();
+    let waiting = waiting || app.history_search.is_some();
     let editing_check = matches!(app.prompt, Some(Prompt::EditCheck(_)));
     let mut block = Block::new()
         .borders(Borders::ALL)

@@ -609,6 +609,12 @@ pub struct Input {
     pastes: Vec<(String, String)>,
 }
 
+pub struct HistorySearch {
+    pub query: Input,
+    pub selected: usize,
+    draft: Input,
+}
+
 /// Pasted lines shown as they are; a longer paste shows as one placeholder.
 const PASTE_LINES: usize = 20;
 
@@ -802,6 +808,9 @@ pub struct App {
     pub input: Input,
     history: Vec<String>,
     history_at: Option<usize>,
+    history_draft: Option<Input>,
+    history_changes: Vec<super::state::HistoryChange>,
+    pub history_search: Option<HistorySearch>,
     pub task: Option<Task>,
     pub prompt: Option<Prompt>,
     pub viewer: Option<Viewer>,
@@ -886,6 +895,9 @@ impl App {
             input: Input::default(),
             history: Vec::new(),
             history_at: None,
+            history_draft: None,
+            history_changes: Vec::new(),
+            history_search: None,
             task: None,
             prompt: None,
             viewer: None,
@@ -936,6 +948,7 @@ impl App {
             || self.viewer.is_some()
             || self.transcript.is_some()
             || self.shortcuts.is_some()
+            || self.history_search.is_some()
             || self.input.cursor != self.input.text.chars().count()
             || self.input.text.contains(['\n', '\r'])
             || self.command_hidden.as_ref() == Some(&self.input.text)
@@ -947,6 +960,58 @@ impl App {
 
     pub fn memory_up(&self) -> bool {
         matches!(&self.session, SessionState::Up { memory_problem: None, .. })
+    }
+
+    pub fn restore_history(&mut self, entries: Vec<String>) {
+        self.history = entries.into_iter().filter(|e| super::state::keep_history(e, &self.secrets)).collect();
+        super::state::trim_history(&mut self.history);
+        self.history_at = None;
+    }
+
+    pub fn take_history_changes(&mut self) -> Vec<super::state::HistoryChange> {
+        std::mem::take(&mut self.history_changes)
+    }
+
+    pub fn history_matches(&self) -> Vec<&str> {
+        let Some(search) = &self.history_search else { return Vec::new() };
+        let query = search.query.text.to_lowercase();
+        let mut seen = HashSet::new();
+        self.history
+            .iter()
+            .rev()
+            .filter(|e| e.to_lowercase().contains(&query) && seen.insert(e.as_str()))
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn history_key(&mut self, key: &KeyEvent) -> Vec<Action> {
+        let matches = self.history_matches();
+        let search = self.history_search.as_ref().expect("history search is open");
+        let picked = matches.get(search.selected).map(|s| (*s).to_owned());
+        let n = matches.len();
+        if ctrl(key, 'c') {
+            self.input = self.history_search.take().unwrap().draft;
+        } else if key.code == KeyCode::Enter {
+            if let Some(picked) = picked {
+                self.history_search = None;
+                self.input.take();
+                return self.submit(picked);
+            }
+        } else if matches!(key.code, KeyCode::Tab | KeyCode::Esc) {
+            let search = self.history_search.take().unwrap();
+            self.input = picked.map_or(search.draft, |s| Input::with(&s));
+        } else {
+            let search = self.history_search.as_mut().unwrap();
+            if n > 0 && (ctrl(key, 'r') || key.code == KeyCode::Up) {
+                search.selected = (search.selected + 1) % n;
+            } else if n > 0 && key.code == KeyCode::Down {
+                search.selected = (search.selected + n - 1) % n;
+            } else {
+                search.query.key(key);
+                search.selected = 0;
+            }
+        }
+        Vec::new()
     }
 
     fn push(&mut self, line: Line<'static>) {
@@ -1142,6 +1207,11 @@ impl App {
             }
             Msg::Paste(text) => {
                 self.last_key = Some(self.tick);
+                if let Some(search) = &mut self.history_search {
+                    search.query.insert(&text);
+                    search.selected = 0;
+                    return Vec::new();
+                }
                 match &mut self.screen {
                     Screen::Memory(view) => match &mut view.edit {
                         Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input) | MemoryEdit::Promote(input)) => {
@@ -1350,6 +1420,9 @@ impl App {
         if ctrl(&key, 'z') {
             return vec![Action::Suspend];
         }
+        if self.history_search.is_some() {
+            return self.history_key(&key);
+        }
         if ctrl(&key, 'd') || (ctrl(&key, 'c') && self.task.is_none() && self.input.text.is_empty()) {
             if self.quit_armed.is_some_and(|at| self.tick.wrapping_sub(at) <= QUIT_TICKS) {
                 self.quit = true;
@@ -1381,6 +1454,11 @@ impl App {
         }
         if let Screen::Memory(_) = self.screen {
             return self.memory_key(&key);
+        }
+        if ctrl(&key, 'r') && self.prompt.is_none() {
+            self.history_search =
+                Some(HistorySearch { query: Input::with(&self.input.text), selected: 0, draft: self.input.clone() });
+            return Vec::new();
         }
         let zoomed = self.zoom.is_some() && self.prompt.is_none() && self.input.text.is_empty();
         if ctrl(&key, 'o') || (zoomed && key.code == KeyCode::Char('o') && key.modifiers.is_empty()) {
@@ -1584,6 +1662,9 @@ impl App {
         if self.history.is_empty() {
             return;
         }
+        if self.history_at.is_none() && back {
+            self.history_draft = Some(self.input.clone());
+        }
         let at = match (self.history_at, back) {
             (None, true) => Some(self.history.len() - 1),
             (None, false) => None,
@@ -1592,7 +1673,8 @@ impl App {
             (Some(_), false) => None,
         };
         self.history_at = at;
-        self.input = at.map(|i| Input::with(&self.history[i])).unwrap_or_default();
+        self.input =
+            at.map(|i| Input::with(&self.history[i])).unwrap_or_else(|| self.history_draft.take().unwrap_or_default());
     }
 
     fn submit(&mut self, line: String) -> Vec<Action> {
@@ -1600,10 +1682,13 @@ impl App {
         if line.is_empty() {
             return Vec::new();
         }
-        if self.history.last() != Some(&line) {
+        if self.history.last() != Some(&line) && super::state::keep_history(&line, &self.secrets) {
             self.history.push(line.clone());
+            self.history_changes.push(super::state::HistoryChange::Append(line.clone()));
+            super::state::trim_history(&mut self.history);
         }
         self.history_at = None;
+        self.history_draft = None;
         self.scroll = 0;
         if let Some(command) = line.strip_prefix('/') {
             return self.command(command);
@@ -1682,6 +1767,14 @@ impl App {
         let set = |what: &str, value: &str| format!("{what}: {value}");
         use super::commands::{builtin, Builtin};
         match builtin(name).map(|c| c.kind) {
+            Some(Builtin::HistoryClear) => {
+                self.history.clear();
+                self.history_at = None;
+                self.history_draft = None;
+                self.history_changes.clear();
+                self.history_changes.push(super::state::HistoryChange::Clear);
+                self.flash = Some("history cleared for this workspace".into());
+            }
             Some(Builtin::MemoryUsed) => {
                 let run = if arg.is_empty() { self.last_run.clone() } else { Some(arg.to_owned()) };
                 return self.open_used(run);
@@ -2704,6 +2797,7 @@ impl App {
                         ("tab", "complete suggestion / enlarge attempt"),
                         ("↑/↓", "pick suggestion / move line / input history"),
                         ("ctrl+g", "edit task in editor"),
+                        ("ctrl+r", "search this workspace's input history"),
                     ]);
                     if self.busy() {
                         pairs.push(("esc", "stop task"));
@@ -3217,7 +3311,7 @@ fn last_lines(text: &str, n: usize) -> Vec<String> {
 }
 
 /// `text` with every secret in it replaced.
-fn scrub(text: &str, secrets: &[String]) -> String {
+pub(super) fn scrub(text: &str, secrets: &[String]) -> String {
     let mut out = text.to_owned();
     for secret in secrets.iter().filter(|s| !s.is_empty()) {
         if out.contains(secret.as_str()) {
@@ -3286,6 +3380,7 @@ fn help() -> Vec<Line<'static>> {
         row("ctrl+l", "clear and redraw the screen"),
         row("ctrl+z", "suspend the interface; fg returns, services keep running"),
         row("ctrl+g", "write the task in $VISUAL or $EDITOR"),
+        row("ctrl+r", "search input history; again: older match; Enter runs; Tab/Esc edits; Ctrl+C cancels"),
         row("↑ / ↓", "the line above or below, then earlier inputs"),
         row("ctrl+d twice", "quit"),
         Line::default(),
@@ -3659,6 +3754,89 @@ mod tests {
         assert_eq!(app.input.text, "/effort medium ");
         app.update(key(KeyCode::Enter));
         assert_eq!(app.settings.effort, Some(Effort::Medium));
+    }
+
+    #[test]
+    fn submitted_history_survives_a_restart_and_arrows_restore_the_draft() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().to_str().unwrap();
+        let store = super::super::state::Store::new(root.path(), root.path()).unwrap();
+        let mut app = App::new(workspace, None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        type_in(&mut app, "fix login");
+        app.task = None;
+        type_in(&mut app, "fix cache");
+        for change in app.take_history_changes() {
+            store.change_history(&change, &app.secrets).unwrap();
+        }
+        let mut restarted = App::new(workspace, None);
+        restarted.restore_history(store.history(&[]).unwrap().0);
+        restarted.input = Input::with("unfinished draft");
+        restarted.update(key(KeyCode::Up));
+        assert_eq!(restarted.input.text, "fix cache");
+        restarted.update(key(KeyCode::Up));
+        assert_eq!(restarted.input.text, "fix login");
+        restarted.update(key(KeyCode::Down));
+        restarted.update(key(KeyCode::Down));
+        assert_eq!(restarted.input.text, "unfinished draft");
+    }
+
+    #[test]
+    fn reverse_history_search_deduplicates_cycles_and_executes_the_picked_input() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.settings.check = Some("true".into());
+        app.restore_history(["run tests", "other", "run slow tests", "run tests"].map(str::to_owned).to_vec());
+        app.input = Input::with("run");
+        app.update(ctrl_key('r'));
+        assert_eq!(app.history_matches(), ["run tests", "run slow tests"]);
+        assert!(frame_text(&mut app).contains("› run tests"));
+        app.update(ctrl_key('r'));
+        assert!(frame_text(&mut app).contains("› run slow tests"));
+        let actions = app.update(key(KeyCode::Enter));
+        assert!(matches!(&actions[0], Action::Run { req, .. } if req.task == "run slow tests"));
+        assert!(app.history_search.is_none());
+    }
+
+    #[test]
+    fn reverse_search_can_edit_a_match_or_cancel_without_interrupting_a_task() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "running task");
+        app.restore_history(vec!["fix café\nthen test".into()]);
+        app.input = Input::with("draft");
+        app.update(ctrl_key('r'));
+        app.update(ctrl_key('u'));
+        app.update(Msg::Paste("café".into()));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "fix café\nthen test");
+        app.input = Input::with("draft");
+        app.update(ctrl_key('r'));
+        app.update(ctrl_key('u'));
+        assert!(app.update(ctrl_key('c')).is_empty());
+        assert_eq!(app.input.text, "draft");
+        assert!(app.task.is_some());
+        app.update(ctrl_key('r'));
+        app.update(ctrl_key('u'));
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.input.text, "fix café\nthen test");
+    }
+
+    #[test]
+    fn clearing_the_log_keeps_history_and_history_clear_removes_it() {
+        let mut app = App::new("/w", None);
+        app.secrets = vec!["known-sensitive-value".into()];
+        type_in(&mut app, "ordinary input");
+        app.input.take();
+        type_in(&mut app, "use known-sensitive-value");
+        app.input.take();
+        type_in(&mut app, "/clear");
+        assert!(app.history.iter().any(|e| e == "ordinary input"));
+        assert!(!app.history.iter().any(|e| e.contains("known-sensitive-value")));
+        type_in(&mut app, "/history-clear");
+        assert!(app.history.is_empty());
+        assert!(matches!(app.take_history_changes().as_slice(), [super::super::state::HistoryChange::Clear]));
     }
 
     #[test]
