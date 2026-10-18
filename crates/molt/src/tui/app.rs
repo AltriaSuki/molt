@@ -5657,6 +5657,7 @@ mod tests {
             rubric: vec![],
             judgement: vec![],
             dispute: None,
+            verification: None,
         }
     }
 

@@ -8,6 +8,7 @@ use molt_api::fs;
 use molt_api::model::{self, CompleteRequest, CompleteResponse, Effort, Usage};
 use molt_api::planner::RunRequest;
 use molt_api::progress::{self, Progress};
+use molt_api::workflow::Workflow;
 use molt_proto::{Budget, ErrorCode, RemoteError, TraceId};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -123,6 +124,8 @@ pub(crate) struct Ctx {
     pub control: Arc<Control>,
     /// Earlier tasks of the conversation, for the model, or `None`.
     pub earlier: Option<String>,
+    /// The stages the run goes through.
+    pub workflow: Arc<Workflow>,
 }
 
 /// A conversation that grows until it no longer fits a model call (see
@@ -190,6 +193,9 @@ impl Ctx {
         let model = req.model.clone().filter(|m| !m.trim().is_empty()).or_else(|| cfg.default_model.clone());
         let web = bus.holds(molt_api::web::FETCH);
         let budget_usd = req.budget_usd.unwrap_or(cfg.budget_usd);
+        // The request was validated, which resolved its workflow.
+        let workflow = crate::runner::workflow(&cfg, req.workflow.as_deref()).unwrap_or_else(|_| Workflow::verify());
+        let share = workflow.stages.design.and_then(|d| d.budget_share).unwrap_or(cfg.design_share);
         Self {
             bus,
             trace,
@@ -202,7 +208,7 @@ impl Ctx {
             max_check_rounds: req.max_check_rounds.unwrap_or(cfg.max_check_rounds),
             syntax_check: req.syntax_check.unwrap_or(cfg.syntax_check),
             budget_usd,
-            design_budget_usd: req.design_budget_usd.unwrap_or(cfg.design_share * budget_usd).min(budget_usd),
+            design_budget_usd: req.design_budget_usd.unwrap_or(share * budget_usd).min(budget_usd),
             spend_cap: None,
             stream: req.stream,
             memory: Memory::default(),
@@ -220,6 +226,7 @@ impl Ctx {
             carried_uncounted: 0,
             control: Control::new(Vec::new()),
             earlier: crate::prompts::earlier_tasks(&req.earlier),
+            workflow: Arc::new(workflow),
         }
     }
 

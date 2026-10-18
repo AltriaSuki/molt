@@ -1442,6 +1442,35 @@ async fn the_cli_runs_the_example_config_when_given_one() {
 }
 
 #[tokio::test]
+async fn the_verification_level_is_in_the_json_and_the_commit_trailers() {
+    let server = fake_api(Fake::Greets).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let w = workspace.path();
+    git(w, &["init", "-q", "-b", "main"]);
+    for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")] {
+        git(w, &["config", key, value]);
+    }
+    std::fs::write(w.join("notes.txt"), "draft\n").unwrap();
+    git(w, &["add", "."]);
+    git(w, &["commit", "-q", "-m", "start"]);
+    let args = ["--check", CHECK, "--attempts", "1", "--commit", "--json", "--no-learn"];
+    let out = tokio::time::timeout(RUN_LIMIT, molt_do(&server, w, data.path(), &args).output())
+        .await
+        .expect("molt do hung")
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "status {:?}\nstderr:\n{stderr}", out.status);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["verification"], "command", "{json:#}");
+    let level = git(w, &["log", "-1", "--format=%(trailers:key=Molt-Verification,valueonly)"]);
+    assert_eq!(level.trim(), "command");
+    let run = git(w, &["log", "-1", "--format=%(trailers:key=Molt-Run,valueonly)"]);
+    assert!(run.trim().starts_with("trace_"), "{run}");
+    assert_requests_valid(&server).await;
+}
+
+#[tokio::test]
 async fn a_result_that_cannot_be_applied_exits_3_and_is_kept() {
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();

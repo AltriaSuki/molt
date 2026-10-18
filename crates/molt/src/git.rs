@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, ensure, Context};
-use molt_api::planner::{Outcome, RunResponse};
+use molt_api::planner::{Outcome, RunResponse, Verification};
 
 /// Names the run a commit holds the result of.
 pub const RUN_TRAILER: &str = "Molt-Run";
@@ -24,6 +24,8 @@ pub const RUN_TRAILER: &str = "Molt-Run";
 pub const UNDO_TRAILER: &str = "Molt-Undo";
 /// The check the run's result passed.
 pub const CHECK_TRAILER: &str = "Molt-Check";
+/// What the run's result was held to: `command`, `judged`, `rules` or `none`.
+pub const VERIFICATION_TRAILER: &str = "Molt-Verification";
 
 /// Longest commit subject, in characters, before it is cut.
 const SUBJECT: usize = 72;
@@ -47,6 +49,8 @@ pub struct RunCommit<'a> {
     pub task: &'a str,
     /// The check the result passed; `None` for an unverified result.
     pub check: Option<&'a str>,
+    /// Its verification level; `None` when the planner did not say.
+    pub verification: Option<Verification>,
     /// The files the run merged, relative to the workspace.
     pub paths: Vec<String>,
     /// Commit on this new branch, made from `HEAD` and switched to.
@@ -135,7 +139,8 @@ impl Before {
             _ => None,
         };
         let summary = resp.summary.as_str();
-        self.repo.commit_run(&RunCommit { run, summary, task, check, paths, branch })
+        let verification = resp.verification;
+        self.repo.commit_run(&RunCommit { run, summary, task, check, verification, paths, branch })
     }
 }
 
@@ -618,6 +623,9 @@ fn run_message(c: &RunCommit) -> (String, String) {
         message.push('\n');
     }
     message.push_str(&format!("{RUN_TRAILER}: {}\n", c.run));
+    if let Some(level) = c.verification {
+        message.push_str(&format!("{VERIFICATION_TRAILER}: {level}\n"));
+    }
     match c.check {
         Some(check) => message.push_str(&format!("{CHECK_TRAILER}: {}\n", one_line(check))),
         None => message.push_str(&format!("{CHECK_TRAILER}: none (unverified)\n")),
@@ -641,6 +649,24 @@ mod tests {
         let (subject, _) =
             run_message(&RunCommit { run: "trace_test", summary: &"界".repeat(90), ..Default::default() });
         assert_eq!(subject.chars().count(), SUBJECT);
+    }
+
+    #[test]
+    fn a_run_commit_names_its_verification_level_in_a_trailer_after_the_run() {
+        let c = RunCommit {
+            run: "trace_1",
+            summary: "Fix it",
+            check: Some("cargo test"),
+            verification: Some(Verification::Command),
+            ..Default::default()
+        };
+        let (_, message) = run_message(&c);
+        assert!(
+            message.ends_with("Molt-Run: trace_1\nMolt-Verification: command\nMolt-Check: cargo test\n"),
+            "{message}"
+        );
+        let (_, message) = run_message(&RunCommit { verification: Some(Verification::None), check: None, ..c });
+        assert!(message.contains("Molt-Verification: none\nMolt-Check: none (unverified)\n"), "{message}");
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {
@@ -670,6 +696,7 @@ mod tests {
             summary: "Fix the parser\n\nIt now accepts empty input.",
             task: "fix the parser",
             check: Some("cargo test\n  -q"),
+            verification: None,
             paths: paths.iter().map(|p| (*p).to_owned()).collect(),
             branch: None,
         }
