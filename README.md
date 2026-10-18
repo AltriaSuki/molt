@@ -68,6 +68,7 @@ sender from that.
 | Every learned note cites the messages behind it, and a run is learned from once | `crates/molt/tests/agent.rs` (`a_second_run_starts_with_what_the_first_learned…`), `crates/molt-memory/src/consolidate.rs` |
 | A benchmark run is graded by tests the agent is not given, which its own edits cannot replace | `crates/molt-bench/src/grade.rs` (`grading_overwrites_the_agents_copy_of_a_hidden_file`), `crates/molt-bench/src/task.rs` (`overlay_replaces_files_links_and_directories_and_stays_inside`) |
 | Every benchmark task fails its check as given and passes it with the reference solution | `crates/molt-bench/tests/tasks.rs` |
+| Fixed review rules distinguish framework skip calls from process exit calls while still flagging actual test skips | `review::tests::process_exit_and_larger_identifiers_are_not_skip_markers_but_real_xit_still_is`, `an_approved_cli_with_a_process_exit_is_applied` |
 | A workspace apply persists preimages before writing, identifies actual post-crash file states, and refuses recovery over later edits | `crates/molt-tools/src/apply.rs` (`first_middle_and_last_write_failures_can_resume_or_undo_idempotently`, `restarting_after_each_durable_stage_observes_disk_truth_and_recovers`, `later_edits_and_candidate_changes_are_preserved_and_reported_by_path`), `crates/molt-tools/tests/fs.rs` (`a_durable_merge_retains_preimages_for_files_links_modes_and_dropped_forks`), `crates/molt/tests/apply.rs` |
 | Attempt symbol queries verify fork ownership and content freshness, isolate parallel views, and never update the durable project model | `crates/molt-memory/tests/forks.rs` (`rename_add_move_delete_and_shell_edits_stay_inside_the_attempt`, `unverified_wrong_workspace_and_symlink_forks_are_refused_without_widening_roots`, `an_edit_during_refresh_returns_no_stale_symbols`) |
 | A benchmark starts a run only while what it spent, plus the whole `--task-usd` of that run and of each run in flight, fits in `--max-usd`; it refuses models it has no price for | `crates/molt-bench/src/run.rs` (`runs_stop_before_they_could_pass_the_budget`, `a_run_of_unknown_cost_stops_the_benchmark`), `crates/molt-bench/src/cli.rs` (`a_model_without_a_price_is_refused`) |
@@ -509,6 +510,9 @@ through its progress callback, with previews enabled by default.
 | 3 | Passed (or finished unverified), but the changes could not be merged, e.g. because the workspace changed under them; they are kept in the fork the report names. |
 | 4 | Passed and applied, but `--commit` could not commit the changes; the reason is printed. |
 | 128+N | Stopped by signal N: 130 for Ctrl-C, 129 for SIGHUP, 143 for SIGTERM. The services are stopped and the run's forks removed. |
+
+Status 3 also covers a passing result withheld by the review. The report explains
+the review findings and names the kept fork for inspection.
 
 ### Config and secrets
 
