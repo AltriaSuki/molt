@@ -4,6 +4,9 @@
 //! tested with plain values.
 
 mod queue;
+mod runs;
+
+pub use runs::Stopped;
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -249,6 +252,18 @@ pub enum Action {
         /// changes to more than `check_files`.
         attempts: Vec<String>,
         check_files: Vec<String>,
+        /// The checkpointed run that was stopped: it is not to go on, so
+        /// its checkpoint is removed once the services have stopped.
+        #[serde(default)]
+        drop_run: Option<String>,
+    },
+    /// List the stopped runs of the workspace, from their checkpoints; they
+    /// come back as [`Msg::Runs`]. Nothing is started.
+    ListRuns,
+    /// Drop the stopped run `run`, its forks and its checkpoint; the answer
+    /// comes back as [`Msg::RunDropped`].
+    DropRun {
+        run: String,
     },
     Quit {
         keep: Vec<String>,
@@ -385,6 +400,12 @@ pub enum Msg {
         trace: TraceId,
         result: Result<AuditPage, String>,
     },
+    /// The stopped runs of the workspace, newest first.
+    Runs(Vec<runs::Stopped>),
+    RunDropped {
+        run: String,
+        result: Result<(), String>,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -489,6 +510,9 @@ pub struct Task {
     /// The attempts' questions not answered yet, oldest first: the number
     /// of each and its options. What the user types next answers the first.
     pub asked: Vec<(u32, Vec<String>)>,
+    /// Of a resumed run, what it spent before this resume that the session
+    /// total does not count yet: its cost, and its calls of unknown cost.
+    carried: (f64, u32),
 }
 
 impl Task {
@@ -515,6 +539,7 @@ impl Task {
             state: RunState::Running,
             waiting: Vec::new(),
             asked: Vec::new(),
+            carried: (0.0, 0),
         }
     }
 
@@ -978,6 +1003,15 @@ pub struct App {
     /// What `/continue` goes on from: the last finished task's conversation
     /// and, while its result is kept, its fork.
     pub continuation: Option<Continuation>,
+    /// The workspace's runs that stopped with a checkpoint, as last listed.
+    stopped_runs: Vec<runs::Stopped>,
+    /// `/runs` asked for the list, to show in full.
+    runs_asked: bool,
+    /// The run the last interface stopped in, until it is resumed or dropped.
+    restored: Option<super::saved::Active>,
+    /// Of the runs that stopped with a checkpoint, what the session total
+    /// counts already: their cost and uncounted calls when their reply came.
+    settled_runs: std::collections::BTreeMap<String, (f64, u32)>,
     /// Values never to show, such as API keys: replaced wherever text from
     /// commands is shown.
     pub secrets: Vec<String>,
@@ -1078,6 +1112,10 @@ impl App {
             last_lanes: Vec::new(),
             earlier: Vec::new(),
             continuation: None,
+            stopped_runs: Vec::new(),
+            runs_asked: false,
+            restored: None,
+            settled_runs: Default::default(),
             secrets: Vec::new(),
             rules: ConfirmSection::default(),
             zoom: None,
@@ -1258,7 +1296,7 @@ impl App {
             matches!(&msg, Msg::Key(_)).then(|| super::settings::Saved::new(self.mode, self.settings.clone()));
         let input_before = matches!(&msg, Msg::Key(_) | Msg::Paste(_) | Msg::Edited(_))
             .then(|| (self.input.text.clone(), self.input.cursor));
-        if matches!(&msg, Msg::Applied(_) | Msg::Discarded(_)) {
+        if matches!(&msg, Msg::Applied(_) | Msg::Discarded(_) | Msg::RunDropped { .. }) {
             self.fork_operations = self.fork_operations.saturating_sub(1);
         }
         let mut actions = self.handle(msg);
@@ -1567,6 +1605,11 @@ impl App {
             }
             Msg::Designed { trace, result, existing } => self.designed(trace, result, &existing),
             Msg::Ran { trace, result } => self.ran(trace, result),
+            Msg::Runs(runs) => {
+                self.listed_runs(runs);
+                Vec::new()
+            }
+            Msg::RunDropped { run, result } => self.run_dropped(run, result),
             Msg::Learned { trace, result } => {
                 self.learning.remove(trace.as_str());
                 self.learned(result);
@@ -2066,7 +2109,15 @@ impl App {
     fn quit_warning(&self, keys: &str) -> String {
         let mut parts = vec![format!("{keys} again to quit")];
         if self.busy() {
-            parts.push("the running task stops".into());
+            let resumable = self.task.as_ref().is_some_and(|t| t.phase == Phase::Running && t.req.checkpoint);
+            parts.push(
+                if resumable {
+                    "the running task stops; /runs resume goes on with it next time"
+                } else {
+                    "the running task stops"
+                }
+                .into(),
+            );
         }
         let keep = self.keep().len();
         match keep {
@@ -2099,9 +2150,15 @@ impl App {
         }
         let mut attempts = Vec::new();
         let mut check_files = Vec::new();
+        let mut drop_run = None;
         if let Some(mut task) = stopped {
             self.interrupted_task = Some(task.req.task.clone());
             if matches!(task.phase, Phase::Running) {
+                // Stopped by the user, the run is not to go on: its checkpoint goes, its work is kept as below.
+                if task.req.checkpoint {
+                    self.settled_runs.remove(task.trace.as_str());
+                    drop_run = Some(task.trace.to_string());
+                }
                 attempts = task.lanes.iter().filter_map(|l| l.fork.clone()).collect();
                 check_files = task.req.check_files.iter().map(|f| f.path.clone()).collect();
                 self.last_lanes = std::mem::take(&mut task.lanes);
@@ -2126,7 +2183,7 @@ impl App {
             self.push(Line::from(span(format!("  {spent}"), Tone::Dim)));
         }
         self.session = SessionState::Starting;
-        vec![Action::Interrupt { keep, attempts, check_files }]
+        vec![Action::Interrupt { keep, attempts, check_files, drop_run }]
     }
 
     /// Count what a task stopped before its reply has spent so far, and say
@@ -2141,8 +2198,9 @@ impl App {
             return Some("what it spent is unknown: previews were off, and its reply will not come".into());
         }
         let uncounted = task.unsettled_unknown.saturating_add(task.open_calls.len() as u32);
-        self.spent_usd += task.unsettled.usd;
-        self.uncounted_calls = self.uncounted_calls.saturating_add(uncounted);
+        // A resumed run's spend before the resume is no reply's to settle now either.
+        self.spent_usd += task.unsettled.usd + task.carried.0;
+        self.uncounted_calls = self.uncounted_calls.saturating_add(uncounted).saturating_add(task.carried.1);
         Some(match uncounted {
             0 => format!("${:.2} spent before it stopped", task.unsettled.usd),
             1 => format!("${:.2} known spent before it stopped · 1 call uncounted", task.unsettled.usd),
@@ -2260,6 +2318,8 @@ impl App {
         req.keep_cancelled_forks = true;
         req.workflow = Some(settings.workflow.clone().unwrap_or_else(|| workflow::AUTO.to_owned()));
         req.continues = continues;
+        // So that a task the interface stopped in (a quit, a crash) can go on: `/runs resume`.
+        req.checkpoint = runs::checkpoints(req.workflow.as_deref());
         // Only a workflow that designs a check stops for it; `auto` may pick one that does.
         let designs = workflow::builtin(req.workflow.as_deref()).is_none_or(|w| w.stages.design.is_some());
 
@@ -2477,6 +2537,7 @@ impl App {
                 self.echo_constraint(&format!("leave {} unchanged", paths.join(", ")));
                 return self.steer(Control::Constrain(Constraint { protect: paths, ..Default::default() }));
             }
+            Some(Builtin::Runs) => return self.runs_command(arg),
             Some(Builtin::Pause) => return self.steer(Control::Pause),
             Some(Builtin::Resume) => return self.steer(Control::Resume),
             Some(Builtin::New) => {
@@ -2970,6 +3031,7 @@ impl App {
                 }
                 if let Some(picked) = d.workflow.clone() {
                     task.req.workflow = Some(picked);
+                    task.req.checkpoint &= runs::checkpoints(task.req.workflow.as_deref());
                 }
                 // The workflow picked for the task designs nothing: it runs as it is.
                 if d.workflow.as_deref().is_some_and(|w| w != workflow::VERIFY) {
@@ -3113,7 +3175,12 @@ impl App {
                 lane.turn = attempt.turns;
             }
         }
-        self.spent_usd += resp.cost_usd;
+        // A resumed run's reply counts what it spent before the resume too; the total may have counted some.
+        let (counted_usd, counted_calls) = self.settled_runs.remove(trace.as_str()).unwrap_or_default();
+        self.spent_usd += (resp.cost_usd - counted_usd).max(0.0);
+        if resp.checkpoint.is_some() {
+            self.settled_runs.insert(trace.to_string(), (resp.cost_usd, resp.uncounted_calls));
+        }
         self.ended = Some(match resp.outcome {
             Outcome::Passed => match resp.changes.len() {
                 1 => "molt: passed · 1 file".to_owned(),
@@ -3136,8 +3203,15 @@ impl App {
         });
         let learns = workflow::builtin(resp.workflow.as_deref().or(Some(workflow::VERIFY)))
             .is_none_or(|w| w.stages.learn.is_some());
-        self.uncounted_calls = self.uncounted_calls.saturating_add(resp.uncounted_calls);
+        self.uncounted_calls = self.uncounted_calls.saturating_add(resp.uncounted_calls.saturating_sub(counted_calls));
         let mut actions = Vec::new();
+        if let Some(run) = &resp.checkpoint {
+            self.push(Line::from(span(
+                format!("  stopped before it finished; /runs resume {} goes on with it", clean_line(run)),
+                Tone::Warn,
+            )));
+            actions.push(Action::ListRuns);
+        }
         let memory_model = agent::memory_model(task.settings.memory_model.as_deref(), task.req.model.as_deref());
         let spent_all = task_budget(&task.settings).is_some_and(|b| resp.cost_usd >= b);
 
@@ -4581,9 +4655,10 @@ pub fn plain(lines: &[Line<'static>]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::saved;
     use molt_api::fs::Change;
     use molt_api::model::Usage;
-    use molt_api::planner::{AttemptReport, Baseline, CheckFile, CheckSpec, Requirement};
+    use molt_api::planner::{AttemptReport, Baseline, CheckFile, CheckSpec, Requirement, Resume};
     use molt_api::progress::RecalledNote;
     use ratatui::crossterm::event::KeyEventState;
 
@@ -6592,12 +6667,13 @@ mod tests {
         assert_eq!(d.command.as_deref(), Some("cargo test"));
         assert_eq!(d.baseline, None, "the baseline was of the old command");
         let actions = app.update(key(KeyCode::Char('n')));
-        let [Action::Run { req, .. }] = actions.as_slice() else { panic!() };
+        let [Action::Run { req, trace }] = actions.as_slice() else { panic!() };
         assert!(!req.verify && req.check.is_none() && req.check_files.is_empty());
+        let run = Some(trace.to_string());
 
         // Esc twice while it runs stops everything.
         let actions = stop(&mut app);
-        assert_eq!(actions, [Action::Interrupt { keep: vec![], attempts: vec![], check_files: vec![] }]);
+        assert_eq!(actions, [Action::Interrupt { keep: vec![], attempts: vec![], check_files: vec![], drop_run: run }]);
         assert!(app.task.is_none());
         assert_eq!(app.session, SessionState::Starting);
         assert_eq!(app.update(Msg::Stopped { kept: vec![], notes: vec![] }), [Action::StartSession]);
@@ -7395,6 +7471,7 @@ mod tests {
                 keep: vec![],
                 attempts: vec!["/d/work/fork-a".into(), "/d/work/fork-b".into()],
                 check_files: vec!["tests/commas.rs".into()],
+                drop_run: Some(run.clone()),
             }]
         );
         // The runtime found changes in one of them.
@@ -7693,5 +7770,147 @@ mod tests {
 
         type_in(&mut app, "/new");
         assert!(app.continuation.is_none());
+    }
+
+    /// The checkpoint of run `run` of `req`, as `/runs` lists it, having spent `usd` with `open` calls unanswered.
+    fn stopped_run(run: &str, req: &RunRequest, usd: f64, open: u32) -> Stopped {
+        let mut saved = molt_planner::checkpoint::Saved::new(run, req.clone());
+        saved.spend.cost_usd = usd;
+        saved.open_calls = open;
+        saved.requirements = vec![Requirement {
+            version: 1,
+            constraint: Constraint { text: "keep the API".into(), ..Default::default() },
+            at_ms: 0,
+        }];
+        Stopped { run: run.into(), saved: Ok(saved), gone: Vec::new() }
+    }
+
+    #[test]
+    fn a_task_cut_off_by_a_crash_goes_on_from_its_checkpoint_only_when_asked_and_its_cost_is_counted_once() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert!(req.checkpoint, "a task that changes things keeps a checkpoint");
+        app.update(finished(&app, Some(0), "a", Some(0.1)));
+        let snapshot = app.snapshot();
+        let active = snapshot.active.clone().unwrap();
+        assert_eq!(
+            (active.run.as_str(), active.phase, active.checkpointed),
+            (trace.as_str(), saved::Phase::Running, true)
+        );
+
+        // The process is killed; a new interface picks the session up and starts nothing.
+        let mut app = App::new("/w", None);
+        app.restore_session(snapshot);
+        assert!(log(&app).contains("molt stopped while running: implement it"), "{}", log(&app));
+        up(&mut app);
+        assert!(app.update(Msg::Runs(vec![stopped_run(trace.as_str(), req, 0.25, 1)])).is_empty());
+        assert!(app.task.is_none());
+        assert_eq!(app.snapshot().active, Some(active), "named until it is resumed or dropped");
+
+        let actions = type_in(&mut app, "/runs resume");
+        let [Action::Run { req: resumed, trace: again }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(again, trace, "it goes on under its own id");
+        assert_eq!(resumed.resume, Some(Resume { run: trace.to_string(), retry: false }));
+        assert!(resumed.checkpoint && resumed.check.as_deref() == Some("true"));
+        assert_eq!(app.task.as_ref().unwrap().version, 1, "its requirements are the checkpoint's");
+        let mut resp = passed(true, None);
+        resp.cost_usd = 0.4;
+        app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+        assert!((app.spent_usd - 0.4).abs() < 1e-9, "the reply counts what it spent before: {}", app.spent_usd);
+        assert_eq!(app.earlier.len(), 1);
+        assert!(app.snapshot().active.is_none());
+    }
+
+    #[test]
+    fn finished_summaries_and_the_session_total_come_back_and_a_new_task_is_a_new_run() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "first");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
+        app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(true, None)) });
+        let snapshot = app.snapshot();
+        assert!(snapshot.active.is_none());
+
+        let mut app = App::new("/w", None);
+        app.restore_session(snapshot);
+        up(&mut app);
+        assert!((app.spent_usd - 0.3).abs() < 1e-9);
+        assert!(log(&app).contains("1 earlier tasks are told to the next one"), "{}", log(&app));
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "second");
+        let [Action::Run { req, trace: next }] = actions.as_slice() else { panic!() };
+        assert_ne!(next, trace);
+        assert_eq!((req.resume.as_ref(), req.earlier.len(), req.earlier[0].task.as_str()), (None, 1, "first"));
+    }
+
+    #[test]
+    fn stopping_a_checkpointed_task_drops_its_checkpoint_and_dropping_a_stopped_run_counts_what_it_spent() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { trace, req }] = actions.as_slice() else { panic!() };
+        let actions = stop(&mut app);
+        let [Action::Interrupt { drop_run, .. }] = actions.as_slice() else { panic!() };
+        assert_eq!(drop_run.as_deref(), Some(trace.as_str()));
+        assert!(app.snapshot().active.is_none(), "stopped by the user, it is not picked up again");
+        app.update(Msg::Stopped { kept: vec![], notes: vec![] });
+        up(&mut app);
+
+        let listed = || vec![stopped_run("trace_cli", req, 0.5, 2)];
+        app.update(Msg::Runs(listed()));
+        assert!(log(&app).contains("1 stopped runs in this workspace can go on"), "{}", log(&app));
+        assert_eq!(type_in(&mut app, "/runs"), [Action::ListRuns]);
+        app.update(Msg::Runs(listed()));
+        assert!(log(&app).contains("  trace_cli  "), "{}", log(&app));
+        assert_eq!(type_in(&mut app, "/runs discard trace_cli"), [Action::DropRun { run: "trace_cli".into() }]);
+        assert!(type_in(&mut app, "/runs resume trace_cli").is_empty(), "not while it is being dropped");
+        app.update(Msg::RunDropped { run: "trace_cli".into(), result: Ok(()) });
+        assert!((app.spent_usd - 0.5).abs() < 1e-9, "{}", app.spent_usd);
+        assert_eq!(app.uncounted_calls, 2, "calls unanswered when it stopped are not free");
+        assert!(type_in(&mut app, "/runs resume trace_cli").is_empty());
+        assert!(app.flash.as_deref().is_some_and(|f| f.contains("no stopped run trace_cli")), "{:?}", app.flash);
+    }
+
+    #[test]
+    fn a_damaged_checkpoint_or_a_lost_fork_is_refused_with_why_and_starts_nothing() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let req = RunRequest::new("t", "/w");
+        let mut lost = stopped_run("trace_lost", &req, 0.1, 0);
+        lost.gone = vec!["/d/work/fork-x".into()];
+        let damaged = Stopped { run: "trace_bad".into(), saved: Err("it is damaged (EOF)".into()), gone: vec![] };
+        app.update(Msg::Runs(vec![lost, damaged]));
+        assert!(type_in(&mut app, "/runs resume trace_bad").is_empty());
+        assert!(log(&app).contains("cannot be resumed: it is damaged"), "{}", log(&app));
+        assert!(type_in(&mut app, "/runs resume trace_lost").is_empty());
+        assert!(log(&app).contains("/d/work/fork-x, which is gone"), "{}", log(&app));
+        assert!(app.task.is_none());
+    }
+
+    #[test]
+    fn what_cannot_go_on_exactly_is_offered_again_and_its_unknown_cost_is_not_free() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "/ask what is this");
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert!(!req.checkpoint, "an answer in one go keeps no checkpoint");
+        let mut snapshot = app.snapshot();
+        snapshot.active.as_mut().unwrap().phase = saved::Phase::Designing;
+        let tmp = tempfile::tempdir().unwrap();
+        let fork = tmp.path().join("fork-1");
+        std::fs::create_dir(&fork).unwrap();
+        snapshot.pending = Some(super::super::kept::Entry::new(fork.to_str().unwrap().into(), "earlier", "passed"));
+
+        let mut app = App::new("/w", None);
+        app.restore_session(snapshot);
+        assert_eq!(app.input.full(), "what is this", "Enter starts it again");
+        assert_eq!(app.uncounted_stops, 1);
+        assert_eq!(app.kept, [fork.to_str().unwrap()], "the result that waited is kept");
+        assert!(app.snapshot().active.is_none());
     }
 }

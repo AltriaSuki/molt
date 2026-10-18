@@ -631,6 +631,29 @@ pub fn checkpoint_dir(cfg: &Config) -> Option<PathBuf> {
     args.iter().skip_while(|a| *a != "--state").nth(1).map(PathBuf::from)
 }
 
+/// One line about a stopped run: its id, when it stopped, what it spent,
+/// its attempts and its task.
+pub fn stopped_run(saved: &molt_planner::checkpoint::Saved) -> String {
+    let ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |now| (now.as_millis() as u64).saturating_sub(saved.saved_ms) / 60_000);
+    let attempts: Vec<String> = saved
+        .attempts
+        .iter()
+        .map(|a| match &a.end {
+            Some(end) => format!("{}: {:?} after {} turns", a.index, end.status, a.turns).to_lowercase(),
+            None => format!("{}: stopped after {} turns", a.index, a.turns),
+        })
+        .collect();
+    let task: String = saved.request.task.lines().next().unwrap_or_default().chars().take(60).collect();
+    format!(
+        "{}  {ago} min ago  ${:.2}  [{}]  {task}",
+        saved.run,
+        saved.spend.cost_usd,
+        if attempts.is_empty() { "no attempt yet".to_owned() } else { attempts.join(", ") }
+    )
+}
+
 fn require_stream_capability(cfg: &Config) -> anyhow::Result<()> {
     let target: Target = format!("topic:publish:{}", progress::TOPIC).parse()?;
     let allowed =

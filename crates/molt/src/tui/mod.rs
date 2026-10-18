@@ -12,6 +12,7 @@ mod kept;
 mod log;
 mod notice;
 mod preview;
+mod saved;
 mod settings;
 mod state;
 mod text;
@@ -174,6 +175,11 @@ async fn event_loop(
             Ok(entries) => app.restore_kept(entries),
             Err(e) => app.flash = Some(format!("saved kept results ignored: {e}")),
         }
+        match saved::load(store) {
+            Ok(Some(saved)) => app.restore_session(saved),
+            Ok(None) => {}
+            Err(e) => app.flash = Some(format!("the saved session was not picked up: {e:#}")),
+        }
     }
     let theme_file = cfg.kernel.data_dir.join("tui-theme.json");
     match std::fs::read(&theme_file) {
@@ -198,6 +204,10 @@ async fn event_loop(
     }
     let data_dir = cfg.kernel.data_dir.clone();
     let (lister, root) = (tx.clone(), PathBuf::from(&workspace));
+    let checkpoints = agent::checkpoint_dir(&cfg);
+    // What stopped runs there are to go on with: read from their checkpoints, with no model call.
+    list_runs_later(&lister, checkpoints.clone(), &workspace);
+    let mut saved_session = None;
     let mut backend = backend::Backend::start(cfg.clone(), workspace.clone(), tx, app.backend_generation).await?;
     backend.send(&Action::StartSession).await?;
     let notice = Notice::from_env(|name| std::env::var(name).ok());
@@ -235,6 +245,16 @@ async fn event_loop(
                 }
             }
         }
+        if let Some(store) = &store {
+            // Before the actions are carried out, so a task is on disk before its run starts.
+            let snapshot = app.snapshot();
+            if saved_session.as_ref() != Some(&snapshot) {
+                if let Err(e) = saved::save(store, &snapshot) {
+                    app.flash = Some(format!("the session could not be saved: {e:#}"));
+                }
+                saved_session = Some(snapshot);
+            }
+        }
         for action in actions {
             match action {
                 Action::Quit { keep: k } => keep = k,
@@ -257,6 +277,7 @@ async fn event_loop(
                         let _ = tx.send(Msg::ServiceLog(result));
                     });
                 }
+                Action::ListRuns => list_runs_later(&lister, checkpoints.clone(), &workspace),
                 Action::ListFiles => {
                     let (tx, root) = (lister.clone(), root.clone());
                     tokio::task::spawn_blocking(move || {
@@ -303,6 +324,14 @@ async fn event_loop(
         }
     }
     *unexecuted = app.unexecuted();
+    if let Some(store) = &store {
+        // Nothing in flight: the next interface starts afresh. A task in flight stays, to go on with.
+        let snapshot = app.snapshot();
+        let result = if snapshot.active.is_none() { saved::remove(store) } else { saved::save(store, &snapshot) };
+        if let Err(e) = result {
+            tracing::warn!("the session could not be saved: {e:#}");
+        }
+    }
     backend.shutdown(&keep).await?;
     Ok(keep)
 }
@@ -544,7 +573,11 @@ impl Runtime {
                 Msg::UsedNotes { run, result }
             }),
 
-            Action::Interrupt { keep, attempts, check_files } => {
+            Action::DropRun { run } => self.call(move |s| async move {
+                let result = s.drop_run(&run).await.map_err(|e| format!("{e:#}"));
+                Msg::RunDropped { run, result }
+            }),
+            Action::Interrupt { keep, attempts, check_files, drop_run } => {
                 for work in self.work.drain(..) {
                     work.abort();
                 }
@@ -591,7 +624,7 @@ impl Runtime {
                                 }
                             }
                             let all: Vec<String> = keep.into_iter().chain(kept.iter().cloned()).collect();
-                            session.shutdown(&all).await;
+                            session.shutdown_dropping(&all, drop_run.as_deref()).await;
                             let _ = tx.send(Msg::Stopped { kept, notes });
                         });
                     }
@@ -611,6 +644,7 @@ impl Runtime {
             | Action::SaveTheme(_)
             | Action::Alert { .. }
             | Action::ListFiles
+            | Action::ListRuns
             | Action::ReadAudit { .. }
             | Action::Export { .. }
             | Action::EditFork { .. } => {}
@@ -741,6 +775,40 @@ fn suspend(terminal: &mut DefaultTerminal, pause: &Pause) -> anyhow::Result<()> 
     restored.context("could not restore the terminal after suspension")?;
     anyhow::ensure!(stopped == 0, "could not suspend the interface");
     Ok(())
+}
+
+/// List the stopped runs of `workspace` in `dir` off the loop; they come as [`Msg::Runs`].
+fn list_runs_later(tx: &UnboundedSender<Msg>, dir: Option<PathBuf>, workspace: &str) {
+    let (tx, workspace) = (tx.clone(), workspace.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let _ = tx.send(Msg::Runs(dir.map_or_else(Vec::new, |dir| list_runs(&dir, &workspace))));
+    });
+}
+
+/// The runs of `workspace` that stopped with a checkpoint in `dir`, newest
+/// first, without their conversations; one whose checkpoint cannot be read
+/// comes with why.
+fn list_runs(dir: &Path, workspace: &str) -> Vec<app::Stopped> {
+    molt_planner::checkpoint::list(dir)
+        .into_iter()
+        .filter_map(|(run, saved)| match saved {
+            Ok(mut saved) if saved.request.workspace == workspace => {
+                let gone = saved
+                    .attempts
+                    .iter()
+                    .filter(|a| a.end.is_none())
+                    .filter_map(|a| a.fork.clone())
+                    .filter(|fork| !Path::new(fork).is_dir())
+                    .collect();
+                for attempt in &mut saved.attempts {
+                    attempt.messages = Vec::new();
+                }
+                Some(app::Stopped { run, saved: Ok(saved), gone })
+            }
+            Ok(_) => None,
+            Err(e) => Some(app::Stopped { run, saved: Err(e), gone: Vec::new() }),
+        })
+        .collect()
 }
 
 /// The workspace's files for `@` completion, as the services see them:
@@ -922,6 +990,30 @@ mod tests {
         let Some(Msg::Committed(Err(e))) = rx.recv().await else { panic!("committed") };
         assert!(e.contains("turned on after the task started"), "{e}");
     }
+    #[test]
+    fn stopped_runs_are_this_workspaces_say_which_forks_are_gone_and_name_damage() {
+        use molt_api::planner::RunRequest;
+        use molt_planner::checkpoint::Saved;
+        let dir = tempfile::tempdir().unwrap();
+        let fork = dir.path().join("fork-kept");
+        std::fs::create_dir(&fork).unwrap();
+        let mut here = Saved::new("trace_here", RunRequest::new("t", "/w"));
+        here.attempt(0).fork = Some(fork.to_str().unwrap().into());
+        here.attempt(0).messages = vec![serde_json::json!({"role": "user", "content": "long"})];
+        here.attempt(1).fork = Some("/nowhere/fork-gone".into());
+        let other = Saved::new("trace_other", RunRequest::new("t", "/elsewhere"));
+        for saved in [&here, &other] {
+            std::fs::write(dir.path().join(format!("{}.json", saved.run)), serde_json::to_vec(saved).unwrap()).unwrap();
+        }
+        std::fs::write(dir.path().join("trace_bad.json"), "{\"format\":1,").unwrap();
+        let mut runs = list_runs(dir.path(), "/w");
+        runs.sort_by(|a, b| a.run.cmp(&b.run));
+        assert_eq!(runs.iter().map(|r| r.run.as_str()).collect::<Vec<_>>(), ["trace_bad", "trace_here"]);
+        assert!(runs[0].saved.as_ref().unwrap_err().contains("damaged"));
+        assert_eq!(runs[1].gone, ["/nowhere/fork-gone"]);
+        assert!(runs[1].saved.as_ref().unwrap().attempts[0].messages.is_empty(), "conversations stay on disk");
+    }
+
     #[test]
     fn themes_are_saved_privately_and_replaced_atomically() {
         use std::os::unix::fs::PermissionsExt;
