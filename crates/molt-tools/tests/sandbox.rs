@@ -69,6 +69,40 @@ async fn mounts_confine_writes_including_symlinks_and_children() {
 }
 
 #[tokio::test]
+async fn build_output_goes_to_a_private_writable_directory_outside_the_fork_that_later_commands_reuse() {
+    let Some(env) = Env::new(SandboxPolicy::default()).await else { return };
+    let response = env
+        .run("test \"$PYTHONDONTWRITEBYTECODE\" = 1 && echo built > \"$CARGO_TARGET_DIR/out\" && echo cached > \"$GOCACHE/entry\" && printf '%s\\n%s\\n' \"$CARGO_TARGET_DIR\" \"$GOCACHE\"")
+        .await;
+    assert!(response.success(), "{response:?}");
+    let build = env.roots.scratch.canonicalize().unwrap().join(".molt/build");
+    let fork = PathBuf::from(&env.fork);
+    let dirs: Vec<PathBuf> = response.stdout.lines().map(PathBuf::from).collect();
+    assert_eq!(dirs.len(), 2, "{}", response.stdout);
+    for dir in &dirs {
+        assert!(dir.starts_with(&build), "{} is not in {}", dir.display(), build.display());
+        assert!(!dir.starts_with(&fork) && !dir.starts_with(&env.roots.root));
+    }
+    assert_eq!(fs::read_to_string(dirs[0].join("out")).unwrap(), "built\n");
+    assert_eq!(fs::read_to_string(dirs[1].join("entry")).unwrap(), "cached\n");
+    // Kept for later commands, also in another fork of the same workspace.
+    let files = Fs::new(env.roots.clone()).unwrap();
+    let other: ForkResponse =
+        serde_json::from_value(files.handle("fork", json!({"workspace":env.roots.root})).await.unwrap()).unwrap();
+    let command = "cat \"$CARGO_TARGET_DIR/out\" \"$GOCACHE/entry\"";
+    let again: RunResponse = serde_json::from_value(
+        env.shell.handle("run", json!({"workspace":other.fork,"command":command})).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(again.stdout, "built\ncached\n", "{again:?}");
+    // Python leaves no bytecode in the fork, and nothing else of the build root is visible.
+    let python = env
+        .run("echo 'x = 1' > module.py && python3 -c 'import module' && test ! -e __pycache__ && ! ls \"$(dirname \"$CARGO_TARGET_DIR\")/cargo-0.lock\"")
+        .await;
+    assert!(python.success(), "{python:?}");
+}
+
+#[tokio::test]
 async fn network_policy_and_read_only_dependencies_are_enforced() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

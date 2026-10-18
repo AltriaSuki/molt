@@ -276,7 +276,7 @@ impl Fake {
                         format!("--- a/{0}\n+++ b/{0}\n@@ -0,0 +1,{1} @@\n{body}", c.path, lines.len())
                     })
                     .collect();
-                json!(fs::DiffResponse { changes, patch, truncated: st.patch_truncated })
+                json!(fs::DiffResponse { changes, patch, truncated: st.patch_truncated, left_out: None })
             }
             fs::MERGE => {
                 let m: fs::MergeRequest = parse(payload);
@@ -313,7 +313,7 @@ impl Fake {
                 if m.drop {
                     st.forks.remove(&m.fork);
                 }
-                json!(fs::MergeResponse { changes, operation: None })
+                json!(fs::MergeResponse { changes, operation: None, left_out: None })
             }
             fs::DROP => {
                 let d: fs::DropRequest = parse(payload);
@@ -517,6 +517,7 @@ fn exit(code: i32, stderr: &str) -> shell::RunResponse {
         stderr: stderr.to_owned(),
         truncated: false,
         duration_ms: 1,
+        offline_failure: false,
     }
 }
 

@@ -44,6 +44,23 @@ impl Env {
 }
 
 #[tokio::test]
+async fn unconfined_commands_build_into_the_same_private_directory_unless_the_user_chose_one() {
+    let env = Env::new();
+    let response =
+        env.run("printf '%s\\n%s\\n%s\\n' \"$CARGO_TARGET_DIR\" \"$GOCACHE\" \"$PYTHONDONTWRITEBYTECODE\"", None).await;
+    assert!(response.success(), "{response:?}");
+    let build = env._tmp.path().canonicalize().unwrap().join("scratch/.molt/build");
+    let lines: Vec<&str> = response.stdout.lines().collect();
+    for (line, name) in lines.iter().zip(["CARGO_TARGET_DIR", "GOCACHE", "PYTHONDONTWRITEBYTECODE"]) {
+        match std::env::var(name) {
+            Ok(chosen) => assert_eq!(*line, chosen, "{name}"),
+            Err(_) if name == "PYTHONDONTWRITEBYTECODE" => assert_eq!(*line, "1"),
+            Err(_) => assert!(PathBuf::from(line).starts_with(&build), "{name}={line}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn shutdown_refuses_commands_during_grace_and_after_it_returns() {
     let env = Env::new();
     let shutdown = env.shell.shutdown();

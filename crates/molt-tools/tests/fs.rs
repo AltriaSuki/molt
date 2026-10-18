@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use molt_api::fs::{
-    ChangeKind, DiffResponse, EditResponse, FilesChanged, ForkResponse, ListResponse, ReadResponse, SearchResponse,
-    WriteResponse,
+    ChangeKind, DiffResponse, EditResponse, FilesChanged, ForkResponse, ListResponse, MergeResponse, ReadResponse,
+    SearchResponse, WriteResponse,
 };
 use molt_proto::{ErrorCode, RemoteError};
 use molt_tools::{Fs, Roots};
@@ -560,6 +560,75 @@ async fn diff_and_merge_carry_changes_back() {
         .join(reply["operation"].as_str().unwrap())
         .join("journal.json")
         .is_file());
+}
+
+#[tokio::test]
+async fn build_artifacts_that_commands_leave_in_a_fork_are_reported_and_never_merged() {
+    let env = Env::new();
+    Env::put(&env.ws, &[("src/lib.rs", "pub fn f() {}\n"), ("vendor/prebuilt.so", "old\n")]);
+    let fork = env.fork().await;
+    let tag = "Signature: 8a477f597d28d172789f06886806bc55\n";
+    // What a check run leaves: a target directory of its own, bytecode, a
+    // tagged cache and a compiled program.
+    Env::put(
+        &fork,
+        &[
+            ("target-done-check/CACHEDIR.TAG", tag),
+            ("target-done-check/debug/libcalc.rlib", "x"),
+            ("__pycache__/calc.cpython-312.pyc", "x"),
+            ("cache/CACHEDIR.TAG", tag),
+            ("cache/entry.txt", "x"),
+            ("scripts/run.sh", "#!/bin/sh\necho run\n"),
+            ("src/target/mod.rs", "pub mod x;\n"),
+            ("vendor/prebuilt.so", "new\n"),
+        ],
+    );
+    fs::create_dir(fork.join("bin")).unwrap();
+    fs::write(fork.join("bin/calc"), b"\x7fELF\0\0\0").unwrap();
+    chmod(&fork.join("bin/calc"), 0o755);
+    chmod(&fork.join("scripts/run.sh"), 0o755);
+    // A file the attempt writes itself is its work, whatever its name.
+    env.ok("write", json!({ "workspace": fork, "path": "plugins/ext.so", "content": "asked for\n" })).await;
+    env.ok("edit", json!({ "workspace": fork, "path": "src/lib.rs", "old": "f()", "new": "g()" })).await;
+
+    let diff = diff_of(&env, &fork).await;
+    let changes: Vec<_> = diff.changes.iter().map(|c| (c.path.as_str(), c.kind)).collect();
+    assert_eq!(
+        changes,
+        [
+            ("plugins/ext.so", ChangeKind::Added),
+            ("scripts/run.sh", ChangeKind::Added),
+            ("src/lib.rs", ChangeKind::Modified),
+            ("src/target/mod.rs", ChangeKind::Added),
+            ("vendor/prebuilt.so", ChangeKind::Modified),
+        ]
+    );
+    let left_out = diff.left_out.clone().expect("artifacts are reported");
+    assert_eq!(left_out.count, 6, "{left_out:?}");
+    assert_eq!(
+        left_out.paths,
+        [
+            "__pycache__/calc.cpython-312.pyc",
+            "bin/calc",
+            "cache/CACHEDIR.TAG",
+            "cache/entry.txt",
+            "target-done-check/CACHEDIR.TAG"
+        ]
+    );
+    assert!(!diff.patch.contains("target-done-check") && !diff.patch.contains("bin/calc"), "{}", diff.patch);
+
+    let merged: MergeResponse =
+        serde_json::from_value(env.ok("merge", json!({ "fork": fork, "drop": true })).await).unwrap();
+    assert_eq!(merged.changes, diff.changes);
+    assert_eq!(merged.left_out, Some(left_out));
+    for gone in ["target-done-check", "__pycache__", "cache", "bin"] {
+        assert!(!env.ws.join(gone).exists(), "{gone} reached the workspace");
+    }
+    assert_eq!(fs::read_to_string(env.ws.join("plugins/ext.so")).unwrap(), "asked for\n");
+    assert_eq!(fs::read_to_string(env.ws.join("src/lib.rs")).unwrap(), "pub fn g() {}\n");
+    assert_eq!(fs::read_to_string(env.ws.join("vendor/prebuilt.so")).unwrap(), "new\n");
+    assert!(env.ws.join("src/target/mod.rs").is_file() && env.ws.join("scripts/run.sh").is_file());
+    assert_eq!(fs::read_dir(&env.scratch).unwrap().map(|e| e.unwrap().file_name()).collect::<Vec<_>>(), [".molt"]);
 }
 
 fn mode(path: &Path) -> u32 {

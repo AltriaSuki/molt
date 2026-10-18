@@ -563,6 +563,43 @@ async fn a_given_check_passes_and_the_result_is_applied() {
 }
 
 #[tokio::test]
+async fn build_output_of_the_check_is_left_out_of_the_result_and_the_workspace() {
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    // A check that builds into a directory of its own in the workspace, as a
+    // designer reaching for a writable target directory did, and leaves
+    // bytecode behind, with no .gitignore to hide either.
+    let check = "mkdir -p target-done-check/debug __pycache__ && echo x > target-done-check/debug/libgreet.rlib \
+                 && echo x > __pycache__/greet.cpython-312.pyc && echo built > \"$CARGO_TARGET_DIR/marker\" \
+                 && grep -q hello greeting.txt";
+    let (resp, _) = setup.run(setup.request(Some(check), 1)).await;
+
+    assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
+    assert!(resp.applied, "{resp:#?}");
+    let changes: Vec<_> = resp.changes.iter().map(|c| (c.path.as_str(), c.kind)).collect();
+    assert_eq!(changes, [("greeting.txt", ChangeKind::Added)], "{resp:#?}");
+    assert!(!resp.patch.contains("target-done-check"), "{}", resp.patch);
+    let left_out = resp.left_out.as_ref().expect("the artifacts are reported");
+    assert_eq!(left_out.count, 2);
+    assert_eq!(left_out.paths, ["__pycache__/greet.cpython-312.pyc", "target-done-check/debug/libgreet.rlib"]);
+    assert_eq!(setup.files(), ["README.txt", "greeting.txt"]);
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    assert!(molt::agent::report(&resp).contains("left out 2 build artifacts"), "{}", molt::agent::report(&resp));
+
+    // The check's own build output went to a private directory in the data dir.
+    let build = setup.data.path().join("work/.molt/build");
+    let marker = std::fs::read_dir(&build)
+        .unwrap()
+        .flat_map(|key| std::fs::read_dir(key.unwrap().path()).unwrap())
+        .map(|slot| slot.unwrap().path().join("marker"))
+        .find(|marker| marker.is_file())
+        .expect("CARGO_TARGET_DIR is writable and kept");
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "built\n");
+    setup.assert_forks_dropped();
+    assert_requests_valid(&server).await;
+}
+
+#[tokio::test]
 async fn a_second_run_starts_with_what_the_first_learned_and_a_map_of_the_code() {
     let server = fake_api(Fake::Greets).await;
     let mut setup = Setup::new(&server);
@@ -1039,6 +1076,42 @@ async fn a_token_only_cli_run_keeps_bearer_credentials_out_of_sandbox_commands()
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(std::fs::read_to_string(workspace.path().join("greeting.txt")).unwrap(), "hello\n");
     assert!(!server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn molt_do_says_before_the_run_which_dependencies_commands_cannot_get_and_how_to_fix_it() {
+    let server = fake_api(Fake::Greets).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let lock = "[[package]]\nname = \"memchr\"\nversion = \"2.7.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    std::fs::write(workspace.path().join("Cargo.lock"), lock).unwrap();
+    let args = ["--check", CHECK, "--attempts", "1", "--no-memory", "--no-review"];
+    let out = tokio::time::timeout(RUN_LIMIT, molt_do(&server, workspace.path(), data.path(), &args).output())
+        .await
+        .expect("molt do hung")
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let notice = stderr.find("dependency preflight: Rust: Cargo.lock lists crates").expect(&stderr);
+    assert!(stderr[notice..].lines().next().unwrap().contains("--deps-cache cargo"), "{stderr}");
+    assert!(notice < stderr.find("check passed").expect(&stderr), "the notice comes before the run: {stderr}");
+
+    // With the Cargo cache, there is nothing to say.
+    let cargo = tempfile::tempdir().unwrap();
+    std::fs::create_dir(cargo.path().join("registry")).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::remove_file(workspace.path().join("greeting.txt")).unwrap();
+    let cached = [&args[..], &["--deps-cache", "cargo"]].concat();
+    let cmd = molt_do(&server, workspace.path(), data.path(), &cached).env("CARGO_HOME", cargo.path()).output();
+    let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("dependency preflight"), "{stderr}");
+    // Unconfined by choice is not offered a cache.
+    let err = molt_do(&server, workspace.path(), data.path(), &["--deps-cache", "cargo", "--no-sandbox"]).output();
+    let err = tokio::time::timeout(RUN_LIMIT, err).await.expect("molt do hung").unwrap();
+    assert!(!err.status.success());
+    assert!(String::from_utf8_lossy(&err.stderr).contains("cannot be used with"), "{err:?}");
 }
 
 #[tokio::test]

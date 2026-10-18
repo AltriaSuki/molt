@@ -52,6 +52,8 @@ pub struct Options {
     pub project: Option<String>,
     pub data_dir: Option<PathBuf>,
     pub pass_env: Vec<String>,
+    /// Dependency caches commands build from offline (`--deps-cache`).
+    pub deps_cache: Vec<String>,
     /// Hosts the agent may read web pages from.
     pub allow_web: Vec<String>,
     pub web_resolver: Option<String>,
@@ -71,6 +73,7 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
     if let Some(shell) = cfg.service_mut("shell") {
         shell.pass_env.extend(opts.pass_env);
     }
+    agent::deps_cache(&mut cfg, &opts.deps_cache)?;
     agent::allow_web(&mut cfg, &opts.allow_web)?;
     if let Some(resolver) = &opts.web_resolver {
         cfg.web_resolver(resolver)?;
@@ -189,6 +192,9 @@ async fn event_loop(
             "",
             text::Tone::Warn,
         ));
+    }
+    for missing in agent::dependency_warnings(&cfg, Path::new(&workspace)) {
+        app.log.extend(text::block(&format!("dependency preflight: {missing}"), "", text::Tone::Warn));
     }
     let data_dir = cfg.kernel.data_dir.clone();
     let (lister, root) = (tx.clone(), PathBuf::from(&workspace));
@@ -792,6 +798,7 @@ mod tests {
             winner: Some(0),
             summary: "Write b".into(),
             changes: vec![Change { path: path.into(), kind: ChangeKind::Added }],
+            left_out: None,
             patch: String::new(),
             patch_truncated: false,
             applied: true,

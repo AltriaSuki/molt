@@ -5,6 +5,8 @@ use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use crate::build_dir::BuildDir;
+use crate::cargo_cache::CargoCache;
 use crate::{fork, Roots};
 
 const MAX_POLICY_BYTES: usize = 64 * 1024;
@@ -32,6 +34,10 @@ pub struct SandboxPolicy {
     pub file_mb: u64,
     pub open_files: u64,
     pub processes: u64,
+    /// A host Cargo home whose `registry` and `git` caches commands build
+    /// from offline (`--deps-cache cargo`); see `cargo_cache`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cargo_cache: Option<PathBuf>,
 }
 
 impl Default for SandboxPolicy {
@@ -45,8 +51,40 @@ impl Default for SandboxPolicy {
             file_mb: 128,
             open_files: 256,
             processes: 2048,
+            cargo_cache: None,
         }
     }
+}
+
+/// The Cargo home of this process's user: `CARGO_HOME`, else `~/.cargo`.
+pub fn host_cargo_home() -> anyhow::Result<PathBuf> {
+    let set = |name| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
+    let home = match set("CARGO_HOME") {
+        Some(home) => home,
+        None => set("HOME")
+            .context("neither CARGO_HOME nor HOME is set, so the Cargo cache cannot be found")?
+            .join(".cargo"),
+    };
+    ensure!(home.is_absolute(), "CARGO_HOME must be an absolute path, not {}", home.display());
+    Ok(home)
+}
+
+/// A host path that may be mounted read-only into the sandbox.
+pub(crate) fn check_mount(path: &Path) -> anyhow::Result<()> {
+    ensure!(
+        ![
+            "/", "/proc", "/dev", "/sys", "/etc", "/run", "/tmp", "/home", "/root", "/var", "/usr", "/bin", "/lib",
+            "/lib64"
+        ]
+        .iter()
+        .any(|p| path == Path::new(p)),
+        "cannot expose a host root or replace a sandbox runtime mount"
+    );
+    ensure!(
+        !["/proc", "/dev", "/sys", "/run", "/home/molt"].iter().any(|p| path.starts_with(p)),
+        "cannot expose host processes, devices, IPC or the sandbox home"
+    );
+    Ok(())
 }
 
 impl SandboxPolicy {
@@ -74,19 +112,7 @@ impl SandboxPolicy {
                 path.is_absolute() && path.canonicalize()? == *path,
                 "dependency paths must be canonical and absolute"
             );
-            ensure!(
-                ![
-                    "/", "/proc", "/dev", "/sys", "/etc", "/run", "/tmp", "/home", "/root", "/var", "/usr", "/bin",
-                    "/lib", "/lib64"
-                ]
-                .iter()
-                .any(|p| path == Path::new(p)),
-                "cannot expose a host root or replace a sandbox runtime mount"
-            );
-            ensure!(
-                !["/proc", "/dev", "/sys", "/run", "/home/molt"].iter().any(|p| path.starts_with(p)),
-                "cannot expose host processes, devices, IPC or the sandbox home"
-            );
+            check_mount(path)?;
             let meta = std::fs::metadata(path)?;
             ensure!(meta.is_dir() || meta.is_file(), "dependencies must be regular files or directories");
         }
@@ -105,6 +131,13 @@ impl SandboxPolicy {
                 "service secrets and host HOME cannot be passed to a sandbox"
             );
         }
+        if let Some(home) = &self.cargo_cache {
+            ensure!(
+                !self.environment.iter().any(|name| name == "CARGO_HOME"),
+                "--deps-cache cargo gives commands a CARGO_HOME of their own: do not also pass CARGO_HOME"
+            );
+            CargoCache::open(home)?;
+        }
         for n in [self.memory_mb, self.cpu_secs, self.file_mb, self.open_files, self.processes] {
             ensure!(n > 0 && n <= 1_000_000, "resource limits must be between 1 and 1000000");
         }
@@ -113,7 +146,7 @@ impl SandboxPolicy {
 
     pub fn probe(&self) -> anyhow::Result<()> {
         self.validate()?;
-        let (mut command, _guard) = self.command(Path::new("/bin/true"), None, None)?;
+        let (mut command, _guard) = self.command(Path::new("/bin/true"), None, None, None)?;
         let command = command.as_std_mut();
         command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
         let mut child = command.spawn().context("starting /usr/bin/bwrap; install bubblewrap 0.9 or newer")?;
@@ -152,20 +185,32 @@ impl SandboxPolicy {
         Ok(())
     }
 
-    pub(crate) fn prepare(&self, roots: &Roots, workspace: &Path, program: &Path) -> anyhow::Result<(Command, Guard)> {
+    pub(crate) fn prepare(
+        &self,
+        roots: &Roots,
+        workspace: &Path,
+        program: &Path,
+        build: &BuildDir,
+    ) -> anyhow::Result<(Command, Guard)> {
         let base = fork::base(roots, &workspace.to_string_lossy())
             .context("isolated commands require an fs.fork workspace")?;
         ensure!(
             !base.starts_with(workspace) && !workspace.starts_with(&base),
             "sandbox scratch must be outside the original project"
         );
-        for path in &self.read_only {
+        for path in self.read_only.iter().map(PathBuf::as_path).chain(build.read_only()) {
             ensure!(
                 !workspace.starts_with(path) && !path.starts_with(workspace),
                 "dependency mounts cannot overlap the writable fork"
             );
         }
-        self.command(program, Some(workspace), Some(&base))
+        for path in build.mounts() {
+            ensure!(
+                !path.starts_with(&base) && !base.starts_with(path) && !path.starts_with(workspace),
+                "the private build directory must be outside the project and the fork"
+            );
+        }
+        self.command(program, Some(workspace), Some(&base), Some(build))
     }
 
     fn command(
@@ -173,14 +218,15 @@ impl SandboxPolicy {
         program: &Path,
         workspace: Option<&Path>,
         base: Option<&Path>,
+        build: Option<&BuildDir>,
     ) -> anyhow::Result<(Command, Guard)> {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            linux::command(self, program, workspace, base)
+            linux::command(self, program, workspace, base, build)
         }
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         {
-            let _ = (program, workspace, base);
+            let _ = (program, workspace, base, build);
             anyhow::bail!("sandbox requires Linux x86_64; explicit unconfined mode is required on this platform")
         }
     }
@@ -319,6 +365,7 @@ mod linux {
         program: &Path,
         workspace: Option<&Path>,
         base: Option<&Path>,
+        build: Option<&BuildDir>,
     ) -> anyhow::Result<(Command, Guard)> {
         let mut seccomp = memfd(c"molt-seccomp")?;
         let filter = filter();
@@ -367,7 +414,7 @@ mod linux {
             "--dir",
             "/home/molt",
         ]);
-        for path in &policy.read_only {
+        for path in policy.read_only.iter().map(PathBuf::as_path).chain(build.iter().flat_map(|b| b.read_only())) {
             command.arg("--ro-bind").arg(path).arg(path);
         }
         if let Some(base) = base {
@@ -379,11 +426,22 @@ mod linux {
         if let Some(ws) = workspace {
             command.arg("--bind").arg(ws).arg(ws).arg("--chdir").arg(ws);
         }
+        // Build output goes to private directories outside the fork, which
+        // persist for the workspace (see `build_dir`).
+        for path in build.iter().flat_map(|b| b.mounts()) {
+            command.arg("--bind").arg(path).arg(path);
+        }
         command.arg("--seccomp").arg(filter_fd.to_string()).arg("--info-fd").arg(info_fd.to_string());
         // Keep loader and shell variables away from the host-side backend.
         // The env helper runs only after entering every isolation boundary.
         command.env_clear().env("PATH", "/usr/bin:/bin").env("LC_ALL", "C");
         command.args(["--", "/usr/bin/env", "-i"]);
+        // Before the passed variables, so a variable the user passes wins.
+        for (name, value) in build.iter().flat_map(|b| b.env()) {
+            let mut entry = std::ffi::OsString::from(format!("{name}="));
+            entry.push(value);
+            command.arg(entry);
+        }
         for name in
             ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"].iter().map(|s| s.to_string()).chain(policy.environment.clone())
         {
