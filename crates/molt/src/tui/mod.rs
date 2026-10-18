@@ -362,6 +362,33 @@ fn secret_name(name: &str) -> bool {
     ["API_KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|marker| name.to_ascii_uppercase().contains(marker))
 }
 
+/// How long an interrupt waits before it lists a fork's changes again,
+/// after the shell's grace for a stopped command (TERM, then KILL 500 ms on).
+const RELIST_AFTER: Duration = Duration::from_secs(1);
+
+/// What an interrupted attempt left in its fork.
+#[derive(Debug, PartialEq)]
+enum Leftover {
+    /// Changes beyond the check's own files: the attempt's work, to keep.
+    Work,
+    /// Nothing but the check's files.
+    Empty,
+    /// Its changes could not be listed, and the fork is still there: kept,
+    /// since it may hold work.
+    Unlisted(String),
+    /// Its changes could not be listed because the fork is gone.
+    Gone(String),
+}
+
+fn leftover(fork: &str, listed: anyhow::Result<Vec<String>>, check_files: &[String]) -> Leftover {
+    match listed {
+        Ok(paths) if paths.iter().any(|p| !check_files.contains(p)) => Leftover::Work,
+        Ok(_) => Leftover::Empty,
+        Err(e) if Path::new(fork).exists() => Leftover::Unlisted(format!("{e:#}")),
+        Err(e) => Leftover::Gone(format!("{e:#}")),
+    }
+}
+
 struct Runtime {
     cfg: Arc<Config>,
     workspace: String,
@@ -513,23 +540,52 @@ impl Runtime {
                 match self.session.take() {
                     Some(session) => {
                         tokio::spawn(async move {
-                            let mut kept = Vec::new();
-                            for fork in attempts {
-                                // A fork with nothing but the check's own files holds no work.
-                                match session.changes(&fork).await {
-                                    Ok(paths) if paths.iter().any(|p| !check_files.contains(p)) => kept.push(fork),
-                                    Ok(_) => {}
-                                    Err(e) => tracing::warn!("could not list the changes in {fork}: {e:#}"),
+                            let mut listed = Vec::new();
+                            for fork in &attempts {
+                                listed.push(session.changes(fork).await);
+                            }
+                            if listed.iter().any(Result::is_err) {
+                                // A command the attempt started may still be writing in its fork until the
+                                // shell has stopped it: look once more after that.
+                                tokio::time::sleep(RELIST_AFTER).await;
+                                for (fork, result) in attempts.iter().zip(listed.iter_mut()) {
+                                    if result.is_err() {
+                                        *result = session.changes(fork).await;
+                                    }
+                                }
+                            }
+                            let (mut kept, mut notes) = (Vec::new(), Vec::new());
+                            for (fork, result) in attempts.into_iter().zip(listed) {
+                                match leftover(&fork, result, &check_files) {
+                                    Leftover::Work => kept.push(fork),
+                                    Leftover::Empty => {
+                                        // The planner left it to us; a scratch dir outside the data dir is not
+                                        // cleaned up at shutdown.
+                                        if let Err(e) = session.discard(&fork).await {
+                                            tracing::warn!("could not drop {fork}: {e:#}");
+                                        }
+                                    }
+                                    Leftover::Unlisted(e) => {
+                                        tracing::warn!("could not list the changes in {fork}: {e}");
+                                        notes.push(format!(
+                                            "the changes in {fork} could not be listed, so it is kept in case it holds work: {e}"
+                                        ));
+                                        kept.push(fork);
+                                    }
+                                    Leftover::Gone(e) => {
+                                        tracing::warn!("could not list the changes in {fork}: {e}");
+                                        notes.push(format!("{fork} is gone, with whatever it held: {e}"));
+                                    }
                                 }
                             }
                             let all: Vec<String> = keep.into_iter().chain(kept.iter().cloned()).collect();
                             session.shutdown(&all).await;
-                            let _ = tx.send(Msg::Stopped { kept });
+                            let _ = tx.send(Msg::Stopped { kept, notes });
                         });
                     }
                     None if self.starting => {}
                     None => {
-                        let _ = tx.send(Msg::Stopped { kept: Vec::new() });
+                        let _ = tx.send(Msg::Stopped { kept: Vec::new(), notes: Vec::new() });
                     }
                 }
             }
@@ -759,6 +815,21 @@ impl Drop for Redirect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_interrupted_fork_whose_changes_cannot_be_listed_is_kept_while_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let fork = dir.path().to_str().unwrap();
+        let check = vec!["tests/check.rs".to_owned()];
+        let unreadable = || Err(anyhow::anyhow!("fs.diff failed: reading the fork: No such file or directory"));
+        assert_eq!(
+            leftover(fork, unreadable(), &check),
+            Leftover::Unlisted("fs.diff failed: reading the fork: No such file or directory".into())
+        );
+        assert!(matches!(leftover("/nowhere/fork-gone", unreadable(), &check), Leftover::Gone(_)));
+        assert_eq!(leftover(fork, Ok(vec!["src/lib.rs".into()]), &check), Leftover::Work);
+        assert_eq!(leftover(fork, Ok(check.clone()), &check), Leftover::Empty, "the check's own files are no work");
+    }
 
     #[tokio::test]
     async fn the_runtime_commits_what_the_task_merged_against_the_tree_it_started_from() {
