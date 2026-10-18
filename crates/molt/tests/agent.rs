@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use molt::agent::{run_task, Done, Interrupted, Learn};
 use molt::{Config, Secrets, TransportKind};
 use molt_api::fs::{ChangeKind, DROP, FORK, MERGE, WRITE};
+use molt_api::memory::SUBMIT_NOTES;
 use molt_api::model::COMPLETE;
 use molt_api::planner::tools::{DISPUTE_CHECK, RUN, SUBMIT_CHECK, SUBMIT_REVIEW, SUBMIT_VETTING, WRITE_FILE};
 use molt_api::planner::{AttemptStatus, CheckSpec, Outcome, RunRequest, RunResponse, RUN as PLANNER_RUN};
@@ -80,16 +81,17 @@ impl Respond for FakeApi {
         let n = messages.len();
         let model = body["model"].as_str().unwrap_or("unknown");
         let stream = body["stream"] == true;
-        // Memory learning from a finished run asks for JSON in a fixed shape.
-        if body["output_config"]["format"]["type"] == "json_schema" {
+        // Memory learning from a finished run submits its notes with a tool,
+        // having first said something no schema allows, as some endpoints do.
+        if learns(&body) {
             let note =
                 json!({ "kind": "lesson", "text": LEARNED_TEXT, "confidence": 0.9, "steps": [1], "contradicts": "" });
-            let text = json!({ "notes": [note], "supports": [] }).to_string();
             let content = vec![
                 json!({ "type": "thinking", "thinking": "", "signature": signature(n) }),
-                json!({ "type": "text", "text": text }),
+                json!({ "type": "text", "text": "<notes>the check greps greeting.txt</notes>" }),
+                tool_use(n, SUBMIT_NOTES, json!({ "notes": [note], "supports": [] })),
             ];
-            return message(n, model, content, "end_turn", stream);
+            return message(n, model, content, "tool_use", stream);
         }
         // The reviewer of a passing result approves it.
         if body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_REVIEW)) {
@@ -398,6 +400,11 @@ async fn bodies(server: &MockServer) -> Vec<Value> {
     server.received_requests().await.unwrap().iter().map(|r| r.body_json().unwrap()).collect()
 }
 
+/// Whether a request is memory learning from a run.
+fn learns(body: &Value) -> bool {
+    body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_NOTES))
+}
+
 fn offers_submit_check(body: &Value) -> bool {
     body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_CHECK))
 }
@@ -490,6 +497,25 @@ fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) ->
         cmd.env_remove(var);
     }
     cmd
+}
+
+#[tokio::test]
+async fn memory_learns_with_the_model_the_run_asked_for() {
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    setup.learn = true;
+    let mut req = setup.request(Some(CHECK), 1);
+    req.model = Some("haiku".into());
+    let (done, _) = setup.run_done(req).await;
+    assert_eq!(done.run.outcome, Outcome::Passed, "{:#?}", done.run);
+    let learned = done.learned.unwrap().unwrap();
+    assert_eq!(learned.added.len(), 1, "{learned:#?}");
+    let bodies = bodies(&server).await;
+    let models: std::collections::BTreeSet<&str> = bodies.iter().filter_map(|b| b["model"].as_str()).collect();
+    assert_eq!(models.into_iter().collect::<Vec<_>>(), ["claude-haiku-4-5"], "attempts and learning alike");
+    let learning = bodies.iter().find(|b| learns(b)).expect("memory learned");
+    assert!(learning.get("output_config").is_none(), "no effort for a model that takes none, and no output schema");
+    assert_requests_valid(&server).await;
 }
 
 #[tokio::test]
@@ -616,7 +642,13 @@ async fn a_second_run_starts_with_what_the_first_learned_and_a_map_of_the_code()
     assert!(!note.provenance.events.is_empty());
     assert!(note.provenance.events.iter().all(|id| logged.contains(id)), "{:?}", note.provenance);
     assert!(audit.iter().any(|e| matches!(e.event, AuditEvent::AuditRead { .. })), "memory read the run back");
-    let asked = bodies(&server).await.len();
+    let asked = bodies(&server).await;
+    // With no memory model set, memory learned with the attempts' model: the gateway's default.
+    let learning: Vec<&Value> = asked.iter().filter(|b| learns(b)).collect();
+    assert_eq!(learning.len(), 1, "one learning call: the tool's input was valid");
+    assert_eq!(learning[0]["model"], MODEL);
+    assert!(asked.iter().all(|b| b["model"] == MODEL), "every stage used one model");
+    let asked = asked.len();
 
     let (second, _) = setup.run_done(setup.request(Some(CHECK), 1)).await;
     assert_eq!(second.run.outcome, Outcome::Passed, "{:#?}", second.run);
@@ -1685,7 +1717,7 @@ async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
     let learned = session.learn(&trace, Some("haiku".into())).await.unwrap();
     assert_eq!(learned.added.len(), 1, "{learned:#?}");
     // Memory learned with the model it was given, not its default.
-    let learning = bodies(&server).await.into_iter().filter(|b| b["output_config"]["format"]["type"] == "json_schema");
+    let learning = bodies(&server).await.into_iter().filter(learns);
     assert_eq!(learning.map(|b| b["model"].clone()).collect::<Vec<_>>(), [json!("claude-haiku-4-5")]);
     let mut notes = session.notes("").await.unwrap();
     assert_eq!(notes.iter().map(|r| r.note.text.as_str()).collect::<Vec<_>>(), [LEARNED_TEXT]);

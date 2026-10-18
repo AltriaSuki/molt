@@ -3,8 +3,10 @@
 //! The episode is read back from the audit log a page at a time, boiled down
 //! to a [digest](crate::digest), and shown to the model together with the
 //! notes memory already holds about the workspace. The model answers in a
-//! fixed JSON shape: new notes, each naming the digest steps that show it,
-//! and the known notes the episode bore out or proved wrong. Step numbers
+//! fixed JSON shape, as the input of a `submit_notes` tool call: new notes,
+//! each naming the digest steps that show it, and the known notes the
+//! episode bore out or proved wrong. An answer that does not fit the shape is
+//! sent back once with the error before the episode is given up on. Step numbers
 //! become the message ids of the note's provenance, so every note points at
 //! its evidence in the log. Everything the answer changes is applied in one
 //! transaction, together with the mark that the episode has been learned
@@ -15,7 +17,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use molt_api::memory::{ConsolidateRequest, ConsolidateResponse, Note, NoteKind, Provenance, RecallRequest};
+use molt_api::memory::{
+    ConsolidateRequest, ConsolidateResponse, Note, NoteKind, Provenance, RecallRequest, SUBMIT_NOTES,
+};
 use molt_api::model::{self, CompleteRequest, CompleteResponse, Usage};
 use molt_proto::audit::{self, Logged, ReadRequest, ReadResponse};
 use molt_proto::{Budget, ErrorCode, Kind, RemoteError, ServiceId, TraceId};
@@ -112,6 +116,21 @@ fn takes_effort(model: &str) -> bool {
     !(id == "haiku" || id.starts_with("claude-haiku"))
 }
 
+/// Turns that show the model why its answer was refused and ask again.
+const REPAIRS: usize = 1;
+
+/// The tool the model answers with ([`SUBMIT_NOTES`]). Its input schema is
+/// the answer's shape: tool use works on every endpoint the attempts run on,
+/// while a server may ignore `output_schema` and answer in any shape it likes.
+fn submit_notes() -> Value {
+    json!({
+        "name": SUBMIT_NOTES,
+        "description": "Submit what this episode teaches: new notes, the known notes it bore out, and any skill \
+            drafts. Call it exactly once; empty arrays are a fine answer.",
+        "input_schema": answer_schema(),
+    })
+}
+
 /// The shape the model answers in.
 fn answer_schema() -> Value {
     json!({
@@ -201,7 +220,27 @@ impl Deadline {
     }
 }
 
-fn skipped(reason: impl Into<String>, usage: Usage, cost_usd: f64) -> ConsolidateResponse {
+/// What the learning calls of one consolidation cost.
+#[derive(Clone, Copy, Debug, Default)]
+struct Spent {
+    usage: Usage,
+    /// Known cost.
+    cost_usd: f64,
+    /// Calls whose cost is unknown.
+    uncounted_calls: u32,
+}
+
+impl Spent {
+    fn add(&mut self, resp: &CompleteResponse) {
+        self.usage.add(&resp.usage);
+        match resp.cost_usd {
+            Some(cost) => self.cost_usd += cost,
+            None => self.uncounted_calls += 1,
+        }
+    }
+}
+
+fn skipped(reason: impl Into<String>, spent: Spent) -> ConsolidateResponse {
     ConsolidateResponse {
         skill_drafts: Vec::new(),
         added: Vec::new(),
@@ -209,8 +248,9 @@ fn skipped(reason: impl Into<String>, usage: Usage, cost_usd: f64) -> Consolidat
         contradicted: Vec::new(),
         skipped: Some(reason.into()),
         proposed: Vec::new(),
-        usage,
-        cost_usd,
+        usage: spent.usage,
+        cost_usd: spent.cost_usd,
+        uncounted_calls: spent.uncounted_calls,
     }
 }
 
@@ -368,8 +408,44 @@ fn prompt(known: &[Note], digest: &str) -> String {
     }
     text.push_str("</known_notes>\n\n<episode>\n");
     text.push_str(&quoted(digest));
-    text.push_str("\n</episode>\n\nWrite the notes this episode supports, as the rules say.");
+    text.push_str(
+        "\n</episode>\n\nWrite the notes this episode supports, as the rules say, and submit them with one call to \
+         submit_notes.",
+    );
     text
+}
+
+/// The answer in `resp`: the input of its `submit_notes` call or, from a
+/// model that answered in text instead, the JSON in that text.
+fn read_answer(resp: &CompleteResponse) -> Result<Answer, String> {
+    if let Some(call) = resp.tool_uses().into_iter().find(|u| u.name == SUBMIT_NOTES) {
+        let parsed = match call.input {
+            // Some endpoints pass the input on as the JSON text the model wrote.
+            Value::String(text) => parse_answer(&text),
+            input => serde_json::from_value(input).map_err(|e| e.to_string()),
+        };
+        return parsed.map_err(|e| format!("the {SUBMIT_NOTES} input does not match its schema: {e}"));
+    }
+    let text = resp.text();
+    if text.trim().is_empty() {
+        return Err(format!("the model neither called {SUBMIT_NOTES} nor wrote the answer as JSON"));
+    }
+    parse_answer(&text)
+}
+
+/// The turn that tells the model why `resp` was refused and asks again.
+/// Every tool call it made gets its result first, as the API requires.
+fn repair(resp: &CompleteResponse, error: &str) -> Value {
+    let ask = format!(
+        "Your answer was not accepted: {error}. Call {SUBMIT_NOTES} once more with input that matches its schema \
+         exactly: every field present, `text`, `kind` and `contradicts` as strings, `steps` as an array of numbers."
+    );
+    let calls = resp.tool_uses();
+    if calls.is_empty() {
+        return model::user_text(ask);
+    }
+    let results = calls.iter().map(|call| model::tool_result(&call.id, ask.clone(), true)).collect();
+    model::user_blocks(results)
 }
 
 /// The answer's JSON, from the model's text.
@@ -572,12 +648,12 @@ pub(crate) async fn consolidate(
     let ws = key.to_owned();
     let id = episode.as_str().to_owned();
     if blocking(db, move |db| learned_already(db, &id)).await? {
-        return Ok(skipped("the episode was already learned from", Usage::default(), 0.0));
+        return Ok(skipped("the episode was already learned from", Spent::default()));
     }
 
     let (entries, cut) = read_episode(bus, &episode, trace, deadline).await?;
     if entries.is_empty() {
-        return Ok(skipped("the audit log holds no messages of the episode", Usage::default(), 0.0));
+        return Ok(skipped("the audit log holds no messages of the episode", Spent::default()));
     }
     // Past the pages memory reads, how the episode ended is out of sight:
     // what was read is used either way.
@@ -588,41 +664,35 @@ pub(crate) async fn consolidate(
     }
     let skill_source =
         if cut { None } else { crate::skills::proof(&entries, episode.as_str(), &ws).ok().filter(|p| p.passed) };
+    // Unless told otherwise, learn with the model the attempts used.
+    let model = req
+        .model
+        .clone()
+        .or_else(|| cfg.model.clone())
+        .or_else(|| run_model(&entries))
+        .or_else(|| cfg.attempts_model.clone());
     let digest = digest::build(&entries, workspace, cut);
     drop(entries);
     if digest.is_empty() {
-        return Ok(skipped("the episode has nothing to learn from", Usage::default(), 0.0));
+        return Ok(skipped("the episode has nothing to learn from", Spent::default()));
     }
 
     let now = crate::now_ms();
     let (task, w) = (digest.task.clone(), ws.clone());
     let known = blocking(db, move |db| known(db, &task, &w, now)).await?;
-    let model = req.model.clone().unwrap_or_else(|| cfg.model.clone());
     let request = CompleteRequest {
         stream: None,
-        effort: takes_effort(&model).then_some(cfg.effort),
-        model: Some(model),
+        effort: model.as_deref().is_none_or(takes_effort).then_some(cfg.effort),
+        model,
         system: Some(SYSTEM.to_owned()),
         messages: vec![model::user_text(prompt(&known, &digest.text))],
-        tools: Vec::new(),
+        tools: vec![submit_notes()],
         max_tokens: Some(cfg.max_tokens),
-        output_schema: Some(answer_schema()),
+        output_schema: None,
     };
-    let budget = Budget::new(cfg.max_tokens.into(), deadline.ms(cfg.model_timeout)?, 0);
-    let payload = serde_json::to_value(&request).map_err(|e| failed(e.to_string()))?;
-    let reply = bus.call(model::COMPLETE, payload, budget, trace).await?;
-    let resp: CompleteResponse =
-        serde_json::from_value(reply).map_err(|e| failed(format!("the model's reply did not parse: {e}")))?;
-    let (usage, cost) = (resp.usage, resp.cost_usd.unwrap_or(0.0));
-    if resp.is_refusal() {
-        return Ok(skipped("the model declined to read the episode", usage, cost));
-    }
-    if resp.stop_reason.as_deref() == Some(model::STOP_MAX_TOKENS) {
-        return Ok(skipped("the model's answer was cut off; raise MOLT_MEMORY_MAX_TOKENS", usage, cost));
-    }
-    let answer = match parse_answer(&resp.text()) {
-        Ok(a) => a,
-        Err(e) => return Ok(skipped(format!("the model's answer did not parse: {e}"), usage, cost)),
+    let (answer, spent) = match ask(bus, cfg, request, trace, deadline).await? {
+        Ok(answered) => answered,
+        Err((reason, spent)) => return Ok(skipped(reason, spent)),
     };
 
     let skill_candidates = answer.skills.clone();
@@ -632,7 +702,7 @@ pub(crate) async fn consolidate(
     let now = crate::now_ms();
     let applied = blocking(db, move |db| apply(db, &id, &w, &changes, now)).await?;
     let Some(Applied { added, reinforced, contradicted, proposed }) = applied else {
-        return Ok(skipped("the episode was already learned from", usage, cost));
+        return Ok(skipped("the episode was already learned from", spent));
     };
     let mut skill_drafts = Vec::new();
     if let Some(source) = skill_source {
@@ -651,9 +721,67 @@ pub(crate) async fn consolidate(
         contradicted,
         skipped: nothing.then(|| "the episode held nothing worth keeping".to_owned()),
         proposed,
-        usage,
-        cost_usd: cost,
+        usage: spent.usage,
+        cost_usd: spent.cost_usd,
+        uncounted_calls: spent.uncounted_calls,
     })
+}
+
+/// The model the episode's run asked for, when it is a `planner.run` that names one.
+fn run_model(entries: &[Logged]) -> Option<String> {
+    let root = entries.iter().map(|e| &e.envelope).find(|m| m.kind == Kind::Request)?;
+    if root.to.to_string() != molt_api::planner::RUN {
+        return None;
+    }
+    let model = root.payload.get("model")?.as_str()?.trim();
+    (!model.is_empty()).then(|| model.to_owned())
+}
+
+/// Have the model answer `request`, and once more after an answer that does
+/// not parse, told why. `Err` inside: why nothing was learned, with what the
+/// calls cost so far. The first call failing is an error; a later one
+/// failing is reported with the cost of the calls before it.
+async fn ask(
+    bus: &dyn Bus,
+    cfg: &Config,
+    mut request: CompleteRequest,
+    trace: &TraceId,
+    deadline: Deadline,
+) -> Result<Result<(Answer, Spent), (String, Spent)>, RemoteError> {
+    let mut spent = Spent::default();
+    let mut turn = 0;
+    loop {
+        let called = async {
+            let budget = Budget::new(cfg.max_tokens.into(), deadline.ms(cfg.model_timeout)?, 0);
+            let payload = serde_json::to_value(&request).map_err(|e| failed(e.to_string()))?;
+            let reply = bus.call(model::COMPLETE, payload, budget, trace).await?;
+            serde_json::from_value::<CompleteResponse>(reply)
+                .map_err(|e| failed(format!("the model's reply did not parse: {e}")))
+        }
+        .await;
+        let resp = match called {
+            Ok(resp) => resp,
+            Err(e) if turn == 0 => return Err(e),
+            Err(e) => return Ok(Err((format!("the model's second answer failed: {}", e.message), spent))),
+        };
+        spent.add(&resp);
+        if resp.is_refusal() {
+            return Ok(Err(("the model declined to read the episode".into(), spent)));
+        }
+        if resp.stop_reason.as_deref() == Some(model::STOP_MAX_TOKENS) {
+            return Ok(Err(("the model's answer was cut off; raise MOLT_MEMORY_MAX_TOKENS".into(), spent)));
+        }
+        let error = match read_answer(&resp) {
+            Ok(answer) => return Ok(Ok((answer, spent))),
+            Err(e) => e,
+        };
+        if turn == REPAIRS {
+            return Ok(Err((format!("the model's answer did not parse, even when told why: {error}"), spent)));
+        }
+        request.messages.push(resp.as_turn());
+        request.messages.push(repair(&resp, &error));
+        turn += 1;
+    }
 }
 
 #[cfg(test)]
@@ -675,7 +803,10 @@ mod tests {
     struct FakeBus {
         log: Vec<Logged>,
         page: usize,
-        answer: Mutex<Option<Value>>,
+        /// The content of each model reply, in order.
+        replies: Mutex<std::collections::VecDeque<Value>>,
+        /// What each reply says it cost; `null` for a model without a price.
+        cost_usd: Value,
         calls: Mutex<Vec<(String, Value, TraceId)>>,
     }
 
@@ -706,14 +837,15 @@ mod tests {
                     Ok(serde_json::to_value(ReadResponse { entries, next }).unwrap())
                 }
                 model::COMPLETE => {
-                    let text = self.answer.lock().unwrap().clone().expect("no model call was expected").to_string();
+                    let content = self.replies.lock().unwrap().pop_front().expect("no model call was expected");
+                    let called = content.as_array().unwrap().iter().any(|b| b["type"] == "tool_use");
                     let resp = json!({
                         "id": "msg_1",
                         "model": "claude-sonnet-x",
-                        "content": [{ "type": "text", "text": text }],
-                        "stop_reason": "end_turn",
+                        "content": content,
+                        "stop_reason": if called { "tool_use" } else { "end_turn" },
                         "usage": { "input_tokens": 1000, "output_tokens": 200 },
-                        "cost_usd": 0.0123,
+                        "cost_usd": self.cost_usd,
                     });
                     Ok(resp)
                 }
@@ -766,8 +898,27 @@ mod tests {
         msgs.into_iter().enumerate().map(|(i, m)| logged(i as u64 + 1, m)).collect()
     }
 
+    /// A model that submits `answer` with the tool, when there is one.
     fn bus(log: Vec<Logged>, page: usize, answer: Option<Value>) -> FakeBus {
-        FakeBus { log, page, answer: Mutex::new(answer), calls: Mutex::default() }
+        replying(log, page, answer.into_iter().map(|a| json!([submission(a)])).collect())
+    }
+
+    fn replying(log: Vec<Logged>, page: usize, replies: Vec<Value>) -> FakeBus {
+        FakeBus { log, page, replies: Mutex::new(replies.into()), cost_usd: json!(0.0123), calls: Mutex::default() }
+    }
+
+    fn submission(input: Value) -> Value {
+        json!({ "type": "tool_use", "id": "toolu_1", "name": SUBMIT_NOTES, "input": input })
+    }
+
+    fn text(text: &str) -> Value {
+        json!({ "type": "text", "text": text })
+    }
+
+    /// The model requests memory made, in order.
+    fn model_calls(bus: &FakeBus) -> Vec<Value> {
+        let calls = bus.calls.lock().unwrap();
+        calls.iter().filter(|(t, ..)| t == model::COMPLETE).map(|(_, p, _)| p.clone()).collect()
     }
 
     fn writer() -> Writer {
@@ -779,9 +930,18 @@ mod tests {
     }
 
     async fn run(bus: &FakeBus, db: &Arc<Db>, episode: &TraceId) -> Result<ConsolidateResponse, RemoteError> {
+        run_with(bus, db, episode, config()).await
+    }
+
+    async fn run_with(
+        bus: &FakeBus,
+        db: &Arc<Db>,
+        episode: &TraceId,
+        cfg: Config,
+    ) -> Result<ConsolidateResponse, RemoteError> {
         let req = ConsolidateRequest { episode: episode.as_str().into(), workspace: WS.into(), model: None };
         let trace = TraceId::random();
-        let (cfg, writer) = (config(), writer());
+        let writer = writer();
         let learner = Learner { bus, db, cfg: &cfg, writer: &writer };
         consolidate(&learner, req, Path::new(WS), WS, &trace, Deadline::after_ms(0)).await
     }
@@ -867,7 +1027,10 @@ mod tests {
         assert!(text.contains("[N1] fact"), "{text}");
         assert!(text.contains("[N2] convention"), "{text}");
         assert!(text.contains("[2] [workspace] run `pytest -q`"), "{text}");
-        assert!(payload["output_schema"].is_object());
+        assert_eq!(payload["tools"][0]["name"], SUBMIT_NOTES);
+        assert_eq!(payload["tools"][0]["input_schema"], answer_schema());
+        assert!(payload.get("output_schema").is_none(), "the answer's shape does not rest on the server");
+        assert!(payload.get("model").is_none(), "no model named anywhere: the gateway's default, as for the attempts");
         let reads: Vec<_> = calls.iter().filter(|(t, ..)| t == audit::READ).collect();
         assert_eq!(reads.len(), 3, "10 messages besides the model request, 4 per page");
         assert_eq!(reads[0].1["skip_requests_to"], json!(["model"]));
@@ -936,10 +1099,15 @@ mod tests {
             consolidate(&learner, req, Path::new(WS), WS, &TraceId::random(), Deadline::after_ms(0)).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Invalid);
 
-        // An answer that is not the agreed JSON is reported, with what it cost, and not marked learned.
-        let resp = run(&bus(episode(&trace), 100, Some(json!("I could not decide"))), &db, &trace).await.unwrap();
-        assert!(resp.skipped.unwrap().contains("did not parse"));
-        assert_eq!(resp.cost_usd, 0.0123);
+        // An answer that is not the agreed JSON, even when the model is told
+        // why, is reported, with what both calls cost, and not marked learned.
+        let stubborn =
+            replying(episode(&trace), 100, vec![json!([text("I could not decide")]), json!([text("<notes/>")])]);
+        let resp = run(&stubborn, &db, &trace).await.unwrap();
+        assert!(resp.skipped.as_deref().unwrap().contains("did not parse, even when told why"), "{resp:?}");
+        assert_eq!(resp.cost_usd, 2.0 * 0.0123);
+        assert_eq!(resp.usage.input_tokens, 2000);
+        assert_eq!(model_calls(&stubborn).len(), 2, "one repair turn, no more");
         assert!(!learned_already(&db, trace.as_str()).unwrap());
     }
 
@@ -1020,6 +1188,107 @@ mod tests {
         let answer = json!({ "notes": [], "supports": [] });
         let resp = run(&bus(done, 100, Some(answer)), &db, &trace).await.unwrap();
         assert_eq!(resp.skipped.as_deref(), Some("the episode held nothing worth keeping"));
+    }
+
+    fn lesson() -> Value {
+        json!({ "kind": "lesson", "text": "pytest needs PYTHONPATH=src here; without it it exits 4.",
+            "confidence": 0.9, "steps": [2], "contradicts": "", "everywhere": false })
+    }
+
+    #[tokio::test]
+    async fn a_server_that_ignores_the_schema_still_gets_notes_through_the_tool() {
+        let db = Arc::new(Db::in_memory().unwrap());
+        let trace = TraceId::random();
+        // The text beside the call is in no agreed shape; the call's input is.
+        let reply = json!([
+            text("<notes><note>pytest needs PYTHONPATH</note></notes>"),
+            submission(json!({ "notes": [lesson()], "supports": [], "skills": [] })),
+        ]);
+        let bus = replying(episode(&trace), 100, vec![reply]);
+        let resp = run(&bus, &db, &trace).await.unwrap();
+        assert_eq!(resp.skipped, None, "{resp:?}");
+        assert_eq!(resp.added.len(), 1, "{resp:?}");
+        assert_eq!((resp.cost_usd, resp.uncounted_calls), (0.0123, 0));
+        assert_eq!(model_calls(&bus).len(), 1, "nothing to repair");
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_does_not_match_the_schema_is_sent_back_once_with_the_error() {
+        let db = Arc::new(Db::in_memory().unwrap());
+        let trace = TraceId::random();
+        // As third-party endpoints were seen to answer: a sequence for a string, no `supports`.
+        let wrong = json!({ "notes": [{ "kind": "lesson", "text": ["pytest", "needs PYTHONPATH"], "confidence": 0.9,
+            "steps": [2], "contradicts": "", "everywhere": false }] });
+        let fixed = json!({ "notes": [lesson()], "supports": [], "skills": [] });
+        let bus = replying(episode(&trace), 100, vec![json!([submission(wrong)]), json!([submission(fixed)])]);
+        let resp = run(&bus, &db, &trace).await.unwrap();
+        assert_eq!(resp.added.len(), 1, "{resp:?}");
+        assert_eq!(resp.cost_usd, 2.0 * 0.0123, "both calls are paid for");
+        assert_eq!(resp.usage.output_tokens, 400);
+
+        let calls = model_calls(&bus);
+        assert_eq!(calls.len(), 2);
+        let messages = calls[1]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "the prompt, the refused answer, why it was refused");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["name"], SUBMIT_NOTES);
+        let result = &messages[2]["content"][0];
+        assert_eq!((result["type"].as_str(), result["tool_use_id"].as_str()), (Some("tool_result"), Some("toolu_1")));
+        assert_eq!(result["is_error"], true);
+        assert!(result["content"].as_str().unwrap().contains("invalid type: sequence"), "{result}");
+        assert_eq!(calls[1]["tools"], calls[0]["tools"], "the tools stay the same across turns");
+    }
+
+    #[tokio::test]
+    async fn a_text_answer_is_repaired_in_text_and_json_in_a_fence_is_accepted() {
+        let db = Arc::new(Db::in_memory().unwrap());
+        let trace = TraceId::random();
+        let fenced = format!("```json\n{}\n```", json!({ "notes": [lesson()], "supports": [] }));
+        let bus = replying(episode(&trace), 100, vec![json!([text("I will write it down.")]), json!([text(&fenced)])]);
+        let resp = run(&bus, &db, &trace).await.unwrap();
+        assert_eq!(resp.added.len(), 1, "{resp:?}");
+        let calls = model_calls(&bus);
+        let ask = &calls[1]["messages"][2];
+        assert_eq!(ask["role"], "user");
+        assert_eq!(ask["content"][0]["type"], "text", "no call to answer, so the error goes back as text");
+        assert!(ask["content"][0]["text"].as_str().unwrap().contains(SUBMIT_NOTES));
+    }
+
+    #[tokio::test]
+    async fn learning_uses_the_attempts_model_unless_memory_has_one() {
+        async fn model_of(cfg: Config, run_model: Option<&str>) -> (Option<String>, bool) {
+            let db = Arc::new(Db::in_memory().unwrap());
+            let trace = TraceId::random();
+            let mut log = episode(&trace);
+            if let Some(m) = run_model {
+                log[0].envelope.payload["model"] = json!(m);
+            }
+            let bus = bus(log, 100, Some(json!({ "notes": [], "supports": [] })));
+            run_with(&bus, &db, &trace, cfg).await.unwrap();
+            let call = model_calls(&bus).remove(0);
+            (call["model"].as_str().map(str::to_owned), call.get("effort").is_some())
+        }
+        let planner_default = || Config { attempts_model: Some("grok-4.5".into()), ..config() };
+        assert_eq!(model_of(config(), Some("glm-4.6")).await, (Some("glm-4.6".into()), true), "the run's model");
+        assert_eq!(model_of(planner_default(), Some("haiku")).await, (Some("haiku".into()), false));
+        assert_eq!(model_of(planner_default(), None).await, (Some("grok-4.5".into()), true), "the planner's default");
+        assert_eq!(model_of(config(), None).await, (None, true), "the gateway's default");
+        let own = Config { model: Some("opus".into()), ..planner_default() };
+        assert_eq!(model_of(own, Some("glm-4.6")).await, (Some("opus".into()), true), "MOLT_MEMORY_MODEL wins");
+    }
+
+    #[tokio::test]
+    async fn a_call_without_a_known_price_is_counted_as_unknown_not_free() {
+        let db = Arc::new(Db::in_memory().unwrap());
+        let trace = TraceId::random();
+        let replies = vec![json!([text("no")]), json!([submission(json!({ "notes": [lesson()], "supports": [] }))])];
+        let mut bus = replying(episode(&trace), 100, replies);
+        bus.cost_usd = Value::Null;
+        let resp = run(&bus, &db, &trace).await.unwrap();
+        assert_eq!(resp.added.len(), 1, "{resp:?}");
+        assert_eq!((resp.cost_usd, resp.uncounted_calls), (0.0, 2));
+        let wire = serde_json::to_value(&resp).unwrap();
+        assert_eq!(wire["uncounted_calls"], 2);
     }
 
     #[test]

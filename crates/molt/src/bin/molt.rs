@@ -213,7 +213,7 @@ struct RunArgs {
     no_review: bool,
     /// Model memory learns from the run with: opus, sonnet, haiku, a model
     /// id, or `same` for the attempts' model. Default: MOLT_MEMORY_MODEL,
-    /// else sonnet.
+    /// else the attempts' model.
     #[arg(long, value_name = "MODEL", conflicts_with_all = ["no_learn", "no_memory"])]
     memory_model: Option<String>,
 }
