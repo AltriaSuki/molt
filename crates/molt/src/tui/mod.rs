@@ -8,6 +8,7 @@
 mod app;
 mod backend;
 mod commands;
+mod kept;
 mod log;
 mod notice;
 mod preview;
@@ -155,6 +156,12 @@ async fn event_loop(
         }
     };
     settings::restore(&mut app, &cfg.tui, store.as_ref());
+    if let Some(store) = &store {
+        match kept::load(store, &app.secrets) {
+            Ok(entries) => app.restore_kept(entries),
+            Err(e) => app.flash = Some(format!("saved kept results ignored: {e}")),
+        }
+    }
     let theme_file = cfg.kernel.data_dir.join("tui-theme.json");
     match std::fs::read(&theme_file) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -193,6 +200,13 @@ async fn event_loop(
             if let Some(store) = &store {
                 if let Err(e) = store.change_history(&change, &app.secrets) {
                     app.flash = Some(format!("input history could not be saved: {e}"));
+                }
+            }
+        }
+        for change in app.take_kept_changes() {
+            if let Some(store) = &store {
+                if let Err(e) = kept::persist(store, &change, &app.secrets) {
+                    app.flash = Some(format!("kept-results metadata could not be saved: {e}"));
                 }
             }
         }
@@ -400,6 +414,10 @@ impl Runtime {
             Action::Learn { trace, model } => self.call(move |s| async move {
                 let result = s.learn(&trace, model).await;
                 Msg::Learned { trace, result }
+            }),
+            Action::Diff { fork } => self.call(move |s| async move {
+                let result = s.diff(&fork).await.map_err(|e| format!("{e:#}"));
+                Msg::Diff { fork, result }
             }),
             Action::Apply { fork } => self.call(move |s| async move {
                 Msg::Applied(s.apply(&fork).await.map(|_| ()).map_err(|e| format!("{e:#}")))

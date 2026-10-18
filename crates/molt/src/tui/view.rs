@@ -24,6 +24,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Screen::Memory(view) => draw_memory(frame, main, view, app.tick),
     }
     draw_status(frame, status, app);
+    if let Some(at) = app.kept_view {
+        let mut viewer = super::app::Viewer {
+            title: "kept results".into(),
+            lines: fit_rows(app.kept_lines(), area.width * 92 / 100),
+            scroll: at.saturating_sub(2) * 3,
+        };
+        draw_viewer(frame, area, &mut viewer, " ↑/↓ select · d diff · enter apply · n discard · esc back ");
+    }
     if let Some(viewer) = &mut app.viewer {
         draw_viewer(frame, area, viewer, " j/k scroll · g/G ends · esc close ");
     }
@@ -106,6 +114,17 @@ fn draw_viewer(frame: &mut Frame, area: Rect, viewer: &mut super::app::Viewer, h
     viewer.scroll = viewer.scroll.min(lines.len().saturating_sub(1));
     let shown: Vec<Line> = lines.into_iter().skip(viewer.scroll).take(usize::from(inner.height)).collect();
     frame.render_widget(Paragraph::new(shown), inner);
+}
+
+/// List selections advance by logical rows; keep long labels from wrapping.
+fn fit_rows(mut lines: Vec<Line<'static>>, panel_width: u16) -> Vec<Line<'static>> {
+    let room = usize::from(panel_width.saturating_sub(2));
+    for line in &mut lines {
+        if let [label] = line.spans.as_mut_slice() {
+            label.content = text::fit(&label.content, room).into();
+        }
+    }
+    lines
 }
 
 fn centered(area: Rect, w_pct: u16, h_pct: u16) -> Rect {
@@ -579,6 +598,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let s = &app.settings;
     let model = s.model.as_deref().unwrap_or("default model");
     let mut parts = vec![model.to_owned()];
+    if !app.kept.is_empty() {
+        parts.insert(0, format!("{} kept", app.kept.len()));
+    }
     if let Some(effort) = s.effort {
         parts.push(serde_json::to_value(effort).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default());
     }

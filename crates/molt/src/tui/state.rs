@@ -111,6 +111,13 @@ impl Store {
         Ok(file)
     }
 
+    pub fn locked<T>(&self, name: &str, work: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let lock = self.open(name, true)?;
+        // SAFETY: this process owns this regular lock file descriptor.
+        ensure!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0, "could not lock interface state");
+        work()
+    }
+
     pub fn read(&self, name: &str, limit: usize) -> anyhow::Result<Option<Vec<u8>>> {
         let file = match self.open(name, false) {
             Ok(file) => file,
