@@ -159,7 +159,47 @@ pub struct Config {
     #[serde(default)]
     pub confirm: ConfirmSection,
     #[serde(default)]
+    pub tui: TuiSection,
+    #[serde(default)]
     pub hooks: Vec<molt_planner::hooks::Hook>,
+}
+
+/// Defaults for the terminal interface, from an explicitly selected config.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TuiSection {
+    pub mode: Option<String>,
+    pub attempts: Option<u32>,
+    pub model: Option<String>,
+    pub effort: Option<molt_api::model::Effort>,
+    pub budget: Option<f64>,
+    pub check: Option<String>,
+    pub memory_model: Option<String>,
+    pub stream: Option<bool>,
+    pub notify: Option<String>,
+    pub commit: Option<bool>,
+}
+
+impl TuiSection {
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.mode.as_deref().is_none_or(|s| matches!(s, "plan" | "confirm" | "auto")),
+            "tui.mode must be plan, confirm or auto"
+        );
+        anyhow::ensure!(
+            self.notify.as_deref().is_none_or(|s| matches!(s, "on" | "all" | "off")),
+            "tui.notify must be on, all or off"
+        );
+        anyhow::ensure!(self.attempts.is_none_or(|n| (1..=8).contains(&n)), "tui.attempts must be 1 to 8");
+        anyhow::ensure!(self.budget.is_none_or(|b| b.is_finite() && b > 0.0), "tui.budget must be finite and positive");
+        for value in [&self.model, &self.memory_model, &self.check].into_iter().flatten() {
+            anyhow::ensure!(
+                !value.trim().is_empty() && value.len() <= 16 * 1024,
+                "tui model or check is empty or exceeds 16 KiB"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// When the interface's confirm mode stops for the user. It goes on by
@@ -213,6 +253,7 @@ const GATEWAY_ENV: &[&str] = &[
     "MOLT_MODEL_ALIASES",
     "MOLT_OPENAI_MODELS",
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
     "MOLT_MODEL",
     "MOLT_EFFORT",
@@ -260,7 +301,9 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        Ok(toml::from_str(text)?)
+        let config: Self = toml::from_str(text)?;
+        config.tui.validate()?;
+        Ok(config)
     }
 
     /// The default agent setup: the model gateway, file and shell services
@@ -346,6 +389,7 @@ impl Config {
             kernel: KernelSection { data_dir: data_dir.to_path_buf(), ..KernelSection::default() },
             services: vec![model, fs, shell, memory, planner],
             confirm: ConfirmSection::default(),
+            tui: TuiSection::default(),
             hooks: Vec::new(),
         })
     }
@@ -401,6 +445,33 @@ impl Config {
             .requests
             .push(CapRequest { target: molt_api::web::FETCH.parse()?, budget: Budget::new(0, 0, 1_000_000) });
         self.services.push(web);
+        Ok(())
+    }
+
+    /// An explicit user choice; attempts cannot select a resolver.
+    pub fn web_resolver(&mut self, spec: &str) -> anyhow::Result<()> {
+        molt_web::validate_resolver(spec).map_err(anyhow::Error::msg)?;
+        let web = self.service_mut(WEB).context("--web-resolver requires --allow-web or a configured web service")?;
+        let exec = web
+            .exec
+            .as_mut()
+            .filter(|exec| Path::new(&exec.command).file_name().is_some_and(|name| name == "molt-web"))
+            .context("--web-resolver requires the molt-web service")?;
+        let mut kept = Vec::new();
+        let mut skip = false;
+        for arg in &exec.args {
+            if skip {
+                skip = false;
+                continue;
+            }
+            if arg == "--resolver" {
+                skip = true;
+            } else if !arg.starts_with("--resolver=") {
+                kept.push(arg.clone());
+            }
+        }
+        kept.extend(["--resolver".into(), spec.into()]);
+        exec.args = kept;
         Ok(())
     }
 
@@ -470,6 +541,41 @@ impl Secrets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_explicit_web_resolver_does_not_change_hosts_or_capabilities() {
+        let mut cfg = Config::agent(Path::new("/project"), Path::new("/data"), Path::new("/bin")).unwrap();
+        assert!(cfg.web_resolver("doh:https://1.1.1.1/dns-query").is_err());
+        cfg.allow_web(&["docs.rs".into()], Path::new("/bin")).unwrap();
+        let requests = serde_json::to_value(&cfg.service("planner").unwrap().requests).unwrap();
+        cfg.web_resolver("doh:https://1.1.1.1/dns-query").unwrap();
+        cfg.web_resolver("system").unwrap();
+        let args = &cfg.service("web").unwrap().exec.as_ref().unwrap().args;
+        assert_eq!(args, &["--allow", "docs.rs", "--resolver", "system"]);
+        assert_eq!(serde_json::to_value(&cfg.service("planner").unwrap().requests).unwrap(), requests);
+        assert!(cfg.web_resolver("doh:https://127.0.0.1/dns-query").is_err());
+    }
+
+    #[test]
+    fn interface_defaults_are_optional_and_validate_before_startup() {
+        assert!(Config::parse("").unwrap().tui.mode.is_none());
+        let config =
+            Config::parse("[tui]\nmode='confirm'\nattempts=4\ncheck='make test'\nbudget=2.5\neffort='high'").unwrap();
+        assert_eq!(config.tui.attempts, Some(4));
+        for field in [
+            "mode='unknown'",
+            "attempts=0",
+            "attempts=9",
+            "budget=-1.0",
+            "budget=nan",
+            "check=''",
+            "model=''",
+            "notify='unknown'",
+            "unknown=1",
+        ] {
+            assert!(Config::parse(&format!("[tui]\n{field}")).is_err(), "{field}");
+        }
+    }
 
     #[test]
     fn parses_the_documented_example() {
@@ -572,9 +678,10 @@ mod tests {
         assert_eq!(model.tier, Tier::Protected);
         assert_eq!(model.requests.iter().map(|r| r.target.to_string()).collect::<Vec<_>>(), ["topic:publish:progress"]);
         assert!(model.pass_env.iter().any(|v| v == "ANTHROPIC_API_KEY"));
+        assert!(model.pass_env.iter().any(|v| v == "ANTHROPIC_AUTH_TOKEN"));
         assert!(model.pass_env.iter().any(|v| v == "OPENAI_API_KEY"));
         for service in cfg.services.iter().filter(|s| s.name.as_str() != "model") {
-            assert!(!service.pass_env.iter().any(|v| v.starts_with("OPENAI_")));
+            assert!(!service.pass_env.iter().any(|v| v.starts_with("OPENAI_") || v.starts_with("ANTHROPIC_")));
         }
         assert!(model.pass_env.iter().any(|v| v == "ANTHROPIC_BASE_URL"));
 

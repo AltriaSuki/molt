@@ -61,6 +61,7 @@ sender from that.
 | Audit verification and startup retain one bounded record; tail retains only the requested entries, independent of total log size | `audit_readers_keep_memory_bounded_as_the_log_grows`, `malformed_oversized_and_unterminated_records_are_never_discarded` |
 | A failing service never takes the kernel down | `a_service_that_never_replies…`, `a_crashed_and_reconnected…`, `a_flooding_service…`, `garbage_on_the_wire_is_ignored`, `crates/molt/tests/e2e.rs` |
 | Both transports behave the same: ordering, at-most-once, sender stamping, isolation, bounded inboxes | `crates/molt-transport/src/testkit.rs`, run by `conformance_unix.rs` and `conformance_nats.rs` |
+| A Bearer-only gateway run works and sandbox commands cannot read its token | `crates/molt/tests/agent.rs` (`a_token_only_cli_run_keeps_bearer_credentials_out_of_sandbox_commands`), `crates/molt-gateway/tests/gateway.rs` (`anthropic_auth_token_uses_bearer_and_api_key_takes_precedence`) |
 | `molt do` never runs a config the project ships, and the API key never reaches the commands it runs | `crates/molt/tests/agent.rs` (`the_cli_carries_out_a_task`) |
 | Only trusted external configuration installs hooks; formatting cannot bypass a protected done-check | `agent::tests::only_configuration_outside_the_project_can_install_hooks`, `tests/agent.rs::lifecycle_formatting_is_rechecked_and_cannot_weaken_the_protected_check` |
 | A conversation sent whole every turn grows the log by its new messages, and reads back byte for byte; a changed or missing referenced value fails verification | `a_conversation_sent_whole_every_turn_is_logged_once_and_read_back_exactly`, `a_changed_or_missing_blob_is_found` |
@@ -68,6 +69,7 @@ sender from that.
 | Every learned note cites the messages behind it, and a run is learned from once | `crates/molt/tests/agent.rs` (`a_second_run_starts_with_what_the_first_learned…`), `crates/molt-memory/src/consolidate.rs` |
 | A benchmark run is graded by tests the agent is not given, which its own edits cannot replace | `crates/molt-bench/src/grade.rs` (`grading_overwrites_the_agents_copy_of_a_hidden_file`), `crates/molt-bench/src/task.rs` (`overlay_replaces_files_links_and_directories_and_stays_inside`) |
 | Every benchmark task fails its check as given and passes it with the reference solution | `crates/molt-bench/tests/tasks.rs` |
+| Fixed review rules distinguish framework skip calls from process exit calls while still flagging actual test skips | `review::tests::process_exit_and_larger_identifiers_are_not_skip_markers_but_real_xit_still_is`, `an_approved_cli_with_a_process_exit_is_applied` |
 | A workspace apply persists preimages before writing, identifies actual post-crash file states, and refuses recovery over later edits | `crates/molt-tools/src/apply.rs` (`first_middle_and_last_write_failures_can_resume_or_undo_idempotently`, `restarting_after_each_durable_stage_observes_disk_truth_and_recovers`, `later_edits_and_candidate_changes_are_preserved_and_reported_by_path`), `crates/molt-tools/tests/fs.rs` (`a_durable_merge_retains_preimages_for_files_links_modes_and_dropped_forks`), `crates/molt/tests/apply.rs` |
 | Attempt symbol queries verify fork ownership and content freshness, isolate parallel views, and never update the durable project model | `crates/molt-memory/tests/forks.rs` (`rename_add_move_delete_and_shell_edits_stay_inside_the_attempt`, `unverified_wrong_workspace_and_symlink_forks_are_refused_without_widening_roots`, `an_edit_during_refresh_returns_no_stale_symbols`) |
 | A benchmark starts a run only while what it spent, plus the whole `--task-usd` of that run and of each run in flight, fits in `--max-usd`; it refuses models it has no price for | `crates/molt-bench/src/run.rs` (`runs_stop_before_they_could_pass_the_budget`, `a_run_of_unknown_cost_stops_the_benchmark`), `crates/molt-bench/src/cli.rs` (`a_model_without_a_price_is_refused`) |
@@ -77,6 +79,10 @@ sender from that.
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
 | Issue CI rejects PR triggers and probes the sandbox before model spend | `scripts/ci/test_issue_to_pr.py::test_only_labelled_open_issues_are_eligible`, `test_sandbox_failure_posts_a_summary_and_never_starts_a_model` |
 | A skill source cannot approve itself; only the CLI manages activation and withdrawal preserves evidence | `skills::tests::drafts_need_independent_evidence_and_disable_cannot_be_undone_by_learning`, `tests/service.rs::an_agent_cannot_manage_or_promote_its_own_skills` |
+| Queued tasks retain their submitted execution settings and wait for apply/discard/commit settlement | `tui::app::tests::queued_tasks_snapshot_execution_settings_and_plain_input_still_steers_the_current_task`, `tui::app::tests::a_queue_waits_for_apply_commit_and_discard_to_settle_before_starting_the_next_task` |
+| Explicit DoH avoids fake-IP bootstrap while keeping private-address refusal, bounded answers and per-redirect host checks | `molt_web::resolver::tests`, `repeated_host_dns_failures_remove_fetch_url_and_refuse_stale_calls` |
+| Idle TUI undo notifies the current memory service; locked CLI undo leaves Git untouched and incomplete notices stay retryable | `session_undo_notifies_memory_and_cli_undo_refuses_its_lock_before_changing_git`, `tui::app::tests::quitting_waits_for_an_uninterruptible_git_operation_to_settle` |
+| Kept results survive restart; conflicting applies leave user edits and the fork intact | `tui::app::tests::plan_results_are_browsable_and_remain_available_until_apply_or_discard_succeeds`, `a_kept_session_result_survives_restart_and_refuses_workspace_conflicts` |
 | Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
 | Offline embedding models are hash-pinned and cannot reintroduce forgotten or cross-project notes | `semantic::tests::pinned_models_retrieve_synonyms_and_reject_changed_files`, `semantic::tests::synonyms_are_recalled_with_scores_and_snapshots_survive_forgetting` |
 
@@ -200,7 +206,13 @@ for every project. `/attempts`, `/model`, `/effort`, `/budget` and
 that task); `/memory-model NAME` sets the model
 memory learns with (`same` for the attempts' model, `default` for
 `MOLT_MEMORY_MODEL` or `sonnet`), and when learning finds nothing the log
-says why. `/help` lists the keys. The services'
+says why. Typing `/` shows matching commands and argument hints above the input
+(up to six at once). ↑/↓ selects a candidate and Tab puts it in; commands with
+fixed values, such as `/effort` and `/model`, suggest those values next. Esc
+hides the list; editing brings it back. Tab otherwise still enlarges attempts.
+With an empty input, `?` opens shortcuts for the current screen, including check
+and apply confirmations and memory; `?` again or Esc closes them. In text, `?`
+is typed normally. `/help` lists all commands and keys. The services'
 log goes to `tui.log` in the data dir, and colors are left out under
 `NO_COLOR`.
 
@@ -214,6 +226,97 @@ once per stop. `/notify all` also calls when a task ends
 (`molt: passed · 3 files`), and `/notify off` turns calling off. The window
 title follows what it is doing (`molt · running 2/4`, `molt · waiting:
 apply`, `molt · idle`), and the terminal's own title is put back on exit.
+
+Interface settings are saved automatically for each workspace: mode, model,
+attempts, effort, budget, check, memory model, previews, notifications and commit.
+The next launch restores them, and `/reset` removes saved settings and restores
+the defaults from the explicitly selected config, or built-in defaults. The auto
+mode label stays yellow. A malformed or unsupported saved file is ignored with a
+single-line notice. Files use mode 0600 in the same private workspace state directory
+as history; values containing known credentials or common key patterns are not saved.
+
+The config passed with `--config` can set defaults, for example:
+
+```toml
+[tui]
+mode = "confirm"
+check = "cargo test"
+attempts = 2
+budget = 3.0
+model = "sonnet"
+```
+
+Commands entered this session override saved values, which override these config
+values, which override built-in defaults. Project command templates still affect
+only their own task and do not overwrite saved preferences. Changing defaults does not rewrite a run request already submitted for a task. Configuration
+files are still loaded only when explicitly selected.
+
+If service startup fails transiently, the interface retries up to three times,
+after approximately 2, 5 and 15 seconds, and shows the countdown. Recognized
+configuration, credential, executable and permission errors stop immediately with
+an action to take. A backend disconnect leaves pending settlement unknown and is
+not retried automatically. `/restart` restarts idle services while preserving the
+log, settings, history and kept forks; finish or stop a task and wait for learning
+and commits first. Restart uses the configuration loaded at launch; relaunch to change that
+configuration or environment. `/log` opens up to 200 lines from the final 64 KiB of
+`tui.log`, sanitizes terminal controls, redacts known credentials and omits lines
+with common credential patterns. A manual restart resets the automatic retry limit.
+
+`/undo [RUN]` takes back the latest (or named) run commit through the idle TUI
+session and tells its existing memory service to stop counting the run. It
+refuses while a task, learning, apply/discard or another Git operation is active.
+A failed memory notice preserves the Git result and can be retried with the same
+run id without another revert. Quitting waits for Git and memory settlement;
+undo clears the earlier-task context so later tasks do not assume the reverted
+result is still present. Retained forks and queued task settings stay available.
+
+While a check or result waits for confirmation, PgUp/PgDn and Ctrl+Home/Ctrl+End
+still scroll the conversation log. At apply confirmation, `v` opens the full
+review with fixed-rule findings, the independent reviewer verdict/findings and
+any review error. Stop reasons distinguish rules from the reviewer; older
+planner replies retain their combined findings without claiming a source.
+In diff and transcript viewers, `G`/End shows the final page with the last row
+at the bottom, including wrapped text.
+
+`/queue add TASK` submits a separate task while another runs. Plain input still
+adds a constraint to the current task. `/queue` opens the task list: `a` adds a
+multiline task, arrows select, `J`/`K` move it, `n` removes it, and Enter inspects
+its complete text. `/queue remove N` and `/queue move FROM TO` use one-based
+positions. Each task captures its mode, model, effort, attempts, check, budget,
+stream, memory-model and commit setting when submitted. Later setting changes
+apply to later submissions. Its workspace and earlier-task context are read when
+it starts, after the preceding apply/discard and optional commit have settled.
+Check and apply confirmations hold the queue; failure or keeping a result lets
+the next task start. A failed task's optional retry offer yields to the queue.
+
+`/queue pause` leaves the current task running; `/queue resume` continues queued
+work. Esc stops the current task and pauses its queue, preserving every queued
+task. `/queue clear` removes only queued tasks. Limits are 100 tasks, 64 KiB per
+task and 4 MiB total; rejected drafts are retained. Invalid `@paths` pause the
+queue without losing the task; the planner reads files when the queued task starts. Queued tasks live in this interface session:
+quitting shows their full text for confirmation and prints it after the terminal
+is restored, with known credentials redacted. A crash does not save the queue.
+
+`/kept` lists this workspace's retained results with their task, outcome, age and
+change counts. Select with arrows, `d` inspects the current diff, Enter applies,
+`n` discards, and Esc returns. Apply and discard wait for idle services; a failed
+operation leaves the result in the list. Apply uses the original fork baseline
+and refuses conflicting workspace edits, naming the files. Kept results survive
+interface restarts; missing fork directories are pruned. Private metadata is
+bounded to 1,000 entries / 4 MiB and filters task text like input history. Saved
+paths are checked by the fs service against the current workspace before use.
+Applying an older kept result does not create a git commit automatically.
+
+Input history is private to the workspace and survives restarts, even when two
+workspaces use the same data directory. ↑/↓ browses it; returning past the newest
+entry restores the unfinished draft. Ctrl+R searches newest first without duplicate
+matches, Ctrl+R again selects an older match, Enter submits it, Tab or Esc puts it
+back in the input for editing, and Ctrl+C cancels the search and restores the draft.
+`/clear` clears only the log; `/history-clear` removes this workspace's input history.
+History retains up to 1000 entries and 4 MiB; entries over 16 KiB, known environment
+credentials, common token prefixes, credential assignments and private keys are
+excluded. This filtering is heuristic. History files use mode 0600 under a private
+workspace directory; malformed records are ignored with a startup notice.
 
 Typing `@` starts a file path: the workspace's files (as `.gitignore` leaves
 them) are suggested as you type, ↑/↓ picks one and Tab puts it in. The files
@@ -336,7 +439,10 @@ With `--commit`, an applied result is committed to git. The commit holds
 exactly the files the run merged, as the workspace has them: it is built in a
 scratch index from the current commit, so what you staged stays staged and
 out of it. Its subject is the first line of the winning attempt's summary, the
-rest of the summary is its body, and it ends with trailers:
+rest of the summary is its body. Subjects stay within 72 characters, using a
+word boundary when possible and no ellipsis; emphasis is removed while literal
+code is kept.
+The message ends with trailers:
 
 ```
 Molt-Run: trace_…
@@ -352,6 +458,10 @@ before it (the commit would take them in), or when the workspace is not in a
 git work tree; the result is still applied, the reason is printed, and the
 exit status is 4. A `--branch` name git refuses, or one that exists, stops the
 run before it starts.
+
+CLI undo checks the data-directory lock before changing Git; when the interface
+holds it, use `/undo` there. A later memory notification failure exits with status
+4 and prints the run id to retry.
 
 `molt undo [RUN]` takes back the commit of a run, by default the newest on the
 current branch not taken back yet. It makes a new commit that puts the run's
@@ -424,8 +534,11 @@ through its progress callback, with previews enabled by default.
 | 1 | No attempt passed, or molt failed. |
 | 2 | The command line was wrong (an unknown flag, `--attempts 9`, ...); nothing started. |
 | 3 | Passed (or finished unverified), but the changes could not be merged, e.g. because the workspace changed under them; they are kept in the fork the report names. |
-| 4 | Passed and applied, but `--commit` could not commit the changes; the reason is printed. |
+| 4 | A commit or undo could not fully complete. A partial undo may leave Git reverted with memory notification pending; retry the named run. The reason is printed. |
 | 128+N | Stopped by signal N: 130 for Ctrl-C, 129 for SIGHUP, 143 for SIGTERM. The services are stopped and the run's forks removed. |
+
+Status 3 also covers a passing result withheld by the review. The report explains
+the review findings and names the kept fork for inspection.
 
 ### Config and secrets
 
@@ -438,9 +551,9 @@ the planner, using the service binaries installed next to `molt`. Data dirs that
 an existing one that others can read.
 
 Services start with a scrubbed environment: `PATH`, `HOME`, the locale and a
-few more, plus what each is configured to receive. `ANTHROPIC_API_KEY` goes to
-the gateway only, and the commands the agent runs never see `MOLT_*` or
-`ANTHROPIC_*` variables. Add what your builds and tests need with
+few more, plus what each is configured to receive. `ANTHROPIC_API_KEY` and
+`ANTHROPIC_AUTH_TOKEN` go to the gateway only, and the commands the agent runs
+never see `MOLT_*` or `ANTHROPIC_*` variables. Add what your builds and tests need with
 `--pass-env` (or `pass_env` in a config).
 
 A fork directory set with `--scratch` in a config must be private: the
@@ -466,11 +579,19 @@ give model/planner publication on progress, fs publication on fs.changed, memory
 subscription on fs.changed, and CLI/TUI subscription on progress. Older kernels
 and SDKs do not recognize the new permission spellings.
 
+For Claude Code or a compatible proxy, the same `ANTHROPIC_AUTH_TOKEN` and
+`ANTHROPIC_BASE_URL` work here. Without `ANTHROPIC_API_KEY`, the gateway sends
+`Authorization: Bearer <token>`; with an API key it sends only `x-api-key`.
+If both are set, a startup warning explains that the API key takes precedence.
+Empty or whitespace-only values count as unset. These credentials never reach
+sandbox commands, including when `--pass-env` is requested.
+
 Defaults come from the environment:
 
 | Variable | Read by | Default |
 | --- | --- | --- |
-| `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` | gateway | required, `https://api.anthropic.com` |
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` | gateway | API key preferred; Bearer token fallback (or use `OPENAI_API_KEY`) |
+| `ANTHROPIC_BASE_URL` | gateway | `https://api.anthropic.com` |
 | `MOLT_MODEL`, `MOLT_EFFORT`, `MOLT_MAX_TOKENS` | gateway | `opus`, unset, `32000` |
 | `MOLT_MODEL_TIMEOUT_S`, `MOLT_MODEL_RETRIES`, `MOLT_MODEL_CONCURRENCY`, `MOLT_FALLBACKS` | gateway | `1200`, `4`, `16`, `1` |
 | `MOLT_MODEL_PRICES`, `MOLT_PRICES_FILE` | gateway | unset, `~/.local/share/molt/prices.json` (see [Model prices](#model-prices)) |
@@ -586,7 +707,8 @@ with the project too. Nothing in a project's directory decides which project
 it is.
 
 ```sh
-molt project list                         # ids, names, directories, data dirs
+molt project list                         # ids, names, directories, output and data dirs
+molt project path "Japan trip"            # absolute working directory, also accepts an id
 molt project new "Japan trip"             # a project with no folder
 molt project new site --path ~/src/site   # a directory under a name of your own
 molt project add site ~/src/site-2        # another clone, with the same notes
@@ -595,7 +717,10 @@ molt do "plan five days in Kyoto" --project "Japan trip" --no-check
 ```
 
 `--project ID|NAME` stands in for `--workspace` in `molt do`, `molt resume`,
-`molt ui` and `molt memory`. A project with no folder works in a private one
+`molt ui` and `molt memory`. `molt project path ID|NAME` prints its absolute
+working directory for finding files or `cd "$(molt project path NAME)"`. Text
+results from `do` and `resume` name the applied directory, and JSON results
+include `workspace`. A project with no folder works in a private one
 of its own, `<registry dir>/projects/<id>/files`, which is where its
 research and writing end up. With `--config`, the registry is left out and
 notes are kept by the workspace's path, as before.
@@ -627,6 +752,23 @@ provides = ["web.*"]
 
 with `{ target = "web.fetch", budget = { calls = 1000000 } }` in the
 planner's `requests`.
+
+For host DNS that returns only private/reserved addresses (including Clash or
+mihomo fake-IP addresses in `198.18.0.0/15`), startup probes warn before any model
+work. To select a DNS JSON HTTPS resolver independently of host DNS, explicitly
+pass `--web-resolver doh:https://1.1.1.1/dns-query` alongside `--allow-web` to
+`do`, `resume` or `ui`. Custom configs use `--resolver` in the `molt-web` exec
+arguments. `system` keeps the default. Resolver endpoints must be HTTPS on port
+443 at a public literal IP, with no credentials, query, fragment or redirects.
+The endpoint must support `application/dns-json`; DNS replies are limited to
+64 KiB / 256 records. This option does not enable an HTTP proxy.
+
+Startup probes check at most 16 hosts in parallel (a wildcard uses its apex);
+every actual page and redirect still checks its own allowlisted host and public
+addresses. Page connections are pinned to the validated addresses with TLS name
+verification and no DNS fallback. Two authenticated host-network failures disable
+`fetch_url` for the run and reject stale calls, rather than repeatedly fetching
+other URLs. A page's text cannot trigger this signal.
 
 ## Memory
 
@@ -973,7 +1115,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none. A run with `--checkpoint` that stops keeps its forks for `molt resume`.
 - A rubric's model-judged criteria are a model's reading, not a proof: the judge can be wrong, and nothing but the criteria with a command checks the result. In the interface, a constraint that adds a check is refused while a run is being judged by a rubric.
 - Only `molt do --commit`, `molt resume --commit` and the interface's `/commit on` commit a result, always on the current branch (`--branch` is for `molt do` only). `molt undo` takes back only those commits, and refuses a file changed after the run rather than merging the revert into it (use `git revert` then).
-- A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet.
+- A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet. Its task queue lives in memory: normal exit prints unexecuted tasks, while a crash loses them.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.
 - Default recall matches keywords with stemming, so differently worded notes can be missed. Optional offline word-vector recall needs a reviewed hash-pinned local model; its mean-pooling backend does not understand word order or supply a pretrained vocabulary.
@@ -981,7 +1123,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.
 - Model prices are as current as the last `molt prices update` (or the release's snapshot) and as right as the community list they came from; a price that changes mid-run is not picked up until the next run. Models that LiteLLM lists only with tiered or regional prices, such as some Qwen models, have no price until declared in `MOLT_MODEL_PRICES`.
-- The web service has no search: an attempt reads pages whose URL it knows or finds in pages it read. It does not use a proxy, so a network that only reaches the web through one cannot use it, and it reads pages as served, without running their scripts.
+- The web service has no search: an attempt reads known URLs or links from pages it read, without running scripts. It does not use an HTTP proxy; an explicit public-IP DNS JSON resolver supports fake-IP DNS but still needs a route to that resolver and the public page addresses. Startup DNS probes sample at most 16 hosts, using wildcard apexes; every actual fetch validates its own destination.
 
 ### Cancellation and model settlement
 
@@ -1152,7 +1294,8 @@ These defaults affect only that task. Explicit interface settings take precedenc
 and a template budget cannot raise an existing limit. Confirm mode shows a
 template's check before starting; auto and plan modes retain their existing rules.
 Templates cannot set modes, permissions or protected paths. `/help` lists project
-commands and Tab completes unique command prefixes (or lists matches). Built-ins
+commands, and their argument hints and descriptions appear in the same live
+completion list as built-ins. Built-ins
 win name conflicts. Invalid, oversized and out-of-workspace files are skipped
 with a startup warning; restart the interface after editing templates. Discovery
 is bounded to 128 directory entries and 64 KiB per file. Nested YAML structures
@@ -1166,7 +1309,7 @@ uses only the terminal's 16 colors and follows its background. Without a saved
 choice, `COLORTERM=truecolor` or `24bit` selects dark and other terminals select
 ANSI. Light's eight text colors meet WCAG AA (4.5:1) against its white background.
 `NO_COLOR` keeps colors disabled. The choice is saved privately in
-`<data dir>/tui-theme.json`; other interface settings are not saved yet.
+`<data dir>/tui-theme.json`; workspace settings are saved separately as described below.
 
 Ctrl+L clears and redraws the interface. On Unix, Ctrl+Z restores the terminal
 and suspends just the interface process; use the shell's `fg` to return. Its

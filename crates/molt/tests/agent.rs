@@ -447,6 +447,7 @@ fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) ->
         .kill_on_drop(true);
     // The developer's own settings must not change the test.
     for var in [
+        "ANTHROPIC_AUTH_TOKEN",
         "MOLT_MODEL",
         "MOLT_EFFORT",
         "MOLT_MAX_TOKENS",
@@ -788,6 +789,7 @@ async fn a_project_keeps_its_notes_without_a_folder_and_after_a_move() {
             let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
             assert!(out.status.success(), "{stderr}");
             assert!(stderr.contains("memory: learned 1 note"), "{stderr}");
+            String::from_utf8(out.stdout).unwrap()
         }
     };
     let show = |args: &[&str], dir: &Path| {
@@ -800,8 +802,13 @@ async fn a_project_keeps_its_notes_without_a_folder_and_after_a_move() {
     let listed = molt(&["project", "new", "Japan trip"], home.path());
     assert!(listed.contains("Japan trip  no folder"), "{listed}");
     let id = listed.split_whitespace().next().unwrap().to_owned();
-    run(&["--project", "Japan trip"], home.path()).await;
-    let files = data.path().join(format!("user-data/molt/projects/{id}/files"));
+    let files = data.path().join(format!("user-data/molt/projects/{id}/files")).canonicalize().unwrap();
+    assert!(listed.contains(&format!("files: {}", files.display())), "{listed}");
+    assert_eq!(molt(&["project", "path", "Japan trip"], home.path()), format!("{}\n", files.display()));
+    assert_eq!(molt(&["project", "path", &id], home.path()), format!("{}\n", files.display()));
+    assert!(molt(&["project", "list"], home.path()).contains(files.to_str().unwrap()));
+    let output = run(&["--project", "Japan trip"], home.path()).await;
+    assert!(output.contains(&format!("applied to {}", files.display())), "{output}");
     assert_eq!(std::fs::read_to_string(files.join("greeting.txt")).unwrap(), "hello\n");
     assert!(show(&["--project", &id], home.path()).contains(LEARNED_TEXT));
 
@@ -868,6 +875,39 @@ async fn a_note_remembered_for_every_project_is_recalled_in_another() {
     memory(&["promote", &id, "--reason", "every project here builds with make"], &at[0]);
     assert!(memory(&["show"], &at[1]).contains("Build with make."));
     assert!(memory(&["show", "build"], &at[0]).contains("promoted as"));
+}
+
+#[tokio::test]
+async fn a_token_only_cli_run_keeps_bearer_credentials_out_of_sandbox_commands() {
+    struct BearerApi;
+    impl Respond for BearerApi {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            assert_eq!(req.headers.get("authorization").unwrap(), "Bearer token-test");
+            assert!(!req.headers.contains_key("x-api-key"));
+            // Reuse the strict body/signature validator with its existing API-key fixture.
+            let mut normalized = req.clone();
+            normalized.headers.remove("authorization");
+            normalized.headers.insert("x-api-key", API_KEY.parse().unwrap());
+            check_request(&normalized).expect("valid Messages API request");
+            FakeApi(Fake::Greets).respond(&normalized)
+        }
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/v1/messages")).respond_with(BearerApi).mount(&server).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let check = format!("test -z \"${{ANTHROPIC_AUTH_TOKEN+x}}\" && {CHECK}");
+    let cmd = molt_do(&server, workspace.path(), data.path(), &["--check", &check, "--attempts", "1"])
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("MOLT_PROVIDER")
+        .env_remove("MOLT_MODEL_ALIASES")
+        .env("ANTHROPIC_AUTH_TOKEN", "token-test")
+        .output();
+    let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read_to_string(workspace.path().join("greeting.txt")).unwrap(), "hello\n");
+    assert!(!server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1130,6 +1170,7 @@ async fn streaming_keeps_json_stdout_complete_and_previews_on_stderr() {
     let result: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(result["outcome"], "passed");
     assert_eq!(result["summary"], "Wrote greeting.txt.");
+    assert_eq!(result["workspace"], workspace.path().canonicalize().unwrap().to_str().unwrap());
     assert!(stderr.contains("preview: Wrote greeting.txt."), "{stderr}");
     assert!(stderr.contains("model finished (cost $"), "{stderr}");
     assert_requests_valid(&server).await;
@@ -1156,7 +1197,7 @@ async fn the_cli_runs_the_example_config_when_given_one() {
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success(), "status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}", out.status);
     assert!(stderr.contains(&format!("config: {}\n", path.display())), "{stderr}");
-    assert!(stdout.contains("applied to the workspace"), "{stdout}");
+    assert!(stdout.contains(&format!("applied to {}", workspace.path().canonicalize().unwrap().display())), "{stdout}");
     assert!(stderr.contains("memory: learned 1 note"), "{stderr}");
     assert!(workspace.path().join(".molt/memory.db").is_file(), "where the example puts it");
     assert_eq!(std::fs::read_to_string(workspace.path().join("greeting.txt")).unwrap(), "hello\n");
@@ -1304,7 +1345,7 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_molt"));
         cmd.args(["do", "anything", "--data-dir"]).arg(data_dir).args(args).current_dir(workspace.path());
         cmd.env("XDG_DATA_HOME", user_data.path());
-        cmd.env_remove("OPENAI_API_KEY").env_remove("MOLT_PROVIDER");
+        cmd.env_remove("OPENAI_API_KEY").env_remove("ANTHROPIC_AUTH_TOKEN").env_remove("MOLT_PROVIDER");
         match key {
             Some(key) => cmd.env("ANTHROPIC_API_KEY", key),
             None => cmd.env_remove("ANTHROPIC_API_KEY"),
@@ -1314,7 +1355,9 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
         String::from_utf8_lossy(&out.stderr).into_owned()
     };
     let err = molt_do(data.path(), None, &[]);
-    assert!(err.contains("ANTHROPIC_API_KEY or OPENAI_API_KEY is not set"), "{err}");
+    assert!(err.contains("ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or OPENAI_API_KEY is not set"), "{err}");
+    let err = molt_do(data.path(), Some("  "), &[]);
+    assert!(err.contains("ANTHROPIC_AUTH_TOKEN"), "{err}");
     let ws = workspace.path().canonicalize().unwrap();
     let inside = ws.join("state");
     let err = molt_do(&inside, Some("test"), &[]);
@@ -1330,9 +1373,126 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
         let err = molt_do(data.path(), Some("test"), &args);
         assert!(err.contains(args[0]), "{err}");
     }
+    let err = molt_do(data.path(), Some("test"), &["--pass-env", "ANTHROPIC_AUTH_TOKEN"]);
+    assert!(err.contains("commands never see"), "{err}");
     let err = molt_do(data.path(), Some("test"), &["--allow-web", "https://docs.rs/serde"]);
     assert!(err.contains("not a host to allow"), "{err}");
     assert!(std::fs::read_dir(data.path()).unwrap().next().is_none(), "nothing was started");
+}
+
+#[tokio::test]
+async fn a_kept_session_result_survives_restart_and_refuses_workspace_conflicts() {
+    use molt::session::Session;
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let workspace = setup.workspace.path().canonicalize().unwrap();
+    let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
+    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    let mut req = setup.request(Some(CHECK), 1);
+    req.apply = false;
+    let response = session.run(&req, &molt_proto::TraceId::random()).await.unwrap();
+    let fork = response.fork.unwrap();
+    session.shutdown(std::slice::from_ref(&fork)).await;
+    // A saved path from a different workspace cannot redirect a human's operation.
+    let other = tempfile::tempdir().unwrap();
+    let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
+    let wrong = Session::start(&setup.cfg, other.path().to_str().unwrap(), events).await.unwrap();
+    for error in [
+        wrong.diff(&fork).await.unwrap_err(),
+        wrong.apply(&fork).await.unwrap_err(),
+        wrong.discard(&fork).await.unwrap_err(),
+    ] {
+        assert!(format!("{error:#}").contains("another workspace"));
+    }
+    assert!(Path::new(&fork).is_dir());
+    assert_eq!(setup.files(), ["README.txt"]);
+    wrong.shutdown(std::slice::from_ref(&fork)).await;
+    let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
+    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    assert!(session.diff(&fork).await.unwrap().patch.contains("+hello"));
+    std::fs::write(workspace.join("greeting.txt"), "user's work\n").unwrap();
+    let error = format!("{:#}", session.apply(&fork).await.unwrap_err());
+    assert!(error.contains("conflict:") && error.contains("greeting.txt"), "{error}");
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("user's work\n"));
+    assert!(Path::new(&fork).is_dir());
+    std::fs::remove_file(workspace.join("greeting.txt")).unwrap();
+    session.apply(&fork).await.unwrap();
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    assert!(!Path::new(&fork).exists());
+    session.shutdown(&[]).await;
+}
+
+#[tokio::test]
+async fn session_undo_notifies_memory_and_cli_undo_refuses_its_lock_before_changing_git() {
+    use molt::session::Session;
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let w = setup.workspace.path();
+    git(w, &["init", "-q", "-b", "main"]);
+    for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")] {
+        git(w, &["config", key, value]);
+    }
+    git(w, &["add", "."]);
+    git(w, &["commit", "-q", "-m", "start"]);
+    let config = setup.data.path().join("config.toml");
+    std::fs::write(&config, toml::to_string(&setup.cfg).unwrap()).unwrap();
+    let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
+    let session = Session::start(&setup.cfg, w.to_str().unwrap(), events).await.unwrap();
+    for locked_cli in [false, true] {
+        let trace = molt_proto::TraceId::random();
+        let before = molt::git::Before::look(w).unwrap();
+        let response = session.run(&setup.request(Some(CHECK), 1), &trace).await.unwrap();
+        assert!(response.applied);
+        before.commit(&response, trace.as_str(), "write greeting", None).unwrap().unwrap();
+        session.learn(&trace, None).await.unwrap();
+        let head = git(w, &["rev-parse", "HEAD"]);
+        if locked_cli {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+                .args(["undo", trace.as_str(), "--config"])
+                .arg(&config)
+                .arg("--workspace")
+                .arg(w)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(4), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("use /undo"));
+            assert_eq!(git(w, &["rev-parse", "HEAD"]), head, "a locked CLI undo changed nothing");
+        }
+        let report = session.undo(if locked_cli { Some(trace.to_string()) } else { None }).await.unwrap();
+        assert!(matches!(report.git, molt::git::Undo::Reverted { .. }));
+        assert!(report.memory.unwrap().is_ok());
+        assert!(!w.join("greeting.txt").exists());
+        assert!(session.notes("").await.unwrap().is_empty());
+        let head = git(w, &["rev-parse", "HEAD"]);
+        let report = session.undo(Some(trace.to_string())).await.unwrap();
+        assert!(matches!(report.git, molt::git::Undo::Already { .. }));
+        assert!(report.memory.unwrap().is_ok());
+        assert_eq!(git(w, &["rev-parse", "HEAD"]), head);
+    }
+    // If Git succeeded but a fresh memory service cannot start, status 4
+    // still exposes the partial result and the exact retry id.
+    let trace = molt_proto::TraceId::random();
+    let before = molt::git::Before::look(w).unwrap();
+    let response = session.run(&setup.request(Some(CHECK), 1), &trace).await.unwrap();
+    before.commit(&response, trace.as_str(), "write greeting", None).unwrap().unwrap();
+    session.learn(&trace, None).await.unwrap();
+    session.shutdown(&[]).await;
+    let mut broken = setup.cfg.clone();
+    let memory = broken.service_mut("memory").unwrap();
+    memory.exec.as_mut().unwrap().command = setup.data.path().join("missing-memory").to_str().unwrap().into();
+    memory.max_restarts = 1;
+    std::fs::write(&config, toml::to_string(&broken).unwrap()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+        .args(["undo", trace.as_str(), "--config"])
+        .arg(&config)
+        .arg("--workspace")
+        .arg(w)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("undid run"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("memory could not be told"));
+    assert!(!w.join("greeting.txt").exists());
 }
 
 /// What the interface does with a task in its default mode, on one session:

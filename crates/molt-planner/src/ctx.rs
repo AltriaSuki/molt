@@ -70,6 +70,12 @@ impl Tally {
     }
 }
 
+#[derive(Default)]
+struct WebHealth {
+    failures: u32,
+    disabled: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct Ctx {
     bus: Arc<dyn Bus>,
@@ -92,6 +98,7 @@ pub(crate) struct Ctx {
     /// The planner may read the web (it holds a capability for `web.fetch`):
     /// attempts are offered `fetch_url`.
     pub web: bool,
+    web_health: Arc<Mutex<WebHealth>>,
     /// The `<project_instructions>` block, when the project has instruction files.
     pub instructions: Option<String>,
     /// The files the user pointed at, and their `<referenced_files>` block.
@@ -151,6 +158,28 @@ impl Conversation {
 }
 
 impl Ctx {
+    pub fn web_available(&self) -> bool {
+        self.web && !self.web_health.lock().unwrap_or_else(PoisonError::into_inner).disabled
+    }
+
+    pub fn web_succeeded(&self) {
+        self.web_health.lock().unwrap_or_else(PoisonError::into_inner).failures = 0;
+    }
+
+    /// Only an authenticated service error can disable the run's web tool, never page text.
+    pub fn web_failed(&self, error: &RemoteError) -> bool {
+        if error.code != ErrorCode::Unavailable || !error.message.starts_with(molt_api::web::ENVIRONMENT_UNAVAILABLE) {
+            return false;
+        }
+        let mut health = self.web_health.lock().unwrap_or_else(PoisonError::into_inner);
+        health.failures = health.failures.saturating_add(1);
+        if health.failures >= 2 && !health.disabled {
+            health.disabled = true;
+            return true;
+        }
+        false
+    }
+
     /// Limits come from the request where it sets them and from `cfg` otherwise.
     pub fn new(bus: Arc<dyn Bus>, cfg: Arc<Config>, trace: TraceId, req: &RunRequest) -> Self {
         let model = req.model.clone().filter(|m| !m.trim().is_empty()).or_else(|| cfg.default_model.clone());
@@ -170,6 +199,7 @@ impl Ctx {
             stream: req.stream,
             memory: Memory::default(),
             web,
+            web_health: Arc::default(),
             instructions: None,
             files: req.files.clone(),
             referenced: None,

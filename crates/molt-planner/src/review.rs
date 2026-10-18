@@ -10,7 +10,7 @@ use std::sync::Arc;
 use molt_api::fs::{Change, ChangeKind};
 use molt_api::model::{tool_result, user_blocks, user_text, ToolUse, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{SubmitReview, SUBMIT_REVIEW};
-use molt_api::planner::{CheckSpec, Requirement, Review, Verdict};
+use molt_api::planner::{CheckSpec, Requirement, Review, ReviewDetails, Verdict};
 use serde_json::Value;
 
 use crate::agent::{self, Meter, Stop};
@@ -37,13 +37,18 @@ pub(crate) struct Winner<'a> {
 pub(crate) async fn review(ctx: &Arc<Ctx>, winner: &Winner<'_>) -> Review {
     let mut findings = rules(winner.check, winner.changes, winner.patch);
     let mut verdict = if findings.is_empty() { Verdict::Approve } else { Verdict::Concern };
+    let mut details = ReviewDetails { rules: findings.clone(), ..ReviewDetails::default() };
     match model(ctx, winner, &findings).await {
         Ok(submit) => {
             verdict = verdict.max(submit.verdict);
-            findings.extend(submit.findings.into_iter().map(|f| f.trim().to_owned()).filter(|f| !f.is_empty()));
+            details.reviewer = Some(submit.verdict);
+            details.findings =
+                submit.findings.into_iter().map(|f| f.trim().to_owned()).filter(|f| !f.is_empty()).collect();
+            findings.extend(details.findings.iter().cloned());
         }
         // An unfinished review approves nothing.
         Err(why) => {
+            details.error = Some(why.clone());
             verdict = verdict.max(Verdict::Concern);
             findings.push(format!("The reviewer did not finish: {why}."));
         }
@@ -55,7 +60,7 @@ pub(crate) async fn review(ctx: &Arc<Ctx>, winner: &Winner<'_>) -> Review {
     };
     ctx.note(format!("review: {name}")).await;
     tracing::info!(run = %ctx.trace, verdict = name, findings = findings.len(), "reviewed the winner");
-    Review { verdict, findings }
+    Review { verdict, findings, details: Some(details) }
 }
 
 /// What the fixed rules find in the changes: deleted tests, new skip markers
@@ -72,13 +77,20 @@ pub(crate) fn rules(check: &CheckSpec, changes: &[Change], patch: &str) -> Vec<S
         }
     }
     for (path, line) in added_lines(patch).filter(|(path, _)| !ours(path)) {
-        if let Some(marker) = SKIP_MARKERS.iter().find(|m| line.contains(*m)) {
+        if let Some(marker) = SKIP_MARKERS.iter().find(|m| has_marker(line, m)) {
             findings.push(format!("{path} adds `{marker}`, which skips or narrows tests: `{}`.", line.trim()));
         } else if is_test_manifest(path) && TEST_CONFIG_WORDS.iter().any(|w| line.contains(w)) {
             findings.push(format!("{path} changes test settings: `{}`.", line.trim()));
         }
     }
     findings
+}
+
+/// A framework name must start at an identifier boundary: exit is not xit.
+fn has_marker(line: &str, marker: &str) -> bool {
+    let identifier = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let named = marker.chars().next().is_some_and(identifier);
+    line.match_indices(marker).any(|(at, _)| !named || line[..at].chars().next_back().is_none_or(|c| !identifier(c)))
 }
 
 /// Text that skips, disables or narrows tests, in the common test frameworks.
@@ -288,6 +300,29 @@ mod tests {
                 "package.json changes test settings: `\"testPathIgnorePatterns\": [\"slow\"],`.",
             ]
         );
+    }
+
+    #[test]
+    fn process_exit_and_larger_identifiers_are_not_skip_markers_but_real_xit_still_is() {
+        for path in ["src/main.rs", "main.py", "main.go", "src/main.js", "tests/cli.test.js"] {
+            for line in [
+                "std::process::exit(1);",
+                "sys.exit(2)",
+                "os.Exit(2)",
+                "process.exit(1);",
+                "myxit(1)",
+                "_xit(1)",
+                "$xit(1)",
+            ] {
+                let patch = format!("--- a/{path}\n+++ b/{path}\n@@\n+{line}\n");
+                assert!(rules(&spec(&[]), &[], &patch).is_empty(), "{path}: {line}");
+            }
+        }
+        for line in ["xit('slow', () => {});", "process.exit(1); xit('slow', () => {});", "it.skip('slow', () => {});"]
+        {
+            let patch = format!("--- a/tests/api.test.js\n+++ b/tests/api.test.js\n@@\n+{line}\n");
+            assert_eq!(rules(&spec(&[]), &[], &patch).len(), 1, "{line}");
+        }
     }
 
     #[test]

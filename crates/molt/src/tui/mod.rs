@@ -8,8 +8,12 @@
 mod app;
 mod backend;
 mod commands;
+mod kept;
+mod log;
 mod notice;
 mod preview;
+mod settings;
+mod state;
 mod text;
 mod transcript;
 mod view;
@@ -39,7 +43,7 @@ use crate::session::Session;
 use crate::{agent, Config};
 
 /// How often the spinners turn.
-const TICK: Duration = Duration::from_millis(150);
+const TICK: Duration = Duration::from_millis(app::TICK_MS);
 
 pub struct Options {
     pub config: Option<PathBuf>,
@@ -50,6 +54,7 @@ pub struct Options {
     pub pass_env: Vec<String>,
     /// Hosts the agent may read web pages from.
     pub allow_web: Vec<String>,
+    pub web_resolver: Option<String>,
 }
 
 /// Run the interface until the user quits. Returns the forks the user kept.
@@ -67,6 +72,9 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
         shell.pass_env.extend(opts.pass_env);
     }
     agent::allow_web(&mut cfg, &opts.allow_web)?;
+    if let Some(resolver) = &opts.web_resolver {
+        cfg.web_resolver(resolver)?;
+    }
     if std::env::var_os("RUST_LOG").is_none() {
         for svc in &mut cfg.services {
             svc.env.entry("RUST_LOG".into()).or_insert_with(|| "warn".into());
@@ -89,13 +97,18 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
     }));
     let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableFocusChange);
     emit(notice::PUSH_TITLE);
-    let home = std::env::var("HOME").ok();
-    let result = event_loop(&mut terminal, cfg, path, home.as_deref(), stop).await;
+    // A virtual project's output directory is otherwise hard to discover.
+    let home = std::env::var("HOME").ok().filter(|_| !project.as_ref().is_some_and(|p| p.paths.is_empty()));
+    let mut unexecuted = Vec::new();
+    let result = event_loop(&mut terminal, cfg, path, home.as_deref(), stop, &mut unexecuted).await;
     emit(notice::POP_TITLE);
     let _ = execute!(std::io::stdout(), DisableFocusChange, DisableBracketedPaste);
     ratatui::restore();
     drop(stderr);
     let _ = std::panic::take_hook();
+    for (index, task) in unexecuted.iter().enumerate() {
+        println!("not run (queued {}):\n{task}", index + 1);
+    }
     result.with_context(|| format!("the services' log is in {}", log.display()))
 }
 
@@ -105,6 +118,7 @@ async fn event_loop(
     workspace: String,
     home: Option<&str>,
     stop: impl Future<Output = i32> + Send + 'static,
+    unexecuted: &mut Vec<String>,
 ) -> anyhow::Result<Vec<String>> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let pause = Arc::new(Pause::default());
@@ -124,8 +138,40 @@ async fn event_loop(
 
     let mut app = App::new(&workspace, home);
     app.secrets = secrets_in_env();
+    app.secrets.extend(
+        cfg.services
+            .iter()
+            .flat_map(|service| &service.env)
+            .filter(|(name, value)| value.len() >= 8 && secret_name(name))
+            .map(|(_, value)| value.clone()),
+    );
     app.rules = cfg.confirm.clone();
     app.load_commands(Path::new(&workspace));
+    let store = match state::Store::new(&cfg.kernel.data_dir, Path::new(&workspace)) {
+        Ok(store) => {
+            match store.history(&app.secrets) {
+                Ok((entries, damaged)) => {
+                    app.restore_history(entries);
+                    if damaged {
+                        app.flash = Some("some damaged input history entries were ignored".into());
+                    }
+                }
+                Err(e) => app.flash = Some(format!("saved input history ignored: {e}")),
+            }
+            Some(store)
+        }
+        Err(e) => {
+            app.flash = Some(format!("workspace interface state could not be opened: {e}"));
+            None
+        }
+    };
+    settings::restore(&mut app, &cfg.tui, store.as_ref());
+    if let Some(store) = &store {
+        match kept::load(store, &app.secrets) {
+            Ok(entries) => app.restore_kept(entries),
+            Err(e) => app.flash = Some(format!("saved kept results ignored: {e}")),
+        }
+    }
     let theme_file = cfg.kernel.data_dir.join("tui-theme.json");
     match std::fs::read(&theme_file) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -135,9 +181,18 @@ async fn event_loop(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => app.flash = Some(format!("could not load saved theme: {e}")),
     }
+    // Show startup state while DNS probes run; no backend or model has started yet.
+    terminal.draw(|frame| view::draw(frame, &mut app))?;
+    for warning in agent::web_warnings(&cfg).await? {
+        app.log.extend(text::block(
+            &app::scrub(&format!("web DNS preflight: {warning}"), &app.secrets),
+            "",
+            text::Tone::Warn,
+        ));
+    }
     let data_dir = cfg.kernel.data_dir.clone();
     let (lister, root) = (tx.clone(), PathBuf::from(&workspace));
-    let mut backend = backend::Backend::start(cfg, workspace, tx).await?;
+    let mut backend = backend::Backend::start(cfg.clone(), workspace.clone(), tx, app.backend_generation).await?;
     backend.send(&Action::StartSession).await?;
     let notice = Notice::from_env(|name| std::env::var(name).ok());
     let mut keep = Vec::new();
@@ -153,10 +208,49 @@ async fn event_loop(
         while let Ok(msg) = rx.try_recv() {
             actions.extend(app.update(msg));
         }
+        for change in app.take_preference_changes() {
+            if let Some(store) = &store {
+                if let Err(e) = settings::persist(store, &change, &app.secrets) {
+                    app.flash = Some(format!("settings changed but could not be saved: {e}"));
+                }
+            }
+        }
+        for change in app.take_history_changes() {
+            if let Some(store) = &store {
+                if let Err(e) = store.change_history(&change, &app.secrets) {
+                    app.flash = Some(format!("input history could not be saved: {e}"));
+                }
+            }
+        }
+        for change in app.take_kept_changes() {
+            if let Some(store) = &store {
+                if let Err(e) = kept::persist(store, &change, &app.secrets) {
+                    app.flash = Some(format!("kept-results metadata could not be saved: {e}"));
+                }
+            }
+        }
         for action in actions {
             match action {
                 Action::Quit { keep: k } => keep = k,
                 Action::Alert { text } => emit(&notice.alert(&text)),
+                Action::RestartSession { keep } => {
+                    app.backend_generation += 1;
+                    if let Err(e) = backend.shutdown(&keep).await {
+                        app.flash =
+                            Some(format!("previous backend shutdown failed: {}", text::clean_line(&e.to_string())));
+                    }
+                    backend =
+                        backend::Backend::start(cfg.clone(), workspace.clone(), lister.clone(), app.backend_generation)
+                            .await?;
+                    backend.send(&Action::StartSession).await?;
+                }
+                Action::ShowLog => {
+                    let (tx, path) = (lister.clone(), data_dir.join("tui.log"));
+                    tokio::task::spawn_blocking(move || {
+                        let result = log::tail(&path).map_err(|e| e.to_string());
+                        let _ = tx.send(Msg::ServiceLog(result));
+                    });
+                }
                 Action::ListFiles => {
                     let (tx, root) = (lister.clone(), root.clone());
                     tokio::task::spawn_blocking(move || {
@@ -197,6 +291,7 @@ async fn event_loop(
             break;
         }
     }
+    *unexecuted = app.unexecuted();
     backend.shutdown(&keep).await?;
     Ok(keep)
 }
@@ -254,11 +349,11 @@ fn read_terminal(tx: UnboundedSender<Msg>, pause: Arc<Pause>) {
 /// get them, but a user can pass any variable to the shell, so the interface
 /// hides them in what commands print.
 fn secrets_in_env() -> Vec<String> {
-    const NAMES: &[&str] = &["API_KEY", "TOKEN", "SECRET", "PASSWORD"];
-    std::env::vars()
-        .filter(|(name, value)| value.len() >= 8 && NAMES.iter().any(|n| name.to_ascii_uppercase().contains(n)))
-        .map(|(_, value)| value)
-        .collect()
+    std::env::vars().filter(|(name, value)| value.len() >= 8 && secret_name(name)).map(|(_, value)| value).collect()
+}
+
+fn secret_name(name: &str) -> bool {
+    ["API_KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|marker| name.to_ascii_uppercase().contains(marker))
 }
 
 struct Runtime {
@@ -293,6 +388,9 @@ impl Runtime {
         self.work.retain(|w| !w.is_finished());
         match action {
             Action::StartSession => {
+                if self.starting || self.session.is_some() {
+                    return;
+                }
                 self.starting = true;
                 let (cfg, workspace, tx, sessions) =
                     (self.cfg.clone(), self.workspace.clone(), self.tx.clone(), self.sessions.clone());
@@ -337,9 +435,25 @@ impl Runtime {
                 let result = s.learn(&trace, model).await;
                 Msg::Learned { trace, result }
             }),
+            Action::Diff { fork } => self.call(move |s| async move {
+                let result = s.diff(&fork).await.map_err(|e| format!("{e:#}"));
+                Msg::Diff { fork, result }
+            }),
             Action::Apply { fork } => self.call(move |s| async move {
                 Msg::Applied(s.apply(&fork).await.map(|_| ()).map_err(|e| format!("{e:#}")))
             }),
+            Action::Undo { run } => {
+                let (session, tx) = (self.session.clone(), self.tx.clone());
+                // The interface waits for both Git and memory before quitting.
+                // Like commits, this is not among the interruptible attempt work.
+                tokio::spawn(async move {
+                    let result = match session {
+                        Some(session) => session.undo(run).await.map_err(|e| format!("{e:#}")),
+                        None => Err("the services are not up".into()),
+                    };
+                    let _ = tx.send(Msg::Undone(result));
+                });
+            }
             Action::PrepareCommit { trace } => {
                 self.before = Some((trace.to_string(), crate::git::Before::look(Path::new(&self.workspace))));
             }
@@ -415,6 +529,8 @@ impl Runtime {
             }
             // The loop handles these: they need the terminal.
             Action::Quit { .. }
+            | Action::RestartSession { .. }
+            | Action::ShowLog
             | Action::Edit { .. }
             | Action::Redraw
             | Action::Suspend

@@ -40,6 +40,17 @@ impl Allow {
         Ok(Self(out))
     }
 
+    pub(crate) fn probe_hosts(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .map(|pattern| match pattern {
+                Pattern::Exact(host) | Pattern::Below(host) => host.clone(),
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     fn allows(&self, host: &str) -> bool {
         self.0.iter().any(|p| match p {
             Pattern::Exact(h) => host == h,

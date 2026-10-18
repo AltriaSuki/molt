@@ -456,6 +456,22 @@ pub struct Review {
     /// findings first, then the reviewer model's.
     #[serde(default)]
     pub findings: Vec<String>,
+    /// Optional source information; older peers only have the combined findings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<ReviewDetails>,
+}
+
+/// Fixed rules and the independent model opinion, without changing the aggregate verdict.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewDetails {
+    #[serde(default)]
+    pub rules: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<Verdict>,
+    #[serde(default)]
+    pub findings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -707,6 +723,14 @@ pub mod tools {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_review_payloads_keep_their_verdict_without_claiming_a_finding_source() {
+        let wire = serde_json::json!({"verdict":"concern", "findings":["a rule or a model found this"]});
+        let review: super::Review = serde_json::from_value(wire.clone()).unwrap();
+        assert!(review.details.is_none());
+        assert_eq!(serde_json::to_value(review).unwrap(), wire);
+    }
+
     use super::*;
 
     #[test]

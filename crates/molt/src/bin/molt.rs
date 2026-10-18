@@ -190,6 +190,10 @@ struct RunArgs {
     /// commands still have no network.
     #[arg(long, value_name = "HOST")]
     allow_web: Vec<String>,
+    /// DNS for web pages: system (default), or doh:https://PUBLIC_IP/dns-query
+    /// using a DNS JSON HTTPS endpoint such as Cloudflare's 1.1.1.1.
+    #[arg(long, value_name = "RESOLVER")]
+    web_resolver: Option<String>,
     /// Run without memory: no project map or notes for the model, and
     /// nothing learned from the run.
     #[arg(long)]
@@ -244,6 +248,10 @@ struct UiArgs {
     /// or `*.python.org` for the hosts below it.
     #[arg(long, value_name = "HOST")]
     allow_web: Vec<String>,
+    /// DNS for web pages: system (default), or doh:https://PUBLIC_IP/dns-query
+    /// using a DNS JSON HTTPS endpoint such as Cloudflare's 1.1.1.1.
+    #[arg(long, value_name = "RESOLVER")]
+    web_resolver: Option<String>,
 }
 
 #[derive(Args)]
@@ -456,6 +464,11 @@ enum ProjectCmd {
     },
     /// List the projects, with their ids, directories and data dirs.
     List,
+    /// Print the absolute working directory of a project, for cd or finding its output.
+    Path {
+        /// The project's id or name.
+        project: String,
+    },
     /// Tell molt a project's directory moved to NEW_DIR. Its notes, audit
     /// log and stopped runs stay with it.
     Move {
@@ -547,6 +560,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                 data_dir: args.data_dir,
                 pass_env: args.pass_env,
                 allow_web: args.allow_web,
+                web_resolver: args.web_resolver,
             };
             for fork in molt::tui::run(opts).await? {
                 eprintln!("kept: {}", agent::printable(&fork));
@@ -759,6 +773,9 @@ fn prepare(config: Option<&Path>, args: &RunArgs) -> anyhow::Result<(Config, Str
         cfg.services.retain(|s| s.name.as_str() != agent::MEMORY);
     }
     agent::allow_web(&mut cfg, &args.allow_web)?;
+    if let Some(resolver) = &args.web_resolver {
+        cfg.web_resolver(resolver)?;
+    }
     if std::env::var_os("RUST_LOG").is_none() {
         for svc in &mut cfg.services {
             svc.env.entry("RUST_LOG".into()).or_insert_with(|| "warn".into());
@@ -864,7 +881,11 @@ async fn execute(
     args: &RunArgs,
     stop: impl std::future::Future<Output = i32>,
 ) -> anyhow::Result<ExitCode> {
+    let workspace = req.workspace.clone();
     let apply = req.apply;
+    for warning in agent::web_warnings(cfg).await? {
+        eprintln!("{}", agent::printable(&format!("web DNS preflight: {warning}")));
+    }
     let checkpointed = req.checkpoint;
     let run = trace.to_string();
     let task = req.task.clone();
@@ -904,6 +925,7 @@ async fn execute(
     if args.json {
         let mut out = serde_json::to_value(&resp)?;
         out["run"] = serde_json::json!(run);
+        out["workspace"] = serde_json::json!(workspace);
         if let Some(committed) = &committed {
             out["commit"] = match committed {
                 Ok(Some(c)) => serde_json::json!({ "sha": c.sha, "branch": c.branch, "ignored": c.ignored }),
@@ -915,7 +937,7 @@ async fn execute(
         out["learning"] = done.learned.as_ref().map_or(serde_json::Value::Null, agent::learning_json);
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
-        print!("{}", agent::report(&resp));
+        print!("{}", agent::report_at(&resp, Some(&workspace)));
     }
     if let Some(learned) = &done.learned {
         eprintln!("{}", agent::learned(learned));
@@ -974,6 +996,22 @@ fn commit_target(workspace: &str, branch: Option<&str>) -> anyhow::Result<anyhow
 
 async fn undo_cmd(config: Option<&Path>, args: UndoArgs) -> anyhow::Result<ExitCode> {
     let (workspace, project) = agent::locate(args.at.project.as_deref(), &args.at.workspace, config.is_some())?;
+    let cfg = agent::memory_config(config, &workspace, args.at.data_dir.as_deref(), project.as_ref())?;
+    // Refuse the common TUI-lock case before touching Git. Keep the lock through
+    // the revert; a later notification failure is still reported as partial.
+    let lock = match molt::DataDirLock::acquire(&cfg.kernel.data_dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                agent::printable(&format!(
+                    "undo did not change Git: {error:#}. If the interface is open, use /undo{} there",
+                    args.run.as_ref().map_or(String::new(), |run| format!(" {run}"))
+                ))
+            );
+            return Ok(ExitCode::from(4));
+        }
+    };
     let repo = git::Repo::open(&workspace)?;
     let run = match repo.undo(args.run.as_deref())? {
         git::Undo::Reverted { run, commit, sha } => {
@@ -985,7 +1023,7 @@ async fn undo_cmd(config: Option<&Path>, args: UndoArgs) -> anyhow::Result<ExitC
             run
         }
     };
-    let cfg = agent::memory_config(config, &workspace, args.at.data_dir.as_deref(), project.as_ref())?;
+    drop(lock);
     if !agent::memory_db(&cfg).is_some_and(|db| db.is_file()) {
         eprintln!("memory has nothing about this project, so nothing to take back there");
         return Ok(ExitCode::SUCCESS);
@@ -1001,8 +1039,8 @@ async fn undo_cmd(config: Option<&Path>, args: UndoArgs) -> anyhow::Result<ExitC
             Ok(ExitCode::SUCCESS)
         }
         Err(e) => {
-            eprintln!("the commit is taken back, but memory could not be told: {e:#}. Run `molt undo {run}` again");
-            Ok(ExitCode::FAILURE)
+            eprintln!("{}", agent::printable(&format!("the commit is taken back, but memory could not be told: {e:#}. Run `molt undo {run}` again; if the interface is open, use /undo {run} there")));
+            Ok(ExitCode::from(4))
         }
     }
 }
@@ -1130,30 +1168,44 @@ fn project_cmd(cmd: ProjectCmd) -> anyhow::Result<()> {
         anyhow::ensure!(d.is_dir(), "{} is not a directory", d.display());
         Ok(d)
     };
-    let show = |p: &molt::project::Project| {
+    let show = |p: &molt::project::Project| -> anyhow::Result<()> {
         let dirs = if p.paths.is_empty() {
             "no folder".to_owned()
         } else {
             p.paths.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
         };
-        println!("{}", agent::printable(&format!("{}  {}  {dirs}\n    data: {}", p.id, p.name, p.data_dir.display())));
+        let files = if p.paths.is_empty() {
+            format!("\n    files: {}", registry.workspace(p)?.display())
+        } else {
+            String::new()
+        };
+        println!(
+            "{}",
+            agent::printable(&format!("{}  {}  {dirs}{files}\n    data: {}", p.id, p.name, p.data_dir.display()))
+        );
+        Ok(())
     };
     match cmd {
         ProjectCmd::New { name, path } => {
             let path = path.as_deref().map(dir).transpose()?;
-            show(&registry.create(&name, path.as_deref(), |id| agent::project_data_dir(&name, id))?);
+            show(&registry.create(&name, path.as_deref(), |id| agent::project_data_dir(&name, id))?)?;
         }
         ProjectCmd::List => {
             let projects = registry.list()?;
             if projects.is_empty() {
                 eprintln!("no projects yet; one is registered the first time molt runs in a directory");
             }
-            projects.iter().for_each(show);
+            for project in &projects {
+                show(project)?;
+            }
+        }
+        ProjectCmd::Path { project } => {
+            println!("{}", registry.workspace(&registry.find(&project)?)?.display());
         }
         ProjectCmd::Move { project, new_dir, from } => {
-            show(&registry.move_path(&project, &dir(&new_dir)?, from.as_deref())?);
+            show(&registry.move_path(&project, &dir(&new_dir)?, from.as_deref())?)?;
         }
-        ProjectCmd::Add { project, dir: d } => show(&registry.add_path(&project, &dir(&d)?)?),
+        ProjectCmd::Add { project, dir: d } => show(&registry.add_path(&project, &dir(&d)?)?)?,
     }
     Ok(())
 }
