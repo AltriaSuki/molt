@@ -1018,7 +1018,10 @@ pub fn report(resp: &RunResponse) -> String {
 
 /// Report a result with the resolved output directory, including virtual projects.
 pub fn report_at(resp: &RunResponse, workspace: Option<&str>) -> String {
-    let mut lines = vec![format!("outcome: {}", outcome_name(resp.outcome))];
+    let mut lines = vec![match &resp.dispute {
+        Some(_) => format!("outcome: {}, the check was disputed", outcome_name(resp.outcome)),
+        None => format!("outcome: {}", outcome_name(resp.outcome)),
+    }];
     if let Some(check) = &resp.check {
         let by = if check.designed { " (designed by the planner)" } else { "" };
         lines.push(format!("check: {}{by}", check.command));
@@ -1609,6 +1612,7 @@ mod tests {
             selection: None,
             rubric: vec![],
             judgement: vec![],
+            dispute: None,
         };
         assert_eq!(
             report(&resp),
