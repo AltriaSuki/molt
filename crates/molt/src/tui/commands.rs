@@ -11,6 +11,8 @@ pub enum Builtin {
     Help,
     HistoryClear,
     Reset,
+    Restart,
+    Log,
     Remember,
     Theme,
     Memory,
@@ -64,6 +66,8 @@ definitions! {
     Help, "help", "", "commands and keyboard help", &[];
     HistoryClear, "history-clear", "", "clear saved input history for this workspace", &[];
     Reset, "reset", "", "restore configured interface defaults and forget saved settings", &[];
+    Restart, "restart", "", "restart idle services, keeping settings, logs and results", &[];
+    Log, "log", "", "inspect a bounded tail of the service log", &[];
     Remember, "remember", "TEXT", "a preference of yours, for every project", &[];
     Theme, "theme", "NAME", "dark, light or terminal ANSI colors; saved for next time", &["dark", "light", "ansi"];
     Memory, "memory", "[query]", "list, inspect and forget notes", &[];

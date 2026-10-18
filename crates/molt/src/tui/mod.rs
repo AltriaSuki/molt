@@ -8,6 +8,7 @@
 mod app;
 mod backend;
 mod commands;
+mod log;
 mod notice;
 mod preview;
 mod settings;
@@ -41,7 +42,7 @@ use crate::session::Session;
 use crate::{agent, Config};
 
 /// How often the spinners turn.
-const TICK: Duration = Duration::from_millis(150);
+const TICK: Duration = Duration::from_millis(app::TICK_MS);
 
 pub struct Options {
     pub config: Option<PathBuf>,
@@ -126,6 +127,13 @@ async fn event_loop(
 
     let mut app = App::new(&workspace, home);
     app.secrets = secrets_in_env();
+    app.secrets.extend(
+        cfg.services
+            .iter()
+            .flat_map(|service| &service.env)
+            .filter(|(name, value)| value.len() >= 8 && secret_name(name))
+            .map(|(_, value)| value.clone()),
+    );
     app.rules = cfg.confirm.clone();
     app.load_commands(Path::new(&workspace));
     let store = match state::Store::new(&cfg.kernel.data_dir, Path::new(&workspace)) {
@@ -158,7 +166,7 @@ async fn event_loop(
     }
     let data_dir = cfg.kernel.data_dir.clone();
     let (lister, root) = (tx.clone(), PathBuf::from(&workspace));
-    let mut backend = backend::Backend::start(cfg, workspace, tx).await?;
+    let mut backend = backend::Backend::start(cfg.clone(), workspace.clone(), tx, app.backend_generation).await?;
     backend.send(&Action::StartSession).await?;
     let notice = Notice::from_env(|name| std::env::var(name).ok());
     let mut keep = Vec::new();
@@ -192,6 +200,24 @@ async fn event_loop(
             match action {
                 Action::Quit { keep: k } => keep = k,
                 Action::Alert { text } => emit(&notice.alert(&text)),
+                Action::RestartSession { keep } => {
+                    app.backend_generation += 1;
+                    if let Err(e) = backend.shutdown(&keep).await {
+                        app.flash =
+                            Some(format!("previous backend shutdown failed: {}", text::clean_line(&e.to_string())));
+                    }
+                    backend =
+                        backend::Backend::start(cfg.clone(), workspace.clone(), lister.clone(), app.backend_generation)
+                            .await?;
+                    backend.send(&Action::StartSession).await?;
+                }
+                Action::ShowLog => {
+                    let (tx, path) = (lister.clone(), data_dir.join("tui.log"));
+                    tokio::task::spawn_blocking(move || {
+                        let result = log::tail(&path).map_err(|e| e.to_string());
+                        let _ = tx.send(Msg::ServiceLog(result));
+                    });
+                }
                 Action::ListFiles => {
                     let (tx, root) = (lister.clone(), root.clone());
                     tokio::task::spawn_blocking(move || {
@@ -289,11 +315,11 @@ fn read_terminal(tx: UnboundedSender<Msg>, pause: Arc<Pause>) {
 /// get them, but a user can pass any variable to the shell, so the interface
 /// hides them in what commands print.
 fn secrets_in_env() -> Vec<String> {
-    const NAMES: &[&str] = &["API_KEY", "TOKEN", "SECRET", "PASSWORD"];
-    std::env::vars()
-        .filter(|(name, value)| value.len() >= 8 && NAMES.iter().any(|n| name.to_ascii_uppercase().contains(n)))
-        .map(|(_, value)| value)
-        .collect()
+    std::env::vars().filter(|(name, value)| value.len() >= 8 && secret_name(name)).map(|(_, value)| value).collect()
+}
+
+fn secret_name(name: &str) -> bool {
+    ["API_KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|marker| name.to_ascii_uppercase().contains(marker))
 }
 
 struct Runtime {
@@ -328,6 +354,9 @@ impl Runtime {
         self.work.retain(|w| !w.is_finished());
         match action {
             Action::StartSession => {
+                if self.starting || self.session.is_some() {
+                    return;
+                }
                 self.starting = true;
                 let (cfg, workspace, tx, sessions) =
                     (self.cfg.clone(), self.workspace.clone(), self.tx.clone(), self.sessions.clone());
@@ -450,6 +479,8 @@ impl Runtime {
             }
             // The loop handles these: they need the terminal.
             Action::Quit { .. }
+            | Action::RestartSession { .. }
+            | Action::ShowLog
             | Action::Edit { .. }
             | Action::Redraw
             | Action::Suspend

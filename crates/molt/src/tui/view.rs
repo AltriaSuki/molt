@@ -126,7 +126,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             right.push(span("● ", Tone::Ok));
         }
         SessionState::Starting => right.push(span(format!("{} starting ", SPINNER[spin(app.tick)]), Tone::Warn)),
-        SessionState::Down(_) => right.push(span("✗ services down ", Tone::Bad)),
+        SessionState::Down(_) => match app.retry_seconds() {
+            Some(seconds) => right.push(span(format!("↻ retrying in {seconds}s "), Tone::Warn)),
+            None => right.push(span("✗ services down ", Tone::Bad)),
+        },
     }
     let screen = if let Screen::Memory(_) = app.screen { "  memory" } else { "" };
     let fixed = " molt ".len() + 1 + text::width(screen) + 2;
@@ -608,6 +611,8 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let mut right = Vec::new();
     if let Some(flash) = &app.flash {
         right.push(span(format!("{} ", clean_line(flash)), Tone::Warn));
+    } else if let Some(seconds) = app.retry_seconds() {
+        right.push(span(format!("retrying in {seconds}s · /log "), Tone::Warn));
     } else {
         if !app.learning.is_empty() {
             right.push(span(format!("{} learning  ", SPINNER[spin(app.tick)]), Tone::Mem));
