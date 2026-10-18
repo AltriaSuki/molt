@@ -76,11 +76,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .title_bottom(Line::from(span(keys, Tone::Dim)).right_aligned());
         let inner = block.inner(r);
         frame.render_widget(block, r);
-        // Scrolled by whole lines, so a turn's first line is where `{` and `}` land.
-        view.scroll = view.scroll.min(view.lines.len().saturating_sub(1));
+        let mut rows = Vec::new();
+        let mut offsets = Vec::with_capacity(view.lines.len());
+        for line in &view.lines {
+            offsets.push(rows.len());
+            rows.extend(wrap_all(std::slice::from_ref(line), inner.width));
+        }
+        view.visual_starts = view.starts.iter().filter_map(|&at| offsets.get(at).copied()).collect();
+        if let Some(turn) = view.pending_turn.take() {
+            view.scroll = view.visual_starts.get(turn).copied().unwrap_or(0);
+        }
         let height = usize::from(inner.height);
-        let rest: Vec<Line> = view.lines.iter().skip(view.scroll).take(height).cloned().collect();
-        let shown: Vec<Line> = wrap_all(&rest, inner.width).into_iter().take(height).collect();
+        view.scroll = view.scroll.min(rows.len().saturating_sub(height));
+        let shown: Vec<Line> = rows.into_iter().skip(view.scroll).take(height).collect();
         frame.render_widget(Paragraph::new(shown), inner);
     }
     if let Some(viewer) = &mut app.shortcuts {
@@ -135,7 +143,7 @@ fn draw_viewer(frame: &mut Frame, area: Rect, viewer: &mut super::app::Viewer, h
     let inner = block.inner(r);
     frame.render_widget(block, r);
     let lines = wrap_all(&viewer.lines, inner.width);
-    viewer.scroll = viewer.scroll.min(lines.len().saturating_sub(1));
+    viewer.scroll = viewer.scroll.min(lines.len().saturating_sub(usize::from(inner.height)));
     let shown: Vec<Line> = lines.into_iter().skip(viewer.scroll).take(usize::from(inner.height)).collect();
     frame.render_widget(Paragraph::new(shown), inner);
 }
@@ -379,7 +387,13 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 span(format!("−{removed}"), Tone::Bad),
             ])];
             lines.extend(stops_line(app));
-            lines.push(keys(&[("enter", "apply"), ("d", "diff"), ("k", "keep in its fork"), ("n", "discard")]));
+            lines.push(keys(&[
+                ("enter", "apply"),
+                ("d", "diff"),
+                ("v", "review"),
+                ("k", "keep in its fork"),
+                ("n", "discard"),
+            ]));
             lines
         }
         Some(Prompt::Retry { req, stopped, .. }) => vec![

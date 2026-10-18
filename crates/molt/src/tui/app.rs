@@ -509,11 +509,13 @@ pub struct TranscriptView {
     stale: bool,
     read_at: u64,
     pub unfold: bool,
-    /// In lines, not wrapped rows.
+    /// In wrapped rows, clamped when the terminal draws it.
     pub scroll: usize,
     pub lines: Vec<Line<'static>>,
     /// Where each turn starts among the lines.
-    starts: Vec<usize>,
+    pub starts: Vec<usize>,
+    pub visual_starts: Vec<usize>,
+    pub pending_turn: Option<usize>,
 }
 
 /// Text shown over everything else: a diff, a check's files, help.
@@ -1726,6 +1728,21 @@ impl App {
         if ctrl(&key, 'c') || (key_is(&key, KeyCode::Esc) && self.busy()) {
             return self.interrupt();
         }
+        // Confirmation must leave the evidence in the log reachable.
+        if self.prompt.is_some() {
+            match key.code {
+                KeyCode::PageUp => self.scroll = self.scroll.saturating_add(10),
+                KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
+                KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => self.scroll = usize::MAX,
+                KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => self.scroll = 0,
+                _ => return self.prompt_key(key),
+            }
+            return Vec::new();
+        }
+        self.prompt_key(key)
+    }
+
+    fn prompt_key(&mut self, key: KeyEvent) -> Vec<Action> {
         match &self.prompt {
             Some(Prompt::Check(_)) => return self.check_key(&key),
             Some(Prompt::Apply { .. }) => return self.apply_key(&key),
@@ -2839,7 +2856,8 @@ impl App {
             if resp.changes.is_empty() {
                 actions.push(Action::Discard { fork });
             } else if task.mode == Mode::Confirm && !task.req.apply && !matches!(resp.outcome, Outcome::Failed) {
-                let stops = apply_stops(&resp, &self.rules);
+                let stops: Vec<_> =
+                    apply_stops(&resp, &self.rules).into_iter().map(|line| scrub(&line, &self.secrets)).collect();
                 if stops.is_empty() && !self.rules.always_ask {
                     applying = true;
                     actions.push(Action::Apply { fork });
@@ -2909,6 +2927,10 @@ impl App {
                 self.task = None;
                 self.push(Line::from(span("  discarded", Tone::Dim)));
                 vec![Action::Discard { fork }]
+            }
+            KeyCode::Char('v') => {
+                self.viewer = Some(review_viewer(resp.review.as_ref(), &self.secrets));
+                Vec::new()
             }
             KeyCode::Char('d') => {
                 self.viewer = Some(diff_viewer(&resp.patch, resp.patch_truncated));
@@ -3240,6 +3262,7 @@ impl App {
                     pairs.extend([
                         ("enter", "apply result"),
                         ("d", "view diff"),
+                        ("v", "inspect rules and reviewer findings"),
                         ("k / esc", "keep result in its fork"),
                         ("n", "discard result"),
                     ]);
@@ -3302,6 +3325,8 @@ impl App {
             scroll: 0,
             lines: Vec::new(),
             starts: Vec::new(),
+            visual_starts: Vec::new(),
+            pending_turn: None,
         });
         self.render_transcript();
         Vec::new()
@@ -3348,34 +3373,34 @@ impl App {
             }
         }
         (view.lines, view.starts) = (lines, starts);
+        view.visual_starts.clear();
     }
 
     fn transcript_key(&mut self, key: &KeyEvent) -> Vec<Action> {
         let Some(view) = &mut self.transcript else { return Vec::new() };
-        let last = view.lines.len().saturating_sub(1);
+        let starts = if view.visual_starts.is_empty() { &view.starts } else { &view.visual_starts };
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.transcript = None,
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => self.transcript = None,
-            KeyCode::Down | KeyCode::Char('j') => view.scroll = (view.scroll + 1).min(last),
+            KeyCode::Down | KeyCode::Char('j') => view.scroll = view.scroll.saturating_add(1),
             KeyCode::Up | KeyCode::Char('k') => view.scroll = view.scroll.saturating_sub(1),
-            KeyCode::PageDown | KeyCode::Char(' ') => view.scroll = (view.scroll + 20).min(last),
+            KeyCode::PageDown | KeyCode::Char(' ') => view.scroll = view.scroll.saturating_add(20),
             KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(20),
             KeyCode::Char('g') | KeyCode::Home => view.scroll = 0,
-            KeyCode::Char('G') | KeyCode::End => view.scroll = last,
+            KeyCode::Char('G') | KeyCode::End => view.scroll = usize::MAX,
             KeyCode::Char('}') => {
-                if let Some(&next) = view.starts.iter().find(|&&s| s > view.scroll) {
+                if let Some(&next) = starts.iter().find(|&&s| s > view.scroll) {
                     view.scroll = next;
                 }
             }
-            KeyCode::Char('{') => {
-                view.scroll = view.starts.iter().rev().find(|&&s| s < view.scroll).copied().unwrap_or(0)
-            }
+            KeyCode::Char('{') => view.scroll = starts.iter().rev().find(|&&s| s < view.scroll).copied().unwrap_or(0),
             KeyCode::Char('e') => {
                 // Stay on the same turn.
-                let at = view.starts.iter().rposition(|&s| s <= view.scroll);
+                let at = starts.iter().rposition(|&s| s <= view.scroll);
                 view.unfold = !view.unfold;
                 self.render_transcript();
                 let view = self.transcript.as_mut().expect("still open");
+                view.pending_turn = at;
                 view.scroll = at.and_then(|i| view.starts.get(i).copied()).unwrap_or(0);
             }
             KeyCode::Char('v') => {
@@ -3713,10 +3738,28 @@ fn apply_stops(resp: &RunResponse, rules: &ConfirmSection) -> Vec<String> {
         stops.push(outcome_name(resp.outcome).to_owned());
     }
     // The planner holds back what its reviewer did not approve; so does confirm mode.
-    match resp.review.as_ref().map(|r| r.verdict) {
-        Some(Verdict::Reject) => stops.push("review rejected".into()),
-        Some(Verdict::Concern) => stops.push("review questioned".into()),
-        Some(Verdict::Approve) | None => {}
+    if let Some(review) = resp.review.as_ref().filter(|r| r.verdict != Verdict::Approve) {
+        let label = if review.verdict == Verdict::Reject { "review rejected" } else { "review questioned" };
+        let mut sources = Vec::new();
+        if let Some(details) = &review.details {
+            if let Some(rule) = details.rules.first() {
+                sources.push(format!("rule: {}", text::fit(&clean_line(rule), 90)));
+            }
+            if let Some(verdict) = details.reviewer {
+                sources.push(format!(
+                    "reviewer {}",
+                    match verdict {
+                        Verdict::Approve => "approved",
+                        Verdict::Concern => "questioned",
+                        Verdict::Reject => "rejected",
+                    }
+                ));
+            }
+            if details.error.is_some() {
+                sources.push("reviewer did not finish".into());
+            }
+        }
+        stops.push(if sources.is_empty() { label.into() } else { format!("{label} ({})", sources.join("; ")) });
     }
     let (added, removed) = text::diff_counts(&resp.patch);
     if added + removed > rules.max_lines {
@@ -3829,17 +3872,53 @@ fn retryable_startup_error(error: &str) -> bool {
     .any(|marker| error.contains(marker))
 }
 
+fn review_viewer(review: Option<&molt_api::planner::Review>, secrets: &[String]) -> Viewer {
+    let mut lines = Vec::new();
+    let verdict = |v| match v {
+        Verdict::Approve => "approve",
+        Verdict::Concern => "concern",
+        Verdict::Reject => "reject",
+    };
+    if let Some(review) = review {
+        lines.extend(block(&format!("aggregate review: {}", verdict(review.verdict)), "", Tone::Shell));
+        if let Some(details) = &review.details {
+            lines.extend(block("fixed rules", "", Tone::Shell));
+            if details.rules.is_empty() {
+                lines.extend(block("no findings", "  ", Tone::Dim));
+            }
+            for finding in &details.rules {
+                lines.extend(block(&scrub(finding, secrets), "  ", Tone::Plain));
+            }
+            let label = details.reviewer.map_or("no verdict", verdict);
+            lines.extend(block(&format!("reviewer: {label}"), "", Tone::Shell));
+            for finding in &details.findings {
+                lines.extend(block(&scrub(finding, secrets), "  ", Tone::Plain));
+            }
+            if let Some(error) = &details.error {
+                lines.extend(block(&scrub(error, secrets), "  ", Tone::Bad));
+            }
+        } else {
+            lines.extend(block("findings (source not recorded by this planner)", "", Tone::Dim));
+            for finding in &review.findings {
+                lines.extend(block(&scrub(finding, secrets), "  ", Tone::Plain));
+            }
+        }
+    } else {
+        lines.extend(block("no review was requested", "", Tone::Dim));
+    }
+    Viewer { title: "review details".into(), lines, scroll: 0 }
+}
+
 fn viewer_key(view: &mut Option<Viewer>, key: &KeyEvent) {
     let Some(viewer) = view else { return };
-    let last = viewer.lines.len().saturating_sub(1);
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => *view = None,
-        KeyCode::Down | KeyCode::Char('j') => viewer.scroll = (viewer.scroll + 1).min(last),
+        KeyCode::Down | KeyCode::Char('j') => viewer.scroll = viewer.scroll.saturating_add(1),
         KeyCode::Up | KeyCode::Char('k') => viewer.scroll = viewer.scroll.saturating_sub(1),
-        KeyCode::PageDown | KeyCode::Char(' ') => viewer.scroll = (viewer.scroll + 20).min(last),
+        KeyCode::PageDown | KeyCode::Char(' ') => viewer.scroll = viewer.scroll.saturating_add(20),
         KeyCode::PageUp => viewer.scroll = viewer.scroll.saturating_sub(20),
         KeyCode::Char('g') | KeyCode::Home => viewer.scroll = 0,
-        KeyCode::Char('G') | KeyCode::End => viewer.scroll = last,
+        KeyCode::Char('G') | KeyCode::End => viewer.scroll = usize::MAX,
         _ => {}
     }
 }
@@ -4178,6 +4257,92 @@ mod tests {
         let actions = app.update(Msg::Ran { trace, result: Ok(response) });
         assert!(matches!(actions.as_slice(), [Action::Run { req, .. }] if req.task == "second"));
         assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn confirmations_keep_log_navigation_and_explain_rules_separately_from_the_reviewer() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        app.rules.always_ask = true;
+        type_in(&mut app, "fix parser");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
+        for apply in [false, true] {
+            if apply {
+                app.update(key(KeyCode::Enter));
+                let mut resp = passed(false, Some("/fork/result"));
+                resp.review = Some(molt_api::planner::Review {
+                    verdict: Verdict::Concern,
+                    findings: vec!["src/parser.rs adds a test skip".into()],
+                    details: Some(molt_api::planner::ReviewDetails {
+                        rules: vec!["src/parser.rs adds a test skip".into()],
+                        reviewer: Some(Verdict::Approve),
+                        ..Default::default()
+                    }),
+                });
+                app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+                let reason = app.task.as_ref().unwrap().stops.join("; ");
+                assert!(reason.contains("rule: src/parser.rs") && reason.contains("reviewer approved"), "{reason}");
+            }
+            app.update(key(KeyCode::PageUp));
+            assert_eq!(app.scroll, 10);
+            app.update(Msg::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL)));
+            assert_eq!(app.scroll, usize::MAX);
+            app.update(Msg::Key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL)));
+            assert_eq!(app.scroll, 0);
+            app.update(key(KeyCode::PageUp));
+            app.update(key(KeyCode::PageDown));
+            assert_eq!(app.scroll, 0);
+            assert!(app.prompt.is_some());
+        }
+        app.update(key(KeyCode::Char('v')));
+        let shown = plain(&app.viewer.as_ref().unwrap().lines).join("\n");
+        assert!(
+            shown.contains("fixed rules")
+                && shown.contains("src/parser.rs adds a test skip")
+                && shown.contains("reviewer: approve"),
+            "{shown}"
+        );
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
+    }
+
+    #[test]
+    fn end_in_diff_and_transcript_viewers_places_the_final_wrapped_row_at_the_bottom() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        let lines = || {
+            let mut lines: Vec<_> = (0..90).map(|i| Line::from(format!("line {i}"))).collect();
+            lines[20] = Line::from("long wrapped text ".repeat(100));
+            lines.push(Line::from("FINAL VISIBLE ROW"));
+            lines
+        };
+        let last_row = 35; // A 35-row panel in the existing 140 x 40 fixture, minus its border.
+        app.viewer = Some(Viewer { title: "diff".into(), lines: lines(), scroll: 0 });
+        app.update(key(KeyCode::Char('G')));
+        let rows = frame_rows(&mut app, 140);
+        assert!(rows[last_row].contains("FINAL VISIBLE ROW"), "{}", rows.join("\n"));
+        assert!(!rows[3].trim_matches([' ', '│']).is_empty());
+        app.update(key(KeyCode::Esc));
+
+        let trace = TraceId::random();
+        app.last_run = Some(trace.to_string());
+        app.update(ctrl_key('o'));
+        app.update(Msg::Audit {
+            trace: trace.clone(),
+            result: Ok(AuditPage { entries: transcript::tests::two_turns(&trace), cursor: Some(100), more: false }),
+        });
+        let view = app.transcript.as_mut().unwrap();
+        view.lines = lines();
+        view.starts = vec![0, 40];
+        app.update(key(KeyCode::Char('G')));
+        let rows = frame_rows(&mut app, 140);
+        assert!(rows[last_row].contains("FINAL VISIBLE ROW"), "{}", rows.join("\n"));
+        app.update(key(KeyCode::Char('g')));
+        app.update(key(KeyCode::Char('}')));
+        let view = app.transcript.as_ref().unwrap();
+        assert_eq!(view.scroll, view.visual_starts[1]);
+        assert!(view.scroll > view.starts[1], "turn navigation counts wrapped rows");
     }
 
     #[test]
@@ -6311,7 +6476,7 @@ mod tests {
         let changes = vec![Change { path: "crates/a/Cargo.toml".into(), kind: ChangeKind::Modified }];
         assert_eq!(apply_stop(RunResponse { changes, ..ok() }), ["touches crates/a/Cargo.toml"]);
         assert_eq!(apply_stop(RunResponse { patch_truncated: true, ..ok() }), ["diff cut short"]);
-        let review = |verdict| Some(molt_api::planner::Review { verdict, findings: vec![] });
+        let review = |verdict| Some(molt_api::planner::Review { verdict, findings: vec![], details: None });
         assert_eq!(apply_stop(RunResponse { review: review(Verdict::Reject), ..ok() }), ["review rejected"]);
         assert_eq!(apply_stop(RunResponse { review: review(Verdict::Concern), ..ok() }), ["review questioned"]);
     }

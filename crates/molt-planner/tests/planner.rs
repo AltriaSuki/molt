@@ -1992,7 +1992,14 @@ fn reviewed(reviewer: impl Fn(&CompleteRequest) -> Reply + Send + Sync + 'static
 async fn an_approved_winner_is_applied_and_the_review_reported() {
     let fake = reviewed(|req| submit_review(req, "approve", &[]));
     let resp = run(&fake, RunRequest { review: true, ..request(Some("check"), 1) }).await;
-    assert_eq!(resp.review, Some(Review { verdict: Verdict::Approve, findings: vec![] }));
+    assert_eq!(
+        resp.review,
+        Some(Review {
+            verdict: Verdict::Approve,
+            findings: vec![],
+            details: Some(molt_api::planner::ReviewDetails { reviewer: Some(Verdict::Approve), ..Default::default() })
+        })
+    );
     assert!(resp.applied, "{}", resp.summary);
     assert_eq!(fake.workspace()["hello.txt"], "hi\n");
 
@@ -2086,6 +2093,10 @@ async fn a_skip_marker_is_a_concern_whatever_the_reviewer_says() {
     let review = resp.review.clone().unwrap();
     assert_eq!(review.verdict, Verdict::Concern);
     assert!(review.findings[0].starts_with("tests/slow.rs adds `#[ignore`"), "{:?}", review.findings);
+    let details = review.details.as_ref().unwrap();
+    assert_eq!(details.reviewer, Some(Verdict::Approve));
+    assert_eq!(details.rules, review.findings);
+    assert!(details.findings.is_empty() && details.error.is_none());
     assert!(!resp.applied && resp.summary.contains("the review questioned the changes"), "{}", resp.summary);
 }
 
