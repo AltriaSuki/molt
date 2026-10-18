@@ -45,7 +45,8 @@ pub(crate) async fn run_cancellable(
     if let Some(resume) = req.resume.clone() {
         return resume_run(bus, cfg, req, resume, trace, cancel).await;
     }
-    validate(&req, &cfg)?;
+    let mut req = req;
+    let routes = routes(&req, &cfg)?;
     let state = match (req.checkpoint, &cfg.state_dir) {
         (false, _) => None,
         (true, Some(dir)) => Some(dir.clone()),
@@ -54,6 +55,10 @@ pub(crate) async fn run_cancellable(
     let mut ctx = Ctx::new(bus, cfg, trace, &req);
     ctx.cancel = cancel.clone();
     ctx.run_cancel = cancel;
+    if let Some(candidates) = routes {
+        // Picked before anything else, so a checkpoint saves the workflow the run goes through.
+        req.workflow = Some(pick(&mut ctx, &req, &candidates).await.to_owned());
+    }
     if let Some(dir) = &state {
         let store = Store::create(dir, Saved::new(ctx.trace.as_str(), req.clone())).map_err(failed)?;
         ctx.checkpoint = Some(Arc::new(store));
@@ -75,8 +80,7 @@ pub(crate) async fn run_cancellable(
         Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason)).await),
     };
     save_check(&ctx, &settled, designed);
-    // Without a check or a rubric there is nothing to pick a winner by, so one attempt is enough.
-    let count = if settled.verified() { req.attempts } else { 1 };
+    let count = attempt_count(&req, &settled, &ctx.workflow);
     let slots = (0..count).map(|index| Slot::Run { index, saved: None }).collect();
     Ok(finish(&ctx, &req, settled, designed, slots).await)
 }
@@ -154,7 +158,7 @@ async fn resume_run(
         }
     };
 
-    let count = if settled.verified() { run_req.attempts } else { 1 };
+    let count = attempt_count(&run_req, &settled, &ctx.workflow);
     let passed = saved.attempts.iter().any(|a| a.end.as_ref().is_some_and(|e| e.status == AttemptStatus::Passed));
     let mut slots = Vec::new();
     for attempt in &saved.attempts {
@@ -222,6 +226,48 @@ fn designed_here(req: &RunRequest, workflow: &Workflow) -> bool {
         && ((req.check.is_none() && req.rubric.is_empty()) || !req.check_files.is_empty())
 }
 
+/// How many attempts run: the workflow's count, or the request's. Without a
+/// check or a rubric there is nothing to pick a winner by, and a kept
+/// result to go on from is one fork, so one attempt is enough.
+fn attempt_count(req: &RunRequest, settled: &Settled, workflow: &Workflow) -> u32 {
+    let continues_kept = req.continues.as_ref().is_some_and(|c| c.fork.is_some());
+    if !settled.verified() || workflow.read_only() || continues_kept {
+        return 1;
+    }
+    workflow.stages.attempts.and_then(|a| a.count).unwrap_or(req.attempts)
+}
+
+/// For a request that names [`workflow::AUTO`], the workflows it can run
+/// with, lightest first; `None` for any other, which is validated here.
+fn routes(req: &RunRequest, cfg: &Config) -> Result<Option<Vec<&'static str>>, RemoteError> {
+    if req.workflow.as_deref() != Some(workflow::AUTO) {
+        validate(req, cfg)?;
+        return Ok(None);
+    }
+    let with = |name: &str| RunRequest { workflow: Some(name.to_owned()), ..req.clone() };
+    let candidates: Vec<&'static str> =
+        workflow::ROUTED.into_iter().filter(|name| validate(&with(name), cfg).is_ok()).collect();
+    if candidates.is_empty() {
+        // Why the heaviest cannot run says what to change.
+        validate(&with(workflow::VERIFY), cfg)?;
+    }
+    Ok(Some(candidates))
+}
+
+/// Pick the run's workflow among `candidates` and make it the run's, saying so.
+async fn pick(ctx: &mut Ctx, req: &RunRequest, candidates: &[&'static str]) -> &'static str {
+    // The pick is a model call of the run: it counts against its budget like any other.
+    let probe = Arc::new(ctx.clone());
+    let routed = crate::route::route(&probe, candidates, req.check.as_deref()).await;
+    drop(probe);
+    let picked = workflow(&ctx.cfg, Some(routed.workflow)).unwrap_or_else(|_| Workflow::verify());
+    ctx.workflow = Arc::new(picked);
+    tracing::info!(run = %ctx.trace, workflow = routed.workflow, reason = %routed.reason, "picked a workflow");
+    ctx.progress(Progress::Routed { run: ctx.run_id(), workflow: routed.workflow.to_owned(), reason: routed.reason })
+        .await;
+    routed.workflow
+}
+
 /// The workflow `name` names: a built-in, or one of the planner's own
 /// configuration. `None` is [`workflow::VERIFY`].
 pub(crate) fn workflow(cfg: &Config, name: Option<&str>) -> Result<Workflow, String> {
@@ -230,7 +276,8 @@ pub(crate) fn workflow(cfg: &Config, name: Option<&str>) -> Result<Workflow, Str
         None => {
             let name = name.unwrap_or_default();
             let known = || {
-                std::iter::once(workflow::VERIFY)
+                [workflow::VERIFY, workflow::ASK, workflow::QUICK]
+                    .into_iter()
                     .chain(cfg.workflows.iter().map(|w| w.name.as_str()))
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -445,18 +492,42 @@ pub(crate) async fn design_cancellable(
     trace: TraceId,
     cancel: CancellationToken,
 ) -> Result<DesignResponse, RemoteError> {
-    validate(&req, &cfg)?;
+    let routes = routes(&req, &cfg)?;
     if req.check.is_some() || !req.rubric.is_empty() || !req.verify {
         let message = "planner.design designs a check: leave out check and rubric, and keep verify".to_owned();
         return Err(RemoteError { code: ErrorCode::Invalid, message });
     }
     let mut ctx = Ctx::new(bus, cfg, trace, &req);
+    ctx.cancel = cancel.clone();
+    ctx.run_cancel = cancel.clone();
+    let picked = match &routes {
+        Some(candidates) => Some(pick(&mut ctx, &req, candidates).await),
+        None => None,
+    };
+    if let Some(name) = picked.filter(|_| ctx.workflow.stages.design.is_none()) {
+        // A workflow that designs nothing: the caller runs the task with it.
+        let tally = ctx.settle(ctx.cfg.late_reply_wait).await;
+        let known = tally.uncounted_calls() == 0;
+        return Ok(DesignResponse {
+            command: None,
+            files: Vec::new(),
+            suite: None,
+            rubric: Vec::new(),
+            rationale: format!("workflow {name} designs no check"),
+            baseline: None,
+            usage: tally.spend.usage,
+            cost_usd: tally.spend.cost_usd,
+            uncounted_calls: tally.uncounted_calls(),
+            remaining_budget_usd: known.then(|| (ctx.budget_usd - tally.spend.cost_usd).max(0.0)),
+            error: None,
+            cancelled: false,
+            workflow: Some(name.to_owned()),
+        });
+    }
     if ctx.workflow.stages.design.is_none() {
         let message = format!("workflow {:?} has no design stage: planner.design has nothing to do", ctx.workflow.name);
         return Err(RemoteError { code: ErrorCode::Invalid, message });
     }
-    ctx.cancel = cancel.clone();
-    ctx.run_cancel = cancel;
     gather_context(&mut ctx).await;
     let ctx = Arc::new(ctx);
     let design = designer::design(&ctx, true).await;
@@ -476,6 +547,7 @@ pub(crate) async fn design_cancellable(
         remaining_budget_usd: (tally.uncounted_calls() == 0).then(|| (ctx.budget_usd - tally.spend.cost_usd).max(0.0)),
         error: None,
         cancelled: false,
+        workflow: picked.map(str::to_owned),
     };
     match design {
         Ok(Design::Check { command, files, suite, rationale, baseline }) => {
@@ -522,11 +594,26 @@ fn inside(path: &str) -> bool {
 fn validate(req: &RunRequest, cfg: &Config) -> Result<(), RemoteError> {
     let budget = req.budget_usd.unwrap_or(cfg.budget_usd);
     let flow = workflow(cfg, req.workflow.as_deref()).map_err(invalid)?;
+    let kept = req.continues.as_ref().and_then(|c| c.fork.as_deref());
     let problem = if flow.stages.compare.is_none() && !req.select.is_first() {
         format!(
             "select {} compares attempts that pass, and workflow {:?} has no compare stage: leave select out",
             req.select, flow.name
         )
+    } else if flow.read_only() && (req.check.is_some() || !req.rubric.is_empty()) {
+        format!(
+            "workflow {:?} answers without changing anything, so there is nothing to check: leave out the check",
+            flow.name
+        )
+    } else if flow.read_only() && req.checkpoint {
+        format!(
+            "workflow {:?} answers in one go without a fork, and keeps no checkpoint: leave checkpoint out",
+            flow.name
+        )
+    } else if kept.is_some_and(|f| f.trim().is_empty()) {
+        "continues names an empty fork: leave it out when the result was applied".to_owned()
+    } else if req.continues.as_ref().is_some_and(|c| c.fork.is_none() && c.conversation.is_empty()) {
+        "continues gives neither a conversation nor a kept result to go on from".to_owned()
     } else if req.task.trim().is_empty() {
         "task is empty".to_owned()
     } else if req.workspace.trim().is_empty() {
@@ -687,6 +774,9 @@ async fn conclude(
     stopped: bool,
 ) -> RunResponse {
     let (spec, check) = checks;
+    if ctx.workflow.read_only() {
+        return answered(ctx, rubric, &finished, &passed);
+    }
     let candidates: Vec<(&Finished, String)> = passed
         .iter()
         .filter(|_| !ctx.run_cancel.is_cancelled())
@@ -715,7 +805,9 @@ async fn conclude(
         rubric: rubric.to_vec(),
         judgement: Vec::new(),
         dispute: None,
-        verification: Some(verification(spec.as_ref(), rubric)),
+        verification: Some(verification(spec.as_ref(), rubric, reviews_by_rules(ctx, req))),
+        workflow: Some(ctx.workflow.name.clone()),
+        conversation: Vec::new(),
     };
     let outcome = match (&spec, rubric.is_empty()) {
         (Some(_), _) => Outcome::Passed,
@@ -779,7 +871,7 @@ async fn conclude(
     let picked = compare(ctx, req, check.as_ref(), !rubric.is_empty(), &candidates).await;
     let (done, fork) = &candidates[picked.position];
     ctx.drop_forks_except(Some(fork)).await;
-    resp.selection = Some(picked.selection);
+    resp.selection = Some(Box::new(picked.selection));
     deliver(ctx, req, outcome, &mut resp, done, fork.clone(), picked.diff, picked.review).await;
     resp
 }
@@ -794,8 +886,12 @@ async fn review_of(
     diff: &molt_api::fs::DiffResponse,
 ) -> Option<Review> {
     // Reviewed against the check it passed and the requirements it followed.
-    let reviews = req.review && ctx.workflow.stages.review.is_some();
-    let check = check.filter(|_| reviews && !diff.changes.is_empty())?;
+    let stage = ctx.workflow.stages.review.filter(|_| req.review && !diff.changes.is_empty())?;
+    if stage.rules_only {
+        let files = check.map(|c| c.files.as_slice()).unwrap_or_default();
+        return Some(review::by_rules(ctx, files, &diff.changes, &diff.patch).await);
+    }
+    let check = check?;
     let requirements = ctx.control.upto(done.report.requirements);
     let winner = Winner {
         fork,
@@ -824,6 +920,7 @@ async fn deliver(
     resp.winner = Some(done.report.index);
     resp.outcome = outcome;
     resp.judgement = done.findings.clone();
+    resp.conversation = done.conversation.clone();
     resp.summary = if done.summary.is_empty() {
         "The attempt finished without a summary.".to_owned()
     } else {
@@ -877,6 +974,10 @@ async fn deliver(
         resp.fork = Some(fork);
     } else if !resp.applied {
         ctx.drop_fork(&fork).await;
+    }
+    // The fixed rules looked at nothing when nothing changed.
+    if resp.verification == Some(Verification::Rules) && resp.review.is_none() {
+        resp.verification = Some(Verification::None);
     }
 }
 
@@ -1056,14 +1157,44 @@ fn not_designed(ctx: &Ctx, reason: &str) -> RunResponse {
         judgement: Vec::new(),
         dispute: None,
         verification: Some(Verification::None),
+        workflow: Some(ctx.workflow.name.clone()),
+        conversation: Vec::new(),
     }
 }
 
-/// What a run's result is held to: its check, else its rubric, else nothing.
-fn verification(check: Option<&CheckSpec>, rubric: &[Criterion]) -> Verification {
+/// The reply of a workflow that only reads: the answer, unverified, with
+/// nothing changed, applied or kept.
+fn answered(ctx: &Ctx, rubric: &[Criterion], finished: &[Finished], passed: &[u32]) -> RunResponse {
+    let mut resp = not_designed(ctx, "");
+    resp.attempts = finished.iter().map(|f| f.report.clone()).collect();
+    match passed.first().and_then(|w| finished.iter().find(|f| f.report.index == *w)) {
+        Some(done) => {
+            resp.outcome = Outcome::Unverified;
+            resp.winner = Some(done.report.index);
+            resp.summary = if done.summary.is_empty() {
+                "The attempt finished without an answer.".to_owned()
+            } else {
+                done.summary.clone()
+            };
+            resp.conversation = done.conversation.clone();
+        }
+        None => resp.summary = failure_summary(None, rubric, finished),
+    }
+    resp
+}
+
+/// Whether a result without a check or a rubric is held to the review's fixed rules.
+fn reviews_by_rules(ctx: &Ctx, req: &RunRequest) -> bool {
+    req.review && ctx.workflow.stages.review.is_some_and(|r| r.rules_only)
+}
+
+/// What a run's result is held to: its check, else its rubric, else the
+/// review's fixed rules when that is all the workflow reviews by, else nothing.
+fn verification(check: Option<&CheckSpec>, rubric: &[Criterion], rules: bool) -> Verification {
     match (check, rubric.is_empty()) {
         (Some(_), _) => Verification::Command,
         (None, false) => Verification::Judged,
+        (None, true) if rules => Verification::Rules,
         (None, true) => Verification::None,
     }
 }

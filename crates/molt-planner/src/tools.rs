@@ -185,6 +185,11 @@ impl Tool {
                     references: f.references.unwrap_or(true),
                     limit: Some(SYMBOL_LIMIT),
                 };
+                // An attempt that only reads works in the workspace itself, which memory indexes as it is.
+                if workspace == ctx.workspace {
+                    let response: SymbolsResponse = ctx.call(memory::SYMBOLS, query, files).await?;
+                    return Ok(show_symbols(response));
+                }
                 let req = ForkSymbolsRequest { query, fork: workspace };
                 let response: ForkSymbolsResponse = ctx.call(memory::FORK_SYMBOLS, req, files).await?;
                 Ok(format!(

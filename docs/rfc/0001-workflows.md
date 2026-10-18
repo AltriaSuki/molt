@@ -2,7 +2,7 @@
 
 - Issue: #156 (roadmap #153, phase 1, C2)
 - Related: #137 (design budget share), #47, #75, #157 (light workflow)
-- Status: phase 1 implemented
+- Status: phase 1 implemented; the light workflows of #157 implemented
 
 ## Summary
 
@@ -65,10 +65,27 @@ A workflow is a document of this shape (shown as JSON; the types are
   empty object enables a stage with its defaults.
 - Unknown stages and unknown parameters are refused, so a typo cannot
   silently turn a stage off.
-- Version 1 has one parameter: `design.budget_share`, the share of the run's
-  budget designing may spend (more than 0, at most 1). Without it the
-  planner's own share applies (`MOLT_DESIGN_BUDGET_SHARE`, #137). A request's
-  `design_budget_usd` still wins over both.
+- `design.budget_share` is the share of the run's budget designing may
+  spend (more than 0, at most 1). Without it the planner's own share applies
+  (`MOLT_DESIGN_BUDGET_SHARE`, #137). A request's `design_budget_usd` still
+  wins over both.
+- `attempts.count` (1 to 8) fixes how many attempts run, whatever the
+  request's `attempts`. Without a check or a rubric one runs anyway.
+- `attempts.read_only: true` has the attempt work in the workspace itself,
+  without a fork, offered only the tools that read (`read_file`,
+  `list_files`, `search`, `find_symbol`, `recall`, `fetch_url`); a call to
+  any other is refused without running. Its result changes nothing and is
+  never applied or kept. Such a workflow has no `design`, `compare` or
+  `review` stage, and a request with a check, a rubric or `checkpoint` is
+  refused.
+- `review.rules_only: true` has only the review's fixed rules look at the
+  diff, with or without a check; no reviewer model is asked. A diff they
+  find nothing in is approved, one they question is kept, not applied.
+
+The last three were added for #157. They are optional, so every version 1
+document written before them still reads the same; a planner that does not
+know them refuses a document that uses them, as it refuses any unknown
+parameter.
 
 Stage parameters that today live on the request (`attempts`, `select`,
 `max_turns`, ...) stay there in version 1; a later version can move a
@@ -84,7 +101,7 @@ passed:
 | --- | --- |
 | `command` | A done-check command, run by the planner in the result's fork, after restoring the check's files. |
 | `judged` | A rubric: each criterion decided by its own command or by an independent model judge. Weaker than `command`. |
-| `rules` | Only the review's fixed rules looked at the diff. Named now so readers know it; no version 1 workflow produces it. |
+| `rules` | Only the review's fixed rules looked at the diff: a result without a check or a rubric in a workflow whose review is `rules_only` (`quick`). A result that changed nothing had nothing to look at, and is `none`. |
 | `none` | Nothing checked the result. |
 
 The level is shown
@@ -131,12 +148,61 @@ refused and a run without a check runs unverified.
 A checkpoint saves the request with its `workflow`, so a resumed run goes on
 through the same workflow.
 
+## The light built-ins: `ask` and `quick` (#157)
+
+```json
+{ "schema": 1, "name": "ask",
+  "stages": { "context": {}, "attempts": { "count": 1, "read_only": true }, "deliver": {} } }
+{ "schema": 1, "name": "quick",
+  "stages": { "context": {}, "attempts": { "count": 1 }, "review": { "rules_only": true }, "deliver": {} } }
+```
+
+- `ask` answers a question. No fork is made, no check is designed and
+  `planner.design` is never called; the reply's outcome is `unverified`, its
+  level `none`, with no changes. Front ends call it an unverified answer.
+- `quick` makes a small change: one attempt, no designed check (a check the
+  request gives is run, and the level is `command`), the review's fixed rules
+  only (level `rules` without a check), then apply.
+- Neither learns: a run that should leave notes is a `verify` run.
+
+### `auto`
+
+`auto` is not a workflow but a name a request may give in its place. The
+planner then picks one of `ask`, `quick` and `verify` with one model call on
+the task alone (one tool, `submit_route`; the model is the planner's
+`route_model`, `MOLT_ROUTE_MODEL`, or the run's), counted in the run's cost
+like any other call. Only workflows the request validates under are offered,
+so with a check or a rubric `ask` is never one, and with a `select` other
+than `first` only `verify` is. The pick is published as a `routed` progress
+event before anything else runs, and the reply's `workflow` names it. A pick
+that fails, does not come, or names a workflow that was not offered is the
+heaviest offered: routing never makes a run lighter by failing. A request
+that names a workflow is never routed, so naming `verify` is how a person
+overrides a pick. A checkpoint saves the workflow picked, not `auto`.
+
+`planner.design` takes `auto` too, for a front end that shows the check
+before the attempts: it picks first and, for a workflow that designs
+nothing, answers at once with `workflow` set and no check, for the caller to
+run the task with that workflow.
+
+### Going on from a task
+
+`RunRequest.continues` carries the previous task's conversation with the
+model, as its reply's `conversation` gave it (the winner's, fitted to a
+quarter of a bus frame), and the fork its result was kept in when it was not
+applied. The attempt's conversation starts with it, then the new task; the
+usual fitting leaves out its oldest turns when it no longer fits the model's
+input. With a kept fork, the one attempt works in that fork, which the run
+never drops: a run that fails leaves it to the user, and one that applies
+merges both tasks' changes. Without one, a new fork of the workspace, which
+holds the earlier result when it was applied.
+
 ## Trust rule
 
 A request names a workflow; it never defines one. Workflows are defined only
 where executable configuration already comes from:
 
-1. the planner's built-ins (`verify`);
+1. the planner's built-ins (`verify`, `ask`, `quick`);
 2. the planner's own configuration (`molt_planner::Config::workflows`), set by
    whoever starts the planner.
 
@@ -154,11 +220,8 @@ Deferred, deliberately:
   name a bus method (with its capability and budget) that the planner calls
   at that point. This needs the extension principles of #153 phase 2 and
   comes then.
-- Loading workflows from the user's trusted configuration file, and a
-  `molt do --workflow NAME` switch.
-- Lightweight workflows such as #157's, built on this schema.
-- Moving request fields into stage parameters, in a later schema version.
-- A workflow that produces `rules`: the review's fixed rules over a result
-  that has no check.
+- Loading workflows from the user's trusted configuration file.
+- Moving more request fields into stage parameters (`attempts.count` is the
+  first), in a later schema version.
 - The learn stage for workflows the caller does not know: it runs on the
   caller's side, which in phase 1 looks up only the built-ins.

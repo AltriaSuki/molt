@@ -67,6 +67,35 @@ needs in them.
 - If some criteria are not met, you get the judge's findings and continue."
 );
 
+/// The system prompt of an attempt that answers with tools that only read.
+pub(crate) const ASK_SYSTEM: &str = "\
+You are a software engineer answering the user's question about a project, working on your own without anyone \
+to ask.
+
+You work in the user's workspace itself, with tools that only read: you cannot change files or run commands, \
+and must not try. Paths in tool calls are relative to the workspace root.
+
+How to work:
+- Look up what you need with the tools: find code with search instead of reading whole trees, and read large \
+files in windows with offset and limit.
+- Answer as soon as you know enough. Say what your answer rests on (the files and lines), and say plainly what \
+you could not find out.
+- If the question asks for a change, describe the change instead: nothing you say is applied.
+- When you are done, stop calling tools and reply with the answer. It is returned to the user unverified.";
+
+/// The system prompt of the call that picks a workflow for a task.
+pub(crate) const ROUTE_SYSTEM: &str = "\
+You decide how much process a software task needs before an agent works on it. Call submit_route once with \
+one of the workflows offered, and a reason of a few words. Pick the lightest one that fits:
+
+- ask: a question to answer, an explanation, a review or a look-up. Nothing in the project is to change.
+- quick: a small, local change whose correctness is plain from the diff: a comment, a rename, a message, a \
+version bump, a one-line fix. One attempt makes it.
+- verify: anything else: a change to behavior, a bug fix, a feature, or anything that touches several places \
+or needs tests. A done-check is designed first and the result is reviewed.
+
+When in doubt between two, pick the heavier.";
+
 pub(crate) const JUDGE_SYSTEM: &str = "\
 You judge the result of a task against its criteria. Another agent did the task; you decide, criterion by \
 criterion, whether its result meets each one.
@@ -417,6 +446,53 @@ pub(crate) fn judge_first_message(
     }
     text.push_str("\n\nJudge the result.");
     user_blocks(vec![text_block(text)])
+}
+
+/// The router's first message: the task, as data, and the workflows it may pick.
+pub(crate) fn route_first_message(task: &str, candidates: &[&str], check: Option<&str>) -> Value {
+    let mut text = format!("<task>\n{task}\n</task>\n\nThe workflows you may pick: {}.", candidates.join(", "));
+    if let Some(check) = check {
+        text.push_str(&format!(" The user gave the done-check `{check}`, which every workflow offered runs."));
+    }
+    user_blocks(vec![text_block(text)])
+}
+
+/// The router's one tool.
+pub(crate) fn route_tools() -> Vec<Value> {
+    vec![tool(
+        t::SUBMIT_ROUTE,
+        "Submit the workflow for the task. This ends your work.",
+        json!({
+            "workflow": {
+                "type": "string",
+                "enum": molt_api::workflow::ROUTED,
+                "description": "One of the workflows offered for this task.",
+            },
+            "reason": { "type": "string", "description": "Why, in a few words." },
+        }),
+        &["workflow", "reason"],
+    )]
+}
+
+pub(crate) const ROUTE_NUDGE: &str = "You have not called submit_route. Call it now with the workflow.";
+
+/// The user turn that starts a task going on from the conversation before
+/// it: the new task, and how its result is checked.
+pub(crate) fn continued_message(task: &str, first: Value) -> Value {
+    let mut blocks = first["content"].as_array().cloned().unwrap_or_default();
+    let lead = format!(
+        "The user goes on from the task above with a new one. Your workspace holds the result of the task above. \
+         Carry out the new task; your final reply answers it.\n\n<task>\n{task}\n</task>"
+    );
+    // The first block of an attempt's first message is the task and its check; the task is said above.
+    if let Some(first) = blocks.first_mut() {
+        let text = first["text"].as_str().unwrap_or_default();
+        let rest = text.split_once("</task>").map_or(text, |(_, rest)| rest).trim_start();
+        *first = text_block(format!("{lead}\n\n{rest}"));
+    } else {
+        blocks.push(text_block(lead));
+    }
+    user_blocks(blocks)
 }
 
 pub(crate) fn designer_first_message(task: &str, preamble: &[&str]) -> Value {
@@ -883,6 +959,20 @@ pub(crate) fn checked_attempt_tools(memory: bool, web: bool) -> Vec<Value> {
 
 /// The only tools a reviewer's calls may use: none of them changes the fork.
 pub(crate) const REVIEWER_READS: &[&str] = &[t::READ_FILE, t::LIST_FILES, t::SEARCH];
+
+/// The only tools an attempt that only reads may use: none of them changes
+/// the workspace or runs a command.
+pub(crate) const ASK_READS: &[&str] =
+    &[t::READ_FILE, t::LIST_FILES, t::SEARCH, t::FIND_SYMBOL, t::RECALL, t::FETCH_URL];
+
+/// The tools of an attempt that only reads: an attempt's, less those that
+/// change files or run commands.
+pub(crate) fn ask_tools(memory: bool, web: bool) -> Vec<Value> {
+    attempt_tools(memory, web)
+        .into_iter()
+        .filter(|t| ASK_READS.contains(&t["name"].as_str().unwrap_or_default()))
+        .collect()
+}
 
 /// The designer's tools: an attempt's, plus submit_check.
 pub(crate) fn designer_tools(memory: bool, web: bool) -> Vec<Value> {

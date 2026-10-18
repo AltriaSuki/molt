@@ -51,6 +51,7 @@ impl Saved {
                     _ => Notify::Waiting,
                 },
                 commit: config.commit.unwrap_or(false),
+                workflow: None,
             },
         )
     }

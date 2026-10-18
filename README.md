@@ -88,6 +88,7 @@ sender from that.
 | Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
 | Commands build into a private writable directory outside the fork, and a result never carries the build artifacts commands leave in the fork: they are reported and not applied | `crates/molt/tests/agent.rs` (`build_output_of_the_check_is_left_out_of_the_result_and_the_workspace`), `crates/molt-tools/tests/fs.rs` (`build_artifacts_that_commands_leave_in_a_fork_are_reported_and_never_merged`), `crates/molt-tools/tests/sandbox.rs` (`build_output_goes_to_a_private_writable_directory_outside_the_fork_that_later_commands_reuse`) |
 | A request names a workflow and never defines one: only the planner's built-ins and its own configuration define workflows, and every result says what it was verified by (`command`, `judged`, `rules` or `none`) in the reply, `--json` and a `Molt-Verification` commit trailer | `crates/molt-planner/tests/planner.rs` (`a_request_can_name_a_workflow_but_only_one_the_planner_has`, `every_result_carries_its_verification_level`), `crates/molt/tests/agent.rs` (`the_verification_level_is_in_the_json_and_the_commit_trailers`) |
+| A question (`ask`) makes no fork, designs no check and can change no file; `quick` runs exactly one attempt and designs nothing; the workflow `auto` picks is said before anything runs, never lighter than a given check allows, and the full one when the pick fails | `crates/molt-planner/tests/planner.rs` (`a_question_is_answered_in_the_workspace_without_a_fork_a_design_or_a_change`, `quick_runs_exactly_one_attempt_without_designing_and_reviews_by_the_fixed_rules`, `auto_picks_a_light_workflow_says_so_first_and_runs_it`, `with_a_check_auto_never_picks_ask_and_a_failed_pick_is_the_full_workflow`) |
 | Offline embedding models are hash-pinned and cannot reintroduce forgotten or cross-project notes | `semantic::tests::pinned_models_retrieve_synonyms_and_reject_changed_files`, `semantic::tests::synonyms_are_recalled_with_scores_and_snapshots_survive_forgetting` |
 
 ## Quick start
@@ -189,6 +190,20 @@ The tasks you give one after another make a conversation: each new task is
 told what the last five asked, how they ended, what they said and which
 files they changed, and whether those changes are in the workspace. Every
 task still has its own check and budget. `/new` starts a new conversation.
+`/continue TASK` goes further: the new task gets the last one's whole
+conversation with the model (its oldest turns left out when it does not fit),
+and works in its result's fork while that result is kept.
+
+Not every task needs the whole pipeline. Before a task starts, one small
+model call picks how much it gets, and the log says so first (`◆ handled as
+quick (a comment) · /verify for the full workflow`): `ask` answers with tools
+that only read, in the workspace itself, without a fork or a check, and its
+answer is marked unverified; `quick` is one attempt with no designed check
+(a `/check` you set is still run) whose diff only the review's fixed rules
+look at; `verify` is everything above. With a check set the pick is never
+`ask`. `/ask`, `/quick` and `/verify` run a task through that workflow without
+a pick, and `/verify` alone runs the last task again through the full one.
+The pick's model is the planner's `MOLT_ROUTE_MODEL`, by default the task's.
 
 The log keeps everything a task reports, in full; PgUp and PgDn scroll it,
 and Ctrl+Home and Ctrl+End (or Home and End with an empty input) jump to its
@@ -365,16 +380,22 @@ the same project is refused until it closes.
 ## `molt do`
 
 ```
-molt do TASK [--check CMD | --no-check | --criterion TEXT...] [--attempts N] [--select MODE] [--model M] [--effort E] [--max-turns N]
+molt do TASK [--check CMD | --no-check | --criterion TEXT...] [--workflow NAME] [--attempts N] [--select MODE] [--model M] [--effort E] [--max-turns N]
         [--budget-usd X] [--design-budget-usd X] [--no-apply | --commit [--branch NAME]] [--no-review] [--json] [--stream]
         [--workspace DIR] [--data-dir DIR] [--pass-env NAME]... [--no-memory] [--no-learn]
         [--memory-model MODEL] [--judge-model MODEL] [--checkpoint] [--config FILE]
 molt resume [RUN] [--retry] [--list] [--budget-usd X] [--design-budget-usd X] [--no-apply] [--commit] [--json] [--workspace DIR] ...
 molt undo [RUN] [--workspace DIR] [--data-dir DIR]
+molt ask QUESTION [--model M] [--effort E] [--max-turns N] [--budget-usd X] [--json] [--workspace DIR] ...
 ```
+
+`molt ask` answers a question about the workspace with one attempt whose tools
+only read, in the workspace itself: no fork, no check, nothing changed, and
+the report says `outcome: unverified answer`.
 
 | Flag | Meaning |
 | --- | --- |
+| `--workflow NAME` | `verify` (the default: design or take a check, race the attempts, compare, review, learn), `quick` (one attempt, the given check or none, only the review's fixed rules, no learning), `ask` (answer with read-only tools; nothing changes), `auto` (one model call picks among those three, never `ask` with `--check`; stderr says which), or one the planner's configuration defines. |
 | `--check CMD` | Shell command that exits 0 once the task is done, run in each attempt's fork. Default: the planner designs one. |
 | `--no-check` | Design no check: one attempt does the task and its result is applied unverified. This is the plain agent loop `molt bench` compares Molt with. |
 | `--criterion TEXT` | A criterion the result must meet, for a task no command can check (repeatable, at most 12): the criteria are the run's rubric, an independent judge decides each, and no check is designed (see [Tasks no command can check](#tasks-no-command-can-check)). Not with `--check` or `--no-check`. |
@@ -1215,7 +1236,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.
 - Model prices are as current as the last `molt prices update` (or the release's snapshot) and as right as the community list they came from; a price that changes mid-run is not picked up until the next run. Models that LiteLLM lists only with tiered or regional prices, such as some Qwen models, have no price until declared in `MOLT_MODEL_PRICES`.
-- Workflows (`docs/rfc/0001-workflows.md`) have one built-in, `verify`, and no command-line switch yet; other workflows come only from the planner's own `Config`, not from a file. The `rules` verification level is named but no workflow produces it yet. The learn stage runs on the caller's side, which knows only the built-ins: a workflow from the planner's configuration learns as the caller asks. The interface does not show the verification level yet.
+- Workflows (`docs/rfc/0001-workflows.md`) have three built-ins, `verify`, `quick` and `ask`; other workflows come only from the planner's own `Config`, not from a file. The learn stage runs on the caller's side, which knows only the built-ins: a workflow from the planner's configuration learns as the caller asks. The interface does not show the verification level yet. `quick` holds back any diff the fixed rules question, whatever its size; it does not send a large diff to the reviewer model. How long `ask` and `quick` take against a real model has not been measured yet. `/continue` follows only the last task of the interface's conversation; `molt do` has no way to go on from a run.
 - The web service has no search: an attempt reads known URLs or links from pages it read, without running scripts. It does not use an HTTP proxy; an explicit public-IP DNS JSON resolver supports fake-IP DNS but still needs a route to that resolver and the public page addresses. Startup DNS probes sample at most 16 hosts, using wildcard apexes; every actual fetch validates its own destination.
 
 ### Cancellation and model settlement

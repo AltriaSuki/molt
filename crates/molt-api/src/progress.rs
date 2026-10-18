@@ -119,6 +119,15 @@ pub enum Progress {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         map_tokens: Option<u32>,
     },
+    /// The planner picked `workflow` for a run that named
+    /// [`crate::workflow::AUTO`], before anything else ran. `reason` is
+    /// short, and empty when the pick was not the model's (it failed, say).
+    Routed {
+        run: String,
+        workflow: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -143,7 +152,8 @@ impl Progress {
             | Self::Required { run, .. }
             | Self::Adopted { run, .. }
             | Self::State { run, .. }
-            | Self::Recalled { run, .. } => run,
+            | Self::Recalled { run, .. }
+            | Self::Routed { run, .. } => run,
         }
     }
 
