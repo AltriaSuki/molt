@@ -67,6 +67,8 @@ struct State {
     /// Model calls stop when cancelled, as the gateway's do: the reply is a
     /// settlement whose usage and cost are unknown.
     cancels_models: bool,
+    /// Every call but a model call yields to the scheduler first, as one over a real bus does.
+    yields: bool,
     calls: Vec<Call>,
     requests: Vec<CompleteRequest>,
     events: Vec<Progress>,
@@ -141,6 +143,7 @@ impl Fake {
             web: false,
             web_unavailable: false,
             cancels_models: false,
+            yields: false,
             calls: Vec::new(),
             requests: Vec::new(),
             events: Vec::new(),
@@ -406,7 +409,14 @@ impl Fake {
 impl Bus for Fake {
     async fn call(&self, target: &str, payload: Value, budget: Budget, _: &TraceId) -> Result<Value, RemoteError> {
         let call = Call { target: target.to_owned(), payload: payload.clone(), budget };
-        self.state.lock().unwrap().calls.push(call);
+        let yields = {
+            let mut st = self.state.lock().unwrap();
+            st.calls.push(call);
+            st.yields && target != "model.complete"
+        };
+        if yields {
+            tokio::task::yield_now().await;
+        }
         match target {
             "model.complete" => {
                 let req: CompleteRequest = parse(payload);
@@ -2202,6 +2212,42 @@ async fn a_review_that_does_not_finish_approves_nothing() {
     assert!(!resp.applied && resp.fork.is_some());
 }
 
+/// What every model reply the fake gave cost: each one is priced at 0.125.
+fn priced_replies(fake: &Fake) -> f64 {
+    fake.requests().len() as f64 * 0.125
+}
+
+#[tokio::test]
+async fn the_reviewers_calls_count_toward_the_runs_cost_even_when_they_start_after_the_attempts_settle() {
+    let fake = reviewed(|req| match turn(req) {
+        1 => use_tools(req, &[("read_file", json!({ "path": "hello.txt" }))]),
+        _ => submit_review(req, "approve", &[]),
+    });
+    fake.set(|st| st.yields = true);
+    let resp = run(&fake, RunRequest { review: true, ..request(Some("check"), 1) }).await;
+    assert!(resp.applied, "{}", resp.summary);
+    assert_eq!(fake.requests().iter().filter(|r| is_reviewer(r)).count(), 2);
+    // Attempt 2 and reviewer 2, each priced: all of it is counted, nothing is unknown.
+    assert!(close(resp.cost_usd, priced_replies(&fake)) && close(resp.cost_usd, 0.5), "{}", resp.cost_usd);
+    assert_eq!((resp.usage.input_tokens, resp.usage.output_tokens, resp.uncounted_calls), (400, 40, 0));
+}
+
+#[tokio::test]
+async fn a_review_call_that_gets_no_reply_is_counted_as_uncounted_not_free() {
+    let fake = reviewed(|_| Reply {
+        resp: Err(RemoteError { code: ErrorCode::Unavailable, message: "the gateway went away".into() }),
+        delay: Duration::ZERO,
+    });
+    fake.set(|st| st.yields = true);
+    let resp = run(&fake, RunRequest { review: true, ..request(Some("check"), 1) }).await;
+    let review = resp.review.clone().unwrap();
+    assert_eq!(review.verdict, Verdict::Concern, "{review:?}");
+    assert!(!resp.applied);
+    // The attempt's two replies are known; the reviewer's call may have been billed, so it is unknown.
+    assert!(close(resp.cost_usd, 0.25), "{}", resp.cost_usd);
+    assert_eq!(resp.uncounted_calls, 1);
+}
+
 #[tokio::test]
 async fn without_review_no_reviewer_runs() {
     let fake = reviewed(|_| panic!("no review was asked for"));
@@ -2719,6 +2765,18 @@ async fn a_writing_task_is_judged_criterion_by_criterion_and_unmet_ones_go_back(
     let ready = fake.events().into_iter().find(|e| matches!(e, Progress::CheckReady { .. })).unwrap();
     let Progress::CheckReady { command, rubric, .. } = ready else { unreachable!() };
     assert_eq!((command, rubric.len()), (None, 2));
+}
+
+#[tokio::test]
+async fn a_judged_runs_cost_is_every_priced_reply_including_the_judges() {
+    let fake = poem(title_judge);
+    fake.set(|st| st.yields = true);
+    let resp = run(&fake, RunRequest { task: "Write a short poem in poem.md.".into(), ..request(None, 1) }).await;
+    assert_eq!(resp.outcome, Outcome::Judged, "{}", resp.summary);
+    assert_eq!(fake.requests().iter().filter(|r| is_judge(r)).count(), 2);
+    // Designer 1, attempt 4, judge 2.
+    assert!(close(resp.cost_usd, priced_replies(&fake)) && close(resp.cost_usd, 7.0 * 0.125), "{}", resp.cost_usd);
+    assert_eq!(resp.uncounted_calls, 0);
 }
 
 #[tokio::test]

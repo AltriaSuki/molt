@@ -333,10 +333,14 @@ async fn finish(ctx: &Arc<Ctx>, req: &RunRequest, settled: Settled, designed: bo
     let stopped = ctx.checkpoint.is_some() && ctx.run_cancel.is_cancelled();
     // Cancelled attempts may have left model calls running, which are billed: give their replies a moment
     // to land and be counted, while the winner is applied.
-    let (mut resp, tally) = tokio::join!(
+    let (mut resp, _) = tokio::join!(
         conclude(ctx, req, (spec, check), &rubric, finished, passed, stopped),
         ctx.settle(ctx.cfg.late_reply_wait)
     );
+    // That wait can end before `conclude` makes its own model calls (the review), so take the totals again
+    // once it is done: with nothing pending this returns at once, and a review call still unanswered after
+    // the wait stays uncounted rather than free.
+    let tally = ctx.settle(ctx.cfg.late_reply_wait).await;
     resp.usage = tally.spend.usage;
     resp.cost_usd = tally.spend.cost_usd;
     resp.uncounted_calls = tally.uncounted_calls() + ctx.carried_uncounted;

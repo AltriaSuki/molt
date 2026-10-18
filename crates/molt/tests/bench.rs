@@ -291,10 +291,9 @@ async fn smoke_runs_are_checked_for_hygiene_memory_and_cost() {
         tasks.to_str().unwrap(),
         "--results",
         results_arg,
-        // The reviewer's call is left out of the cost `molt do` reports (#174), which the cost assertion
-        // catches; this test is about the assertions working, so the run has no reviewer.
+        // Molt as it ships, reviewer included: the cost assertion holds its reported cost to the audit log's.
         "--arm",
-        "molt=--no-review",
+        "molt",
         "--max-usd",
         "5",
         "--task-usd",
