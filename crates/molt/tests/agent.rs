@@ -1342,6 +1342,48 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
     assert!(std::fs::read_dir(data.path()).unwrap().next().is_none(), "nothing was started");
 }
 
+#[tokio::test]
+async fn a_kept_session_result_survives_restart_and_refuses_workspace_conflicts() {
+    use molt::session::Session;
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let workspace = setup.workspace.path().canonicalize().unwrap();
+    let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
+    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    let mut req = setup.request(Some(CHECK), 1);
+    req.apply = false;
+    let response = session.run(&req, &molt_proto::TraceId::random()).await.unwrap();
+    let fork = response.fork.unwrap();
+    session.shutdown(std::slice::from_ref(&fork)).await;
+    // A saved path from a different workspace cannot redirect a human's operation.
+    let other = tempfile::tempdir().unwrap();
+    let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
+    let wrong = Session::start(&setup.cfg, other.path().to_str().unwrap(), events).await.unwrap();
+    for error in [
+        wrong.diff(&fork).await.unwrap_err(),
+        wrong.apply(&fork).await.unwrap_err(),
+        wrong.discard(&fork).await.unwrap_err(),
+    ] {
+        assert!(format!("{error:#}").contains("another workspace"));
+    }
+    assert!(Path::new(&fork).is_dir());
+    assert_eq!(setup.files(), ["README.txt"]);
+    wrong.shutdown(std::slice::from_ref(&fork)).await;
+    let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
+    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    assert!(session.diff(&fork).await.unwrap().patch.contains("+hello"));
+    std::fs::write(workspace.join("greeting.txt"), "user's work\n").unwrap();
+    let error = format!("{:#}", session.apply(&fork).await.unwrap_err());
+    assert!(error.contains("conflict:") && error.contains("greeting.txt"), "{error}");
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("user's work\n"));
+    assert!(Path::new(&fork).is_dir());
+    std::fs::remove_file(workspace.join("greeting.txt")).unwrap();
+    session.apply(&fork).await.unwrap();
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    assert!(!Path::new(&fork).exists());
+    session.shutdown(&[]).await;
+}
+
 /// What the interface does with a task in its default mode, on one session:
 /// design the check and show it, run with the check as accepted, keep the
 /// result for the user to look at, apply it, learn, then list and forget

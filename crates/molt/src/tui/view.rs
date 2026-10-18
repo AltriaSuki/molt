@@ -24,21 +24,40 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Screen::Memory(view) => draw_memory(frame, main, view, app.tick),
     }
     draw_status(frame, status, app);
+    if let Some(view) = &app.queue_view {
+        let mut viewer = super::app::Viewer {
+            title: if app.queue_paused { "task queue · paused" } else { "task queue" }.into(),
+            lines: fit_rows(app.queue_lines(), area.width * 92 / 100),
+            scroll: view.selected.saturating_sub(2) * 3,
+        };
+        draw_viewer(
+            frame,
+            area,
+            &mut viewer,
+            " a add · J/K move · n remove · p/r pause/resume · enter inspect · esc back ",
+        );
+        if let Some(input) = &view.draft {
+            let area = centered(area, 84, 60);
+            frame.render_widget(Clear, area);
+            let block = Block::new()
+                .borders(Borders::ALL)
+                .title(" queue a task · snapshots current settings ")
+                .title_bottom(" Enter queue · Ctrl+J newline · Esc cancel ");
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            draw_field(frame, inner, input, true);
+        }
+    }
+    if let Some(at) = app.kept_view {
+        let mut viewer = super::app::Viewer {
+            title: "kept results".into(),
+            lines: fit_rows(app.kept_lines(), area.width * 92 / 100),
+            scroll: at.saturating_sub(2) * 3,
+        };
+        draw_viewer(frame, area, &mut viewer, " ↑/↓ select · d diff · enter apply · n discard · esc back ");
+    }
     if let Some(viewer) = &mut app.viewer {
-        let r = centered(area, 92, 88);
-        frame.render_widget(Clear, r);
-        let block = Block::new()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(style(Tone::Dim))
-            .title(Line::from(span(format!(" {} ", viewer.title), Tone::Shell)))
-            .title_bottom(Line::from(span(" j/k scroll · g/G ends · esc close ", Tone::Dim)).right_aligned());
-        let inner = block.inner(r);
-        frame.render_widget(block, r);
-        let lines = wrap_all(&viewer.lines, inner.width);
-        viewer.scroll = viewer.scroll.min(lines.len().saturating_sub(1));
-        let shown: Vec<Line> = lines.into_iter().skip(viewer.scroll).take(usize::from(inner.height)).collect();
-        frame.render_widget(Paragraph::new(shown), inner);
+        draw_viewer(frame, area, viewer, " j/k scroll · g/G ends · esc close ");
     }
     if let Some(view) = &mut app.transcript {
         let r = centered(area, 92, 88);
@@ -64,7 +83,72 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let shown: Vec<Line> = wrap_all(&rest, inner.width).into_iter().take(height).collect();
         frame.render_widget(Paragraph::new(shown), inner);
     }
+    if let Some(viewer) = &mut app.shortcuts {
+        draw_viewer(frame, area, viewer, " j/k scroll · ? / esc close ");
+    }
+    if let Some(search) = &app.history_search {
+        let r = centered(area, 92, 70);
+        frame.render_widget(Clear, r);
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(style(Tone::Dim))
+            .title(" history · Ctrl+R older ")
+            .title_bottom(" Enter run · Tab/Esc edit · Ctrl+C cancel ");
+        let inner = block.inner(r);
+        frame.render_widget(block, r);
+        let [query, matches] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+        draw_field(frame, query, &search.query, true);
+        let entries = app.history_matches();
+        let count = usize::from(matches.height).min(6);
+        let start = search.selected.saturating_sub(count.saturating_sub(1));
+        let mut lines: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(count)
+            .map(|(i, entry)| {
+                let mark = if i == search.selected { "› " } else { "  " };
+                Line::from(span(
+                    format!("{mark}{}", clean_line(entry)),
+                    if i == search.selected { Tone::Shell } else { Tone::Dim },
+                ))
+            })
+            .collect();
+        if entries.is_empty() {
+            lines.push(Line::from(span("no matching input", Tone::Dim)));
+        }
+        frame.render_widget(Paragraph::new(lines), matches);
+    }
     app.theme.paint(frame.buffer_mut());
+}
+
+fn draw_viewer(frame: &mut Frame, area: Rect, viewer: &mut super::app::Viewer, hint: &str) {
+    let r = centered(area, 92, 88);
+    frame.render_widget(Clear, r);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(style(Tone::Dim))
+        .title(Line::from(span(format!(" {} ", viewer.title), Tone::Shell)))
+        .title_bottom(Line::from(span(hint.to_owned(), Tone::Dim)).right_aligned());
+    let inner = block.inner(r);
+    frame.render_widget(block, r);
+    let lines = wrap_all(&viewer.lines, inner.width);
+    viewer.scroll = viewer.scroll.min(lines.len().saturating_sub(1));
+    let shown: Vec<Line> = lines.into_iter().skip(viewer.scroll).take(usize::from(inner.height)).collect();
+    frame.render_widget(Paragraph::new(shown), inner);
+}
+
+/// List selections advance by logical rows; keep long labels from wrapping.
+fn fit_rows(mut lines: Vec<Line<'static>>, panel_width: u16) -> Vec<Line<'static>> {
+    let room = usize::from(panel_width.saturating_sub(2));
+    for line in &mut lines {
+        if let [label] = line.spans.as_mut_slice() {
+            label.content = text::fit(&label.content, room).into();
+        }
+    }
+    lines
 }
 
 fn centered(area: Rect, w_pct: u16, h_pct: u16) -> Rect {
@@ -85,7 +169,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             right.push(span("● ", Tone::Ok));
         }
         SessionState::Starting => right.push(span(format!("{} starting ", SPINNER[spin(app.tick)]), Tone::Warn)),
-        SessionState::Down(_) => right.push(span("✗ services down ", Tone::Bad)),
+        SessionState::Down(_) => match app.retry_seconds() {
+            Some(seconds) => right.push(span(format!("↻ retrying in {seconds}s "), Tone::Warn)),
+            None => right.push(span("✗ services down ", Tone::Bad)),
+        },
     }
     let screen = if let Screen::Memory(_) = app.screen { "  memory" } else { "" };
     let fixed = " molt ".len() + 1 + text::width(screen) + 2;
@@ -116,16 +203,23 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App) {
     // The input grows with its lines, up to half the screen.
     let (rows, _) = field_rows(&app.input, field_width(area.width));
     let input_height = u16::try_from(rows.len()).unwrap_or(u16::MAX).clamp(1, (area.height / 2).max(1)) + 2;
-    let taken = area.height.saturating_sub(input_height + 2);
+    let completion_room = area.height.saturating_sub(input_height + 1);
+    let completions = command_lines(app, usize::from(completion_room.saturating_sub(1)).min(6));
+    let completion_height = u16::try_from(completions.len()).unwrap_or(0);
+    let taken = area.height.saturating_sub(input_height + completion_height + 2);
     let live_height = if lanes {
         let room = taken.saturating_sub(1);
         if app.zoom.is_some() { room * 2 / 3 } else { (room / 2).min(14) }.max(4)
     } else {
         u16::try_from(live.len()).unwrap_or(u16::MAX).min(taken)
     };
-    let [log, live_area, input] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(live_height), Constraint::Length(input_height)])
-            .areas(area);
+    let [log, live_area, completion_area, input] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(live_height),
+        Constraint::Length(completion_height),
+        Constraint::Length(input_height),
+    ])
+    .areas(area);
 
     // The log, from its end unless scrolled.
     let width = log.width.saturating_sub(2).max(1);
@@ -155,7 +249,36 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App) {
         let inner = Rect { x: live_area.x + 1, width: live_area.width.saturating_sub(2), ..live_area };
         frame.render_widget(Paragraph::new(live), inner);
     }
+    let inner = Rect { x: completion_area.x + 1, width: completion_area.width.saturating_sub(2), ..completion_area };
+    frame.render_widget(Paragraph::new(completions), inner);
     draw_input(frame, input, app);
+}
+
+/// Keep the picked command visible while showing at most six candidates.
+fn command_lines(app: &App, limit: usize) -> Vec<Line<'static>> {
+    let completions = app.command_completions();
+    if completions.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let picked = app.command_pick.min(completions.len() - 1);
+    let start = picked.saturating_sub(limit - 1);
+    let mut lines: Vec<_> = completions
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(limit)
+        .map(|(i, c)| {
+            let tone = if i == picked { Tone::Shell } else { Tone::Dim };
+            Line::from(vec![
+                span(if i == picked { "› " } else { "  " }, tone),
+                span(clean_line(&c.label), tone),
+                span(format!("  {}", clean_line(&c.description)), Tone::Dim),
+            ])
+        })
+        .collect();
+    let count = format!("{}/{}", picked + 1, completions.len());
+    lines.push(keys(&[("↑↓", "pick"), ("tab", "complete"), ("esc", "hide"), (&count, "")]));
+    lines
 }
 
 /// What is under way, or what waits on the user, above the input.
@@ -412,7 +535,9 @@ fn task_spend(task: &Task) -> (String, Tone) {
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     let waiting = matches!(app.prompt, Some(Prompt::Check(_) | Prompt::Apply { .. }))
         || app.viewer.is_some()
-        || app.transcript.is_some();
+        || app.transcript.is_some()
+        || app.shortcuts.is_some();
+    let waiting = waiting || app.history_search.is_some();
     let editing_check = matches!(app.prompt, Some(Prompt::EditCheck(_)));
     let mut block = Block::new()
         .borders(Borders::ALL)
@@ -494,9 +619,22 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let mode_tone = if app.mode == Mode::Auto { Tone::Warn } else { Tone::Shell };
     left.push(span(app.mode.label(), mode_tone));
     left.push(span(" (shift+tab)", Tone::Dim));
+    if let Some(task) = app.task.as_ref().filter(|task| task.mode != app.mode) {
+        left.push(span(
+            format!(" · running {}", task.mode.label()),
+            if task.mode == Mode::Auto { Tone::Warn } else { Tone::Shell },
+        ));
+    }
     let s = &app.settings;
     let model = s.model.as_deref().unwrap_or("default model");
     let mut parts = vec![model.to_owned()];
+    if !app.queue.is_empty() {
+        let paused = if app.queue_paused { " · paused" } else { "" };
+        parts.insert(0, format!("{} queued{paused}", app.queue.len()));
+    }
+    if !app.kept.is_empty() {
+        parts.insert(0, format!("{} kept", app.kept.len()));
+    }
     if let Some(effort) = s.effort {
         parts.push(serde_json::to_value(effort).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default());
     }
@@ -529,6 +667,8 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let mut right = Vec::new();
     if let Some(flash) = &app.flash {
         right.push(span(format!("{} ", clean_line(flash)), Tone::Warn));
+    } else if let Some(seconds) = app.retry_seconds() {
+        right.push(span(format!("retrying in {seconds}s · /log "), Tone::Warn));
     } else {
         if !app.learning.is_empty() {
             right.push(span(format!("{} learning  ", SPINNER[spin(app.tick)]), Tone::Mem));

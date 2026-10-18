@@ -77,6 +77,8 @@ sender from that.
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
 | Issue CI rejects PR triggers and probes the sandbox before model spend | `scripts/ci/test_issue_to_pr.py::test_only_labelled_open_issues_are_eligible`, `test_sandbox_failure_posts_a_summary_and_never_starts_a_model` |
 | A skill source cannot approve itself; only the CLI manages activation and withdrawal preserves evidence | `skills::tests::drafts_need_independent_evidence_and_disable_cannot_be_undone_by_learning`, `tests/service.rs::an_agent_cannot_manage_or_promote_its_own_skills` |
+| Queued tasks retain their submitted execution settings and wait for apply/discard/commit settlement | `tui::app::tests::queued_tasks_snapshot_execution_settings_and_plain_input_still_steers_the_current_task`, `tui::app::tests::a_queue_waits_for_apply_commit_and_discard_to_settle_before_starting_the_next_task` |
+| Kept results survive restart; conflicting applies leave user edits and the fork intact | `tui::app::tests::plan_results_are_browsable_and_remain_available_until_apply_or_discard_succeeds`, `a_kept_session_result_survives_restart_and_refuses_workspace_conflicts` |
 | Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
 | Offline embedding models are hash-pinned and cannot reintroduce forgotten or cross-project notes | `semantic::tests::pinned_models_retrieve_synonyms_and_reject_changed_files`, `semantic::tests::synonyms_are_recalled_with_scores_and_snapshots_survive_forgetting` |
 
@@ -200,7 +202,13 @@ for every project. `/attempts`, `/model`, `/effort`, `/budget` and
 that task); `/memory-model NAME` sets the model
 memory learns with (`same` for the attempts' model, `default` for
 `MOLT_MEMORY_MODEL` or `sonnet`), and when learning finds nothing the log
-says why. `/help` lists the keys. The services'
+says why. Typing `/` shows matching commands and argument hints above the input
+(up to six at once). ↑/↓ selects a candidate and Tab puts it in; commands with
+fixed values, such as `/effort` and `/model`, suggest those values next. Esc
+hides the list; editing brings it back. Tab otherwise still enlarges attempts.
+With an empty input, `?` opens shortcuts for the current screen, including check
+and apply confirmations and memory; `?` again or Esc closes them. In text, `?`
+is typed normally. `/help` lists all commands and keys. The services'
 log goes to `tui.log` in the data dir, and colors are left out under
 `NO_COLOR`.
 
@@ -214,6 +222,81 @@ once per stop. `/notify all` also calls when a task ends
 (`molt: passed · 3 files`), and `/notify off` turns calling off. The window
 title follows what it is doing (`molt · running 2/4`, `molt · waiting:
 apply`, `molt · idle`), and the terminal's own title is put back on exit.
+
+Interface settings are saved automatically for each workspace: mode, model,
+attempts, effort, budget, check, memory model, previews, notifications and commit.
+The next launch restores them, and `/reset` removes saved settings and restores
+the defaults from the explicitly selected config, or built-in defaults. The auto
+mode label stays yellow. A malformed or unsupported saved file is ignored with a
+single-line notice. Files use mode 0600 in the same private workspace state directory
+as history; values containing known credentials or common key patterns are not saved.
+
+The config passed with `--config` can set defaults, for example:
+
+```toml
+[tui]
+mode = "confirm"
+check = "cargo test"
+attempts = 2
+budget = 3.0
+model = "sonnet"
+```
+
+Commands entered this session override saved values, which override these config
+values, which override built-in defaults. Project command templates still affect
+only their own task and do not overwrite saved preferences. Changing defaults does not rewrite a run request already submitted for a task. Configuration
+files are still loaded only when explicitly selected.
+
+If service startup fails transiently, the interface retries up to three times,
+after approximately 2, 5 and 15 seconds, and shows the countdown. Recognized
+configuration, credential, executable and permission errors stop immediately with
+an action to take. A backend disconnect leaves pending settlement unknown and is
+not retried automatically. `/restart` restarts idle services while preserving the
+log, settings, history and kept forks; finish or stop a task and wait for learning
+and commits first. Restart uses the configuration loaded at launch; relaunch to change that
+configuration or environment. `/log` opens up to 200 lines from the final 64 KiB of
+`tui.log`, sanitizes terminal controls, redacts known credentials and omits lines
+with common credential patterns. A manual restart resets the automatic retry limit.
+
+`/queue add TASK` submits a separate task while another runs. Plain input still
+adds a constraint to the current task. `/queue` opens the task list: `a` adds a
+multiline task, arrows select, `J`/`K` move it, `n` removes it, and Enter inspects
+its complete text. `/queue remove N` and `/queue move FROM TO` use one-based
+positions. Each task captures its mode, model, effort, attempts, check, budget,
+stream, memory-model and commit setting when submitted. Later setting changes
+apply to later submissions. Its workspace and earlier-task context are read when
+it starts, after the preceding apply/discard and optional commit have settled.
+Check and apply confirmations hold the queue; failure or keeping a result lets
+the next task start. A failed task's optional retry offer yields to the queue.
+
+`/queue pause` leaves the current task running; `/queue resume` continues queued
+work. Esc stops the current task and pauses its queue, preserving every queued
+task. `/queue clear` removes only queued tasks. Limits are 100 tasks, 64 KiB per
+task and 4 MiB total; rejected drafts are retained. Invalid `@paths` pause the
+queue without losing the task; the planner reads files when the queued task starts. Queued tasks live in this interface session:
+quitting shows their full text for confirmation and prints it after the terminal
+is restored, with known credentials redacted. A crash does not save the queue.
+
+`/kept` lists this workspace's retained results with their task, outcome, age and
+change counts. Select with arrows, `d` inspects the current diff, Enter applies,
+`n` discards, and Esc returns. Apply and discard wait for idle services; a failed
+operation leaves the result in the list. Apply uses the original fork baseline
+and refuses conflicting workspace edits, naming the files. Kept results survive
+interface restarts; missing fork directories are pruned. Private metadata is
+bounded to 1,000 entries / 4 MiB and filters task text like input history. Saved
+paths are checked by the fs service against the current workspace before use.
+Applying an older kept result does not create a git commit automatically.
+
+Input history is private to the workspace and survives restarts, even when two
+workspaces use the same data directory. ↑/↓ browses it; returning past the newest
+entry restores the unfinished draft. Ctrl+R searches newest first without duplicate
+matches, Ctrl+R again selects an older match, Enter submits it, Tab or Esc puts it
+back in the input for editing, and Ctrl+C cancels the search and restores the draft.
+`/clear` clears only the log; `/history-clear` removes this workspace's input history.
+History retains up to 1000 entries and 4 MiB; entries over 16 KiB, known environment
+credentials, common token prefixes, credential assignments and private keys are
+excluded. This filtering is heuristic. History files use mode 0600 under a private
+workspace directory; malformed records are ignored with a startup notice.
 
 Typing `@` starts a file path: the workspace's files (as `.gitignore` leaves
 them) are suggested as you type, ↑/↓ picks one and Tab puts it in. The files
@@ -977,7 +1060,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none. A run with `--checkpoint` that stops keeps its forks for `molt resume`.
 - A rubric's model-judged criteria are a model's reading, not a proof: the judge can be wrong, and nothing but the criteria with a command checks the result. In the interface, a constraint that adds a check is refused while a run is being judged by a rubric.
 - Only `molt do --commit`, `molt resume --commit` and the interface's `/commit on` commit a result, always on the current branch (`--branch` is for `molt do` only). `molt undo` takes back only those commits, and refuses a file changed after the run rather than merging the revert into it (use `git revert` then).
-- A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet.
+- A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet. Its task queue lives in memory: normal exit prints unexecuted tasks, while a crash loses them.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.
 - Default recall matches keywords with stemming, so differently worded notes can be missed. Optional offline word-vector recall needs a reviewed hash-pinned local model; its mean-pooling backend does not understand word order or supply a pretrained vocabulary.
@@ -1156,7 +1239,8 @@ These defaults affect only that task. Explicit interface settings take precedenc
 and a template budget cannot raise an existing limit. Confirm mode shows a
 template's check before starting; auto and plan modes retain their existing rules.
 Templates cannot set modes, permissions or protected paths. `/help` lists project
-commands and Tab completes unique command prefixes (or lists matches). Built-ins
+commands, and their argument hints and descriptions appear in the same live
+completion list as built-ins. Built-ins
 win name conflicts. Invalid, oversized and out-of-workspace files are skipped
 with a startup warning; restart the interface after editing templates. Discovery
 is bounded to 128 directory entries and 64 KiB per file. Nested YAML structures
@@ -1170,7 +1254,7 @@ uses only the terminal's 16 colors and follows its background. Without a saved
 choice, `COLORTERM=truecolor` or `24bit` selects dark and other terminals select
 ANSI. Light's eight text colors meet WCAG AA (4.5:1) against its white background.
 `NO_COLOR` keeps colors disabled. The choice is saved privately in
-`<data dir>/tui-theme.json`; other interface settings are not saved yet.
+`<data dir>/tui-theme.json`; workspace settings are saved separately as described below.
 
 Ctrl+L clears and redraws the interface. On Unix, Ctrl+Z restores the terminal
 and suspends just the interface process; use the shell's `fg` to return. Its

@@ -159,7 +159,47 @@ pub struct Config {
     #[serde(default)]
     pub confirm: ConfirmSection,
     #[serde(default)]
+    pub tui: TuiSection,
+    #[serde(default)]
     pub hooks: Vec<molt_planner::hooks::Hook>,
+}
+
+/// Defaults for the terminal interface, from an explicitly selected config.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TuiSection {
+    pub mode: Option<String>,
+    pub attempts: Option<u32>,
+    pub model: Option<String>,
+    pub effort: Option<molt_api::model::Effort>,
+    pub budget: Option<f64>,
+    pub check: Option<String>,
+    pub memory_model: Option<String>,
+    pub stream: Option<bool>,
+    pub notify: Option<String>,
+    pub commit: Option<bool>,
+}
+
+impl TuiSection {
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.mode.as_deref().is_none_or(|s| matches!(s, "plan" | "confirm" | "auto")),
+            "tui.mode must be plan, confirm or auto"
+        );
+        anyhow::ensure!(
+            self.notify.as_deref().is_none_or(|s| matches!(s, "on" | "all" | "off")),
+            "tui.notify must be on, all or off"
+        );
+        anyhow::ensure!(self.attempts.is_none_or(|n| (1..=8).contains(&n)), "tui.attempts must be 1 to 8");
+        anyhow::ensure!(self.budget.is_none_or(|b| b.is_finite() && b > 0.0), "tui.budget must be finite and positive");
+        for value in [&self.model, &self.memory_model, &self.check].into_iter().flatten() {
+            anyhow::ensure!(
+                !value.trim().is_empty() && value.len() <= 16 * 1024,
+                "tui model or check is empty or exceeds 16 KiB"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// When the interface's confirm mode stops for the user. It goes on by
@@ -260,7 +300,9 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        Ok(toml::from_str(text)?)
+        let config: Self = toml::from_str(text)?;
+        config.tui.validate()?;
+        Ok(config)
     }
 
     /// The default agent setup: the model gateway, file and shell services
@@ -346,6 +388,7 @@ impl Config {
             kernel: KernelSection { data_dir: data_dir.to_path_buf(), ..KernelSection::default() },
             services: vec![model, fs, shell, memory, planner],
             confirm: ConfirmSection::default(),
+            tui: TuiSection::default(),
             hooks: Vec::new(),
         })
     }
@@ -470,6 +513,27 @@ impl Secrets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interface_defaults_are_optional_and_validate_before_startup() {
+        assert!(Config::parse("").unwrap().tui.mode.is_none());
+        let config =
+            Config::parse("[tui]\nmode='confirm'\nattempts=4\ncheck='make test'\nbudget=2.5\neffort='high'").unwrap();
+        assert_eq!(config.tui.attempts, Some(4));
+        for field in [
+            "mode='unknown'",
+            "attempts=0",
+            "attempts=9",
+            "budget=-1.0",
+            "budget=nan",
+            "check=''",
+            "model=''",
+            "notify='unknown'",
+            "unknown=1",
+        ] {
+            assert!(Config::parse(&format!("[tui]\n{field}")).is_err(), "{field}");
+        }
+    }
 
     #[test]
     fn parses_the_documented_example() {

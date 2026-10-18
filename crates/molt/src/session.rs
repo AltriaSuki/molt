@@ -10,7 +10,7 @@
 //! `memory.correct` and `memory.promote` for the memory screen, and
 //! `memory.remember` for notes the user writes down.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
@@ -102,7 +102,8 @@ impl Session {
             Some(_) => Some(agent::wait_until_up(kernel, &cli, MEMORY, deadline).await.map_err(|e| format!("{e:#}"))),
         };
         let budget = Budget::new(0, 0, CALLS);
-        let mut targets = vec![planner::RUN, planner::DESIGN, planner::CONTROL, fs::DIFF, fs::MERGE, fs::DROP];
+        let mut targets =
+            vec![planner::RUN, planner::DESIGN, planner::CONTROL, fs::DIFF, fs::VIEW, fs::MERGE, fs::DROP];
         if !cfg.hooks.is_empty() {
             targets.extend([fs::FORK, molt_api::shell::RUN]);
         }
@@ -184,6 +185,7 @@ impl Session {
 
     /// Merge a result kept in `fork` into the workspace, and drop the fork.
     pub async fn apply(&self, fork: &str) -> anyhow::Result<MergeResponse> {
+        self.validate_fork(fork).await?;
         let result = self.call(fs::MERGE, MergeRequest { fork: fork.to_owned(), drop: true }, TREE_MS, None).await?;
         self.notify_applied().await;
         Ok(result)
@@ -218,12 +220,26 @@ impl Session {
 
     /// The paths `fork` changed.
     pub async fn changes(&self, fork: &str) -> anyhow::Result<Vec<String>> {
-        let resp: DiffResponse = self.call(fs::DIFF, DiffRequest { fork: fork.to_owned() }, DIFF_MS, None).await?;
-        Ok(resp.changes.into_iter().map(|c| c.path).collect())
+        Ok(self.diff(fork).await?.changes.into_iter().map(|c| c.path).collect())
     }
 
     pub async fn discard(&self, fork: &str) -> anyhow::Result<()> {
+        self.validate_fork(fork).await?;
         let _: DropResponse = self.call(fs::DROP, DropRequest { fork: fork.to_owned() }, TREE_MS, None).await?;
+        Ok(())
+    }
+
+    /// Read a kept result through the service, without mounting or trusting its saved path.
+    pub async fn diff(&self, fork: &str) -> anyhow::Result<DiffResponse> {
+        self.validate_fork(fork).await?;
+        self.call(fs::DIFF, DiffRequest { fork: fork.to_owned() }, DIFF_MS, None).await
+    }
+
+    async fn validate_fork(&self, fork: &str) -> anyhow::Result<()> {
+        let view: fs::ViewResponse =
+            self.call(fs::VIEW, fs::ViewRequest { fork: fork.to_owned() }, DIFF_MS, None).await?;
+        let workspace = Path::new(&self.workspace).canonicalize()?;
+        anyhow::ensure!(Path::new(&view.workspace) == workspace, "the result belongs to another workspace");
         Ok(())
     }
 

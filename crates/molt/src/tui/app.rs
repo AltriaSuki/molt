@@ -3,6 +3,8 @@
 //! returns the [`Action`]s the runtime carries out, so the whole flow can be
 //! tested with plain values.
 
+mod queue;
+
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
@@ -44,6 +46,9 @@ const EARLIER_SUMMARY_BYTES: usize = 4000;
 /// Ticks after a key within which the user is taken to be looking: about
 /// five seconds.
 const LOOKING_TICKS: u64 = 33;
+pub const TICK_MS: u64 = 150;
+const STARTUP_RETRY_TICKS: [u64; 3] = [14, 34, 100];
+
 /// Suggestions shown for an `@path` being typed.
 const SUGGESTIONS: usize = 8;
 /// Workspace files listed for `@` completion; past this, a path is not
@@ -53,11 +58,13 @@ pub const LISTED_FILES: usize = 50_000;
 const TRANSCRIPT_TICKS: u64 = 7;
 
 /// When the interface calls the user from outside the terminal.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Notify {
     Off,
     /// When it stops for the user, or the services go down.
     #[default]
+    #[serde(rename = "on", alias = "waiting")]
     Waiting,
     /// Also when a task ends.
     All,
@@ -71,7 +78,8 @@ enum Attention {
     Down,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Keep every result in its fork; never change the workspace.
     Plan,
@@ -100,7 +108,8 @@ impl Mode {
 }
 
 /// What the next task runs with.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub attempts: Option<u32>,
     pub model: Option<String>,
@@ -137,6 +146,10 @@ impl Default for Settings {
 #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     StartSession,
+    RestartSession {
+        keep: Vec<String>,
+    },
+    ShowLog,
     Redraw,
     Suspend,
     SaveTheme(text::Theme),
@@ -157,6 +170,9 @@ pub enum Action {
     Control {
         trace: TraceId,
         action: Control,
+    },
+    Diff {
+        fork: String,
     },
     Apply {
         fork: String,
@@ -265,6 +281,13 @@ pub enum Msg {
         memory_problem: Option<String>,
     },
     SessionFailed(String),
+    BackendFailed(String),
+    /// The UI drops messages from a backend replaced by a manual restart.
+    Backend {
+        generation: u64,
+        message: Box<Msg>,
+    },
+    ServiceLog(Result<Vec<String>, String>),
     /// The services of an interrupted session have stopped; `kept` are the
     /// forks of interrupted attempts kept for their changes.
     Stopped {
@@ -289,6 +312,10 @@ pub enum Msg {
         trace: TraceId,
         action: Control,
         result: Result<ControlResponse, String>,
+    },
+    Diff {
+        fork: String,
+        result: Result<molt_api::fs::DiffResponse, String>,
     },
     Applied(Result<(), String>),
     /// `None`: the workspace's commit has the files as they are already.
@@ -387,6 +414,8 @@ pub struct Task {
     pub trace: TraceId,
     pub req: RunRequest,
     pub phase: Phase,
+    pub mode: Mode,
+    settings: Settings,
     pub lanes: Vec<Lane>,
     pub designer_preview: Preview,
     /// The whole task's budget, as the user set it; `req.budget_usd` is
@@ -411,12 +440,14 @@ pub struct Task {
 }
 
 impl Task {
-    fn new(trace: TraceId, req: RunRequest, phase: Phase) -> Self {
+    fn new(trace: TraceId, req: RunRequest, phase: Phase, mode: Mode, settings: Settings) -> Self {
         Self {
             trace,
             budget_usd: req.budget_usd,
             req,
             phase,
+            mode,
+            settings,
             lanes: Vec::new(),
             design_spend: Spend::default(),
             counted: HashSet::new(),
@@ -454,6 +485,8 @@ pub enum Prompt {
         /// The user stopped the run, rather than every attempt failing.
         stopped: bool,
         attempts: Vec<AttemptReport>,
+        mode: Mode,
+        settings: Box<Settings>,
     },
 }
 
@@ -607,6 +640,12 @@ pub struct Input {
     pub cursor: usize,
     /// Long pastes, each shown as its placeholder in `text` and put back by [`Input::take`].
     pastes: Vec<(String, String)>,
+}
+
+pub struct HistorySearch {
+    pub query: Input,
+    pub selected: usize,
+    draft: Input,
 }
 
 /// Pasted lines shown as they are; a longer paste shows as one placeholder.
@@ -793,18 +832,29 @@ pub struct App {
     workspace_path: String,
     pub mode: Mode,
     pub settings: Settings,
+    preference_defaults: super::settings::Saved,
+    preference_changes: Vec<super::settings::Change>,
+    reset_preferences: bool,
     pub commands: std::collections::BTreeMap<String, super::commands::Command>,
     pub theme: text::Theme,
     pub session: SessionState,
+    pub backend_generation: u64,
+    startup_retries: usize,
+    retry_at: Option<u64>,
+    committing: bool,
     pub log: Vec<Line<'static>>,
     /// Lines scrolled up from the end of the log; 0 follows it.
     pub scroll: usize,
     pub input: Input,
     history: Vec<String>,
     history_at: Option<usize>,
+    history_draft: Option<Input>,
+    history_changes: Vec<super::state::HistoryChange>,
+    pub history_search: Option<HistorySearch>,
     pub task: Option<Task>,
     pub prompt: Option<Prompt>,
     pub viewer: Option<Viewer>,
+    pub shortcuts: Option<Viewer>,
     pub transcript: Option<TranscriptView>,
     pub screen: Screen,
     pub last_run: Option<String>,
@@ -814,8 +864,18 @@ pub struct App {
     pub uncounted_calls: u32,
     /// Runs memory is learning from.
     pub learning: HashSet<String>,
-    /// Results the user kept in their forks; never removed.
+    /// Results still available in their forks, including restored results.
+    pub queue: Vec<queue::Queued>,
+    pub queue_paused: bool,
+    pub queue_view: Option<queue::View>,
+    fork_operations: usize,
     pub kept: Vec<String>,
+    kept_entries: Vec<super::kept::Entry>,
+    kept_changes: Vec<super::kept::Change>,
+    pub kept_view: Option<usize>,
+    kept_pending: Option<String>,
+    pending_result: Option<super::kept::Entry>,
+    interrupted_task: Option<String>,
     /// The result waiting to be applied, to commit once it is: `/commit on`.
     to_commit: Option<Action>,
     /// The diff of the last task that finished, for `/last`.
@@ -854,6 +914,8 @@ pub struct App {
     pub pick: usize,
     /// An `@` query whose suggestions Esc put away.
     hidden: Option<String>,
+    pub command_pick: usize,
+    command_hidden: Option<String>,
 }
 
 fn key_is(key: &KeyEvent, code: KeyCode) -> bool {
@@ -875,24 +937,45 @@ impl App {
             workspace_path: workspace_path.to_owned(),
             mode: Mode::Confirm,
             settings: Settings::default(),
+            preference_defaults: super::settings::Saved::new(Mode::Confirm, Settings::default()),
+            preference_changes: Vec::new(),
+            reset_preferences: false,
             commands: Default::default(),
             theme: text::Theme::detect(std::env::var("COLORTERM").ok().as_deref()),
             session: SessionState::Starting,
+            backend_generation: 0,
+            startup_retries: 0,
+            retry_at: None,
+            committing: false,
             log: Vec::new(),
             scroll: 0,
             input: Input::default(),
             history: Vec::new(),
             history_at: None,
+            history_draft: None,
+            history_changes: Vec::new(),
+            history_search: None,
             task: None,
             prompt: None,
             viewer: None,
+            shortcuts: None,
             transcript: None,
             screen: Screen::Main,
             last_run: None,
             spent_usd: 0.0,
             uncounted_calls: 0,
             learning: HashSet::new(),
+            queue: Vec::new(),
+            queue_paused: false,
+            queue_view: None,
+            fork_operations: 0,
             kept: Vec::new(),
+            kept_entries: Vec::new(),
+            kept_changes: Vec::new(),
+            kept_view: None,
+            kept_pending: None,
+            pending_result: None,
+            interrupted_task: None,
             to_commit: None,
             last: None,
             last_lanes: Vec::new(),
@@ -913,6 +996,8 @@ impl App {
             listing: false,
             pick: 0,
             hidden: None,
+            command_pick: 0,
+            command_hidden: None,
         }
     }
 
@@ -924,21 +1009,94 @@ impl App {
         }
     }
 
-    pub fn command_candidates(&self, prefix: &str) -> Vec<String> {
-        let mut names: Vec<_> = super::commands::BUILTINS
-            .iter()
-            .copied()
-            .chain(self.commands.keys().map(String::as_str))
-            .filter(|name| name.starts_with(prefix))
-            .map(str::to_owned)
-            .collect();
-        names.sort();
-        names.dedup();
-        names
+    pub fn command_completions(&self) -> Vec<super::commands::Completion> {
+        if !matches!(self.screen, Screen::Main)
+            || self.queue_view.is_some()
+            || self.kept_view.is_some()
+            || self.prompt.is_some()
+            || self.viewer.is_some()
+            || self.transcript.is_some()
+            || self.shortcuts.is_some()
+            || self.history_search.is_some()
+            || self.input.cursor != self.input.text.chars().count()
+            || self.input.text.contains(['\n', '\r'])
+            || self.command_hidden.as_ref() == Some(&self.input.text)
+        {
+            return Vec::new();
+        }
+        super::commands::completions(&self.input.text, &self.commands)
+    }
+
+    pub fn retry_seconds(&self) -> Option<u64> {
+        self.retry_at.map(|at| (at.saturating_sub(self.tick) * TICK_MS / 1000).max(1))
     }
 
     pub fn memory_up(&self) -> bool {
         matches!(&self.session, SessionState::Up { memory_problem: None, .. })
+    }
+
+    pub fn configure_preferences(&mut self, defaults: super::settings::Saved, saved: Option<super::settings::Saved>) {
+        let active = saved.unwrap_or_else(|| defaults.clone());
+        self.mode = active.mode;
+        self.settings = active.settings;
+        self.preference_defaults = defaults;
+        self.preference_changes.clear();
+    }
+
+    pub fn take_preference_changes(&mut self) -> Vec<super::settings::Change> {
+        std::mem::take(&mut self.preference_changes)
+    }
+
+    pub fn restore_history(&mut self, entries: Vec<String>) {
+        self.history = entries.into_iter().filter(|e| super::state::keep_history(e, &self.secrets)).collect();
+        super::state::trim_history(&mut self.history);
+        self.history_at = None;
+    }
+
+    pub fn take_history_changes(&mut self) -> Vec<super::state::HistoryChange> {
+        std::mem::take(&mut self.history_changes)
+    }
+
+    pub fn history_matches(&self) -> Vec<&str> {
+        let Some(search) = &self.history_search else { return Vec::new() };
+        let query = search.query.text.to_lowercase();
+        let mut seen = HashSet::new();
+        self.history
+            .iter()
+            .rev()
+            .filter(|e| e.to_lowercase().contains(&query) && seen.insert(e.as_str()))
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn history_key(&mut self, key: &KeyEvent) -> Vec<Action> {
+        let matches = self.history_matches();
+        let search = self.history_search.as_ref().expect("history search is open");
+        let picked = matches.get(search.selected).map(|s| (*s).to_owned());
+        let n = matches.len();
+        if ctrl(key, 'c') {
+            self.input = self.history_search.take().unwrap().draft;
+        } else if key.code == KeyCode::Enter {
+            if let Some(picked) = picked {
+                self.history_search = None;
+                self.input.take();
+                return self.submit(picked);
+            }
+        } else if matches!(key.code, KeyCode::Tab | KeyCode::Esc) {
+            let search = self.history_search.take().unwrap();
+            self.input = picked.map_or(search.draft, |s| Input::with(&s));
+        } else {
+            let search = self.history_search.as_mut().unwrap();
+            if n > 0 && (ctrl(key, 'r') || key.code == KeyCode::Up) {
+                search.selected = (search.selected + 1) % n;
+            } else if n > 0 && key.code == KeyCode::Down {
+                search.selected = (search.selected + n - 1) % n;
+            } else {
+                search.query.key(key);
+                search.selected = 0;
+            }
+        }
+        Vec::new()
     }
 
     fn push(&mut self, line: Line<'static>) {
@@ -974,10 +1132,21 @@ impl App {
         if let Some(Prompt::Apply { fork, .. }) = &self.prompt {
             keep.push(fork.clone());
         }
+        if let Some(entry) = &self.pending_result {
+            if !keep.contains(&entry.fork) {
+                keep.push(entry.fork.clone());
+            }
+        }
         keep
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
+        let msg = match msg {
+            Msg::Backend { generation, message } if generation == self.backend_generation => *message,
+            Msg::Backend { .. } => return Vec::new(),
+            msg => msg,
+        };
+
         let before = self.attention();
         if matches!(msg, Msg::Ran { .. } | Msg::Applied(_) | Msg::Stopped { .. }) {
             self.files_stale = true;
@@ -986,7 +1155,40 @@ impl App {
         if let (Msg::Ran { trace, .. }, Some(view)) = (&msg, &mut self.transcript) {
             view.stale |= view.trace == *trace;
         }
+        let preferences_before =
+            matches!(&msg, Msg::Key(_)).then(|| super::settings::Saved::new(self.mode, self.settings.clone()));
+        let input_before = matches!(&msg, Msg::Key(_) | Msg::Paste(_) | Msg::Edited(_))
+            .then(|| (self.input.text.clone(), self.input.cursor));
+        if matches!(&msg, Msg::Applied(_) | Msg::Discarded(_)) {
+            self.fork_operations = self.fork_operations.saturating_sub(1);
+        }
         let mut actions = self.handle(msg);
+        if actions.iter().any(|a| matches!(a, Action::Quit { .. })) {
+            if let Some(entry) = self.pending_result.clone() {
+                self.keep_entry(entry);
+            }
+        }
+        self.committing |= actions.iter().any(|a| matches!(a, Action::Commit { .. }));
+        self.fork_operations +=
+            actions.iter().filter(|a| matches!(a, Action::Apply { .. } | Action::Discard { .. })).count();
+        actions.extend(self.advance_queue());
+        if self.reset_preferences {
+            self.preference_changes.clear();
+            self.preference_changes.push(super::settings::Change::Reset);
+            self.reset_preferences = false;
+        } else if preferences_before
+            .is_some_and(|before| before != super::settings::Saved::new(self.mode, self.settings.clone()))
+        {
+            let change = super::settings::Change::Save(super::settings::Saved::new(self.mode, self.settings.clone()));
+            if matches!(self.preference_changes.last(), Some(super::settings::Change::Save(_))) {
+                self.preference_changes.pop();
+            }
+            self.preference_changes.push(change);
+        }
+        if input_before.is_some_and(|(text, cursor)| text != self.input.text || cursor != self.input.cursor) {
+            self.command_pick = 0;
+            self.command_hidden = None;
+        }
         if !self.listing && self.files_stale && self.at_query().is_some() {
             self.listing = true;
             self.files_stale = false;
@@ -1128,6 +1330,15 @@ impl App {
             }
             Msg::Paste(text) => {
                 self.last_key = Some(self.tick);
+                if let Some(search) = &mut self.history_search {
+                    search.query.insert(&text);
+                    search.selected = 0;
+                    return Vec::new();
+                }
+                if let Some(view) = &mut self.queue_view {
+                    view.draft.get_or_insert_with(Input::default).paste(&text);
+                    return Vec::new();
+                }
                 match &mut self.screen {
                     Screen::Memory(view) => match &mut view.edit {
                         Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input) | MemoryEdit::Promote(input)) => {
@@ -1148,6 +1359,14 @@ impl App {
             }
             Msg::Tick => {
                 self.tick = self.tick.wrapping_add(1);
+                if self.retry_at.is_some_and(|at| self.tick >= at) {
+                    self.retry_at = None;
+                    if matches!(self.session, SessionState::Down(_)) && self.task.is_none() && self.learning.is_empty()
+                    {
+                        self.session = SessionState::Starting;
+                        return vec![Action::StartSession];
+                    }
+                }
                 Vec::new()
             }
             Msg::Signal => {
@@ -1155,6 +1374,8 @@ impl App {
                 vec![Action::Quit { keep: self.keep() }]
             }
             Msg::SessionUp { versions, memory_problem } => {
+                self.startup_retries = 0;
+                self.retry_at = None;
                 if let Some(problem) = &memory_problem {
                     self.push(Line::from(span(format!("running without memory: {}", clean_line(problem)), Tone::Dim)));
                 }
@@ -1162,17 +1383,67 @@ impl App {
                 Vec::new()
             }
             Msg::SessionFailed(e) => {
-                self.error("the services did not start", &e);
-                self.session = SessionState::Down(clean_line(&e));
+                let starting = matches!(self.session, SessionState::Starting);
+                let error = scrub(&e, &self.secrets);
+                self.error("the services did not start", &error);
+                self.session = SessionState::Down(clean_line(&error));
+                if starting && self.task.is_none() && self.learning.is_empty() {
+                    if retryable_startup_error(&e) && self.startup_retries < STARTUP_RETRY_TICKS.len() {
+                        self.retry_at = Some(self.tick + STARTUP_RETRY_TICKS[self.startup_retries]);
+                        self.startup_retries += 1;
+                    } else {
+                        self.retry_at = None;
+                        self.flash = Some(if retryable_startup_error(&e) {
+                            "startup retries exhausted; /log shows the service output, /restart tries again".into()
+                        } else {
+                            "check the configuration or credentials and relaunch; /log shows the service output".into()
+                        });
+                    }
+                }
+                Vec::new()
+            }
+            Msg::BackendFailed(error) => {
+                self.retry_at = None;
+                let error = scrub(&error, &self.secrets);
+                self.error("the interface backend stopped", &error);
+                self.session = SessionState::Down(clean_line(&error));
+                self.flash =
+                    Some("backend unavailable; pending operations have unknown settlement; /restart when idle".into());
+                Vec::new()
+            }
+            Msg::Backend { .. } => Vec::new(),
+            Msg::ServiceLog(result) => {
+                if self.viewer.as_ref().is_some_and(|v| v.title == "service log") {
+                    let lines = match result {
+                        Ok(lines) => lines
+                            .into_iter()
+                            .map(|line| {
+                                let line = clean_line(&scrub(&line, &self.secrets));
+                                if !line.trim().is_empty() && !super::state::keep_history(&line, &[]) {
+                                    "[log line omitted: credential-like or oversized content]".into()
+                                } else {
+                                    line
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                        Err(e) => vec![format!("could not read the service log: {}", clean_line(&e))],
+                    };
+                    self.viewer.as_mut().unwrap().lines =
+                        lines.into_iter().flat_map(|l| block(&l, "", Tone::Plain)).collect();
+                }
                 Vec::new()
             }
             Msg::Stopped { kept } => {
+                self.fork_operations = 0;
                 if !kept.is_empty() {
                     self.push(Line::from(span(format!("  kept {} · interrupted", kept.len()), Tone::Dim)));
                     for fork in &kept {
                         self.push(Line::from(span(format!("  kept in {}", clean_line(fork)), Tone::Dim)));
                     }
-                    self.kept.extend(kept);
+                    let task = self.interrupted_task.take().unwrap_or_else(|| "interrupted task".into());
+                    for fork in kept {
+                        self.keep_entry(super::kept::Entry::new(fork, &task, "interrupted"));
+                    }
                 }
                 self.session = SessionState::Starting;
                 vec![Action::StartSession]
@@ -1192,7 +1463,44 @@ impl App {
                 self.controlled(&trace, &action, result);
                 Vec::new()
             }
+            Msg::Diff { fork, result } => {
+                if self.viewer.as_ref().is_none_or(|v| v.title != format!("kept diff: {fork}")) {
+                    return Vec::new();
+                }
+                self.viewer = Some(match result {
+                    Ok(diff) => {
+                        if let Some(entry) = self.kept_entries.iter_mut().find(|entry| entry.fork == fork) {
+                            entry.diff(diff.changes.len(), &diff.patch);
+                            self.kept_changes.push(super::kept::Change::Save(entry.clone()));
+                        }
+                        let mut view = diff_viewer(&scrub(&diff.patch, &self.secrets), diff.truncated);
+                        view.title = format!("kept diff: {fork}");
+                        view
+                    }
+                    Err(error) => Viewer {
+                        title: "kept diff unavailable".into(),
+                        lines: block(&scrub(&error, &self.secrets), "", Tone::Bad),
+                        scroll: 0,
+                    },
+                });
+                Vec::new()
+            }
+            Msg::Applied(result) if self.kept_pending.is_some() => {
+                self.kept_finished(result, "applied");
+                Vec::new()
+            }
+            Msg::Discarded(result) if self.kept_pending.is_some() => {
+                self.kept_finished(result, "discarded");
+                Vec::new()
+            }
             Msg::Applied(result) => {
+                if result.is_err() {
+                    if let Some(entry) = self.pending_result.take() {
+                        self.keep_entry(entry);
+                    }
+                } else {
+                    self.pending_result = None;
+                }
                 let commit = self.to_commit.take().filter(|_| result.is_ok());
                 match result {
                     Ok(()) => {
@@ -1209,6 +1517,7 @@ impl App {
                 commit.into_iter().collect()
             }
             Msg::Committed(result) => {
+                self.committing = false;
                 match result {
                     Ok(Some(c)) => {
                         let on =
@@ -1228,6 +1537,11 @@ impl App {
             Msg::Discarded(result) => {
                 if let Err(e) = result {
                     self.error("could not remove the result", &e);
+                    if let Some(entry) = self.pending_result.take() {
+                        self.keep_entry(entry);
+                    }
+                } else {
+                    self.pending_result = None;
                 }
                 Vec::new()
             }
@@ -1336,19 +1650,44 @@ impl App {
         if ctrl(&key, 'z') {
             return vec![Action::Suspend];
         }
+        if self.history_search.is_some() {
+            return self.history_key(&key);
+        }
+        if ctrl(&key, 'c') && self.queue_view.as_ref().is_some_and(|view| view.draft.is_some()) {
+            return self.queue_key(&key);
+        }
         if ctrl(&key, 'd') || (ctrl(&key, 'c') && self.task.is_none() && self.input.text.is_empty()) {
             if self.quit_armed.is_some_and(|at| self.tick.wrapping_sub(at) <= QUIT_TICKS) {
                 self.quit = true;
                 return vec![Action::Quit { keep: self.keep() }];
             }
             self.quit_armed = Some(self.tick);
+            self.show_unexecuted();
             self.flash = Some(self.quit_warning(if ctrl(&key, 'd') { "ctrl+d" } else { "ctrl+c" }));
             return Vec::new();
         }
         self.quit_armed = None;
+        if self.shortcuts.is_some() {
+            if key_is(&key, KeyCode::Char('?')) {
+                self.shortcuts = None;
+            } else {
+                viewer_key(&mut self.shortcuts, &key);
+            }
+            return Vec::new();
+        }
+        if key_is(&key, KeyCode::Char('?')) && self.can_show_shortcuts() {
+            self.shortcuts = Some(Viewer { title: "shortcuts".into(), lines: self.shortcut_lines(), scroll: 0 });
+            return Vec::new();
+        }
         if self.viewer.is_some() {
             self.viewer_key(&key);
             return Vec::new();
+        }
+        if self.queue_view.is_some() {
+            return self.queue_key(&key);
+        }
+        if self.kept_view.is_some() {
+            return self.kept_key(&key);
         }
         if self.transcript.is_some() {
             return self.transcript_key(&key);
@@ -1356,9 +1695,29 @@ impl App {
         if let Screen::Memory(_) = self.screen {
             return self.memory_key(&key);
         }
+        if ctrl(&key, 'r') && self.prompt.is_none() {
+            self.history_search =
+                Some(HistorySearch { query: Input::with(&self.input.text), selected: 0, draft: self.input.clone() });
+            return Vec::new();
+        }
         let zoomed = self.zoom.is_some() && self.prompt.is_none() && self.input.text.is_empty();
         if ctrl(&key, 'o') || (zoomed && key.code == KeyCode::Char('o') && key.modifiers.is_empty()) {
             return self.open_transcript();
+        }
+        let commands = self.command_completions();
+        if !commands.is_empty() && key.modifiers.is_empty() {
+            let n = commands.len();
+            let at = self.command_pick.min(n - 1);
+            match key.code {
+                KeyCode::Up => self.command_pick = (at + n - 1) % n,
+                KeyCode::Down => self.command_pick = (at + 1) % n,
+                KeyCode::Tab => self.input = Input::with(&commands[at].text),
+                KeyCode::Esc => self.command_hidden = Some(self.input.text.clone()),
+                _ => {}
+            }
+            if matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Esc) {
+                return Vec::new();
+            }
         }
         if ctrl(&key, 'c') && !self.input.text.is_empty() {
             self.input.take();
@@ -1402,16 +1761,6 @@ impl App {
                 return Vec::new();
             }
             KeyCode::Tab => {
-                if !editing_check && self.input.text.starts_with('/') && !self.input.text.contains(char::is_whitespace)
-                {
-                    let names = self.command_candidates(&self.input.text[1..]);
-                    if names.len() == 1 {
-                        self.input = Input::with(&format!("/{} ", names[0]));
-                    } else if !names.is_empty() {
-                        self.flash = Some(names.iter().map(|n| format!("/{n}")).collect::<Vec<_>>().join(" · "));
-                    }
-                    return Vec::new();
-                }
                 if let Some(task) = &self.task {
                     let indices: Vec<u32> = task.lanes.iter().map(|l| l.index).collect();
                     self.zoom = match self.zoom.and_then(|z| indices.iter().position(|&i| i == z)) {
@@ -1514,6 +1863,9 @@ impl App {
             1 => parts.push("1 result stays in its fork".into()),
             n => parts.push(format!("{n} results stay in their forks")),
         }
+        if !self.queue.is_empty() {
+            parts.push(format!("{} queued tasks will not run; their text is printed after exit", self.queue.len()));
+        }
         parts.join("; ")
     }
 
@@ -1521,24 +1873,32 @@ impl App {
         if self.task.is_none() && self.learning.is_empty() {
             return Vec::new();
         }
+        self.queue_paused |= !self.queue.is_empty();
         let keep = self.keep();
-        if let Some(Prompt::Apply { fork, .. }) = self.prompt.take() {
-            self.kept.push(fork.clone());
-            self.push(Line::from(span(format!("  kept in {}", clean_line(&fork)), Tone::Dim)));
+        if let Some(entry) = self.pending_result.take() {
+            self.push(Line::from(span(format!("  kept in {}", clean_line(&entry.fork)), Tone::Dim)));
+            self.keep_entry(entry);
         }
         self.prompt = None;
         let mut attempts = Vec::new();
         let mut check_files = Vec::new();
         if let Some(mut task) = self.task.take() {
+            self.interrupted_task = Some(task.req.task.clone());
             if matches!(task.phase, Phase::Running) {
                 attempts = task.lanes.iter().filter_map(|l| l.fork.clone()).collect();
                 check_files = task.req.check_files.iter().map(|f| f.path.clone()).collect();
                 self.last_lanes = std::mem::take(&mut task.lanes);
                 // Starting again needs the check in full; a designed one is only known once accepted.
                 if task.req.check.is_some() {
-                    let designed = self.settings.check.as_deref() != task.req.check.as_deref();
-                    self.prompt =
-                        Some(Prompt::Retry { req: Box::new(task.req), designed, stopped: true, attempts: Vec::new() });
+                    let designed = task.settings.check.as_deref() != task.req.check.as_deref();
+                    self.prompt = Some(Prompt::Retry {
+                        req: Box::new(task.req),
+                        designed,
+                        stopped: true,
+                        attempts: Vec::new(),
+                        mode: task.mode,
+                        settings: Box::new(task.settings),
+                    });
                 }
             }
         }
@@ -1553,6 +1913,9 @@ impl App {
         if self.history.is_empty() {
             return;
         }
+        if self.history_at.is_none() && back {
+            self.history_draft = Some(self.input.clone());
+        }
         let at = match (self.history_at, back) {
             (None, true) => Some(self.history.len() - 1),
             (None, false) => None,
@@ -1561,7 +1924,8 @@ impl App {
             (Some(_), false) => None,
         };
         self.history_at = at;
-        self.input = at.map(|i| Input::with(&self.history[i])).unwrap_or_default();
+        self.input =
+            at.map(|i| Input::with(&self.history[i])).unwrap_or_else(|| self.history_draft.take().unwrap_or_default());
     }
 
     fn submit(&mut self, line: String) -> Vec<Action> {
@@ -1569,10 +1933,13 @@ impl App {
         if line.is_empty() {
             return Vec::new();
         }
-        if self.history.last() != Some(&line) {
+        if self.history.last() != Some(&line) && super::state::keep_history(&line, &self.secrets) {
             self.history.push(line.clone());
+            self.history_changes.push(super::state::HistoryChange::Append(line.clone()));
+            super::state::trim_history(&mut self.history);
         }
         self.history_at = None;
+        self.history_draft = None;
         self.scroll = 0;
         if let Some(command) = line.strip_prefix('/') {
             return self.command(command);
@@ -1581,6 +1948,11 @@ impl App {
     }
 
     fn submit_task(&mut self, line: String) -> Vec<Action> {
+        if self.fork_operations > 0 || self.committing {
+            self.flash = Some("wait for the current apply, discard or commit".into());
+            self.input = Input::with(&line);
+            return Vec::new();
+        }
         if self.task.as_ref().is_some_and(|t| t.phase == Phase::Running) {
             // Typed while the attempts run: more of what the task asks.
             self.echo_constraint(&line);
@@ -1596,6 +1968,10 @@ impl App {
             self.input = Input::with(&line);
             return Vec::new();
         }
+        self.start_task(line, self.mode, self.settings.clone())
+    }
+
+    fn start_task(&mut self, line: String, mode: Mode, settings: Settings) -> Vec<Action> {
         let files = match self.referenced(&line) {
             Ok(files) => files,
             Err(e) => {
@@ -1607,24 +1983,24 @@ impl App {
         let trace = TraceId::random();
         let mut req = RunRequest::new(line.clone(), self.workspace_path.clone());
         req.files = files;
-        if let Some(n) = self.settings.attempts {
+        if let Some(n) = settings.attempts {
             req.attempts = n;
         }
-        req.model = self.settings.model.clone();
-        req.effort = self.settings.effort;
-        req.budget_usd = self.settings.budget_usd;
-        req.apply = self.mode == Mode::Auto;
+        req.model = settings.model.clone();
+        req.effort = settings.effort;
+        req.budget_usd = settings.budget_usd;
+        req.apply = mode == Mode::Auto;
         req.earlier = self.earlier.clone();
-        req.stream = self.settings.stream;
+        req.stream = settings.stream;
 
         self.gap();
         self.echo(&line);
-        let mut task = Task::new(trace.clone(), req, Phase::Running);
+        let mut task = Task::new(trace.clone(), req, Phase::Running, mode, settings.clone());
         self.last_run = Some(trace.to_string());
-        let action = if let Some(check) = &self.settings.check {
+        let action = if let Some(check) = &settings.check {
             task.req.check = Some(check.clone());
             Action::Run { req: task.req.clone(), trace }
-        } else if self.mode == Mode::Confirm {
+        } else if mode == Mode::Confirm {
             task.phase = Phase::Designing;
             Action::Design { req: task.req.clone(), trace }
         } else {
@@ -1639,7 +2015,7 @@ impl App {
     /// The actions that start a task with `action`: looking at the work tree
     /// first, when results are committed.
     fn starting(&self, trace: TraceId, action: Action) -> Vec<Action> {
-        if self.settings.commit {
+        if self.task.as_ref().is_some_and(|task| task.settings.commit) {
             vec![Action::PrepareCommit { trace }, action]
         } else {
             vec![action]
@@ -1649,12 +2025,64 @@ impl App {
     fn command(&mut self, command: &str) -> Vec<Action> {
         let (name, arg) = command.split_once(' ').map_or((command, ""), |(n, a)| (n, a.trim()));
         let set = |what: &str, value: &str| format!("{what}: {value}");
-        match name {
-            "memory-used" => {
+        use super::commands::{builtin, Builtin};
+        match builtin(name).map(|c| c.kind) {
+            Some(Builtin::Restart) => {
+                if self.task.is_some()
+                    || !self.learning.is_empty()
+                    || self.committing
+                    || self.kept_pending.is_some()
+                    || self.fork_operations > 0
+                {
+                    self.flash = Some(
+                        "finish or stop the task and wait for learning, applies, discards and commits before /restart"
+                            .into(),
+                    );
+                    return Vec::new();
+                }
+                if matches!(self.session, SessionState::Starting) {
+                    self.flash = Some("the services are already starting; /log shows their output".into());
+                    return Vec::new();
+                }
+                self.retry_at = None;
+                self.startup_retries = 0;
+                self.session = SessionState::Starting;
+                self.push(Line::from(span("restarting the services", Tone::Dim)));
+                return vec![Action::RestartSession { keep: self.kept.clone() }];
+            }
+            Some(Builtin::Queue) => return self.queue_command(arg),
+            Some(Builtin::Kept) => {
+                self.kept_view = Some(0);
+            }
+            Some(Builtin::Log) => {
+                self.viewer = Some(Viewer {
+                    title: "service log".into(),
+                    lines: block("reading the service log", "", Tone::Dim),
+                    scroll: 0,
+                });
+                return vec![Action::ShowLog];
+            }
+
+            Some(Builtin::Reset) => {
+                self.mode = self.preference_defaults.mode;
+                self.settings = self.preference_defaults.settings.clone();
+                self.reset_preferences = true;
+                self.flash = Some("settings reset to the configured defaults".into());
+            }
+
+            Some(Builtin::HistoryClear) => {
+                self.history.clear();
+                self.history_at = None;
+                self.history_draft = None;
+                self.history_changes.clear();
+                self.history_changes.push(super::state::HistoryChange::Clear);
+                self.flash = Some("history cleared for this workspace".into());
+            }
+            Some(Builtin::MemoryUsed) => {
                 let run = if arg.is_empty() { self.last_run.clone() } else { Some(arg.to_owned()) };
                 return self.open_used(run);
             }
-            "theme" => {
+            Some(Builtin::Theme) => {
                 if arg.is_empty() {
                     self.flash = Some(format!("theme: {}; /theme dark|light|ansi", self.theme.name()));
                 } else if let Some(theme) = text::Theme::parse(arg) {
@@ -1665,10 +2093,10 @@ impl App {
                     self.flash = Some("theme: dark, light or ansi".into());
                 }
             }
-            "help" => {
+            Some(Builtin::Help) => {
                 self.viewer = Some(Viewer { title: "help".into(), lines: self.help(), scroll: 0 });
             }
-            "memory" => {
+            Some(Builtin::Memory) => {
                 if !self.memory_up() {
                     self.flash = Some("memory is not running".into());
                     return Vec::new();
@@ -1684,7 +2112,7 @@ impl App {
                 });
                 return vec![Action::LoadNotes { query }];
             }
-            "remember" => {
+            Some(Builtin::Remember) => {
                 if !self.memory_up() {
                     self.flash = Some("memory is not running".into());
                     return Vec::new();
@@ -1695,7 +2123,7 @@ impl App {
                 }
                 return vec![Action::Remember { text: arg.to_owned() }];
             }
-            "check" if self.running() => {
+            Some(Builtin::Check) if self.running() => {
                 if arg.is_empty() {
                     self.flash = Some("the running task keeps a check; give the command to use instead".into());
                     return Vec::new();
@@ -1704,7 +2132,7 @@ impl App {
                 return self
                     .steer(Control::Constrain(Constraint { check: Some(arg.to_owned()), ..Default::default() }));
             }
-            "protect" => {
+            Some(Builtin::Protect) => {
                 let paths: Vec<String> = arg.split_whitespace().map(str::to_owned).collect();
                 if paths.is_empty() {
                     self.flash = Some("protect: the files or directories to leave as they are".into());
@@ -1717,17 +2145,17 @@ impl App {
                 self.echo_constraint(&format!("leave {} unchanged", paths.join(", ")));
                 return self.steer(Control::Constrain(Constraint { protect: paths, ..Default::default() }));
             }
-            "pause" => return self.steer(Control::Pause),
-            "resume" => return self.steer(Control::Resume),
-            "new" => {
+            Some(Builtin::Pause) => return self.steer(Control::Pause),
+            Some(Builtin::Resume) => return self.steer(Control::Resume),
+            Some(Builtin::New) => {
                 self.earlier.clear();
                 self.flash = Some("a new conversation: the next task starts without the earlier ones".into());
             }
-            "check" => {
+            Some(Builtin::Check) => {
                 self.settings.check = (!arg.is_empty()).then(|| arg.to_owned());
                 self.flash = Some(set("check", self.settings.check.as_deref().unwrap_or("designed for each task")));
             }
-            "attempts" => match arg.parse::<u32>() {
+            Some(Builtin::Attempts) => match arg.parse::<u32>() {
                 Ok(n @ 1..=8) => {
                     self.settings.attempts = Some(n);
                     self.flash = Some(set("attempts", arg));
@@ -1738,7 +2166,7 @@ impl App {
                 }
                 _ => self.flash = Some("attempts: 1 to 8".into()),
             },
-            "commit" => {
+            Some(Builtin::Commit) => {
                 match arg {
                     "on" => self.settings.commit = true,
                     "off" | "default" | "" => self.settings.commit = false,
@@ -1749,7 +2177,7 @@ impl App {
                 }
                 self.flash = Some(format!("commit: {} (next task)", if self.settings.commit { "on" } else { "off" }));
             }
-            "stream" => {
+            Some(Builtin::Stream) => {
                 match arg {
                     "on" | "default" | "" => self.settings.stream = true,
                     "off" => self.settings.stream = false,
@@ -1760,7 +2188,7 @@ impl App {
                 }
                 self.flash = Some(format!("stream: {} (next task)", if self.settings.stream { "on" } else { "off" }));
             }
-            "notify" => {
+            Some(Builtin::Notify) => {
                 self.settings.notify = match arg {
                     "on" | "default" | "" => Notify::Waiting,
                     "all" => Notify::All,
@@ -1779,11 +2207,11 @@ impl App {
                     .into(),
                 );
             }
-            "model" => {
+            Some(Builtin::Model) => {
                 self.settings.model = (!arg.is_empty() && arg != "default").then(|| arg.to_owned());
                 self.flash = Some(set("model", self.settings.model.as_deref().unwrap_or("default")));
             }
-            "memory-model" => {
+            Some(Builtin::MemoryModel) => {
                 self.settings.memory_model = (!arg.is_empty() && arg != "default").then(|| arg.to_owned());
                 let shown = match self.settings.memory_model.as_deref() {
                     None => "default",
@@ -1792,7 +2220,7 @@ impl App {
                 };
                 self.flash = Some(set("memory model", shown));
             }
-            "effort" => {
+            Some(Builtin::Effort) => {
                 if arg.is_empty() || arg == "default" {
                     self.settings.effort = None;
                     self.flash = Some(set("effort", "default"));
@@ -1806,7 +2234,7 @@ impl App {
                     }
                 }
             }
-            "budget" => match arg.trim_start_matches('$').parse::<f64>() {
+            Some(Builtin::Budget) => match arg.trim_start_matches('$').parse::<f64>() {
                 Ok(usd) if usd.is_finite() && usd > 0.0 => {
                     self.settings.budget_usd = Some(usd);
                     self.flash = Some(format!("budget: ${usd:.2} per task"));
@@ -1817,7 +2245,7 @@ impl App {
                 }
                 _ => self.flash = Some("budget: a positive amount of US dollars".into()),
             },
-            "lanes" => {
+            Some(Builtin::Lanes) => {
                 if self.last_lanes.is_empty() {
                     self.flash = Some("no task has finished yet".into());
                 } else {
@@ -1825,20 +2253,26 @@ impl App {
                         Some(Viewer { title: "attempts".into(), lines: lane_lines(&self.last_lanes), scroll: 0 });
                 }
             }
-            "last" => match &self.last {
+            Some(Builtin::Last) => match &self.last {
                 Some(last) => self.viewer = Some(diff_viewer(&last.patch, last.truncated)),
                 None => self.flash = Some("no task has finished with changes yet".into()),
             },
-            "clear" => {
+            Some(Builtin::Clear) => {
                 self.log.clear();
                 self.scroll = 0;
             }
-            "quit" | "exit" => {
+            Some(Builtin::Quit) => {
+                if !self.queue.is_empty() {
+                    self.quit_armed = Some(self.tick);
+                    self.show_unexecuted();
+                    self.flash = Some(self.quit_warning("ctrl+d"));
+                    return Vec::new();
+                }
                 self.quit = true;
                 return vec![Action::Quit { keep: self.keep() }];
             }
-            other => {
-                if let Some(template) = self.commands.get(other).cloned() {
+            None => {
+                if let Some(template) = self.commands.get(name).cloned() {
                     if self.task.is_some() {
                         self.flash = Some("a task is waiting; project commands start a new task".into());
                         return Vec::new();
@@ -1884,7 +2318,7 @@ impl App {
                     }
                     return actions;
                 }
-                self.flash = Some(format!("no command /{}; /help lists them", clean_line(other)));
+                self.flash = Some(format!("no command /{}; /help lists them", clean_line(name)));
             }
         }
         Vec::new()
@@ -2286,7 +2720,8 @@ impl App {
         self.remember(&task.req.task, &resp);
         self.uncounted_calls = self.uncounted_calls.saturating_add(resp.uncounted_calls);
         let mut actions = Vec::new();
-        let memory_model = agent::memory_model(self.settings.memory_model.as_deref(), task.req.model.as_deref());
+        let memory_model = agent::memory_model(task.settings.memory_model.as_deref(), task.req.model.as_deref());
+        let spent_all = task_budget(&task.settings).is_some_and(|b| resp.cost_usd >= b);
 
         for a in &resp.attempts {
             let (mark, tone) = match a.status {
@@ -2389,16 +2824,21 @@ impl App {
         let mut deciding = false;
         let mut applying = false;
         self.to_commit =
-            (self.settings.commit && resp.outcome != Outcome::Failed && !resp.changes.is_empty()).then(|| {
+            (task.settings.commit && resp.outcome != Outcome::Failed && !resp.changes.is_empty()).then(|| {
                 Action::Commit { trace: trace.clone(), task: task.req.task.clone(), resp: Box::new(resp.clone()) }
             });
+        self.pending_result = resp.fork.as_ref().filter(|_| !resp.applied).map(|fork| {
+            let mut entry = super::kept::Entry::new(fork.clone(), &task.req.task, outcome_name(resp.outcome));
+            entry.diff(resp.changes.len(), &resp.patch);
+            entry
+        });
         if resp.applied {
             self.push(Line::from(span("  applied", Tone::Ok)));
             actions.extend(self.to_commit.take());
         } else if let Some(fork) = resp.fork.clone() {
             if resp.changes.is_empty() {
                 actions.push(Action::Discard { fork });
-            } else if self.mode == Mode::Confirm && !task.req.apply && !matches!(resp.outcome, Outcome::Failed) {
+            } else if task.mode == Mode::Confirm && !task.req.apply && !matches!(resp.outcome, Outcome::Failed) {
                 let stops = apply_stops(&resp, &self.rules);
                 if stops.is_empty() && !self.rules.always_ask {
                     applying = true;
@@ -2410,7 +2850,9 @@ impl App {
                 }
             } else {
                 self.push(Line::from(span(format!("  kept in {}", clean_line(&fork)), Tone::Dim)));
-                self.kept.push(fork);
+                if let Some(entry) = self.pending_result.take() {
+                    self.keep_entry(entry);
+                }
             }
         }
         if !(deciding || applying) {
@@ -2435,12 +2877,13 @@ impl App {
                     designed,
                     stopped: false,
                     attempts: resp.attempts.clone(),
+                    mode: task.mode,
+                    settings: Box::new(task.settings.clone()),
                 });
             }
         }
 
         // Memory learns from failures too; the run's budget covers it.
-        let spent_all = task_budget(&self.settings).is_some_and(|b| resp.cost_usd >= b);
         if self.memory_up() && !spent_all {
             self.learning.insert(trace.to_string());
             actions.push(Action::Learn { trace, model: memory_model });
@@ -2477,7 +2920,9 @@ impl App {
                 self.to_commit = None;
                 self.task = None;
                 self.push(Line::from(span(format!("  kept in {}", clean_line(&fork)), Tone::Dim)));
-                self.kept.push(fork);
+                if let Some(entry) = self.pending_result.take() {
+                    self.keep_entry(entry);
+                }
                 Vec::new()
             }
             _ => Vec::new(),
@@ -2495,8 +2940,8 @@ impl App {
                     self.flash = Some("the services are not up".into());
                     return Some(Vec::new());
                 }
-                let Some(Prompt::Retry { req, designed, .. }) = self.prompt.take() else { return None };
-                Some(self.retry(*req, designed))
+                let Some(Prompt::Retry { req, designed, mode, settings, .. }) = self.prompt.take() else { return None };
+                Some(self.retry(*req, designed, mode, *settings))
             }
             KeyCode::Char('v') if empty && key.modifiers.is_empty() => {
                 let mut lines = Vec::new();
@@ -2522,7 +2967,7 @@ impl App {
     }
 
     /// Run a failed task again with the check it ran with.
-    fn retry(&mut self, req: RunRequest, designed: bool) -> Vec<Action> {
+    fn retry(&mut self, req: RunRequest, designed: bool, mode: Mode, settings: Settings) -> Vec<Action> {
         let trace = TraceId::random();
         self.gap();
         self.echo(&req.task.clone());
@@ -2538,7 +2983,8 @@ impl App {
         self.scroll = 0;
         self.zoom = None;
         self.last_run = Some(trace.to_string());
-        self.task = Some(Task { check_shown: true, ..Task::new(trace.clone(), req.clone(), Phase::Running) });
+        self.task =
+            Some(Task { check_shown: true, ..Task::new(trace.clone(), req.clone(), Phase::Running, mode, settings) });
         self.starting(trace.clone(), Action::Run { req, trace })
     }
 
@@ -2548,7 +2994,13 @@ impl App {
             Err(e) => self.push(head(format!("learned nothing: {}", clean_line(&e)))),
             Ok(r) => {
                 self.spent_usd += r.cost_usd;
-                let count = |n: usize| if n == 1 { "1 note".to_owned() } else { format!("{n} notes") };
+                let count = |n: usize| {
+                    if n == 1 {
+                        "1 note".to_owned()
+                    } else {
+                        format!("{n} notes")
+                    }
+                };
                 let mut parts = Vec::new();
                 if !r.added.is_empty() {
                     parts.push(format!("learned {}", count(r.added.len())));
@@ -2579,19 +3031,252 @@ impl App {
         }
     }
 
-    fn viewer_key(&mut self, key: &KeyEvent) {
-        let Some(viewer) = &mut self.viewer else { return };
-        let last = viewer.lines.len().saturating_sub(1);
+    pub fn restore_kept(&mut self, entries: Vec<super::kept::Entry>) {
+        self.kept = entries.iter().map(|entry| entry.fork.clone()).collect();
+        self.kept_entries = entries;
+    }
+
+    pub fn take_kept_changes(&mut self) -> Vec<super::kept::Change> {
+        std::mem::take(&mut self.kept_changes)
+    }
+
+    fn keep_entry(&mut self, mut entry: super::kept::Entry) {
+        entry.task = scrub(&entry.task, &self.secrets);
+        if !self.kept.contains(&entry.fork) {
+            self.kept.push(entry.fork.clone());
+        }
+        self.kept_entries.retain(|old| old.fork != entry.fork);
+        self.kept_entries.push(entry.clone());
+        self.kept_changes.push(super::kept::Change::Save(entry));
+    }
+
+    fn kept_finished(&mut self, result: Result<(), String>, verb: &str) {
+        let fork = self.kept_pending.take().unwrap();
+        match result {
+            Ok(()) => {
+                self.kept.retain(|old| *old != fork);
+                self.kept_entries.retain(|entry| entry.fork != fork);
+                self.kept_changes.push(super::kept::Change::Remove(fork));
+                self.push(Line::from(span(format!("  {verb} kept result"), Tone::Ok)));
+                if let Some(at) = &mut self.kept_view {
+                    *at = (*at).min(self.kept_entries.len().saturating_sub(1));
+                }
+            }
+            Err(error) => {
+                self.error(&format!("kept result was not {verb}"), &scrub(&error, &self.secrets));
+                self.viewer = Some(Viewer {
+                    title: "kept result remains available".into(),
+                    lines: block(&scrub(&error, &self.secrets), "", Tone::Bad),
+                    scroll: 0,
+                });
+            }
+        }
+    }
+
+    fn kept_key(&mut self, key: &KeyEvent) -> Vec<Action> {
+        let at = self.kept_view.unwrap_or(0).min(self.kept_entries.len().saturating_sub(1));
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.viewer = None,
-            KeyCode::Down | KeyCode::Char('j') => viewer.scroll = (viewer.scroll + 1).min(last),
-            KeyCode::Up | KeyCode::Char('k') => viewer.scroll = viewer.scroll.saturating_sub(1),
-            KeyCode::PageDown | KeyCode::Char(' ') => viewer.scroll = (viewer.scroll + 20).min(last),
-            KeyCode::PageUp => viewer.scroll = viewer.scroll.saturating_sub(20),
-            KeyCode::Char('g') | KeyCode::Home => viewer.scroll = 0,
-            KeyCode::Char('G') | KeyCode::End => viewer.scroll = last,
+            KeyCode::Esc | KeyCode::Char('q') => self.kept_view = None,
+            KeyCode::Up | KeyCode::Char('k') => self.kept_view = Some(at.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.kept_view = Some((at + 1).min(self.kept_entries.len().saturating_sub(1)))
+            }
+            KeyCode::Char('d') if !self.kept_entries.is_empty() => {
+                if !matches!(self.session, SessionState::Up { .. }) {
+                    self.flash = Some("the services are not up".into());
+                    return Vec::new();
+                }
+                let fork = self.kept_entries[at].fork.clone();
+                self.viewer = Some(Viewer {
+                    title: format!("kept diff: {fork}"),
+                    lines: block("reading the result's diff", "", Tone::Dim),
+                    scroll: 0,
+                });
+                return vec![Action::Diff { fork }];
+            }
+            KeyCode::Enter | KeyCode::Char('n') if !self.kept_entries.is_empty() => {
+                if self.task.is_some()
+                    || self.pending_result.is_some()
+                    || self.fork_operations > 0
+                    || !self.learning.is_empty()
+                    || self.committing
+                    || self.kept_pending.is_some()
+                    || !matches!(self.session, SessionState::Up { .. })
+                {
+                    self.flash = Some("wait for idle services before applying or discarding kept results".into());
+                    return Vec::new();
+                }
+                let fork = self.kept_entries[at].fork.clone();
+                self.kept_pending = Some(fork.clone());
+                return vec![if key.code == KeyCode::Enter {
+                    Action::Apply { fork }
+                } else {
+                    Action::Discard { fork }
+                }];
+            }
             _ => {}
         }
+        Vec::new()
+    }
+
+    pub fn kept_lines(&self) -> Vec<Line<'static>> {
+        if self.kept_entries.is_empty() {
+            return block("no kept results in this workspace", "", Tone::Dim);
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        self.kept_entries
+            .iter()
+            .enumerate()
+            .flat_map(|(index, entry)| {
+                let mark = if Some(index) == self.kept_view { "›" } else { " " };
+                let size = entry.files.map_or_else(
+                    || "size unknown · d to inspect".into(),
+                    |files| format!("{files} files · +{} −{}", entry.added, entry.removed),
+                );
+                let age = text::duration(Duration::from_secs(now.saturating_sub(entry.time)));
+                vec![
+                    Line::from(span(format!("{mark} {}", clean_line(&entry.task)), Tone::Shell)),
+                    Line::from(span(format!("  {} · {size} · {age} ago", clean_line(&entry.outcome)), Tone::Dim)),
+                    Line::from(span(format!("  {}", clean_line(&entry.fork)), Tone::Dim)),
+                ]
+            })
+            .collect()
+    }
+
+    fn viewer_key(&mut self, key: &KeyEvent) {
+        viewer_key(&mut self.viewer, key);
+    }
+
+    fn can_show_shortcuts(&self) -> bool {
+        if let Some(view) = &self.queue_view {
+            if view.draft.as_ref().is_some_and(|input| !input.text.is_empty()) {
+                return false;
+            }
+        }
+        if self.viewer.is_some() || self.transcript.is_some() || self.kept_view.is_some() || self.queue_view.is_some() {
+            return true;
+        }
+        match &self.screen {
+            Screen::Main => self.input.text.is_empty(),
+            Screen::Memory(view) => match &view.edit {
+                Some(MemoryEdit::Filter(i) | MemoryEdit::Reason(i) | MemoryEdit::Promote(i)) => i.text.is_empty(),
+                Some(MemoryEdit::Change(c)) => c.input().is_none_or(|i| i.text.is_empty()),
+                None => true,
+            },
+        }
+    }
+
+    fn shortcut_lines(&self) -> Vec<Line<'static>> {
+        let mut pairs = vec![("? / esc", "close shortcuts")];
+        let context;
+        if self.viewer.is_some() {
+            context = "viewer";
+            pairs.extend([("j/k, ↑/↓", "scroll"), ("g/G", "start / end"), ("esc / q", "close viewer")]);
+        } else if self.queue_view.is_some() {
+            context = "task queue";
+            pairs.extend([
+                ("a", "add a task with current settings"),
+                ("j/k, ↑/↓", "select a task"),
+                ("J/K", "move later / earlier"),
+                ("n / delete", "remove selected task"),
+                ("p / r", "pause / resume queue"),
+                ("enter / v", "inspect full task"),
+                ("esc / q", "back to tasks"),
+            ]);
+        } else if self.kept_view.is_some() {
+            context = "kept results";
+            pairs.extend([
+                ("j/k, ↑/↓", "select a result"),
+                ("d", "inspect its current diff"),
+                ("enter", "apply when idle"),
+                ("n", "discard when idle"),
+                ("esc / q", "back to tasks"),
+            ]);
+        } else if self.transcript.is_some() {
+            context = "transcript";
+            pairs.extend([
+                ("j/k, ↑/↓", "scroll"),
+                ("{/}", "previous / next turn"),
+                ("e", "fold / unfold"),
+                ("v", "open in editor"),
+                ("esc / ctrl+o", "close transcript"),
+            ]);
+        } else if let Screen::Memory(view) = &self.screen {
+            context = "memory";
+            if view.edit.is_some() {
+                pairs.extend([("enter", "accept the field / save"), ("esc", "cancel editing")]);
+                if let Some(MemoryEdit::Change(c)) = &view.edit {
+                    pairs.push(("shift+tab", "previous field"));
+                    if c.step == ChangeStep::Confirm {
+                        pairs.push(("t", "toggle temporary"));
+                    }
+                }
+            } else {
+                pairs.extend([
+                    ("j/k, ↑/↓", "select a note"),
+                    ("/", "filter notes"),
+                    ("enter / v", "inspect note"),
+                    ("a / c", "accept / correct note"),
+                    ("f", "forget with a reason"),
+                    ("p", "promote to every project"),
+                    ("u", "latest task's recalled notes"),
+                    ("r", "reload notes"),
+                    ("esc / q", "back to tasks"),
+                ]);
+            }
+        } else {
+            context = match &self.prompt {
+                Some(Prompt::Check(d)) => {
+                    pairs.extend([("enter", "run attempts"), ("esc", "cancel task")]);
+                    if d.command.is_some() {
+                        pairs.extend([("e", "edit check"), ("n", "run without check")]);
+                    }
+                    if !d.files.is_empty() {
+                        pairs.push(("v", "view check files"));
+                    }
+                    "check confirmation"
+                }
+                Some(Prompt::Apply { .. }) => {
+                    pairs.extend([
+                        ("enter", "apply result"),
+                        ("d", "view diff"),
+                        ("k / esc", "keep result in its fork"),
+                        ("n", "discard result"),
+                    ]);
+                    "apply confirmation"
+                }
+                Some(Prompt::Retry { .. }) => {
+                    pairs.extend([("r", "retry with the same check"), ("v", "view attempts"), ("esc", "dismiss")]);
+                    "retry"
+                }
+                Some(Prompt::EditCheck(_)) => {
+                    pairs.extend([("enter", "save check command"), ("esc", "back to check confirmation")]);
+                    "edit check"
+                }
+                None => {
+                    pairs.extend([
+                        ("enter", if self.running() { "add input to the running task" } else { "submit task" }),
+                        ("shift+enter / ctrl+j", "new line (also \\ then enter)"),
+                        ("shift+tab", "switch mode"),
+                        ("tab", "complete suggestion / enlarge attempt"),
+                        ("↑/↓", "pick suggestion / move line / input history"),
+                        ("ctrl+g", "edit task in editor"),
+                        ("ctrl+r", "search this workspace's input history"),
+                    ]);
+                    if self.busy() {
+                        pairs.push(("esc", "stop task"));
+                    }
+                    "tasks"
+                }
+            };
+            pairs.extend([("ctrl+o", "open transcript"), ("pgup / pgdn", "scroll log")]);
+        }
+        pairs.extend([("ctrl+l", "redraw screen"), ("ctrl+z", "suspend interface"), ("ctrl+d twice", "quit")]);
+        let mut lines = vec![Line::from(span(context, Tone::Dim))];
+        lines.extend(pairs.into_iter().map(|(key, description)| {
+            Line::from(vec![span(format!("  {key:<24}"), Tone::Shell), span(description, Tone::Plain)])
+        }));
+        lines
     }
 
     /// The transcript of the running task, or else of the last one; of the
@@ -3090,7 +3775,7 @@ fn last_lines(text: &str, n: usize) -> Vec<String> {
 }
 
 /// `text` with every secret in it replaced.
-fn scrub(text: &str, secrets: &[String]) -> String {
+pub(super) fn scrub(text: &str, secrets: &[String]) -> String {
     let mut out = text.to_owned();
     for secret in secrets.iter().filter(|s| !s.is_empty()) {
         if out.contains(secret.as_str()) {
@@ -3122,16 +3807,56 @@ fn task_budget(settings: &Settings) -> Option<f64> {
     settings.budget_usd
 }
 
+fn retryable_startup_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    ![
+        "not set",
+        "missing api",
+        "api key is missing",
+        "invalid api key",
+        "authentication failed",
+        "unauthorized",
+        "invalid credentials",
+        "invalid config",
+        "invalid configuration",
+        "no such file",
+        "permission denied",
+        "unknown provider",
+        "unknown model",
+        "unsupported",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+}
+
+fn viewer_key(view: &mut Option<Viewer>, key: &KeyEvent) {
+    let Some(viewer) = view else { return };
+    let last = viewer.lines.len().saturating_sub(1);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => *view = None,
+        KeyCode::Down | KeyCode::Char('j') => viewer.scroll = (viewer.scroll + 1).min(last),
+        KeyCode::Up | KeyCode::Char('k') => viewer.scroll = viewer.scroll.saturating_sub(1),
+        KeyCode::PageDown | KeyCode::Char(' ') => viewer.scroll = (viewer.scroll + 20).min(last),
+        KeyCode::PageUp => viewer.scroll = viewer.scroll.saturating_sub(20),
+        KeyCode::Char('g') | KeyCode::Home => viewer.scroll = 0,
+        KeyCode::Char('G') | KeyCode::End => viewer.scroll = last,
+        _ => {}
+    }
+}
+
 fn help() -> Vec<Line<'static>> {
     let row = |keys: &str, what: &str| {
-        Line::from(vec![span(format!("  {keys:<18}"), Tone::Shell), span(what.to_owned(), Tone::Plain)])
+        Line::from(vec![span(format!("  {keys:<24} "), Tone::Shell), span(what.to_owned(), Tone::Plain)])
     };
     let head = |t: &str| Line::from(span(t.to_owned(), Tone::Dim));
-    vec![
+    let mut lines = vec![
         head("tasks"),
         row("enter", "run the task in the input"),
         row("shift+tab", "mode: plan only, confirm, auto"),
-        row("tab", "show one attempt large; again for the next"),
+        row("tab", "complete a picked suggestion; otherwise show one attempt large"),
+        row("/", "commands and argument hints; arrows pick, Tab completes"),
+        row("@path", "point the task at a file; arrows pick, Tab completes"),
+        row("? (empty input)", "shortcuts for the current screen"),
         row("ctrl+o", "the transcript: model text, tool arguments and results (o: of the attempt shown large)"),
         row("esc", "stop the task"),
         row("enter (running)", "add what you typed to the running task"),
@@ -3141,38 +3866,21 @@ fn help() -> Vec<Line<'static>> {
         row("ctrl+l", "clear and redraw the screen"),
         row("ctrl+z", "suspend the interface; fg returns, services keep running"),
         row("ctrl+g", "write the task in $VISUAL or $EDITOR"),
+        row("ctrl+r", "search input history; again: older match; Enter runs; Tab/Esc edits; Ctrl+C cancels"),
         row("↑ / ↓", "the line above or below, then earlier inputs"),
         row("ctrl+d twice", "quit"),
         Line::default(),
         head("commands"),
-        row("/memory [words]", "notes about this project"),
-        row("/memory-used [run]", "recorded context for this run (default: latest)"),
-        row("/remember TEXT", "a preference of yours, for every project"),
-        row("/check [command]", "use this check for every task; empty: design one"),
-        row("", "while a task runs: check its result with this instead"),
-        row("/protect PATH...", "the running task must leave these as they are"),
-        row("/pause, /resume", "start nothing new in the running task, then go on"),
-        row("/new", "a new conversation: later tasks forget the earlier ones"),
-        row("/attempts N", "attempts at once, 1 to 8"),
-        row("/stream on|off", "model text previews for the next task"),
-        row("@path", "point the task at a file; tab puts in the picked suggestion"),
-        row("/notify on|all|off", "bell and desktop notice when waiting (all: also when a task ends)"),
-        row("/commit on|off", "commit each applied result to git; `molt undo` takes it back"),
-        row("/model NAME", "opus, sonnet, haiku or a model id"),
-        row("/memory-model NAME", "model memory learns with; same: the attempts'"),
-        row("/effort LEVEL", "low, medium, high, xhigh or max"),
-        row("/budget USD", "spending limit per task"),
-        row("/last", "the diff of the last finished task"),
-        row("/lanes", "the tool calls of the last finished task"),
-        row("/theme NAME", "dark, light or terminal ANSI colors; saved for next time"),
-        row("/clear", "clear the log"),
-        row("/quit", "quit"),
+    ];
+    lines.extend(super::commands::BUILTINS.iter().map(|c| row(&c.label(), c.description)));
+    lines.extend([
         Line::default(),
         head("modes"),
         row("plan only", "results stay in their forks; the workspace is not changed"),
         row("confirm", "stop for the check or the result when one needs a look"),
         row("auto", "design the check and apply what passes"),
-    ]
+    ]);
+    lines
 }
 
 /// Lines as plain text, for tests.
@@ -3241,6 +3949,327 @@ mod tests {
             turn: 1,
             call: "fake-stream".into(),
             seq,
+        }
+    }
+
+    fn queue_app() -> App {
+        let mut app = App::new("/work/project", None);
+        app.update(Msg::SessionUp { versions: vec![], memory_problem: Some("not configured".into()) });
+        app.mode = Mode::Plan;
+        app.settings.check = Some("true".into());
+        app
+    }
+
+    #[test]
+    fn queued_tasks_snapshot_execution_settings_and_plain_input_still_steers_the_current_task() {
+        let mut app = queue_app();
+        type_in(&mut app, "first");
+        type_in(&mut app, "/model haiku");
+        type_in(&mut app, "/attempts 2");
+        type_in(&mut app, "/budget 1.5");
+        type_in(&mut app, "/effort high");
+        type_in(&mut app, "/stream off");
+        assert!(type_in(&mut app, "/queue add second").is_empty());
+        type_in(&mut app, "/model sonnet");
+        type_in(&mut app, "/queue add third");
+        let actions = type_in(&mut app, "also support Unicode");
+        assert!(
+            matches!(actions.as_slice(), [Action::Control { action: Control::Constrain(c), .. }] if c.text == "also support Unicode")
+        );
+        assert_eq!(app.queue.len(), 2);
+        app.mode = Mode::Auto;
+        app.settings.check = Some("false".into());
+        app.settings.model = Some("opus".into());
+        app.take_preference_changes();
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let actions = app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/first"))) });
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(
+            (req.task.as_str(), req.model.as_deref(), req.check.as_deref()),
+            ("second", Some("haiku"), Some("true"))
+        );
+        assert_eq!(
+            (req.attempts, req.budget_usd, req.effort, req.apply, req.stream),
+            (2, Some(1.5), Some(Effort::High), false, false)
+        );
+        assert_eq!(req.earlier.last().unwrap().task, "first");
+        assert_eq!(app.mode, Mode::Auto);
+        assert_eq!(app.settings.model.as_deref(), Some("opus"));
+        assert!(app.take_preference_changes().is_empty());
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let actions = app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/second"))) });
+        assert!(
+            matches!(actions.as_slice(), [Action::Run { req, .. }] if req.task == "third" && req.model.as_deref() == Some("sonnet") && !req.apply)
+        );
+        assert_eq!(app.kept, ["/fork/first", "/fork/second"]);
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn a_queue_waits_for_apply_commit_and_discard_to_settle_before_starting_the_next_task() {
+        let mut app = queue_app();
+        app.mode = Mode::Confirm;
+        app.rules.always_ask = true;
+        app.settings.commit = true;
+        type_in(&mut app, "first");
+        type_in(&mut app, "/queue add second");
+        type_in(&mut app, "/queue add third");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        assert!(app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/first"))) }).is_empty());
+        assert_eq!(app.queue.len(), 2);
+        assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
+        assert_eq!(app.update(key(KeyCode::Enter)), [Action::Apply { fork: "/fork/first".into() }]);
+        assert_eq!(app.queue.len(), 2);
+        let actions = app.update(Msg::Applied(Ok(())));
+        assert!(matches!(actions.as_slice(), [Action::Commit { .. }]));
+        assert_eq!(app.queue.len(), 2);
+        let actions = app.update(Msg::Committed(Ok(None)));
+        assert!(matches!(actions.as_slice(), [Action::PrepareCommit { .. }, Action::Run { req, .. }]
+            if req.task == "second" && req.earlier.last().unwrap().applied));
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/second"))) });
+        assert_eq!(app.update(key(KeyCode::Char('n'))), [Action::Discard { fork: "/fork/second".into() }]);
+        assert_eq!(app.queue.len(), 1);
+        let actions = app.update(Msg::Discarded(Ok(())));
+        assert!(
+            matches!(actions.as_slice(), [Action::PrepareCommit { .. }, Action::Run { req, .. }] if req.task == "third")
+        );
+    }
+
+    #[test]
+    fn queued_confirm_tasks_design_their_own_check_and_wait_for_each_decision() {
+        let mut app = queue_app();
+        type_in(&mut app, "first");
+        app.mode = Mode::Confirm;
+        app.settings.check = None;
+        app.rules.always_ask = true;
+        type_in(&mut app, "/queue add second");
+        type_in(&mut app, "/queue add third");
+        app.mode = Mode::Auto;
+        app.settings.check = Some("false".into());
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let actions = app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/first"))) });
+        let [Action::Design { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.task, "second");
+        assert!(!req.apply && req.check.is_none());
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
+        assert!(matches!(app.prompt, Some(Prompt::Check(_))));
+        assert_eq!(app.queue.len(), 1);
+        let actions = app.update(key(KeyCode::Esc));
+        assert!(matches!(actions.as_slice(), [Action::Design { req, .. }] if req.task == "third"));
+    }
+
+    #[test]
+    fn stopping_the_current_task_preserves_and_pauses_its_queue_until_explicit_resume() {
+        let mut app = queue_app();
+        type_in(&mut app, "first");
+        type_in(&mut app, "/queue add second\nwith a second line");
+        assert!(matches!(app.update(key(KeyCode::Esc)).as_slice(), [Action::Interrupt { .. }]));
+        assert!(app.queue_paused && app.queue.len() == 1);
+        assert!(frame_text(&mut app).contains("1 queued"));
+        assert_eq!(app.update(Msg::Stopped { kept: vec![] }), [Action::StartSession]);
+        assert!(app
+            .update(Msg::SessionUp { versions: vec![], memory_problem: Some("not configured".into()) })
+            .is_empty());
+        let actions = type_in(&mut app, "/queue resume");
+        assert!(matches!(actions.as_slice(), [Action::Run { req, .. }] if req.task == "second\nwith a second line"));
+    }
+
+    #[test]
+    fn queue_exit_warning_and_terminal_report_retain_complete_unexecuted_task_text() {
+        for command in [false, true] {
+            let mut app = queue_app();
+            type_in(&mut app, "/queue pause");
+            let task = "first line\nsecond line with spaces  and Unicode 中文";
+            type_in(&mut app, &format!("/queue add {task}"));
+            if command {
+                assert!(type_in(&mut app, "/quit").is_empty());
+            } else {
+                assert!(app.update(ctrl_key('d')).is_empty());
+            }
+            let shown = plain(&app.viewer.as_ref().unwrap().lines).join("\n");
+            assert!(shown.contains("first line\n  second line with spaces  and Unicode 中文"), "{shown}");
+            assert_eq!(app.unexecuted(), [task]);
+            assert!(matches!(app.update(ctrl_key('d')).as_slice(), [Action::Quit { .. }]));
+            assert!(app.quit && app.queue.len() == 1);
+            assert_eq!(app.unexecuted(), [task]);
+        }
+    }
+
+    #[test]
+    fn the_queue_browser_adds_multiline_tasks_and_can_reorder_inspect_and_remove_them() {
+        let mut app = queue_app();
+        type_in(&mut app, "/queue pause");
+        for task in ["first", "second", "third"] {
+            type_in(&mut app, &format!("/queue add {task}"));
+        }
+        type_in(&mut app, "/queue move 3 1");
+        type_in(&mut app, "/queue remove 2");
+        assert_eq!(app.unexecuted(), ["third", "second"]);
+        type_in(&mut app, "/queue");
+        assert!(frame_text(&mut app).contains("task queue · paused"));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Char('K')));
+        assert_eq!(app.unexecuted(), ["second", "third"]);
+        app.update(key(KeyCode::Char('n')));
+        app.update(key(KeyCode::Char('a')));
+        app.update(Msg::Paste("cancel this draft".into()));
+        app.update(ctrl_key('c'));
+        assert!(app.queue_view.as_ref().unwrap().draft.is_none() && app.quit_armed.is_none());
+        app.update(key(KeyCode::Char('a')));
+        app.update(Msg::Paste("new\nmultiline task".into()));
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.unexecuted(), ["third", "new\nmultiline task"]);
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Enter));
+        assert!(plain(&app.viewer.as_ref().unwrap().lines).join("\n").contains("new\nmultiline task"));
+        app.update(key(KeyCode::Esc));
+        app.update(key(KeyCode::Esc));
+        type_in(&mut app, "/queue move 0 1");
+        assert_eq!(app.queue.len(), 2);
+        type_in(&mut app, "/queue clear");
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn queue_limits_keep_rejected_drafts_and_bad_file_references_pause_without_losing_the_task() {
+        let mut app = queue_app();
+        type_in(&mut app, "/queue pause");
+        let oversized = format!("/queue add {}", "a".repeat(64 * 1024 + 1));
+        type_in(&mut app, &oversized);
+        assert!(app.queue.is_empty());
+        assert_eq!(app.input.full(), oversized);
+        app.input.take();
+        for _ in 0..100 {
+            type_in(&mut app, "/queue add task");
+        }
+        type_in(&mut app, "/queue add overflow");
+        assert_eq!(app.queue.len(), 100);
+        assert_eq!(app.input.full(), "/queue add overflow");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = queue_app();
+        app.workspace_path = tmp.path().to_str().unwrap().into();
+        type_in(&mut app, "first");
+        type_in(&mut app, "/queue add update @../outside");
+        app.input = Input::with("my unsent draft");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        assert!(app.update(Msg::Ran { trace, result: Err("failed".into()) }).is_empty());
+        assert!(app.queue_paused && app.queue.len() == 1 && app.task.is_none());
+        assert_eq!(app.input.full(), "my unsent draft");
+        std::fs::write(tmp.path().join("later.txt"), "added by the preceding task").unwrap();
+        app.input.take();
+        type_in(&mut app, "/queue remove 1");
+        type_in(&mut app, "/queue add update @later.txt");
+        app.files = Some(vec![]);
+        app.files_complete = true;
+        let actions = type_in(&mut app, "/queue resume");
+        assert!(matches!(actions.as_slice(), [Action::Run { req, .. }] if req.files == ["later.txt"]));
+    }
+
+    #[test]
+    fn a_failed_task_yields_its_optional_retry_offer_to_queued_work() {
+        let mut app = queue_app();
+        type_in(&mut app, "first");
+        type_in(&mut app, "/queue add second");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let mut response = passed(false, None);
+        response.outcome = Outcome::Failed;
+        let actions = app.update(Msg::Ran { trace, result: Ok(response) });
+        assert!(matches!(actions.as_slice(), [Action::Run { req, .. }] if req.task == "second"));
+        assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn plan_results_are_browsable_and_remain_available_until_apply_or_discard_succeeds() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        app.mode = Mode::Plan;
+        type_in(&mut app, "/check true");
+        type_in(&mut app, "fix parser");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/result"))) });
+        app.learning.clear();
+        type_in(&mut app, "/kept");
+        let shown = frame_text(&mut app);
+        assert!(shown.contains("fix parser") && shown.contains("1 files") && shown.contains("1 kept"), "{shown}");
+        assert_eq!(app.update(key(KeyCode::Char('d'))), [Action::Diff { fork: "/fork/result".into() }]);
+        app.update(Msg::Diff {
+            fork: "/fork/result".into(),
+            result: Ok(molt_api::fs::DiffResponse { changes: vec![], patch: "+new\n-old".into(), truncated: false }),
+        });
+        assert!(plain(&app.viewer.as_ref().unwrap().lines).join("\n").contains("+new"));
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.update(key(KeyCode::Enter)), [Action::Apply { fork: "/fork/result".into() }]);
+        app.update(Msg::Applied(Err("conflict: src/parser.rs".into())));
+        assert_eq!(app.kept, ["/fork/result"]);
+        assert!(frame_text(&mut app).contains("conflict: src/parser.rs"));
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.update(key(KeyCode::Enter)), [Action::Apply { fork: "/fork/result".into() }]);
+        app.update(Msg::Applied(Ok(())));
+        assert!(app.kept.is_empty());
+        let entry = super::super::kept::Entry::new("/fork/discard".into(), "another task", "passed");
+        app.restore_kept(vec![entry]);
+        assert_eq!(app.update(key(KeyCode::Char('n'))), [Action::Discard { fork: "/fork/discard".into() }]);
+        app.update(Msg::Discarded(Err("busy".into())));
+        assert_eq!(app.kept, ["/fork/discard"]);
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.update(key(KeyCode::Char('n'))), [Action::Discard { fork: "/fork/discard".into() }]);
+        app.update(Msg::Discarded(Ok(())));
+        assert!(app.kept.is_empty());
+    }
+
+    #[test]
+    fn restored_kept_results_apply_only_when_idle_and_late_diffs_do_not_reopen_a_viewer() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        app.restore_kept(vec![super::super::kept::Entry::new("/fork/old".into(), "old task", "passed")]);
+        type_in(&mut app, "new task");
+        type_in(&mut app, "/kept");
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert!(app.flash.as_ref().unwrap().contains("idle"));
+        assert!(app.update(key(KeyCode::Char('n'))).is_empty());
+        app.update(key(KeyCode::Char('d')));
+        app.update(key(KeyCode::Esc));
+        app.update(Msg::Diff { fork: "/fork/old".into(), result: Err("late".into()) });
+        assert!(app.viewer.is_none());
+        app.update(key(KeyCode::Esc));
+        app.task = None;
+        type_in(&mut app, "/kept");
+        assert_eq!(app.update(key(KeyCode::Enter)), [Action::Apply { fork: "/fork/old".into() }]);
+        app.update(key(KeyCode::Esc));
+        assert!(type_in(&mut app, "/restart").is_empty());
+        assert!(app.flash.as_ref().unwrap().contains("finish or stop"));
+        assert!(type_in(&mut app, "another task").is_empty());
+        assert!(app.flash.as_ref().unwrap().contains("current apply"));
+    }
+
+    #[test]
+    fn quitting_a_confirmed_result_records_it_and_failed_live_applies_keep_its_metadata() {
+        for exit in [0, 1, 2] {
+            let mut app = App::new("/work/project", None);
+            up(&mut app);
+            app.rules.always_ask = true;
+            type_in(&mut app, "/check true");
+            type_in(&mut app, "fix parser");
+            let trace = app.task.as_ref().unwrap().trace.clone();
+            app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/waiting"))) });
+            if exit == 0 {
+                app.update(key(KeyCode::Enter));
+                app.update(Msg::Applied(Err("conflict".into())));
+            } else {
+                if exit == 2 {
+                    app.update(key(KeyCode::Enter));
+                }
+                let actions = app.update(Msg::Signal);
+                assert!(actions
+                    .iter()
+                    .any(|action| matches!(action, Action::Quit { keep } if keep == &["/fork/waiting"])));
+            }
+            assert_eq!(app.kept, ["/fork/waiting"]);
+            assert!(
+                matches!(app.take_kept_changes().last(), Some(super::super::kept::Change::Save(entry)) if entry.task == "fix parser")
+            );
         }
     }
 
@@ -3383,6 +4412,7 @@ mod tests {
         let actions = app.update(Msg::Applied(Ok(())));
         assert!(matches!(actions.as_slice(), [Action::Commit { trace: t, .. }] if *t == trace), "{actions:?}");
 
+        app.update(Msg::Committed(Ok(None)));
         // A result the user keeps in its fork, or that fails to apply, is not committed.
         let actions = type_in(&mut app, "once more");
         let [Action::PrepareCommit { trace }, ..] = actions.as_slice() else { panic!("{actions:?}") };
@@ -3514,6 +4544,430 @@ mod tests {
     fn workspace_files() -> Msg {
         let files = ["Cargo.toml", "src/lexer.rs", "src/lib.rs", "src/parser/lex_table.rs", "tests/lexer.rs"];
         Msg::Files { files: files.map(str::to_owned).to_vec(), complete: true }
+    }
+
+    #[test]
+    fn slash_commands_and_values_are_suggested_before_submission() {
+        let mut app = App::new("/w", None);
+        app.update(Msg::Paste("/ef".into()));
+        assert!(frame_text(&mut app).contains("/effort LEVEL"));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "/effort ");
+        let frame = frame_text(&mut app);
+        for value in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(frame.contains(value), "{value}: {frame}");
+        }
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "/effort medium ");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.settings.effort, Some(Effort::Medium));
+    }
+
+    #[test]
+    fn startup_retries_back_off_three_times_and_success_cancels_the_timer() {
+        let mut app = App::new("/w", None);
+        for delay in STARTUP_RETRY_TICKS {
+            assert_eq!(
+                app.update(Msg::SessionFailed("connection refused".into())),
+                [Action::Alert { text: "molt: services down".into() }]
+            );
+            assert!(app.retry_seconds().is_some());
+            assert!(frame_text(&mut app).contains("retrying in"));
+            for _ in 1..delay {
+                assert!(app.update(Msg::Tick).is_empty());
+            }
+            assert_eq!(app.update(Msg::Tick), [Action::StartSession]);
+            assert!(app.update(Msg::Tick).is_empty());
+        }
+        app.update(Msg::SessionFailed("connection refused".into()));
+        for _ in 0..200 {
+            assert!(app.update(Msg::Tick).is_empty());
+        }
+        assert!(app.retry_seconds().is_none());
+        assert!(app.flash.as_ref().is_some_and(|s| s.contains("exhausted")));
+        up(&mut app);
+        app.session = SessionState::Starting;
+        app.update(Msg::SessionFailed("connection refused".into()));
+        assert!(app.retry_seconds().is_some());
+        up(&mut app);
+        for _ in 0..200 {
+            assert!(app.update(Msg::Tick).is_empty());
+        }
+        assert!(matches!(app.session, SessionState::Up { .. }));
+    }
+
+    #[test]
+    fn configuration_errors_and_a_closed_backend_do_not_retry_automatically() {
+        for error in ["ANTHROPIC_API_KEY is not set", "invalid configuration", "permission denied", "unknown provider"]
+        {
+            let mut app = App::new("/w", None);
+            app.update(Msg::SessionFailed(error.into()));
+            assert!(app.retry_seconds().is_none(), "{error}");
+            assert!(app.flash.as_ref().unwrap().contains("configuration or credentials"));
+            for _ in 0..200 {
+                assert!(app.update(Msg::Tick).is_empty());
+            }
+        }
+        let mut app = App::new("/w", None);
+        app.update(Msg::BackendFailed("pipe closed".into()));
+        assert!(app.retry_seconds().is_none());
+        for _ in 0..200 {
+            assert!(app.update(Msg::Tick).is_empty());
+        }
+    }
+
+    #[test]
+    fn manual_restart_preserves_settings_logs_and_kept_results_and_rejects_busy_tasks() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/attempts 4");
+        app.kept = vec!["/fork/kept".into()];
+        app.committing = true;
+        assert!(type_in(&mut app, "/restart").is_empty());
+        app.update(Msg::Committed(Ok(None)));
+        app.push(Line::from("existing log"));
+        assert_eq!(type_in(&mut app, "/restart"), [Action::RestartSession { keep: vec!["/fork/kept".into()] }]);
+        assert_eq!(app.settings.attempts, Some(4));
+        assert_eq!(app.kept, ["/fork/kept"]);
+        assert!(log(&app).contains("existing log"));
+        assert!(type_in(&mut app, "/restart").is_empty());
+        up(&mut app);
+        type_in(&mut app, "implement it");
+        assert!(type_in(&mut app, "/restart").is_empty());
+        assert!(app.flash.as_ref().unwrap().contains("finish or stop"));
+        assert!(app.task.is_some());
+    }
+
+    #[test]
+    fn messages_from_a_replaced_backend_cannot_take_down_the_new_session() {
+        let mut app = App::new("/w", None);
+        app.backend_generation = 2;
+        up(&mut app);
+        app.update(Msg::Backend { generation: 1, message: Box::new(Msg::BackendFailed("old EOF".into())) });
+        assert!(matches!(app.session, SessionState::Up { .. }));
+        app.update(Msg::Backend { generation: 1, message: Box::new(Msg::SessionFailed("old startup failure".into())) });
+        assert!(matches!(app.session, SessionState::Up { .. }));
+        app.update(Msg::Backend { generation: 2, message: Box::new(Msg::BackendFailed("current EOF".into())) });
+        assert!(matches!(app.session, SessionState::Down(_)));
+    }
+
+    #[test]
+    fn log_inspection_redacts_credentials_and_does_not_reopen_a_closed_viewer() {
+        let mut app = App::new("/w", None);
+        app.secrets = vec!["known-sensitive-value".into()];
+        assert_eq!(type_in(&mut app, "/log"), [Action::ShowLog]);
+        app.update(Msg::ServiceLog(Ok(vec![
+            "service ready".into(),
+            "key known-sensitive-value".into(),
+            "TOKEN=unknown-value".into(),
+        ])));
+        let shown = plain(&app.viewer.as_ref().unwrap().lines).join("\n");
+        assert!(shown.contains("service ready") && shown.contains("[redacted]"));
+        assert!(!shown.contains("known-sensitive-value") && !shown.contains("unknown-value"));
+        app.update(key(KeyCode::Esc));
+        app.update(Msg::ServiceLog(Ok(vec!["late".into()])));
+        assert!(app.viewer.is_none());
+    }
+
+    #[test]
+    fn saved_settings_override_config_until_reset_and_feed_the_next_request() {
+        let root = tempfile::tempdir().unwrap();
+        let store = super::super::state::Store::new(root.path(), root.path()).unwrap();
+        let config = crate::Config::parse("[tui]\nmode='auto'\nattempts=2\ncheck='cargo test'").unwrap();
+        let defaults = super::super::settings::Saved::defaults(&config.tui);
+        let mut app = App::new("/w", None);
+        app.configure_preferences(defaults.clone(), None);
+        for line in ["/attempts 4", "/check make test", "/model opus", "/effort high", "/budget 2.5"] {
+            type_in(&mut app, line);
+        }
+        for change in app.take_preference_changes() {
+            super::super::settings::persist(&store, &change, &[]).unwrap();
+        }
+        let mut restarted = App::new("/w", None);
+        restarted.configure_preferences(defaults.clone(), super::super::settings::load(&store, &[]).unwrap());
+        up(&mut restarted);
+        assert_eq!(restarted.mode, Mode::Auto);
+        assert!(frame_text(&mut restarted).contains("auto (shift+tab)"));
+        let actions = type_in(&mut restarted, "implement it");
+        assert!(
+            matches!(&actions[0], Action::Run { req, .. } if req.attempts == 4 && req.check.as_deref() == Some("make test")
+            && req.model.as_deref() == Some("opus") && req.effort == Some(Effort::High) && req.budget_usd == Some(2.5))
+        );
+        restarted.task = None;
+        type_in(&mut restarted, "/reset");
+        for change in restarted.take_preference_changes() {
+            super::super::settings::persist(&store, &change, &[]).unwrap();
+        }
+        assert_eq!(restarted.settings.attempts, Some(2));
+        assert_eq!(restarted.settings.check.as_deref(), Some("cargo test"));
+        assert!(super::super::settings::load(&store, &[]).unwrap().is_none());
+        let mut plain = App::new("/w", None);
+        type_in(&mut plain, "/attempts 3");
+        type_in(&mut plain, "/reset");
+        assert_eq!(plain.mode, Mode::Confirm);
+        assert_eq!(plain.settings, Settings::default());
+    }
+
+    #[test]
+    fn invalid_settings_and_project_template_overrides_do_not_get_saved() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        for line in ["/attempts 0", "/budget NaN", "/effort unknown"] {
+            type_in(&mut app, line);
+        }
+        assert!(app.take_preference_changes().is_empty());
+        app.commands.insert(
+            "local".into(),
+            super::super::commands::Command {
+                template: "fix it".into(),
+                attempts: Some(4),
+                check: Some("true".into()),
+                ..Default::default()
+            },
+        );
+        let before = app.settings.clone();
+        type_in(&mut app, "/local");
+        assert_eq!(app.settings, before);
+        assert!(app.take_preference_changes().is_empty());
+    }
+
+    #[test]
+    fn submitted_history_survives_a_restart_and_arrows_restore_the_draft() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().to_str().unwrap();
+        let store = super::super::state::Store::new(root.path(), root.path()).unwrap();
+        let mut app = App::new(workspace, None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        type_in(&mut app, "fix login");
+        app.task = None;
+        type_in(&mut app, "fix cache");
+        for change in app.take_history_changes() {
+            store.change_history(&change, &app.secrets).unwrap();
+        }
+        let mut restarted = App::new(workspace, None);
+        restarted.restore_history(store.history(&[]).unwrap().0);
+        restarted.input = Input::with("unfinished draft");
+        restarted.update(key(KeyCode::Up));
+        assert_eq!(restarted.input.text, "fix cache");
+        restarted.update(key(KeyCode::Up));
+        assert_eq!(restarted.input.text, "fix login");
+        restarted.update(key(KeyCode::Down));
+        restarted.update(key(KeyCode::Down));
+        assert_eq!(restarted.input.text, "unfinished draft");
+    }
+
+    #[test]
+    fn reverse_history_search_deduplicates_cycles_and_executes_the_picked_input() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.settings.check = Some("true".into());
+        app.restore_history(["run tests", "other", "run slow tests", "run tests"].map(str::to_owned).to_vec());
+        app.input = Input::with("run");
+        app.update(ctrl_key('r'));
+        assert_eq!(app.history_matches(), ["run tests", "run slow tests"]);
+        assert!(frame_text(&mut app).contains("› run tests"));
+        app.update(ctrl_key('r'));
+        assert!(frame_text(&mut app).contains("› run slow tests"));
+        let actions = app.update(key(KeyCode::Enter));
+        assert!(matches!(&actions[0], Action::Run { req, .. } if req.task == "run slow tests"));
+        assert!(app.history_search.is_none());
+    }
+
+    #[test]
+    fn reverse_search_can_edit_a_match_or_cancel_without_interrupting_a_task() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "running task");
+        app.restore_history(vec!["fix café\nthen test".into()]);
+        app.input = Input::with("draft");
+        app.update(ctrl_key('r'));
+        app.update(ctrl_key('u'));
+        app.update(Msg::Paste("café".into()));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "fix café\nthen test");
+        app.input = Input::with("draft");
+        app.update(ctrl_key('r'));
+        app.update(ctrl_key('u'));
+        assert!(app.update(ctrl_key('c')).is_empty());
+        assert_eq!(app.input.text, "draft");
+        assert!(app.task.is_some());
+        app.update(ctrl_key('r'));
+        app.update(ctrl_key('u'));
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.input.text, "fix café\nthen test");
+    }
+
+    #[test]
+    fn clearing_the_log_keeps_history_and_history_clear_removes_it() {
+        let mut app = App::new("/w", None);
+        app.secrets = vec!["known-sensitive-value".into()];
+        type_in(&mut app, "ordinary input");
+        app.input.take();
+        type_in(&mut app, "use known-sensitive-value");
+        app.input.take();
+        type_in(&mut app, "/clear");
+        assert!(app.history.iter().any(|e| e == "ordinary input"));
+        assert!(!app.history.iter().any(|e| e.contains("known-sensitive-value")));
+        type_in(&mut app, "/history-clear");
+        assert!(app.history.is_empty());
+        assert!(matches!(app.take_history_changes().as_slice(), [super::super::state::HistoryChange::Clear]));
+    }
+
+    #[test]
+    fn question_mark_opens_and_closes_shortcuts_but_is_text_in_a_task() {
+        let mut app = App::new("/w", None);
+        app.update(key(KeyCode::Char('?')));
+        assert!(app.input.text.is_empty());
+        assert!(frame_text(&mut app).contains("shortcuts"));
+        app.update(key(KeyCode::Char('?')));
+        assert!(!frame_text(&mut app).contains("shortcuts"));
+        app.update(Msg::Paste("why".into()));
+        app.update(key(KeyCode::Char('?')));
+        assert_eq!(app.input.text, "why?");
+        app.input.take();
+        app.update(key(KeyCode::Char('?')));
+        app.update(key(KeyCode::Esc));
+        assert!(!frame_text(&mut app).contains("shortcuts"));
+    }
+
+    #[test]
+    fn the_picker_scrolls_wraps_hides_and_preserves_the_input_until_tab() {
+        let mut app = App::new("/w", None);
+        app.update(Msg::Paste("/attempts ".into()));
+        let frame = frame_rows(&mut app, 140);
+        assert_eq!(frame.iter().filter(|l| l.contains("attempts at once")).count(), 6);
+        app.update(key(KeyCode::Up));
+        let frame = frame_text(&mut app);
+        assert!(frame.contains("› default") && frame.contains("9/9"), "{frame}");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|frame| super::super::view::draw(frame, &mut app)).unwrap();
+        let small: String = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(small.contains("› default"), "the picked value stays visible in a short terminal: {small}");
+        assert_eq!(app.input.text, "/attempts ");
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Up));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "/attempts 1 ");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.settings.attempts, Some(1));
+        app.update(Msg::Paste("/model ".into()));
+        app.update(key(KeyCode::Esc));
+        assert!(app.command_completions().is_empty());
+        assert_eq!(app.input.text, "/model ");
+        app.update(key(KeyCode::Char('s')));
+        assert!(frame_text(&mut app).contains("› sonnet"));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "/model sonnet ");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.settings.model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn completion_does_not_replace_free_text_or_text_after_the_cursor() {
+        let mut app = App::new("/w", None);
+        for text in ["/model custom-model", "/check echo hello", "/effort high\nmore text", "/unknown"] {
+            app.input = Input::with(text);
+            assert!(app.command_completions().is_empty(), "{text}");
+            app.update(key(KeyCode::Tab));
+            assert_eq!(app.input.text, text);
+        }
+        app.input = Input::with("/model sonnet");
+        app.update(key(KeyCode::Left));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "/model sonnet");
+    }
+
+    #[test]
+    fn completion_takes_tab_and_escape_before_the_running_task_does() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        type_in(&mut app, "implement it");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        attempt_with_tool_call(&mut app, &trace, "cargo test");
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.zoom, Some(0));
+        app.update(Msg::Paste("/ef".into()));
+        assert!(frame_text(&mut app).contains("/effort LEVEL"));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "/effort ");
+        assert_eq!(app.zoom, Some(0));
+        assert!(app.update(key(KeyCode::Esc)).is_empty());
+        assert!(app.running());
+        assert!(app.command_completions().is_empty());
+        app.input.take();
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.zoom, None);
+    }
+
+    #[test]
+    fn shortcut_help_keeps_confirmation_and_memory_editing_intact() {
+        let mut app = App::new("/w", None);
+        app.prompt = Some(Prompt::Check(design()));
+        app.update(key(KeyCode::Char('?')));
+        let text = frame_text(&mut app);
+        assert!(text.contains("check confirmation") && text.contains("edit check"));
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.prompt, Some(Prompt::Check(_))));
+        app.prompt = Some(Prompt::Apply { resp: Box::new(passed(false, Some("/fork"))), fork: "/fork".into() });
+        app.update(key(KeyCode::Char('?')));
+        let text = frame_text(&mut app);
+        assert!(text.contains("apply confirmation") && text.contains("keep result in its fork"));
+        app.update(key(KeyCode::Char('?')));
+        assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
+        app.prompt = None;
+        app.screen = Screen::Memory(MemoryView {
+            query: String::new(),
+            notes: vec![],
+            selected: 0,
+            loading: false,
+            error: None,
+            edit: None,
+        });
+        app.update(key(KeyCode::Char('?')));
+        assert!(frame_text(&mut app).contains("filter notes"));
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.screen, Screen::Memory(_)));
+        app.update(key(KeyCode::Char('/')));
+        app.update(Msg::Paste("why".into()));
+        app.update(key(KeyCode::Char('?')));
+        let Screen::Memory(view) = &app.screen else { panic!("memory closed") };
+        assert!(matches!(&view.edit, Some(MemoryEdit::Filter(i)) if i.text == "why?"));
+        assert!(app.shortcuts.is_none());
+        app.screen = Screen::Main;
+        type_in(&mut app, "/help");
+        app.update(key(KeyCode::Char('?')));
+        assert!(plain(&app.shortcuts.as_ref().unwrap().lines).join("\n").contains("close viewer"));
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.viewer.as_ref().unwrap().title, "help");
+    }
+
+    #[test]
+    fn every_builtin_is_parsed_documented_and_reserves_its_name() {
+        let mut names = HashSet::new();
+        let help = plain(&help()).join("\n");
+        for definition in super::super::commands::BUILTINS {
+            assert!(names.insert(definition.name), "duplicate {}", definition.name);
+            assert!(help.contains(&definition.label()), "{} missing from help", definition.name);
+            assert!(help.contains(definition.description));
+            let mut app = App::new("/w", None);
+            up(&mut app);
+            let arg = definition.values.first().copied().unwrap_or("");
+            app.command(&format!("{} {arg}", definition.name));
+            assert!(!app.flash.as_deref().is_some_and(|s| s.starts_with("no command")), "{}", definition.name);
+        }
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".molt/commands");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in &names {
+            std::fs::write(dir.join(format!("{name}.md")), "conflict").unwrap();
+        }
+        let (projects, warnings) = super::super::commands::load(root.path());
+        assert!(projects.is_empty());
+        assert_eq!(warnings.len(), names.len());
     }
 
     #[test]
@@ -3711,7 +5165,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("fix-issue.md"),
-            "---\ncheck: cargo test\nattempts: 3\nbudget: 2.5\n---\nFix issue $ARGUMENTS",
+            "---\ndescription: Fix an issue\nargument-hint: ISSUE\ncheck: cargo test\nattempts: 3\nbudget: 2.5\n---\nFix issue $ARGUMENTS",
         )
         .unwrap();
         std::fs::write(dir.join("help.md"), "wrong").unwrap();
@@ -3719,8 +5173,12 @@ mod tests {
         app.load_commands(root.path());
         up(&mut app);
         app.settings.budget_usd = Some(1.0);
-        assert_eq!(app.command_candidates("fix-"), ["fix-issue"]);
-        assert!(type_in(&mut app, "/fix-issue 12").is_empty());
+        app.update(Msg::Paste("/fix-".into()));
+        let frame = frame_text(&mut app);
+        assert!(frame.contains("/fix-issue ISSUE") && frame.contains("Fix an issue"));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "/fix-issue ");
+        assert!(type_in(&mut app, "12").is_empty());
         let task = app.task.as_ref().unwrap();
         assert_eq!(task.req.task, "Fix issue 12");
         assert_eq!(task.req.attempts, 3);
