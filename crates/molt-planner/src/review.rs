@@ -34,6 +34,17 @@ pub(crate) struct Winner<'a> {
     pub requirements: &'a [Requirement],
 }
 
+/// The review by the fixed rules alone, for a workflow that asks no
+/// reviewer model: what they find holds the changes back.
+pub(crate) async fn by_rules(ctx: &Arc<Ctx>, check_files: &[String], changes: &[Change], patch: &str) -> Review {
+    let findings = rules(check_files, changes, patch);
+    let verdict = if findings.is_empty() { Verdict::Approve } else { Verdict::Concern };
+    let name = if findings.is_empty() { "approve" } else { "concern" };
+    ctx.note(format!("review by the fixed rules only: {name}")).await;
+    let details = ReviewDetails { rules: findings.clone(), ..ReviewDetails::default() };
+    Review { verdict, findings, details: Some(details) }
+}
+
 pub(crate) async fn review(ctx: &Arc<Ctx>, winner: &Winner<'_>) -> Review {
     let mut findings = rules(&winner.check.files, winner.changes, winner.patch);
     let mut verdict = if findings.is_empty() { Verdict::Approve } else { Verdict::Concern };

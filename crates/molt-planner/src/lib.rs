@@ -5,6 +5,7 @@
 //! scripted fakes.
 
 mod agent;
+mod ask;
 mod attempt;
 pub mod checkpoint;
 mod control;
@@ -18,6 +19,7 @@ mod memory;
 mod prompts;
 mod referenced;
 mod review;
+mod route;
 mod runner;
 mod select;
 mod tools;
@@ -53,6 +55,11 @@ pub struct Config {
     pub model_timeout: Duration,
     /// Deadline for one done-check run.
     pub check_timeout: Duration,
+    /// Questions the attempts of an interactive run may ask the person, in all.
+    pub max_questions: u32,
+    /// How long an attempt waits for the answer to its question before it
+    /// decides itself.
+    pub ask_timeout: Duration,
     /// Runs handled at once.
     pub max_concurrent_runs: usize,
     /// Size of the project map at the start of a run, in estimated tokens.
@@ -78,6 +85,9 @@ pub struct Config {
     /// Workflows a run may name besides the built-ins. They come from
     /// whoever starts the planner, never from a request or a project.
     pub workflows: Vec<molt_api::workflow::Workflow>,
+    /// Model for the one call that picks a workflow for a run that names
+    /// `auto`; `None` uses the run's model.
+    pub route_model: Option<String>,
 }
 
 impl Default for Config {
@@ -92,6 +102,8 @@ impl Default for Config {
             max_tokens: 32_000,
             model_timeout: Duration::from_secs(1200),
             check_timeout: Duration::from_secs(900),
+            max_questions: 3,
+            ask_timeout: Duration::from_secs(600),
             max_concurrent_runs: 4,
             map_tokens: 3_000,
             late_reply_wait: Duration::from_secs(2),
@@ -101,6 +113,7 @@ impl Default for Config {
             instruction_files: vec!["AGENTS.md".into(), "CLAUDE.md".into()],
             syntax_check: molt_api::fs::SyntaxCheck::Report,
             workflows: Vec::new(),
+            route_model: None,
         }
     }
 }
@@ -109,8 +122,8 @@ impl Config {
     /// [`Config::default`] overridden by `MOLT_PLANNER_MODEL`,
     /// `MOLT_MAX_TURNS`, `MOLT_MAX_CHECK_ROUNDS`, `MOLT_BUDGET_USD`,
     /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_MAX_TOKENS`, `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
-    /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES` and
-    /// `MOLT_SYNTAX_CHECK`.
+    /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES`,
+    /// `MOLT_SYNTAX_CHECK` and `MOLT_ROUTE_MODEL`.
     ///
     /// | Variable | Default |
     /// |---|---|
@@ -126,6 +139,7 @@ impl Config {
     /// | `MOLT_CONTEXT_TOKENS` | unset: 200000 for Claude models, 128000 for others |
     /// | `MOLT_INSTRUCTION_FILES` | `AGENTS.md,CLAUDE.md`; `none` reads none |
     /// | `MOLT_SYNTAX_CHECK` | `report`; or `reject`, or `off` |
+    /// | `MOLT_ROUTE_MODEL` | unset: the run's model picks the workflow of a run that names `auto` |
     ///
     /// An empty variable counts as unset. A value that does not parse is an
     /// error, and so is a zero: none of these limits has a "no limit" value.
@@ -180,6 +194,8 @@ impl Config {
             max_tokens: small("MOLT_MAX_TOKENS", d.max_tokens)?,
             model_timeout: Duration::from_secs(number("MOLT_MODEL_TIMEOUT_S", d.model_timeout.as_secs())?),
             check_timeout: Duration::from_secs(number("MOLT_CHECK_TIMEOUT_S", d.check_timeout.as_secs())?),
+            max_questions: d.max_questions,
+            ask_timeout: d.ask_timeout,
             map_tokens: small("MOLT_MAP_TOKENS", d.map_tokens)?.min(32_000),
             max_concurrent_runs: d.max_concurrent_runs,
             late_reply_wait: d.late_reply_wait,
@@ -206,6 +222,7 @@ impl Config {
                     .map_err(|_| anyhow::anyhow!("MOLT_SYNTAX_CHECK={v:?}: use report, reject or off"))?,
             },
             workflows: d.workflows,
+            route_model: get("MOLT_ROUTE_MODEL"),
         })
     }
 }

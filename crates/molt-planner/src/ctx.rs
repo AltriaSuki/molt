@@ -99,6 +99,8 @@ pub(crate) struct Ctx {
     /// stops, so that it spends at most its share (see [`Ctx::capped`]).
     pub spend_cap: Option<f64>,
     pub stream: bool,
+    /// A person can answer: attempts are offered `ask_user`.
+    pub interactive: bool,
     /// What memory knows about the workspace; empty when memory is not up.
     pub memory: Memory,
     /// The planner may read the web (it holds a capability for `web.fetch`):
@@ -126,6 +128,8 @@ pub(crate) struct Ctx {
     pub earlier: Option<String>,
     /// The stages the run goes through.
     pub workflow: Arc<Workflow>,
+    /// The task before this one that the run goes on from.
+    pub continues: Option<Arc<molt_api::planner::Continuation>>,
 }
 
 /// A conversation that grows until it no longer fits a model call (see
@@ -211,6 +215,7 @@ impl Ctx {
             design_budget_usd: req.design_budget_usd.unwrap_or(share * budget_usd).min(budget_usd),
             spend_cap: None,
             stream: req.stream,
+            interactive: req.interactive,
             memory: Memory::default(),
             web,
             web_health: Arc::default(),
@@ -227,6 +232,7 @@ impl Ctx {
             control: Control::new(Vec::new()),
             earlier: crate::prompts::earlier_tasks(&req.earlier),
             workflow: Arc::new(workflow),
+            continues: req.continues.clone().map(Arc::new),
         }
     }
 
@@ -397,6 +403,7 @@ impl Ctx {
             Some(n) => format!("attempt {n}"),
             None if conv.system == crate::prompts::REVIEWER_SYSTEM => "the reviewer".to_owned(),
             None if conv.system == crate::prompts::JUDGE_SYSTEM => "the judge".to_owned(),
+            None if conv.system == crate::prompts::ROUTE_SYSTEM => "picking a workflow".to_owned(),
             None => "the check's designer".to_owned(),
         };
         let busy = self.control.busy(format!("{who}: a model call"));

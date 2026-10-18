@@ -111,6 +111,17 @@ pub enum Progress {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         waiting: Vec<String>,
     },
+    /// Attempt `attempt` asked the person `text` and waits for the answer: a
+    /// constraint on `planner.control` that answers `question`, numbered
+    /// from 1 within the run.
+    Asked {
+        run: String,
+        attempt: u32,
+        question: u32,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<String>,
+    },
     /// What memory gave the run to start with: the notes recalled, best
     /// first, and the size of the project map.
     Recalled {
@@ -118,6 +129,15 @@ pub enum Progress {
         notes: Vec<RecalledNote>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         map_tokens: Option<u32>,
+    },
+    /// The planner picked `workflow` for a run that named
+    /// [`crate::workflow::AUTO`], before anything else ran. `reason` is
+    /// short, and empty when the pick was not the model's (it failed, say).
+    Routed {
+        run: String,
+        workflow: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
     },
 }
 
@@ -140,10 +160,12 @@ impl Progress {
             | Self::CheckRan { run, .. }
             | Self::AttemptFinished { run, .. }
             | Self::Note { run, .. }
+            | Self::Asked { run, .. }
             | Self::Required { run, .. }
             | Self::Adopted { run, .. }
             | Self::State { run, .. }
-            | Self::Recalled { run, .. } => run,
+            | Self::Recalled { run, .. }
+            | Self::Routed { run, .. } => run,
         }
     }
 

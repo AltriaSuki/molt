@@ -126,6 +126,12 @@ pub struct RunRequest {
     /// Publish model text previews while calls are in flight.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stream: bool,
+    /// A person follows the run and can answer: attempts are offered
+    /// [`tools::ASK_USER`], whose question the planner publishes as
+    /// [`crate::progress::Progress::Asked`]. The answer comes back on
+    /// [`CONTROL`] as a [`Constraint`] that [`Constraint::answers`] it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interactive: bool,
     /// Have a reviewer look at a winner that passed its check, for changes
     /// that game the check, before it is applied. With `apply`, only an
     /// approved result is merged.
@@ -161,8 +167,29 @@ pub struct RunRequest {
     /// The workflow to run, by name: one the planner defines (see
     /// [`crate::workflow`]). A request names one and never defines one.
     /// `None`: [`crate::workflow::VERIFY`], which the fields above configure.
+    /// [`crate::workflow::AUTO`] has the planner pick one for the task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<String>,
+    /// Go on from the previous task of the conversation: its whole
+    /// conversation with the model comes before this task, and its kept
+    /// result, when there is one, is where the attempt works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues: Option<Continuation>,
+}
+
+/// What a task goes on from (see [`RunRequest::continues`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Continuation {
+    /// The previous task's conversation, as its reply's
+    /// [`RunResponse::conversation`] gave it. The planner leaves out its
+    /// oldest turns when it does not fit the model's input.
+    #[serde(default)]
+    pub conversation: Vec<serde_json::Value>,
+    /// The fork its result was kept in, when it was not applied: the
+    /// attempt works there, so one attempt runs. `None`: a new fork of the
+    /// workspace, which holds the result when it was applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<String>,
 }
 
 /// A task done before this one in the same conversation.
@@ -262,6 +289,7 @@ impl RunRequest {
             design_budget_usd: None,
             apply: true,
             stream: false,
+            interactive: false,
             checkpoint: false,
             keep_cancelled_forks: false,
             resume: None,
@@ -269,6 +297,7 @@ impl RunRequest {
             earlier: Vec::new(),
             files: Vec::new(),
             workflow: None,
+            continues: None,
         }
     }
 }
@@ -310,6 +339,10 @@ pub struct Constraint {
     /// A new done-check command, in place of the one the run had.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<String>,
+    /// The question (of a [`crate::progress::Progress::Asked`]) that `text`
+    /// answers. The attempt that asked waits for it; every attempt follows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<u32>,
 }
 
 /// One version of a run's requirements after the task itself, which is
@@ -458,6 +491,11 @@ pub struct DesignResponse {
     /// Local design work stopped; this does not confirm remote cancellation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cancelled: bool,
+    /// The workflow the planner picked, for a request that named
+    /// [`crate::workflow::AUTO`]. Another than `verify` designs nothing:
+    /// run the task with it. `None` for any other request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -597,9 +635,10 @@ pub struct RunResponse {
     /// the one the result was checked with.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requirements: Vec<Requirement>,
-    /// How the winner was picked when more than one attempt passed.
+    /// How the winner was picked when more than one attempt passed. Boxed,
+    /// like `dispute`, to keep the reply small where it is rarely set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selection: Option<Selection>,
+    pub selection: Option<Box<Selection>>,
     /// The criteria the result was judged by, in a run with a rubric.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rubric: Vec<Criterion>,
@@ -616,6 +655,15 @@ pub struct RunResponse {
     /// say: unknown, not unverified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<Verification>,
+    /// The workflow the run went through, by name. `None` in a reply from
+    /// an older planner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// The conversation of the attempt whose result this is, for a next
+    /// task that goes on from it ([`Continuation`]); the oldest turns are
+    /// left out to keep it within a model call. Empty without a winner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conversation: Vec<serde_json::Value>,
 }
 
 /// What a result was held to: the level of evidence behind it.
@@ -626,8 +674,8 @@ pub enum Verification {
     Command,
     /// A rubric: an independent model judge, and the criteria's own commands.
     Judged,
-    /// Only the review's fixed rules over the diff. No workflow of schema 1
-    /// produces it yet; it is named so that readers know it.
+    /// Only the review's fixed rules over the diff, as the built-in `quick`
+    /// does for a result without a check.
     Rules,
     /// Nothing checked the result.
     None,
@@ -699,6 +747,9 @@ pub mod tools {
     pub const FIND_SYMBOL: &str = "find_symbol";
     pub const RECALL: &str = "recall";
     pub const FETCH_URL: &str = "fetch_url";
+    /// Offered only to attempts of an interactive run: ask the person a
+    /// question, and wait a while for the answer.
+    pub const ASK_USER: &str = "ask_user";
     /// Offered only to the check designer: the check it settled on.
     pub const SUBMIT_CHECK: &str = "submit_check";
     /// Offered only to the reviewer: its verdict.
@@ -711,6 +762,9 @@ pub mod tools {
     /// Offered only to attempts that run against a done-check: say the check
     /// contradicts the task, which ends the attempt.
     pub const DISPUTE_CHECK: &str = "dispute_check";
+    /// Offered only to the call that picks a workflow for a run that names
+    /// `auto`: the workflow, and why.
+    pub const SUBMIT_ROUTE: &str = "submit_route";
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ReadFile {
@@ -780,6 +834,14 @@ pub mod tools {
         pub url: String,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AskUser {
+        pub question: String,
+        /// Answers to pick from; the person may answer otherwise.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub options: Vec<String>,
+    }
+
     /// `command` is `None` when no automated check fits the task (a
     /// question to answer, say); the run is then unverified.
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -834,6 +896,13 @@ pub mod tools {
         pub assertion: String,
         pub task_quote: String,
         pub reproduce: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SubmitRoute {
+        pub workflow: String,
+        #[serde(default)]
+        pub reason: String,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

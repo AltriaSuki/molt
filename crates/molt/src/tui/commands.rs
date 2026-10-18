@@ -24,6 +24,10 @@ pub enum Builtin {
     Pause,
     Resume,
     New,
+    Ask,
+    Quick,
+    Verify,
+    Continue,
     Attempts,
     Stream,
     Notify,
@@ -83,6 +87,10 @@ definitions! {
     Pause, "pause", "", "start nothing new in the running task", &[];
     Resume, "resume", "", "continue the paused task", &[];
     New, "new", "", "a new conversation: later tasks forget the earlier ones", &[];
+    Ask, "ask", "QUESTION", "answer with tools that only read; nothing changes, the answer is unverified", &[];
+    Quick, "quick", "TASK", "one attempt, no designed check, the fixed review rules", &[];
+    Verify, "verify", "[TASK]", "the full workflow: design a check, race, review; alone: the last task again", &[];
+    Continue, "continue", "TASK", "go on from the last task with its whole conversation and its kept result", &[];
     Attempts, "attempts", "N", "attempts at once, 1 to 8", &["1", "2", "3", "4", "5", "6", "7", "8", "default"];
     Stream, "stream", "on|off", "model text previews for the next task", &["on", "off", "default"];
     Notify, "notify", "on|all|off", "bell and desktop notice when waiting (all: also when a task ends)", &["on", "all", "off", "default"];

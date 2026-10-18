@@ -54,6 +54,7 @@ enum Tool {
     FindSymbol(t::FindSymbol),
     Recall(t::Recall),
     Fetch(t::FetchUrl),
+    Ask(t::AskUser),
 }
 
 impl Tool {
@@ -75,6 +76,8 @@ impl Tool {
             t::RECALL => Self::Recall(input(call)?),
             // Offered only when the planner may call web.fetch; otherwise the kernel refuses the call.
             t::FETCH_URL => Self::Fetch(input(call)?),
+            // Offered only to the attempts of an interactive run; see `execute`.
+            t::ASK_USER => Self::Ask(input(call)?),
             other => return Err(format!("There is no tool named {other:?}.")),
         })
     }
@@ -98,6 +101,7 @@ impl Tool {
             Self::FindSymbol(f) => format!("find symbol {}", f.name),
             Self::Recall(r) => format!("recall {}", r.query),
             Self::Fetch(f) => format!("fetch {}", f.url),
+            Self::Ask(a) => format!("ask the user: {}", a.question),
         }
     }
 
@@ -130,6 +134,7 @@ impl Tool {
             Self::FindSymbol(_) => t::FIND_SYMBOL,
             Self::Recall(_) => t::RECALL,
             Self::Fetch(_) => t::FETCH_URL,
+            Self::Ask(_) => t::ASK_USER,
         }
     }
 
@@ -185,6 +190,11 @@ impl Tool {
                     references: f.references.unwrap_or(true),
                     limit: Some(SYMBOL_LIMIT),
                 };
+                // An attempt that only reads works in the workspace itself, which memory indexes as it is.
+                if workspace == ctx.workspace {
+                    let response: SymbolsResponse = ctx.call(memory::SYMBOLS, query, files).await?;
+                    return Ok(show_symbols(response));
+                }
                 let req = ForkSymbolsRequest { query, fork: workspace };
                 let response: ForkSymbolsResponse = ctx.call(memory::FORK_SYMBOLS, req, files).await?;
                 Ok(format!(
@@ -229,6 +239,8 @@ impl Tool {
                     }
                 }
             }
+            // `execute` asks for the attempt that made the call.
+            Self::Ask(_) => Err(Failure::Rejected("ask_user cannot be used here".into())),
         }
     }
 }
@@ -303,8 +315,18 @@ pub(crate) async fn execute(
 ) -> Vec<Value> {
     let mut results: Vec<Option<(String, bool)>> = vec![None; calls.len()];
     let mut reads = JoinSet::new();
+    // Only an attempt of an interactive run has someone to ask.
+    let asker = match actor {
+        Actor::Attempt { index, .. } if ctx.interactive => Some(index),
+        _ => None,
+    };
+    let no_ask = format!("There is no tool named {:?}.", t::ASK_USER);
     for (i, call) in calls.iter().enumerate() {
         let tool = if cut_off == Some(call.id.as_str()) { Err(prompts::CUT_OFF.to_owned()) } else { Tool::parse(call) };
+        let tool = tool.and_then(|tool| match tool {
+            Tool::Ask(_) if asker.is_none() => Err(no_ask.clone()),
+            tool => Ok(tool),
+        });
         let detail = match &tool {
             Ok(tool) => tool.detail(),
             Err(_) => format!("{} (rejected)", call.name),
@@ -312,6 +334,14 @@ pub(crate) async fn execute(
         report(ctx, actor, &call.name, &detail).await;
         match tool {
             Err(msg) => results[i] = Some((msg, true)),
+            Ok(Tool::Ask(question)) => {
+                collect(&mut reads, &mut results).await;
+                let asked = match asker {
+                    Some(index) => crate::ask::ask(ctx, index, question).await,
+                    None => Err(no_ask.clone()),
+                };
+                results[i] = Some(flatten(asked));
+            }
             Ok(tool) if tool.read_only() => {
                 let (ctx, fork) = (ctx.clone(), fork.to_owned());
                 reads.spawn(async move { (i, tool.execute(&ctx, &fork).await) });

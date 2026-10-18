@@ -12,10 +12,11 @@ use molt_api::fs::ChangeKind;
 use molt_api::memory::{ConsolidateResponse, Layer, RecallSnapshot, Recalled, ReviewRequest, ReviewResponse};
 use molt_api::model::Effort;
 use molt_api::planner::{
-    AttemptReport, AttemptStatus, Constraint, Control, ControlResponse, DesignResponse, Earlier, Outcome, RunRequest,
-    RunResponse, RunState, Verdict,
+    AttemptReport, AttemptStatus, Constraint, Continuation, Control, ControlResponse, DesignResponse, Earlier, Outcome,
+    RunRequest, RunResponse, RunState, Verdict,
 };
 use molt_api::progress::Progress;
+use molt_api::workflow;
 use molt_proto::audit::Logged;
 use molt_proto::TraceId;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -127,6 +128,10 @@ pub struct Settings {
     pub notify: Notify,
     /// Commit each applied result to git, as `molt do --commit` does.
     pub commit: bool,
+    /// The workflow of a task `/ask`, `/quick` or `/verify` started; `None`:
+    /// the planner picks one (`auto`). Set for one task, never saved.
+    #[serde(skip)]
+    pub workflow: Option<String>,
 }
 
 impl Default for Settings {
@@ -142,6 +147,7 @@ impl Default for Settings {
             memory_model: None,
             notify: Notify::default(),
             commit: false,
+            workflow: None,
         }
     }
 }
@@ -480,6 +486,9 @@ pub struct Task {
     pub state: RunState,
     /// What a pausing run waits for before it is paused.
     pub waiting: Vec<String>,
+    /// The attempts' questions not answered yet, oldest first: the number
+    /// of each and its options. What the user types next answers the first.
+    pub asked: Vec<(u32, Vec<String>)>,
 }
 
 impl Task {
@@ -505,6 +514,7 @@ impl Task {
             version: 0,
             state: RunState::Running,
             waiting: Vec::new(),
+            asked: Vec::new(),
         }
     }
 
@@ -965,6 +975,9 @@ pub struct App {
     /// The conversation so far: the latest finished tasks, oldest first,
     /// which each new task is told about. `/new` empties it.
     pub earlier: Vec<Earlier>,
+    /// What `/continue` goes on from: the last finished task's conversation
+    /// and, while its result is kept, its fork.
+    pub continuation: Option<Continuation>,
     /// Values never to show, such as API keys: replaced wherever text from
     /// commands is shown.
     pub secrets: Vec<String>,
@@ -1064,6 +1077,7 @@ impl App {
             last: None,
             last_lanes: Vec::new(),
             earlier: Vec::new(),
+            continuation: None,
             secrets: Vec::new(),
             rules: ConfirmSection::default(),
             zoom: None,
@@ -1604,6 +1618,10 @@ impl App {
                 match result {
                     Ok(()) => {
                         self.push(Line::from(span("  applied", Tone::Ok)));
+                        // The result the next task goes on from is in the workspace now.
+                        if let Some(c) = &mut self.continuation {
+                            c.fork = None;
+                        }
                         if let (Some(task), Some(last)) = (&self.task, self.earlier.last_mut()) {
                             if last.task == task.req.task {
                                 last.applied = true;
@@ -1684,6 +1702,10 @@ impl App {
                     }
                 } else {
                     self.pending_result = None;
+                    // Its result is gone: there is nothing to go on from.
+                    if self.continuation.as_ref().is_some_and(|c| c.fork.is_some()) {
+                        self.continuation = None;
+                    }
                 }
                 Vec::new()
             }
@@ -2172,6 +2194,15 @@ impl App {
             self.input = Input::with(&line);
             return Vec::new();
         }
+        if let Some((question, options)) =
+            self.task.as_mut().filter(|t| t.phase == Phase::Running && !t.asked.is_empty()).map(|t| t.asked.remove(0))
+        {
+            // Typed while an attempt waits on its question: the answer, an option by its number or in words.
+            let picked = line.parse::<usize>().ok().and_then(|n| options.get(n.checked_sub(1)?)).cloned();
+            let text = picked.unwrap_or(line);
+            self.echo_constraint(&text);
+            return self.steer(Control::Constrain(Constraint { text, answers: Some(question), ..Default::default() }));
+        }
         if self.task.as_ref().is_some_and(|t| t.phase == Phase::Running) {
             // Typed while the attempts run: more of what the task asks.
             self.echo_constraint(&line);
@@ -2191,6 +2222,17 @@ impl App {
     }
 
     fn start_task(&mut self, line: String, mode: Mode, settings: Settings) -> Vec<Action> {
+        self.start_task_with(line, mode, settings, None)
+    }
+
+    /// Start `line` as a new task; with `continues`, going on from the last one.
+    fn start_task_with(
+        &mut self,
+        line: String,
+        mode: Mode,
+        settings: Settings,
+        continues: Option<Continuation>,
+    ) -> Vec<Action> {
         let files = match self.referenced(&line) {
             Ok(files) => files,
             Err(e) => {
@@ -2202,6 +2244,8 @@ impl App {
         let trace = TraceId::random();
         let mut req = RunRequest::new(line.clone(), self.workspace_path.clone());
         req.files = files;
+        // Someone is here to answer the attempts' questions.
+        req.interactive = true;
         if let Some(n) = settings.attempts {
             req.attempts = n;
         }
@@ -2214,6 +2258,10 @@ impl App {
         req.stream = settings.stream;
         // An interrupt looks at what the attempts changed itself: the planner must not drop their forks first.
         req.keep_cancelled_forks = true;
+        req.workflow = Some(settings.workflow.clone().unwrap_or_else(|| workflow::AUTO.to_owned()));
+        req.continues = continues;
+        // Only a workflow that designs a check stops for it; `auto` may pick one that does.
+        let designs = workflow::builtin(req.workflow.as_deref()).is_none_or(|w| w.stages.design.is_some());
 
         self.gap();
         self.echo(&line);
@@ -2222,7 +2270,7 @@ impl App {
         let action = if let Some(check) = &settings.check {
             task.req.check = Some(check.clone());
             Action::Run { req: task.req.clone(), trace }
-        } else if mode == Mode::Confirm {
+        } else if mode == Mode::Confirm && designs {
             task.phase = Phase::Designing;
             Action::Design { req: task.req.clone(), trace }
         } else {
@@ -2242,6 +2290,52 @@ impl App {
         } else {
             vec![action]
         }
+    }
+
+    /// Run `task` through the workflow `name`; `/verify` alone runs the last
+    /// task again through the full workflow.
+    fn with_workflow(&mut self, name: &str, task: &str) -> Vec<Action> {
+        if self.task.is_some() {
+            self.flash = Some(format!("a task is waiting; /{name} starts a new task once it is done"));
+            return Vec::new();
+        }
+        let task = match (task.is_empty(), self.earlier.last()) {
+            (false, _) => task.to_owned(),
+            (true, Some(last)) if name == workflow::VERIFY => last.task.clone(),
+            (true, _) => {
+                self.flash = Some(format!("/{name} TASK: the task to run with workflow {name}"));
+                return Vec::new();
+            }
+        };
+        let saved = self.settings.workflow.replace(name.to_owned());
+        let actions = self.submit_task(task);
+        self.settings.workflow = saved;
+        actions
+    }
+
+    /// Start `task` going on from the last finished one.
+    fn continue_task(&mut self, task: &str) -> Vec<Action> {
+        if self.task.is_some() {
+            self.flash = Some("a task is waiting; /continue goes on from it once it is done".into());
+            return Vec::new();
+        }
+        if task.is_empty() {
+            self.flash = Some("/continue TASK: what to do next, going on from the last task".into());
+            return Vec::new();
+        }
+        let Some(continues) = self.continuation.clone() else {
+            self.flash = Some("nothing to go on from: /continue follows a task finished in this conversation".into());
+            return Vec::new();
+        };
+        if self.fork_operations > 0 || self.git_busy {
+            self.flash = Some("wait for the current apply, discard or commit".into());
+            return Vec::new();
+        }
+        if !matches!(self.session, SessionState::Up { .. }) {
+            self.flash = Some("the services are not up".into());
+            return Vec::new();
+        }
+        self.start_task_with(task.to_owned(), self.mode, self.settings.clone(), Some(continues))
     }
 
     fn command(&mut self, command: &str) -> Vec<Action> {
@@ -2387,8 +2481,18 @@ impl App {
             Some(Builtin::Resume) => return self.steer(Control::Resume),
             Some(Builtin::New) => {
                 self.earlier.clear();
+                self.continuation = None;
                 self.flash = Some("a new conversation: the next task starts without the earlier ones".into());
             }
+            Some(kind @ (Builtin::Ask | Builtin::Quick | Builtin::Verify)) => {
+                let name = match kind {
+                    Builtin::Ask => workflow::ASK,
+                    Builtin::Quick => workflow::QUICK,
+                    _ => workflow::VERIFY,
+                };
+                return self.with_workflow(name, arg);
+            }
+            Some(Builtin::Continue) => return self.continue_task(arg),
             Some(Builtin::Check) => {
                 self.settings.check = (!arg.is_empty()).then(|| arg.to_owned());
                 self.flash = Some(set("check", self.settings.check.as_deref().unwrap_or("designed for each task")));
@@ -2566,6 +2670,7 @@ impl App {
                                     remaining_budget_usd: task.req.budget_usd,
                                     error: None,
                                     cancelled: false,
+                                    workflow: None,
                                 }));
                                 actions.clear();
                             }
@@ -2659,6 +2764,11 @@ impl App {
             return;
         }
         match event {
+            Progress::Routed { workflow, reason, .. } => {
+                task.req.workflow = Some(workflow.clone());
+                let line = agent::routed_line(&workflow, &reason, "/verify");
+                self.log.push(Line::from(vec![span("◆ ", Tone::Shell), span(clean_line(&line), Tone::Dim)]));
+            }
             Progress::CheckReady { command, files, designed, rubric, .. } => {
                 if task.check_shown {
                     return;
@@ -2800,7 +2910,10 @@ impl App {
                     lane.ended.get_or_insert_with(Instant::now);
                 }
             }
-            Progress::Required { requirement, .. } => task.version = task.version.max(requirement.version),
+            Progress::Required { requirement, .. } => {
+                task.version = task.version.max(requirement.version);
+                task.asked.retain(|(q, _)| Some(*q) != requirement.constraint.answers);
+            }
             Progress::Adopted { attempt, version, .. } => {
                 if let Some(lane) = lane(task, attempt) {
                     lane.push(Line::from(span(format!("   now follows v{version}"), Tone::Warn)));
@@ -2809,6 +2922,23 @@ impl App {
             Progress::State { state, waiting, .. } => {
                 task.state = state;
                 task.waiting = waiting;
+            }
+            Progress::Asked { attempt, question, text, options, .. } => {
+                if task.asked.iter().any(|(q, _)| *q == question) {
+                    return;
+                }
+                let words = scrub(&text, &self.secrets);
+                for (i, l) in text::clean(&words).into_iter().enumerate() {
+                    let head = if i == 0 { format!("? attempt {attempt} asks  ") } else { "  ".to_owned() };
+                    self.log.push(Line::from(vec![span(head, Tone::Warn), span(l, Tone::Plain)]));
+                }
+                for (i, option) in options.iter().enumerate() {
+                    let option = scrub(option, &self.secrets);
+                    self.log.push(Line::from(span(format!("  {}. {}", i + 1, clean_line(&option)), Tone::Plain)));
+                }
+                let how = if options.is_empty() { "type the answer" } else { "type an option's number or an answer" };
+                self.log.push(Line::from(span(format!("  {how}; every attempt follows it"), Tone::Dim)));
+                task.asked.push((question, options));
             }
         }
     }
@@ -2837,6 +2967,13 @@ impl App {
                         ),
                     );
                     return Vec::new();
+                }
+                if let Some(picked) = d.workflow.clone() {
+                    task.req.workflow = Some(picked);
+                }
+                // The workflow picked for the task designs nothing: it runs as it is.
+                if d.workflow.as_deref().is_some_and(|w| w != workflow::VERIFY) {
+                    return self.start_after_check(d, true);
                 }
                 task.stops = check_stops(&d, existing);
                 if task.stops.is_empty() && !self.rules.always_ask {
@@ -2931,6 +3068,8 @@ impl App {
                 lines.extend(rubric_lines(&d.rubric.iter().map(|c| c.text.clone()).collect::<Vec<_>>()));
                 task.req.rubric = d.rubric;
             }
+            // The line saying which workflow was picked says it designs no check.
+            _ if d.workflow.as_deref().is_some_and(|w| w != workflow::VERIFY) => {}
             _ => {
                 lines.push(Line::from(vec![
                     span("◆ check", Tone::Shell),
@@ -2985,6 +3124,18 @@ impl App {
             Outcome::Failed => "molt: failed".to_owned(),
         });
         self.remember(&task.req.task, &resp);
+        // A kept result the task went on from is merged with it when it is applied.
+        if let Some(kept) = task.req.continues.as_ref().and_then(|c| c.fork.clone()).filter(|_| resp.applied) {
+            self.kept.retain(|old| *old != kept);
+            self.kept_entries.retain(|entry| entry.fork != kept);
+            self.kept_changes.push(super::kept::Change::Remove(kept));
+        }
+        self.continuation = (!resp.conversation.is_empty()).then(|| Continuation {
+            conversation: resp.conversation.clone(),
+            fork: resp.fork.clone().filter(|_| !resp.applied && !resp.changes.is_empty()),
+        });
+        let learns = workflow::builtin(resp.workflow.as_deref().or(Some(workflow::VERIFY)))
+            .is_none_or(|w| w.stages.learn.is_some());
         self.uncounted_calls = self.uncounted_calls.saturating_add(resp.uncounted_calls);
         let mut actions = Vec::new();
         let memory_model = agent::memory_model(task.settings.memory_model.as_deref(), task.req.model.as_deref());
@@ -3057,7 +3208,11 @@ impl App {
             }
             Outcome::Passed | Outcome::Unverified | Outcome::Judged => {
                 let tone = if resp.outcome == Outcome::Passed { Tone::Ok } else { Tone::Warn };
-                let mut head = vec![span(format!("✓ {}", outcome_name(resp.outcome)), tone)];
+                let label = match resp.workflow.as_deref() {
+                    Some(workflow::ASK) if resp.outcome == Outcome::Unverified => "unverified answer",
+                    _ => outcome_name(resp.outcome),
+                };
+                let mut head = vec![span(format!("✓ {label}"), tone)];
                 if !resp.changes.is_empty() {
                     head.extend(size);
                 }
@@ -3164,8 +3319,8 @@ impl App {
             }
         }
 
-        // Memory learns from failures too; the run's budget covers it.
-        if self.memory_up() && !spent_all {
+        // Memory learns from failures too, in a workflow that learns; the run's budget covers it.
+        if self.memory_up() && !spent_all && learns {
             self.learning.insert(trace.to_string());
             actions.push(Action::Learn { trace, model: memory_model });
         }
@@ -3469,6 +3624,13 @@ impl App {
         let fork = self.kept_pending.take().unwrap();
         match result {
             Ok(()) => {
+                if let Some(c) = self.continuation.as_mut().filter(|c| c.fork.as_deref() == Some(fork.as_str())) {
+                    // Applied, the result is in the workspace; discarded, there is nothing to go on from.
+                    c.fork = None;
+                    if verb != "applied" {
+                        self.continuation = None;
+                    }
+                }
                 self.kept.retain(|old| *old != fork);
                 self.kept_entries.retain(|entry| entry.fork != fork);
                 self.kept_changes.push(super::kept::Change::Remove(fork));
@@ -4137,6 +4299,7 @@ fn disputed_check(req: &RunRequest, resp: &RunResponse) -> Option<DesignResponse
         remaining_budget_usd: req.budget_usd,
         error: None,
         cancelled: false,
+        workflow: None,
     })
 }
 
@@ -6072,6 +6235,7 @@ mod tests {
             remaining_budget_usd: None,
             error: None,
             cancelled: false,
+            workflow: None,
         }
     }
 
@@ -6122,6 +6286,8 @@ mod tests {
             judgement: vec![],
             dispute: None,
             verification: None,
+            workflow: None,
+            conversation: Vec::new(),
         }
     }
 
@@ -6225,6 +6391,56 @@ mod tests {
         app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-2"))) });
         assert!(app.prompt.is_none());
         assert_eq!(app.kept, ["/d/work/fork-2"]);
+    }
+
+    #[test]
+    fn an_attempts_question_is_shown_and_what_is_typed_next_answers_it() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.settings.check = Some("make test".into());
+        let actions = type_in(&mut app, "indent the file");
+        let [Action::Run { req, trace: run }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert!(req.interactive, "someone is here to answer");
+        let run = run.clone();
+        app.update(Msg::Progress(Progress::AttemptStarted { run: run.to_string(), attempt: 0, fork: None }));
+        app.update(Msg::Progress(Progress::Asked {
+            run: run.to_string(),
+            attempt: 0,
+            question: 1,
+            text: "Tabs or spaces?".into(),
+            options: vec!["tabs".into(), "four spaces".into()],
+        }));
+        let shown = log(&app);
+        assert!(shown.contains("? attempt 0 asks  Tabs or spaces?"), "{shown}");
+        assert!(shown.contains("  2. four spaces") && shown.contains("type an option's number"), "{shown}");
+
+        // An option by its number.
+        let (trace, action) = control(&type_in(&mut app, "2"));
+        assert_eq!(trace, run);
+        let answer = Constraint { text: "four spaces".into(), answers: Some(1), ..Default::default() };
+        assert_eq!(action, Control::Constrain(answer));
+        assert!(log(&app).contains("+ four spaces"), "{}", log(&app));
+
+        // Answered, what is typed next steers the run as before.
+        let (_, action) = control(&type_in(&mut app, "keep the header"));
+        assert_eq!(action, Control::Constrain(Constraint { text: "keep the header".into(), ..Default::default() }));
+
+        // A question answered elsewhere is no longer waiting.
+        let asked = |question| Progress::Asked {
+            run: run.to_string(),
+            attempt: 1,
+            question,
+            text: "Which file?".into(),
+            options: vec![],
+        };
+        app.update(Msg::Progress(asked(2)));
+        let requirement = Requirement {
+            version: 3,
+            constraint: Constraint { text: "main.rs".into(), answers: Some(2), ..Default::default() },
+            at_ms: 0,
+        };
+        app.update(Msg::Progress(Progress::Required { run: run.to_string(), requirement }));
+        assert!(app.task.as_ref().unwrap().asked.is_empty());
     }
 
     fn control(actions: &[Action]) -> (TraceId, Control) {
@@ -7363,5 +7579,119 @@ mod tests {
         app.update(Msg::Edited(Err("vi exit status: 1".into())));
         assert_eq!(app.flash.as_deref(), Some("the editor failed: vi exit status: 1"));
         assert_eq!(app.input.text, "step one\nstep two", "a failed edit keeps the input");
+    }
+
+    fn conversation() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({ "role": "user", "content": [{ "type": "text", "text": "<task>first</task>" }] }),
+            serde_json::json!({ "role": "assistant", "content": [{ "type": "text", "text": "Done." }] }),
+        ]
+    }
+
+    #[test]
+    fn ask_and_quick_run_their_workflow_without_designing_even_in_confirm_mode() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        assert_eq!(app.mode, Mode::Confirm);
+        let actions = type_in(&mut app, "/ask what does the parser accept?");
+        let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!((req.task.as_str(), req.workflow.as_deref()), ("what does the parser accept?", Some("ask")));
+        assert_eq!(app.settings.workflow, None, "the workflow is the task's, not the next one's");
+        let answer = RunResponse {
+            outcome: Outcome::Unverified,
+            check: None,
+            changes: vec![],
+            patch: String::new(),
+            workflow: Some("ask".into()),
+            conversation: conversation(),
+            ..passed(false, None)
+        };
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(answer) });
+        assert!(actions.is_empty(), "an answer is not learned from: {actions:?}");
+        assert!(log(&app).contains("✓ unverified answer"), "{}", log(&app));
+
+        let actions = type_in(&mut app, "/quick add a comment to main");
+        assert!(
+            matches!(actions.as_slice(), [Action::Run { req, .. }] if req.workflow.as_deref() == Some("quick")),
+            "{actions:?}"
+        );
+        let actions = type_in(&mut app, "/quick");
+        assert!(actions.is_empty() && app.flash.as_deref().is_some_and(|f| f.contains("a task is waiting")));
+    }
+
+    #[test]
+    fn a_routed_task_says_what_it_was_handled_as_and_verify_runs_it_again_in_full() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.mode = Mode::Auto;
+        let actions = type_in(&mut app, "add a comment to main");
+        let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.workflow.as_deref(), Some("auto"), "the planner picks the workflow");
+        let routed = Progress::Routed { run: trace.to_string(), workflow: "quick".into(), reason: "a comment".into() };
+        app.update(Msg::Progress(routed));
+        assert!(log(&app).contains("handled as quick (a comment) · /verify for the full workflow"), "{}", log(&app));
+        assert_eq!(app.task.as_ref().unwrap().req.workflow.as_deref(), Some("quick"));
+        let done = RunResponse { workflow: Some("quick".into()), ..passed(true, None) };
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(done) });
+        assert!(actions.iter().all(|a| !matches!(a, Action::Learn { .. })), "quick does not learn: {actions:?}");
+
+        let actions = type_in(&mut app, "/verify");
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!((req.task.as_str(), req.workflow.as_deref()), ("add a comment to main", Some("verify")));
+    }
+
+    #[test]
+    fn confirm_mode_runs_a_task_picked_as_quick_without_stopping_for_a_check() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "add a comment to main");
+        let [Action::Design { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.workflow.as_deref(), Some("auto"));
+        let picked = DesignResponse { command: None, files: vec![], workflow: Some("quick".into()), ..design() };
+        let actions = app.update(Msg::Designed { trace: trace.clone(), result: Ok(picked), existing: vec![] });
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.workflow.as_deref(), Some("quick"));
+        assert!(req.verify && req.check.is_none() && app.prompt.is_none());
+
+        // Picked as verify, the check is shown as before and the run names verify.
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "fix the parser");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let picked = DesignResponse { workflow: Some("verify".into()), ..design() };
+        app.rules.always_ask = true;
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(picked), existing: vec![] });
+        assert!(matches!(app.prompt, Some(Prompt::Check(_))));
+        assert_eq!(app.task.as_ref().unwrap().req.workflow.as_deref(), Some("verify"));
+    }
+
+    #[test]
+    fn continue_sends_the_last_conversation_and_works_in_its_kept_result() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.mode = Mode::Plan;
+        assert!(type_in(&mut app, "/continue more").is_empty());
+        assert!(app.flash.as_deref().is_some_and(|f| f.starts_with("nothing to go on from")));
+        let actions = type_in(&mut app, "first");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let kept = RunResponse { conversation: conversation(), ..passed(false, Some("/fork/first")) };
+        app.update(Msg::Ran { trace: trace.clone(), result: Ok(kept) });
+        assert_eq!(app.kept, ["/fork/first"]);
+
+        let actions = type_in(&mut app, "/continue now document it");
+        let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.task, "now document it");
+        assert_eq!(
+            req.continues,
+            Some(Continuation { conversation: conversation(), fork: Some("/fork/first".into()) }),
+            "the whole conversation, and the result it goes on from"
+        );
+        let applied = RunResponse { conversation: conversation(), ..passed(true, None) };
+        app.update(Msg::Ran { trace: trace.clone(), result: Ok(applied) });
+        assert!(app.kept.is_empty(), "the kept result was applied with the task that went on from it");
+        assert_eq!(app.continuation.as_ref().map(|c| c.fork.clone()), Some(None));
+
+        type_in(&mut app, "/new");
+        assert!(app.continuation.is_none());
     }
 }
