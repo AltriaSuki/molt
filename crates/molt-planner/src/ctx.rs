@@ -92,6 +92,11 @@ pub(crate) struct Ctx {
     /// What file writes and edits the model asks for do about syntax errors they introduce.
     pub syntax_check: fs::SyntaxCheck,
     pub budget_usd: f64,
+    /// The most designing the check may spend, at most `budget_usd`.
+    pub design_budget_usd: f64,
+    /// While the check is designed: the run's known cost at which designing
+    /// stops, so that it spends at most its share (see [`Ctx::capped`]).
+    pub spend_cap: Option<f64>,
     pub stream: bool,
     /// What memory knows about the workspace; empty when memory is not up.
     pub memory: Memory,
@@ -184,6 +189,7 @@ impl Ctx {
     pub fn new(bus: Arc<dyn Bus>, cfg: Arc<Config>, trace: TraceId, req: &RunRequest) -> Self {
         let model = req.model.clone().filter(|m| !m.trim().is_empty()).or_else(|| cfg.default_model.clone());
         let web = bus.holds(molt_api::web::FETCH);
+        let budget_usd = req.budget_usd.unwrap_or(cfg.budget_usd);
         Self {
             bus,
             trace,
@@ -195,7 +201,9 @@ impl Ctx {
             max_turns: req.max_turns.unwrap_or(cfg.max_turns),
             max_check_rounds: req.max_check_rounds.unwrap_or(cfg.max_check_rounds),
             syntax_check: req.syntax_check.unwrap_or(cfg.syntax_check),
-            budget_usd: req.budget_usd.unwrap_or(cfg.budget_usd),
+            budget_usd,
+            design_budget_usd: req.design_budget_usd.unwrap_or(cfg.design_share * budget_usd).min(budget_usd),
+            spend_cap: None,
             stream: req.stream,
             memory: Memory::default(),
             web,
@@ -329,6 +337,20 @@ impl Ctx {
     /// Run totals over the designer and every attempt, and the model calls not answered yet.
     pub fn tally(&self) -> Tally {
         *self.tally.borrow()
+    }
+
+    /// This context, stopping its model calls once the run's known cost
+    /// reaches `cap`. The run's own budget still holds; only the calls made
+    /// through the copy are capped, and a call already made runs to its end.
+    pub fn capped(&self, cap: f64) -> Arc<Self> {
+        let mut capped = self.clone();
+        capped.spend_cap = Some(cap);
+        Arc::new(capped)
+    }
+
+    /// The cap of [`Ctx::capped`] is reached.
+    pub fn over_cap(&self) -> bool {
+        self.spend_cap.is_some_and(|cap| self.tally().spend.cost_usd >= cap)
     }
 
     pub fn over_budget(&self) -> bool {

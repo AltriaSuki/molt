@@ -12,7 +12,7 @@ use molt_api::memory::{
     UndoRequest,
 };
 use molt_api::model::Effort;
-use molt_api::planner::{Outcome, Resume, RunRequest, Select};
+use molt_api::planner::{Criterion, Outcome, Resume, RunRequest, Select};
 use molt_planner::checkpoint;
 use molt_proto::{ServiceId, TraceId};
 
@@ -100,6 +100,11 @@ struct DoArgs {
     /// and its result is applied unverified.
     #[arg(long, conflicts_with = "check")]
     no_check: bool,
+    /// A criterion the result must meet, for a task no command can check,
+    /// such as writing (repeatable): an independent judge decides each one,
+    /// and no check is designed.
+    #[arg(long, value_name = "TEXT", value_parser = criterion, conflicts_with_all = ["check", "no_check"])]
+    criterion: Vec<String>,
     /// Parallel attempts.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=8))]
     attempts: u32,
@@ -152,6 +157,12 @@ struct RunArgs {
     /// was spent before.
     #[arg(long, value_parser = usd)]
     budget_usd: Option<f64>,
+    /// The most designing the check may spend, in US dollars, out of the
+    /// run's budget (at most all of it). Default: a quarter of the run's
+    /// budget, or the share MOLT_DESIGN_BUDGET_SHARE sets. Checked before each
+    /// model call, like the run's budget.
+    #[arg(long, value_name = "USD", value_parser = usd)]
+    design_budget_usd: Option<f64>,
     /// Keep the result in its fork instead of applying it to the workspace.
     #[arg(long)]
     no_apply: bool,
@@ -437,6 +448,13 @@ fn usd(text: &str) -> Result<f64, String> {
     match text.parse::<f64>() {
         Ok(usd) if usd.is_finite() && usd > 0.0 => Ok(usd),
         _ => Err(format!("{text:?} is not a positive amount")),
+    }
+}
+
+fn criterion(text: &str) -> Result<String, String> {
+    match text.trim() {
+        "" => Err("a criterion is empty: say in one sentence what the result must satisfy".into()),
+        text => Ok(text.to_owned()),
     }
 }
 
@@ -807,6 +825,7 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     let mut req = RunRequest::new(args.task, workspace);
     req.check = args.check;
     req.verify = !args.no_check;
+    req.rubric = args.criterion.into_iter().map(|text| Criterion { text, command: None }).collect();
     req.attempts = args.attempts;
     req.select = args.select;
     req.model = args.model;
@@ -815,6 +834,7 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     req.syntax_check = args.syntax_check;
     req.judge_model = args.judge_model;
     req.budget_usd = args.common.budget_usd;
+    req.design_budget_usd = args.common.design_budget_usd;
     req.apply = !args.common.no_apply;
     req.stream = args.common.stream;
     req.checkpoint = args.checkpoint;
@@ -861,6 +881,7 @@ async fn resume_task(config: Option<&Path>, args: ResumeArgs) -> anyhow::Result<
     req.apply = !args.common.no_apply;
     req.stream = args.common.stream;
     req.budget_usd = args.common.budget_usd.or(req.budget_usd);
+    req.design_budget_usd = args.common.design_budget_usd.or(req.design_budget_usd);
     eprintln!("resuming run {run}: {}", agent::printable(req.task.lines().next().unwrap_or_default()));
     execute(&cfg, req, TraceId::from_raw(&run), &args.common, stop).await
 }

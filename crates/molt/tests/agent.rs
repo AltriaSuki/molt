@@ -18,7 +18,9 @@ use molt::{Config, Secrets, TransportKind};
 use molt_api::fs::{ChangeKind, DROP, FORK, MERGE, WRITE};
 use molt_api::memory::SUBMIT_NOTES;
 use molt_api::model::COMPLETE;
-use molt_api::planner::tools::{DISPUTE_CHECK, RUN, SUBMIT_CHECK, SUBMIT_REVIEW, SUBMIT_VETTING, WRITE_FILE};
+use molt_api::planner::tools::{
+    DISPUTE_CHECK, LIST_FILES, RUN, SUBMIT_CHECK, SUBMIT_JUDGEMENT, SUBMIT_REVIEW, SUBMIT_VETTING, WRITE_FILE,
+};
 use molt_api::planner::{AttemptStatus, CheckSpec, Outcome, RunRequest, RunResponse, RUN as PLANNER_RUN};
 use molt_api::progress::Progress;
 use molt_api::shell::RUN as RUN_CHECK;
@@ -57,6 +59,8 @@ enum Fake {
     Refuses,
     /// Attempts dispute the check rather than greet.
     Disputes,
+    /// The designer lists files turn after turn and never submits a check.
+    NeverSubmits,
     /// Attempts run a command that starts a long `sleep`, writes its pid to
     /// this file and waits for it.
     Hangs(PathBuf),
@@ -110,6 +114,15 @@ impl Respond for FakeApi {
             ];
             return message(n, model, content, "tool_use", stream);
         }
+        // The judge of a rubric finds its one criterion met.
+        if body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_JUDGEMENT)) {
+            let input = json!({ "findings": [{ "criterion": 1, "met": true, "reason": "greeting.txt greets." }] });
+            let content = vec![
+                json!({ "type": "thinking", "thinking": "", "signature": signature(n) }),
+                tool_use(n, SUBMIT_JUDGEMENT, input),
+            ];
+            return message(n, model, content, "tool_use", stream);
+        }
         let designer = body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_CHECK));
         let last = messages.last().cloned().unwrap_or(Value::Null);
         let after_tools = last["content"].as_array().is_some_and(|c| c.iter().any(|b| b["type"] == "tool_result"));
@@ -121,6 +134,7 @@ impl Respond for FakeApi {
         let write = |path: &str, content: &str| tool_use(n, WRITE_FILE, json!({ "path": path, "content": content }));
         let (mut content, stop) = match (&self.0, designer, turn) {
             (Fake::Refuses, ..) => return message(n, model, vec![], "refusal", stream),
+            (Fake::NeverSubmits, true, _) => (vec![tool_use(n, LIST_FILES, json!({}))], "tool_use"),
             (_, true, Turn::First) => (vec![write("check.sh", &format!("{CHECK}\n"))], "tool_use"),
             (_, true, _) => {
                 let input = json!({ "command": "sh check.sh", "files": ["check.sh"], "rationale": "Greets." });
@@ -484,6 +498,7 @@ fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) ->
         "MOLT_MAX_TURNS",
         "MOLT_MAX_CHECK_ROUNDS",
         "MOLT_BUDGET_USD",
+        "MOLT_DESIGN_BUDGET_SHARE",
         "MOLT_CHECK_TIMEOUT_S",
         "MOLT_MAP_TOKENS",
         "MOLT_CONTEXT_TOKENS",
@@ -773,6 +788,72 @@ async fn molt_do_prints_a_disputed_check_and_exits_nonzero() {
     let dispute = resp.dispute.expect("the reply carries the dispute");
     assert_eq!((dispute.attempt, dispute.reproduce.as_str()), (0, CHECK));
     assert_eq!(resp.attempts[0].status, AttemptStatus::Cancelled);
+    assert_requests_valid(&server).await;
+    assert_forks_dropped(data.path());
+}
+
+#[tokio::test]
+async fn molt_do_given_criteria_designs_nothing_and_a_judge_decides_them() {
+    let server = fake_api(Fake::Greets).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let args = ["--criterion", "greeting.txt greets the reader", "--attempts", "1", "--no-learn", "--no-review"];
+    let cmd = molt_do(&server, workspace.path(), data.path(), &args).output();
+    let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("greeting.txt greets the reader"), "{stdout}");
+    assert_eq!(std::fs::read_to_string(workspace.path().join("greeting.txt")).unwrap(), "hello\n");
+    let bodies = bodies(&server).await;
+    assert!(!bodies.iter().any(offers_submit_check), "no model call designs a check");
+    let judged = bodies
+        .iter()
+        .filter(|b| b["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_JUDGEMENT)));
+    assert_eq!(judged.count(), 1);
+    // The attempt's two turns and the judge's one: nothing else.
+    assert_eq!(bodies.len(), 3);
+    assert_requests_valid(&server).await;
+
+    // A criterion with a check or without one makes no sense together.
+    for conflicting in [["--check", CHECK], ["--no-check", "--no-learn"]] {
+        let mut args = vec!["--criterion", "greets"];
+        args.extend(conflicting);
+        let out = molt_do(&server, workspace.path(), data.path(), &args).output().await.unwrap();
+        assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn molt_do_stops_a_designer_that_never_submits_at_its_budget_and_says_what_to_do() {
+    let server = fake_api(Fake::NeverSubmits).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The first call spends more than designing may: the second is never made.
+    let args = ["--budget-usd", "1", "--design-budget-usd", "0.000001", "--no-learn"];
+    let cmd = molt_do(&server, workspace.path(), data.path(), &args).output();
+    let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("the design budget ran out before the designer submitted a check"), "{stdout}");
+    assert!(stdout.contains("of the run's $1.00 budget is left"), "{stdout}");
+    for next in ["--check CMD", "--criterion TEXT", "--no-check", "--design-budget-usd USD"] {
+        assert!(stdout.contains(next), "{next}: {stdout}");
+    }
+    let bodies = bodies(&server).await;
+    assert_eq!(bodies.len(), 1, "one designer call, and no attempt");
+    assert!(offers_submit_check(&bodies[0]));
+    assert!(!workspace.path().join("greeting.txt").exists());
+
+    // More for designing than the run has is refused before anything starts.
+    let args = ["--budget-usd", "1", "--design-budget-usd", "2", "--no-learn"];
+    let out = molt_do(&server, workspace.path(), data.path(), &args).output().await.unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("design_budget_usd ($2.00) is more than the run's budget ($1.00)"), "{stderr}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
     assert_requests_valid(&server).await;
     assert_forks_dropped(data.path());
 }

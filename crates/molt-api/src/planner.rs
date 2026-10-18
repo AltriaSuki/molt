@@ -28,13 +28,19 @@ use crate::model::{Effort, Usage};
 pub const RUN: &str = "planner.run";
 /// Design the done-check for a task without running it, so a person can
 /// look at it first. Takes a [`RunRequest`] (only the task, workspace,
-/// model, effort and budget matter) and answers a [`DesignResponse`]; a
+/// model, effort, budget and design budget matter) and answers a [`DesignResponse`]; a
 /// `planner.run` with its command and files then skips the design.
 pub const DESIGN: &str = "planner.design";
 /// Steer a run while it goes: add to what it must do, pause it, or let it go
 /// on. Takes a [`ControlRequest`] and answers a [`ControlResponse`]. Only a
 /// run still going on the planner that answers can be steered.
 pub const CONTROL: &str = "planner.control";
+/// What a run or design that stopped because designing used up its share
+/// of the budget says to do next, in `molt do`'s flags. A front end with
+/// other controls can put its own in place of this text.
+pub const DESIGN_BUDGET_NEXT: &str = "Give the check yourself with --check CMD, or the criteria a judge should \
+     decide with --criterion TEXT (repeatable); run unverified with --no-check; or allow more for designing with \
+     --design-budget-usd USD (at most the run's budget).";
 
 fn two() -> u32 {
     2
@@ -106,6 +112,13 @@ pub struct RunRequest {
     /// not counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_usd: Option<f64>,
+    /// The most designing the check may spend, in US dollars: the
+    /// designer's and the vetter's model calls together. It comes out of
+    /// the run's budget and is at most that. Default: a share of the run's
+    /// budget set by the planner. Like the run's budget, it is checked
+    /// before each model call, so the last one can go past it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_budget_usd: Option<f64>,
     /// Merge the winning attempt into the workspace. When false, the winner's
     /// fork is kept and its path returned.
     #[serde(default = "yes")]
@@ -125,7 +138,8 @@ pub struct RunRequest {
     pub checkpoint: bool,
     /// Go on with the checkpointed run named here rather than start one. The
     /// task, check, attempts, model and limits are the checkpoint's; `apply`,
-    /// `stream` and a `budget_usd` given here replace its own, and the
+    /// `stream`, and a `budget_usd` or `design_budget_usd` given here replace
+    /// its own, and the
     /// workspace must be its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<Resume>,
@@ -234,6 +248,7 @@ impl RunRequest {
             max_check_rounds: None,
             syntax_check: None,
             budget_usd: None,
+            design_budget_usd: None,
             apply: true,
             stream: false,
             checkpoint: false,
@@ -799,6 +814,16 @@ mod tests {
         assert!(serde_json::to_value(&req).unwrap().get("files").is_none());
         let req = RunRequest { files: vec!["src/lexer.rs".into()], ..req };
         assert_eq!(serde_json::to_value(&req).unwrap()["files"], serde_json::json!(["src/lexer.rs"]));
+    }
+
+    #[test]
+    fn a_request_without_a_design_budget_reads_and_writes_as_before() {
+        let wire = serde_json::json!({"task": "t", "workspace": "/w"});
+        let req: RunRequest = serde_json::from_value(wire).unwrap();
+        assert_eq!(req.design_budget_usd, None);
+        assert!(serde_json::to_value(&req).unwrap().get("design_budget_usd").is_none());
+        let req = RunRequest { design_budget_usd: Some(0.5), ..req };
+        assert_eq!(serde_json::to_value(&req).unwrap()["design_budget_usd"], serde_json::json!(0.5));
     }
 
     #[test]
