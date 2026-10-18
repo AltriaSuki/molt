@@ -63,6 +63,7 @@ struct State {
     memory_hangs: bool,
     /// The planner holds `web.fetch`, which answers every URL with one page.
     web: bool,
+    web_unavailable: bool,
     /// Model calls stop when cancelled, as the gateway's do: the reply is a
     /// settlement whose usage and cost are unknown.
     cancels_models: bool,
@@ -138,6 +139,7 @@ impl Fake {
             memory: false,
             memory_hangs: false,
             web: false,
+            web_unavailable: false,
             cancels_models: false,
             calls: Vec::new(),
             requests: Vec::new(),
@@ -423,6 +425,12 @@ impl Bus for Fake {
                 if !self.state.lock().unwrap().web {
                     // As the kernel refuses a call without a capability.
                     return Err(RemoteError { code: ErrorCode::Denied, message: "no capability".into() });
+                }
+                if self.state.lock().unwrap().web_unavailable {
+                    return Err(RemoteError {
+                        code: ErrorCode::Unavailable,
+                        message: format!("{}fake-IP DNS; do not retry", molt_api::web::ENVIRONMENT_UNAVAILABLE),
+                    });
                 }
                 let r: molt_api::web::FetchRequest = parse(payload);
                 Ok(json!(molt_api::web::FetchResponse {
@@ -1192,6 +1200,39 @@ async fn fetch_url_is_offered_only_to_a_planner_that_may_read_the_web() {
             assert_eq!(result["is_error"], json!(true), "{text}");
         }
     }
+}
+
+#[tokio::test]
+async fn repeated_host_dns_failures_remove_fetch_url_and_refuse_stale_calls() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 | 2 => {
+                assert!(req.tools.iter().any(|tool| tool["name"] == "fetch_url"));
+                use_tools(req, &[("fetch_url", json!({"url":"https://docs.rs/hello"}))])
+            }
+            3 => {
+                assert!(!req.tools.iter().any(|tool| tool["name"] == "fetch_url"));
+                use_tools(req, &[("fetch_url", json!({"url":"https://docs.rs/another"}))])
+            }
+            4 => {
+                assert!(last_text(req).contains("fetch_url is disabled"));
+                write_hello(req, "hi\n")
+            }
+            _ => done("Done offline."),
+        },
+        hello_check,
+    );
+    fake.set(|state| {
+        state.web = true;
+        state.web_unavailable = true;
+    });
+    let result = run(&fake, request(Some("check"), 1)).await;
+    assert_eq!(result.outcome, Outcome::Passed);
+    assert_eq!(fake.calls_to("web.fetch").len(), 2);
+    assert!(fake
+        .events()
+        .iter()
+        .any(|event| matches!(event, Progress::Note {message,..} if message.contains("fetch_url disabled"))));
 }
 
 #[tokio::test]
@@ -1992,7 +2033,14 @@ fn reviewed(reviewer: impl Fn(&CompleteRequest) -> Reply + Send + Sync + 'static
 async fn an_approved_winner_is_applied_and_the_review_reported() {
     let fake = reviewed(|req| submit_review(req, "approve", &[]));
     let resp = run(&fake, RunRequest { review: true, ..request(Some("check"), 1) }).await;
-    assert_eq!(resp.review, Some(Review { verdict: Verdict::Approve, findings: vec![] }));
+    assert_eq!(
+        resp.review,
+        Some(Review {
+            verdict: Verdict::Approve,
+            findings: vec![],
+            details: Some(molt_api::planner::ReviewDetails { reviewer: Some(Verdict::Approve), ..Default::default() })
+        })
+    );
     assert!(resp.applied, "{}", resp.summary);
     assert_eq!(fake.workspace()["hello.txt"], "hi\n");
 
@@ -2005,6 +2053,38 @@ async fn an_approved_winner_is_applied_and_the_review_reported() {
     assert_eq!(tools, ["read_file", "list_files", "search", "submit_review"]);
     // Its calls count toward the run.
     assert!(close(resp.cost_usd, 0.375), "{}", resp.cost_usd);
+}
+
+#[tokio::test]
+async fn an_approved_cli_with_a_process_exit_is_applied() {
+    let fake = Fake::new(
+        |req| {
+            if is_reviewer(req) {
+                return submit_review(req, "approve", &[]);
+            }
+            match turn(req) {
+                1 => use_tools(
+                    req,
+                    &[
+                        ("write_file", json!({"path":"hello.txt", "content":"hi\n"})),
+                        (
+                            "write_file",
+                            json!({"path":"main.go", "content":"package main\nimport \"os\"\nfunc main() { os.Exit(2) }\n"}),
+                        ),
+                    ],
+                ),
+                _ => done("Write a CLI with exit status 2."),
+            }
+        },
+        hello_check,
+    );
+    let response = run(&fake, RunRequest { review: true, ..request(Some("check"), 1) }).await;
+    assert_eq!(response.outcome, Outcome::Passed);
+    assert!(response.applied, "{response:#?}");
+    let review = response.review.unwrap();
+    assert_eq!(review.verdict, Verdict::Approve);
+    assert!(review.findings.is_empty());
+    assert!(fake.workspace()["main.go"].contains("os.Exit(2)"));
 }
 
 #[tokio::test]
@@ -2054,6 +2134,10 @@ async fn a_skip_marker_is_a_concern_whatever_the_reviewer_says() {
     let review = resp.review.clone().unwrap();
     assert_eq!(review.verdict, Verdict::Concern);
     assert!(review.findings[0].starts_with("tests/slow.rs adds `#[ignore`"), "{:?}", review.findings);
+    let details = review.details.as_ref().unwrap();
+    assert_eq!(details.reviewer, Some(Verdict::Approve));
+    assert_eq!(details.rules, review.findings);
+    assert!(details.findings.is_empty() && details.error.is_none());
     assert!(!resp.applied && resp.summary.contains("the review questioned the changes"), "{}", resp.summary);
 }
 

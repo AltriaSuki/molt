@@ -11,6 +11,9 @@
 use serde::{Deserialize, Serialize};
 
 pub const FETCH: &str = "web.fetch";
+/// An authenticated web service reports a host-level DNS configuration problem.
+/// Paired with ErrorCode::Unavailable; page text cannot trigger this signal.
+pub const ENVIRONMENT_UNAVAILABLE: &str = "web network configuration unavailable: ";
 
 /// Fetch one page.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

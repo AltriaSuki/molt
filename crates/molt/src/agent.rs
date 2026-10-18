@@ -171,6 +171,42 @@ pub fn allow_web(cfg: &mut Config, hosts: &[String]) -> anyhow::Result<()> {
     cfg.allow_web(hosts, &bin_dir()?)
 }
 
+/// Bounded DNS diagnostics for the standard web service, before any model work.
+pub async fn web_warnings(cfg: &Config) -> anyhow::Result<Vec<String>> {
+    let Some(exec) = cfg.service("web").and_then(|service| service.exec.as_ref()) else { return Ok(Vec::new()) };
+    if Path::new(&exec.command).file_name().is_none_or(|name| name != "molt-web") {
+        return Ok(Vec::new());
+    }
+    let mut hosts = Vec::new();
+    let mut resolver = "system";
+    let mut args = exec.args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--allow" => {
+                if let Some(value) = args.next() {
+                    hosts.push(value.clone());
+                }
+            }
+            "--resolver" => {
+                if let Some(value) = args.next() {
+                    resolver = value;
+                }
+            }
+            _ => {
+                if let Some(value) = arg.strip_prefix("--allow=") {
+                    hosts.push(value.to_owned());
+                }
+                if let Some(value) = arg.strip_prefix("--resolver=") {
+                    resolver = value;
+                }
+            }
+        }
+    }
+    anyhow::ensure!(!hosts.is_empty(), "the molt-web service needs at least one --allow host");
+    let allow = molt_web::Allow::parse(&hosts).map_err(anyhow::Error::msg)?;
+    molt_web::preflight(&allow, resolver).await
+}
+
 /// The directory of the running executable, where the services are.
 fn bin_dir() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe().context("finding the molt executable")?;
@@ -610,6 +646,7 @@ pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::
         kernel: cfg.kernel.clone(),
         services: vec![service],
         confirm: cfg.confirm.clone(),
+        tui: cfg.tui.clone(),
         hooks: cfg.hooks.clone(),
     };
     let running = crate::start(&alone).await?;
@@ -854,6 +891,11 @@ fn model_label(context: &molt_api::progress::ModelCall) -> String {
 
 /// The result of a run as a few lines for the terminal, made [`printable`].
 pub fn report(resp: &RunResponse) -> String {
+    report_at(resp, None)
+}
+
+/// Report a result with the resolved output directory, including virtual projects.
+pub fn report_at(resp: &RunResponse, workspace: Option<&str>) -> String {
     let mut lines = vec![format!("outcome: {}", outcome_name(resp.outcome))];
     if let Some(check) = &resp.check {
         let by = if check.designed { " (designed by the planner)" } else { "" };
@@ -886,7 +928,7 @@ pub fn report(resp: &RunResponse) -> String {
     }
     lines.extend(selection_lines(resp));
     if resp.applied {
-        lines.push("applied to the workspace".to_owned());
+        lines.push(format!("applied to {}", workspace.unwrap_or("the workspace")));
     } else if let Some(fork) = &resp.fork {
         lines.push(format!("not applied; the result is in {fork}"));
     }
@@ -1378,6 +1420,8 @@ mod tests {
             "outcome: passed\ncheck: cargo test\nchanges:\n  modified src/lib.rs\napplied to the workspace\n\
              known cost: $0.0120 (1200 tokens)\n\nFixed the parser.\n"
         );
+        assert!(report_at(&resp, Some("/user-data/molt/projects/trip/files"))
+            .contains("applied to /user-data/molt/projects/trip/files\n"));
         resp.applied = false;
         resp.fork = Some("/cache/work/fork_1".into());
         resp.uncounted_calls = 2;
@@ -1386,7 +1430,8 @@ mod tests {
             report(&resp).contains("known cost: $0.0120 (1200 tokens), 2 model calls have unknown or unsettled cost\n")
         );
         resp.uncounted_calls = 0;
-        resp.review = Some(Review { verdict: Verdict::Reject, findings: vec!["src/lib.rs:3 returns 42.".into()] });
+        resp.review =
+            Some(Review { verdict: Verdict::Reject, findings: vec!["src/lib.rs:3 returns 42.".into()], details: None });
         assert!(
             report(&resp).contains("review: reject\n  - src/lib.rs:3 returns 42.\nnot applied"),
             "{}",

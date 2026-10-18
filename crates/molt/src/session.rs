@@ -10,7 +10,7 @@
 //! `memory.correct` and `memory.promote` for the memory screen, and
 //! `memory.remember` for notes the user writes down.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
@@ -19,7 +19,7 @@ use molt_api::fs::{self, DiffRequest, DiffResponse, DropRequest, DropResponse, M
 use molt_api::memory::{
     self, ConsolidateRequest, ConsolidateResponse, CorrectRequest, ForgetRequest, ForgetResponse, Note, NoteKind,
     PromoteRequest, PromoteResponse, RecallRequest, RecallResponse, RecallSnapshot, Recalled, RememberRequest,
-    RememberResponse, ReviewRequest, ReviewResponse,
+    RememberResponse, RetractResponse, ReviewRequest, ReviewResponse, UndoRequest,
 };
 use molt_api::planner::{self, Control, ControlRequest, ControlResponse, DesignResponse, RunRequest, RunResponse};
 use molt_api::progress::{self, Progress};
@@ -57,6 +57,13 @@ pub struct Session {
     forks: Mutex<Option<RunForks>>,
     versions: Vec<(String, String)>,
     hooks: Vec<molt_planner::hooks::Hook>,
+}
+
+/// Git settlement is retained even when memory could not be notified; retry by run id is safe.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct Undone {
+    pub git: crate::git::Undo,
+    pub memory: Option<Result<RetractResponse, String>>,
 }
 
 impl Session {
@@ -102,7 +109,8 @@ impl Session {
             Some(_) => Some(agent::wait_until_up(kernel, &cli, MEMORY, deadline).await.map_err(|e| format!("{e:#}"))),
         };
         let budget = Budget::new(0, 0, CALLS);
-        let mut targets = vec![planner::RUN, planner::DESIGN, planner::CONTROL, fs::DIFF, fs::MERGE, fs::DROP];
+        let mut targets =
+            vec![planner::RUN, planner::DESIGN, planner::CONTROL, fs::DIFF, fs::VIEW, fs::MERGE, fs::DROP];
         if !cfg.hooks.is_empty() {
             targets.extend([fs::FORK, molt_api::shell::RUN]);
         }
@@ -115,6 +123,7 @@ impl Session {
                 memory::CORRECT,
                 memory::REMEMBER,
                 memory::PROMOTE,
+                memory::UNDO,
             ]);
         }
         for target in targets {
@@ -184,6 +193,7 @@ impl Session {
 
     /// Merge a result kept in `fork` into the workspace, and drop the fork.
     pub async fn apply(&self, fork: &str) -> anyhow::Result<MergeResponse> {
+        self.validate_fork(fork).await?;
         let result = self.call(fs::MERGE, MergeRequest { fork: fork.to_owned(), drop: true }, TREE_MS, None).await?;
         self.notify_applied().await;
         Ok(result)
@@ -218,13 +228,45 @@ impl Session {
 
     /// The paths `fork` changed.
     pub async fn changes(&self, fork: &str) -> anyhow::Result<Vec<String>> {
-        let resp: DiffResponse = self.call(fs::DIFF, DiffRequest { fork: fork.to_owned() }, DIFF_MS, None).await?;
-        Ok(resp.changes.into_iter().map(|c| c.path).collect())
+        Ok(self.diff(fork).await?.changes.into_iter().map(|c| c.path).collect())
     }
 
     pub async fn discard(&self, fork: &str) -> anyhow::Result<()> {
+        self.validate_fork(fork).await?;
         let _: DropResponse = self.call(fs::DROP, DropRequest { fork: fork.to_owned() }, TREE_MS, None).await?;
         Ok(())
+    }
+
+    /// Read a kept result through the service, without mounting or trusting its saved path.
+    pub async fn diff(&self, fork: &str) -> anyhow::Result<DiffResponse> {
+        self.validate_fork(fork).await?;
+        self.call(fs::DIFF, DiffRequest { fork: fork.to_owned() }, DIFF_MS, None).await
+    }
+
+    async fn validate_fork(&self, fork: &str) -> anyhow::Result<()> {
+        let view: fs::ViewResponse =
+            self.call(fs::VIEW, fs::ViewRequest { fork: fork.to_owned() }, DIFF_MS, None).await?;
+        let workspace = Path::new(&self.workspace).canonicalize()?;
+        anyhow::ensure!(Path::new(&view.workspace) == workspace, "the result belongs to another workspace");
+        Ok(())
+    }
+
+    /// Undo as the person, using this session's memory service and audit log.
+    pub async fn undo(&self, run: Option<String>) -> anyhow::Result<Undone> {
+        let workspace = self.workspace.clone();
+        let git =
+            tokio::task::spawn_blocking(move || crate::git::Repo::open(Path::new(&workspace))?.undo(run.as_deref()))
+                .await??;
+        let run = git.run().to_owned();
+        let memory = if self.memory.is_none() {
+            None
+        } else if let Some(error) = self.memory_problem() {
+            Some(Err(error))
+        } else {
+            let req = UndoRequest { run, reason: "the user undid the run with TUI /undo".into() };
+            Some(self.call(memory::UNDO, req, NOTES_MS, None).await.map_err(|e| format!("{e:#}")))
+        };
+        Ok(Undone { git, memory })
     }
 
     /// The notes about the workspace that match `query`, best first.

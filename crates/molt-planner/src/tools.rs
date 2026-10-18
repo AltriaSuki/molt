@@ -207,9 +207,26 @@ impl Tool {
                 Ok(if resp.notes.is_empty() { "No notes match.".to_owned() } else { note_lines(&resp.notes) })
             }
             Self::Fetch(f) => {
-                let page: FetchResponse =
-                    ctx.call(web::FETCH, FetchRequest { url: f.url }, Budget::new(0, FETCH_MS, 0)).await?;
-                Ok(show_page(page))
+                if !ctx.web {
+                    return Err(Failure::Rejected("web fetching is not permitted for this run".into()));
+                }
+                if !ctx.web_available() {
+                    return Err(Failure::Rejected("fetch_url is disabled after repeated host DNS configuration failures; do not retry web URLs, ask the user to fix DNS or explicitly select a DoH resolver".into()));
+                }
+                let result: Result<FetchResponse, RemoteError> =
+                    ctx.call(web::FETCH, FetchRequest { url: f.url }, Budget::new(0, FETCH_MS, 0)).await;
+                match result {
+                    Ok(page) => {
+                        ctx.web_succeeded();
+                        Ok(show_page(page))
+                    }
+                    Err(error) => {
+                        if ctx.web_failed(&error) {
+                            ctx.note("fetch_url disabled for this run after repeated host DNS configuration failures; ask the user to fix DNS or select --web-resolver").await;
+                        }
+                        Err(error.into())
+                    }
+                }
             }
         }
     }

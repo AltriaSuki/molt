@@ -75,12 +75,20 @@ struct Marked {
 }
 
 /// What `molt undo` found for a run.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Undo {
     /// The commit was taken back by the new commit `sha`.
     Reverted { run: String, commit: String, sha: String },
     /// A commit marked with [`UNDO_TRAILER`] took the run back already.
     Already { run: String, sha: String },
+}
+
+impl Undo {
+    pub fn run(&self) -> &str {
+        match self {
+            Self::Reverted { run, .. } | Self::Already { run, .. } => run,
+        }
+    }
 }
 
 /// A work tree as it was before a run: what `molt do --commit` and the
@@ -494,18 +502,102 @@ impl Drop for Scratch {
     }
 }
 
+/// Remove paired emphasis without changing literal code or identifier underscores.
+fn plain_summary(text: &str) -> String {
+    fn unmark(text: &str, marker: &str) -> String {
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(start) = rest.find(marker) {
+            let prefix = &rest[..start];
+            let tail = &rest[start + marker.len()..];
+            let paired = tail.find(marker).filter(|&end| {
+                let content = &tail[..end];
+                !content.is_empty()
+                    && content.trim() == content
+                    && prefix.chars().next_back().is_none_or(|c| !c.is_alphanumeric() && c != '_')
+                    && tail[end + marker.len()..].chars().next().is_none_or(|c| !c.is_alphanumeric() && c != '_')
+            });
+            out.push_str(prefix);
+            match paired {
+                Some(end) => {
+                    out.push_str(&tail[..end]);
+                    rest = &tail[end + marker.len()..];
+                }
+                None => {
+                    out.push_str(marker);
+                    rest = tail;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+    let mut fenced: Option<(u8, usize)> = None;
+    text.lines()
+        .map(|line| {
+            let trimmed = line.trim_start().as_bytes();
+            let delimiter = trimmed.first().copied().filter(|c| *c == b'`' || *c == b'~');
+            let count = delimiter.map_or(0, |c| trimmed.iter().take_while(|&&byte| byte == c).count());
+            if let Some((active, length)) = fenced {
+                if delimiter == Some(active) && count >= length {
+                    fenced = None;
+                }
+                return line.to_owned();
+            }
+            if count >= 3 {
+                fenced = Some((delimiter.unwrap(), count));
+                return line.to_owned();
+            }
+            let mut out = String::new();
+            let mut rest = line;
+            while let Some(at) = rest.find('`') {
+                let mut plain = rest[..at].to_owned();
+                for marker in ["**", "__", "*", "_"] {
+                    plain = unmark(&plain, marker);
+                }
+                out.push_str(&plain);
+                let run = rest[at..].bytes().take_while(|&b| b == b'`').count();
+                let delimiter = &rest[at..at + run];
+                match rest[at + run..].find(delimiter) {
+                    Some(end) => {
+                        let end = at + run + end + run;
+                        out.push_str(&rest[at..end]);
+                        rest = &rest[end..];
+                    }
+                    None => {
+                        out.push_str(&rest[at..]);
+                        rest = "";
+                    }
+                }
+            }
+            let mut plain = rest.to_owned();
+            for marker in ["**", "__", "*", "_"] {
+                plain = unmark(&plain, marker);
+            }
+            out.push_str(&plain);
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The subject and the whole message of a run's commit: the summary's first
 /// line, cut to [`SUBJECT`] characters, then the rest of it, then the trailers.
 fn run_message(c: &RunCommit) -> (String, String) {
     let summary = c.summary.trim();
     let text = if summary.is_empty() { c.task.trim() } else { summary };
+    let text = plain_summary(text);
     let mut lines = text.lines();
     let first = lines.next().unwrap_or_default().trim().trim_start_matches('#').trim();
     let first = if first.is_empty() { "Apply the result of a molt run" } else { first };
     let mut subject: String = first.chars().take(SUBJECT).collect();
     let mut body = String::new();
     if subject.chars().count() < first.chars().count() {
-        subject = subject.chars().take(SUBJECT - 1).collect::<String>().trim_end().to_owned() + "…";
+        if let Some((at, _)) = subject.char_indices().rfind(|(_, c)| c.is_whitespace()) {
+            if at > 0 {
+                subject.truncate(at);
+            }
+        }
         body.push_str(first);
         body.push('\n');
     }
@@ -536,6 +628,20 @@ fn run_message(c: &RunCommit) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_messages_cut_at_word_boundaries_and_remove_emphasis_without_changing_code() {
+        let summary = format!("**{}ending**\n\nUse **bold** and __strong__, preserve `**literal**` and MAX_SIZE.\n```rust\nlet x = \"**code**\";\n```", "word ".repeat(15));
+        let (subject, message) = run_message(&RunCommit { run: "trace_test", summary: &summary, ..Default::default() });
+        assert!(subject.chars().count() <= SUBJECT && !subject.ends_with('…'));
+        assert_eq!(subject, "word ".repeat(14).trim());
+        assert!(message.contains("Use bold and strong, preserve `**literal**` and MAX_SIZE."), "{message}");
+        assert!(message.contains("let x = \"**code**\";"), "{message}");
+        assert!(message.contains("Molt-Run: trace_test"));
+        let (subject, _) =
+            run_message(&RunCommit { run: "trace_test", summary: &"界".repeat(90), ..Default::default() });
+        assert_eq!(subject.chars().count(), SUBJECT);
+    }
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git").args(args).current_dir(dir).env_remove("GIT_INDEX_FILE").output().unwrap();

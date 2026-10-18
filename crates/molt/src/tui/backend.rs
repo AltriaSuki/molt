@@ -49,7 +49,12 @@ pub(super) struct Backend {
 }
 
 impl Backend {
-    pub async fn start(cfg: Config, workspace: String, tx: mpsc::UnboundedSender<Msg>) -> anyhow::Result<Self> {
+    pub async fn start(
+        cfg: Config,
+        workspace: String,
+        tx: mpsc::UnboundedSender<Msg>,
+        generation: u64,
+    ) -> anyhow::Result<Self> {
         let mut command = Command::new(std::env::current_exe()?);
         command.arg("ui-backend").stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).process_group(0);
         let mut child = command.spawn().context("starting the interface backend")?;
@@ -60,7 +65,7 @@ impl Backend {
             let result = async {
                 while let Some(bytes) = read(&mut output).await? {
                     let msg = serde_json::from_slice(&bytes).context("invalid interface backend message")?;
-                    if tx.send(msg).is_err() {
+                    if tx.send(Msg::Backend { generation, message: Box::new(msg) }).is_err() {
                         return Ok::<_, anyhow::Error>(());
                     }
                 }
@@ -68,7 +73,7 @@ impl Backend {
             }
             .await;
             if let Err(e) = result {
-                let _ = tx.send(Msg::SessionFailed(e.to_string()));
+                let _ = tx.send(Msg::Backend { generation, message: Box::new(Msg::BackendFailed(e.to_string())) });
             }
         });
         Ok(Self { child, input })
