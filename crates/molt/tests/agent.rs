@@ -17,7 +17,7 @@ use molt::agent::{run_task, Done, Interrupted, Learn};
 use molt::{Config, Secrets, TransportKind};
 use molt_api::fs::{ChangeKind, DROP, FORK, MERGE, WRITE};
 use molt_api::model::COMPLETE;
-use molt_api::planner::tools::{RUN, SUBMIT_CHECK, SUBMIT_REVIEW, WRITE_FILE};
+use molt_api::planner::tools::{DISPUTE_CHECK, RUN, SUBMIT_CHECK, SUBMIT_REVIEW, SUBMIT_VETTING, WRITE_FILE};
 use molt_api::planner::{AttemptStatus, CheckSpec, Outcome, RunRequest, RunResponse, RUN as PLANNER_RUN};
 use molt_api::progress::Progress;
 use molt_api::shell::RUN as RUN_CHECK;
@@ -54,6 +54,8 @@ enum Fake {
     GreetsAtLength(usize),
     /// Every request is refused.
     Refuses,
+    /// Attempts dispute the check rather than greet.
+    Disputes,
     /// Attempts run a command that starts a long `sleep`, writes its pid to
     /// this file and waits for it.
     Hangs(PathBuf),
@@ -98,6 +100,14 @@ impl Respond for FakeApi {
             ];
             return message(n, model, content, "tool_use", stream);
         }
+        // The vetter of a designed check finds it fits the task.
+        if body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_VETTING)) {
+            let content = vec![
+                json!({ "type": "thinking", "thinking": "", "signature": signature(n) }),
+                tool_use(n, SUBMIT_VETTING, json!({ "conflicts": [] })),
+            ];
+            return message(n, model, content, "tool_use", stream);
+        }
         let designer = body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_CHECK));
         let last = messages.last().cloned().unwrap_or(Value::Null);
         let after_tools = last["content"].as_array().is_some_and(|c| c.iter().any(|b| b["type"] == "tool_result"));
@@ -113,6 +123,14 @@ impl Respond for FakeApi {
             (_, true, _) => {
                 let input = json!({ "command": "sh check.sh", "files": ["check.sh"], "rationale": "Greets." });
                 (vec![tool_use(n, SUBMIT_CHECK, input)], "tool_use")
+            }
+            (Fake::Disputes, false, _) => {
+                let input = json!({
+                    "assertion": "the check greps greeting.txt for hello",
+                    "task_quote": "Write a greeting into greeting.txt.",
+                    "reproduce": CHECK,
+                });
+                (vec![tool_use(n, DISPUTE_CHECK, input)], "tool_use")
             }
             (Fake::FixesAfterFeedback, false, Turn::First) => (vec![write("greeting.txt", "goodbye\n")], "tool_use"),
             (Fake::Hangs(pidfile), false, Turn::First) => {
@@ -693,6 +711,38 @@ async fn a_failed_check_goes_back_to_the_attempt_which_fixes_it() {
     assert!(feedback[0].contains("exit code 1"), "{}", feedback[0]);
     assert_requests_valid(&server).await;
     setup.assert_forks_dropped();
+}
+
+#[tokio::test]
+async fn molt_do_prints_a_disputed_check_and_exits_nonzero() {
+    let server = fake_api(Fake::Disputes).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let args = ["--check", CHECK, "--attempts", "1", "--no-learn"];
+    let cmd = molt_do(&server, workspace.path(), data.path(), &args).output();
+    let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.starts_with("outcome: failed, the check was disputed\n"), "{stdout}");
+    assert!(stdout.contains("The done-check was disputed: attempt 0 found that it contradicts the task."), "{stdout}");
+    assert!(stdout.contains("The check asserts: the check greps greeting.txt for hello"), "{stdout}");
+    assert!(stdout.contains("The task says: \"Write a greeting into greeting.txt.\""), "{stdout}");
+    assert!(stdout.contains(&format!("To reproduce: `{CHECK}`")), "{stdout}");
+    assert!(stderr.contains("attempt 0 disputed the check"), "{stderr}");
+    assert!(!workspace.path().join("greeting.txt").exists());
+
+    // With --json the dispute is a field of its own, and the attempt is not a failed one.
+    let args = ["--check", CHECK, "--attempts", "1", "--no-learn", "--json"];
+    let cmd = molt_do(&server, workspace.path(), data.path(), &args).output();
+    let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let resp: RunResponse = serde_json::from_slice(&out.stdout).unwrap();
+    let dispute = resp.dispute.expect("the reply carries the dispute");
+    assert_eq!((dispute.attempt, dispute.reproduce.as_str()), (0, CHECK));
+    assert_eq!(resp.attempts[0].status, AttemptStatus::Cancelled);
+    assert_requests_valid(&server).await;
+    assert_forks_dropped(data.path());
 }
 
 #[tokio::test]

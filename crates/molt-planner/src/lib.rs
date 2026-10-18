@@ -21,6 +21,7 @@ mod review;
 mod runner;
 mod select;
 mod tools;
+mod vet;
 
 use std::sync::Arc;
 use std::time::Duration;

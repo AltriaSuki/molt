@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use molt_api::model::Usage;
-use molt_api::planner::{AttemptStatus, CheckFile, Criterion, Finding, Requirement, RunRequest};
+use molt_api::planner::{AttemptStatus, CheckDispute, CheckFile, Criterion, Finding, Requirement, RunRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -122,6 +122,9 @@ pub struct SavedEnd {
     /// How it did on the run's rubric, when it was judged and met it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<Finding>,
+    /// It stopped because it disputed the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispute: Option<CheckDispute>,
 }
 
 impl Saved {

@@ -2832,6 +2832,7 @@ impl App {
                 AttemptStatus::Error => ("!", Tone::Warn),
             };
             let status = match a.status {
+                _ if a.dispute.is_some() => "disputed the check",
                 AttemptStatus::Passed => "passed",
                 AttemptStatus::Failed => "failed",
                 AttemptStatus::Cancelled => "cancelled",
@@ -2967,6 +2968,15 @@ impl App {
             self.task = Some(Task { phase: Phase::Deciding, lanes: Vec::new(), ..task });
         } else if applying {
             self.task = Some(Task { phase: Phase::Applying, lanes: Vec::new(), stops: Vec::new(), ..task });
+        } else if let Some(d) = disputed_check(&task.req, &resp) {
+            // The check needs the user's look before anything runs to it again: stop at its card.
+            let mut req = task.req.clone();
+            req.check = None;
+            req.check_files = Vec::new();
+            req.suite = None;
+            let next = Task::new(TraceId::random(), req, Phase::Confirming, task.mode, task.settings.clone());
+            self.task = Some(Task { stops: vec![DISPUTED.into()], ..next });
+            self.prompt = Some(Prompt::Check(d));
         } else if resp.outcome == Outcome::Failed && !resp.attempts.is_empty() {
             // Only a check known in full can be run again without designing it anew.
             let mut req = task.req;
@@ -3794,6 +3804,44 @@ fn rubric_lines(rubric: &[String]) -> Vec<Line<'static>> {
 }
 
 /// Why a designed check needs the user's look before the attempts start.
+/// Why confirm mode stopped at a check an attempt disputed.
+pub(crate) const DISPUTED: &str = "check disputed";
+
+/// The check card for a run that ended on a dispute, with the dispute as its
+/// rationale. `None` without a dispute, or when the check's files are not
+/// known here (the planner designed them within the run), so it cannot be
+/// run again as it was.
+fn disputed_check(req: &RunRequest, resp: &RunResponse) -> Option<DesignResponse> {
+    let dispute = resp.dispute.as_ref().filter(|_| resp.outcome == Outcome::Failed)?;
+    let (command, files, suite) = match (&req.check, &resp.check) {
+        (Some(command), _) => (command.clone(), req.check_files.clone(), req.suite.clone()),
+        (None, Some(spec)) if spec.files.is_empty() => (spec.command.clone(), Vec::new(), spec.suite.clone()),
+        _ => return None,
+    };
+    let rationale = format!(
+        "Attempt {} disputed this check: it asserts {}, but the task says \"{}\". To reproduce: {}. Edit the \
+         check, or run it again as it is.",
+        dispute.attempt + 1,
+        dispute.assertion.trim(),
+        dispute.task_quote.trim(),
+        dispute.reproduce.trim()
+    );
+    Some(DesignResponse {
+        command: Some(command),
+        files,
+        suite,
+        rubric: Vec::new(),
+        rationale,
+        baseline: None,
+        usage: Default::default(),
+        cost_usd: 0.0,
+        uncounted_calls: 0,
+        remaining_budget_usd: req.budget_usd,
+        error: None,
+        cancelled: false,
+    })
+}
+
 fn check_stops(d: &DesignResponse, existing: &[String]) -> Vec<String> {
     if d.command.is_none() && !d.rubric.is_empty() {
         return vec!["criteria judged by a model".into()];
@@ -5558,6 +5606,7 @@ mod tests {
                     cost_usd: 0.1,
                     note: String::new(),
                     requirements: 0,
+                    dispute: None,
                 },
                 AttemptReport {
                     index: 1,
@@ -5568,6 +5617,7 @@ mod tests {
                     cost_usd: 0.2,
                     note: String::new(),
                     requirements: 0,
+                    dispute: None,
                 },
             ],
             usage: Usage::default(),
@@ -5578,6 +5628,7 @@ mod tests {
             selection: None,
             rubric: vec![],
             judgement: vec![],
+            dispute: None,
         }
     }
 
@@ -6384,7 +6435,61 @@ mod tests {
             cost_usd: 0.1,
             note: note.into(),
             requirements: 0,
+            dispute: None,
         }
+    }
+
+    #[test]
+    fn a_disputed_check_stops_at_the_check_card_to_be_edited_and_run_again() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.rules.always_ask = true;
+        let actions = type_in(&mut app, "accept trailing commas");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
+        let actions = app.update(key(KeyCode::Enter));
+        assert!(matches!(actions.as_slice(), [Action::Run { .. }]), "{actions:?}");
+
+        let dispute = molt_api::planner::CheckDispute {
+            attempt: 0,
+            assertion: "tests/commas.rs expects column 20".into(),
+            task_quote: "columns count Unicode characters".into(),
+            reproduce: "cargo test --test commas".into(),
+        };
+        let mut disputed = attempt(0, AttemptStatus::Cancelled, "disputed the check");
+        disputed.dispute = Some(dispute.clone());
+        let resp = RunResponse {
+            summary: "The done-check was disputed: attempt 0 found that it contradicts the task.".into(),
+            dispute: Some(Box::new(dispute)),
+            ..failed(vec![disputed, attempt(1, AttemptStatus::Failed, "x")])
+        };
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+        assert!(actions.iter().all(|a| matches!(a, Action::Learn { .. })), "nothing runs: {actions:?}");
+        assert!(log(&app).contains("  – attempt 1 disputed the check · 3 turns"), "{}", log(&app));
+        // It stops at the check card, with the dispute, instead of offering a retry.
+        let Some(Prompt::Check(d)) = &app.prompt else { panic!("not at the check card: {:?}", app.prompt.is_some()) };
+        assert_eq!(d.command.as_deref(), Some("cargo test --test commas"));
+        assert_eq!(d.files.len(), 1, "the check's files come along");
+        assert!(d.rationale.starts_with("Attempt 1 disputed this check: it asserts tests/commas.rs expects column 20, but the task says \"columns count Unicode characters\". To reproduce: cargo test --test commas."), "{}", d.rationale);
+        let task = app.task.as_ref().unwrap();
+        assert_eq!((&task.phase, task.stops.as_slice()), (&Phase::Confirming, [DISPUTED.to_owned()].as_slice()));
+        assert_ne!(task.trace, trace, "going on is a new run");
+        let screen = frame_text(&mut app);
+        assert!(screen.contains("◆ check  disputed by an attempt"), "{screen}");
+        assert!(screen.contains("Attempt 1 disputed this check"), "{screen}");
+
+        // Edit the check, then go on with it.
+        app.update(key(KeyCode::Char('e')));
+        assert!(matches!(app.prompt, Some(Prompt::EditCheck(_))));
+        app.input = Input::with("cargo test --test commas -- --skip column");
+        app.update(key(KeyCode::Enter));
+        let actions = app.update(key(KeyCode::Enter));
+        let [Action::Run { req, trace: next }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.check.as_deref(), Some("cargo test --test commas -- --skip column"));
+        assert_eq!(req.check_files.len(), 1);
+        assert_eq!(next, &app.task.as_ref().unwrap().trace);
+        assert_eq!(app.task.as_ref().unwrap().phase, Phase::Running);
     }
 
     #[test]

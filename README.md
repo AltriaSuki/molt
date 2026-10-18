@@ -444,6 +444,34 @@ from a judged run than from a checked one. `planner.design` returns the
 rubric in place of a check when it designs one, and a run given a rubric
 designs nothing.
 
+### When the check is wrong
+
+A designed check can expect something the task rules out: a column counted
+wrong, a message without the quotes the task asks for. When the designer's
+check comes with test files of its own, a separate vetter model, which only
+reads, compares those files and the command with the task (and the files the
+task points to) and lists each assertion the task contradicts or gives no
+basis for, quoting the task. A conflict goes back to the designer as the
+result of its `submit_check`, to revise; when its second check still
+conflicts, the design fails with the conflicts listed and no attempt starts
+(`planner.design` returns the same error, which confirm mode shows). The
+vetter's calls count toward the run's cost and budget. A vetter that does not
+finish holds nothing back: the check is used, and the design's rationale says
+it was not vetted.
+
+An attempt that finds the check contradicting the task can call
+`dispute_check` with the assertion, the task's words it contradicts and a
+command that shows it, instead of bending the code to the check. That ends the
+attempt, which is reported as cancelled with its `dispute`, not as failed; the
+other attempts go on. When no attempt passes and one disputed, the reply
+carries the `dispute`, its summary leads with it, `molt do` prints it under
+`outcome: failed, the check was disputed` and exits with status 1, and the
+TUI stops at the check card with the dispute, where `e` edits the check and
+Enter runs the task again with it. (The card needs the check in full: a check
+designed in auto mode with files of its own stays in the planner, so there the
+dispute is only shown.) Attempts judged by a rubric or run without
+a check have no `dispute_check`.
+
 ### Commits and `molt undo`
 
 With `--commit`, an applied result is committed to git. The commit holds
