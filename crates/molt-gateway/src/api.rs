@@ -154,12 +154,15 @@ pub(crate) struct Api {
 
 impl Api {
     pub fn new(cfg: &Config) -> anyhow::Result<Self> {
-        anyhow::ensure!(!cfg.api_key.is_empty(), "no Anthropic API key");
+        anyhow::ensure!(
+            !cfg.api_key.is_empty() || cfg.auth_token.as_ref().is_some_and(|token| !token.is_empty()),
+            "no Anthropic credential: set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN"
+        );
         // Appended rather than joined, so a base URL with a path prefix keeps it.
         let url: Url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'))
             .parse()
             .with_context(|| format!("bad base URL {:?}", cfg.base_url))?;
-        // No redirects: reqwest would re-send x-api-key to whatever host a 307 names.
+        // No redirects: credentials must not be re-sent to a host named by a 307.
         let mut builder = reqwest::Client::builder()
             .timeout(cfg.timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -171,10 +174,17 @@ impl Api {
         }
         let http = builder.build().context("building the HTTP client")?;
 
-        let mut key = HeaderValue::from_str(&cfg.api_key).context("the API key is not a valid header value")?;
-        key.set_sensitive(true);
         let mut headers = HeaderMap::new();
-        headers.insert("x-api-key", key);
+        if !cfg.api_key.is_empty() {
+            let mut key = HeaderValue::from_str(&cfg.api_key).context("the API key is not a valid header value")?;
+            key.set_sensitive(true);
+            headers.insert("x-api-key", key);
+        } else if let Some(token) = &cfg.auth_token {
+            let mut token = HeaderValue::from_str(&format!("Bearer {token}"))
+                .context("the Anthropic auth token is not a valid header value")?;
+            token.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, token);
+        }
         headers.insert("anthropic-version", HeaderValue::from_static(API_VERSION));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         Ok(Self {

@@ -447,6 +447,7 @@ fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) ->
         .kill_on_drop(true);
     // The developer's own settings must not change the test.
     for var in [
+        "ANTHROPIC_AUTH_TOKEN",
         "MOLT_MODEL",
         "MOLT_EFFORT",
         "MOLT_MAX_TOKENS",
@@ -868,6 +869,39 @@ async fn a_note_remembered_for_every_project_is_recalled_in_another() {
     memory(&["promote", &id, "--reason", "every project here builds with make"], &at[0]);
     assert!(memory(&["show"], &at[1]).contains("Build with make."));
     assert!(memory(&["show", "build"], &at[0]).contains("promoted as"));
+}
+
+#[tokio::test]
+async fn a_token_only_cli_run_keeps_bearer_credentials_out_of_sandbox_commands() {
+    struct BearerApi;
+    impl Respond for BearerApi {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            assert_eq!(req.headers.get("authorization").unwrap(), "Bearer token-test");
+            assert!(!req.headers.contains_key("x-api-key"));
+            // Reuse the strict body/signature validator with its existing API-key fixture.
+            let mut normalized = req.clone();
+            normalized.headers.remove("authorization");
+            normalized.headers.insert("x-api-key", API_KEY.parse().unwrap());
+            check_request(&normalized).expect("valid Messages API request");
+            FakeApi(Fake::Greets).respond(&normalized)
+        }
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/v1/messages")).respond_with(BearerApi).mount(&server).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let check = format!("test -z \"${{ANTHROPIC_AUTH_TOKEN+x}}\" && {CHECK}");
+    let cmd = molt_do(&server, workspace.path(), data.path(), &["--check", &check, "--attempts", "1"])
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("MOLT_PROVIDER")
+        .env_remove("MOLT_MODEL_ALIASES")
+        .env("ANTHROPIC_AUTH_TOKEN", "token-test")
+        .output();
+    let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read_to_string(workspace.path().join("greeting.txt")).unwrap(), "hello\n");
+    assert!(!server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1304,7 +1338,7 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_molt"));
         cmd.args(["do", "anything", "--data-dir"]).arg(data_dir).args(args).current_dir(workspace.path());
         cmd.env("XDG_DATA_HOME", user_data.path());
-        cmd.env_remove("OPENAI_API_KEY").env_remove("MOLT_PROVIDER");
+        cmd.env_remove("OPENAI_API_KEY").env_remove("ANTHROPIC_AUTH_TOKEN").env_remove("MOLT_PROVIDER");
         match key {
             Some(key) => cmd.env("ANTHROPIC_API_KEY", key),
             None => cmd.env_remove("ANTHROPIC_API_KEY"),
@@ -1314,7 +1348,9 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
         String::from_utf8_lossy(&out.stderr).into_owned()
     };
     let err = molt_do(data.path(), None, &[]);
-    assert!(err.contains("ANTHROPIC_API_KEY or OPENAI_API_KEY is not set"), "{err}");
+    assert!(err.contains("ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or OPENAI_API_KEY is not set"), "{err}");
+    let err = molt_do(data.path(), Some("  "), &[]);
+    assert!(err.contains("ANTHROPIC_AUTH_TOKEN"), "{err}");
     let ws = workspace.path().canonicalize().unwrap();
     let inside = ws.join("state");
     let err = molt_do(&inside, Some("test"), &[]);
@@ -1330,6 +1366,8 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
         let err = molt_do(data.path(), Some("test"), &args);
         assert!(err.contains(args[0]), "{err}");
     }
+    let err = molt_do(data.path(), Some("test"), &["--pass-env", "ANTHROPIC_AUTH_TOKEN"]);
+    assert!(err.contains("commands never see"), "{err}");
     let err = molt_do(data.path(), Some("test"), &["--allow-web", "https://docs.rs/serde"]);
     assert!(err.contains("not a host to allow"), "{err}");
     assert!(std::fs::read_dir(data.path()).unwrap().next().is_none(), "nothing was started");

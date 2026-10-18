@@ -87,6 +87,7 @@ mod tests {
         Config {
             providers: Default::default(),
             api_key: "k".into(),
+            auth_token: None,
             base_url: "http://127.0.0.1:1".into(),
             default_model: "opus".into(),
             max_tokens: 32_000,

@@ -1,7 +1,7 @@
 //! The model gateway: serves `model.complete` through explicit Anthropic
 //! Messages and OpenAI Chat Completions adapters.
 //!
-//! It is the only process that holds the API key. It turns a
+//! It is the only process that holds provider credentials. It turns a
 //! [`CompleteRequest`] into a Messages API request shaped for the chosen
 //! model (thinking, effort, server-side fallbacks, prompt caching), retries
 //! transient failures, and returns the content verbatim with usage and an
@@ -40,6 +40,8 @@ const REPLY_MARGIN: Duration = Duration::from_millis(500);
 #[derive(Clone)]
 pub struct Config {
     pub api_key: String,
+    /// Anthropic Bearer authentication, used only when the API key is absent.
+    pub auth_token: Option<String>,
     /// Provider routing and the optional second provider, held only here.
     pub providers: provider::Providers,
     /// Without a trailing slash, e.g. `https://api.anthropic.com`.
@@ -65,11 +67,12 @@ pub struct Config {
     pub prices: Arc<PriceTable>,
 }
 
-// Written out so that logging a config never prints the key.
+// Written out so that logging a config never prints credentials.
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("api_key", &"<redacted>")
+            .field("auth_token", &"<redacted>")
             .field("providers", &self.providers)
             .field("base_url", &self.base_url)
             .field("default_model", &self.default_model)
@@ -90,7 +93,8 @@ impl Config {
     ///
     /// | Variable | Default |
     /// |---|---|
-    /// | `ANTHROPIC_API_KEY` | required |
+    /// | `ANTHROPIC_API_KEY` | preferred Anthropic credential |
+    /// | `ANTHROPIC_AUTH_TOKEN` | Bearer fallback when the API key is unset |
     /// | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
     /// | `MOLT_MODEL` | `opus` |
     /// | `MOLT_MAX_TOKENS` | `32000` |
@@ -115,9 +119,10 @@ impl Config {
         };
         let providers = provider::Providers::from_vars(&get)?;
         let api_key = get("ANTHROPIC_API_KEY").unwrap_or_default();
+        let auth_token = get("ANTHROPIC_AUTH_TOKEN");
         ensure!(
-            !api_key.is_empty() || providers.openai_key.is_some(),
-            "ANTHROPIC_API_KEY or OPENAI_API_KEY is not set"
+            !api_key.is_empty() || auth_token.is_some() || providers.openai_key.is_some(),
+            "ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or OPENAI_API_KEY is not set"
         );
         let base_url = get("ANTHROPIC_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.into());
         let effort = match get("MOLT_EFFORT") {
@@ -137,6 +142,7 @@ impl Config {
         Ok(Self {
             providers,
             api_key,
+            auth_token,
             base_url: base_url.trim_end_matches('/').to_owned(),
             default_model: get("MOLT_MODEL").unwrap_or_else(|| {
                 if get("MOLT_PROVIDER").as_deref() == Some("openai") {
@@ -185,9 +191,19 @@ pub struct Gateway {
 
 impl Gateway {
     pub fn new(cfg: Config) -> anyhow::Result<Self> {
-        let anthropic = (!cfg.api_key.is_empty()).then(|| api::Api::new(&cfg)).transpose()?;
+        if !cfg.api_key.is_empty() && cfg.auth_token.as_ref().is_some_and(|token| !token.is_empty()) {
+            tracing::warn!(
+                "both ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN are set; using ANTHROPIC_API_KEY (x-api-key)"
+            );
+        }
+        let anthropic = (!cfg.api_key.is_empty() || cfg.auth_token.as_ref().is_some_and(|token| !token.is_empty()))
+            .then(|| api::Api::new(&cfg))
+            .transpose()?;
         let openai = cfg.providers.openai_key.as_ref().map(|key| api::Api::openai(&cfg, key)).transpose()?;
-        ensure!(anthropic.is_some() || openai.is_some(), "no model provider API key");
+        ensure!(
+            anthropic.is_some() || openai.is_some(),
+            "no model provider credential: set ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or OPENAI_API_KEY"
+        );
         Ok(Self { cfg, anthropic, openai })
     }
 
@@ -239,7 +255,7 @@ impl Gateway {
         }
         .ok_or_else(|| RemoteError {
             code: ErrorCode::Invalid,
-            message: format!("no API key configured for {provider}"),
+            message: format!("no credential configured for {provider}"),
         })?;
         let messages = req.messages.len();
         let call = match provider {
@@ -567,6 +583,17 @@ mod tests {
     }
 
     #[test]
+    fn auth_token_is_a_credential_and_empty_variables_are_unset() {
+        let cfg = from(&[("ANTHROPIC_AUTH_TOKEN", " token-test "), ("ANTHROPIC_API_KEY", "  ")]).unwrap();
+        assert!(cfg.api_key.is_empty());
+        assert_eq!(cfg.auth_token.as_deref(), Some("token-test"));
+        let error = from(&[("ANTHROPIC_AUTH_TOKEN", "  ")]).unwrap_err().to_string();
+        for name in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"] {
+            assert!(error.contains(name), "{error}");
+        }
+    }
+
+    #[test]
     fn env_overrides() {
         let cfg = from(&[
             ("ANTHROPIC_API_KEY", "sk-test"),
@@ -607,8 +634,9 @@ mod tests {
 
     #[test]
     fn debug_hides_the_key() {
-        let cfg = from(&[("ANTHROPIC_API_KEY", "sk-secret")]).unwrap();
-        assert!(!format!("{cfg:?}").contains("sk-secret"));
+        let cfg = from(&[("ANTHROPIC_API_KEY", "sk-secret"), ("ANTHROPIC_AUTH_TOKEN", "token-secret")]).unwrap();
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("sk-secret") && !debug.contains("token-secret"));
     }
 
     #[test]

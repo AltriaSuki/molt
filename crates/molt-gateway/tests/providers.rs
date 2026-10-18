@@ -14,6 +14,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn config(server: &MockServer) -> Config {
     Config {
         api_key: "anthropic-key".into(),
+        auth_token: None,
         base_url: server.uri(),
         providers: Providers {
             openai_key: Some("openai-key".into()),
@@ -263,6 +264,7 @@ async fn refusal_content_is_never_a_tool_or_a_final_answer() {
 fn debug_redacts_both_keys_and_openai_needs_https_or_loopback() {
     let cfg = Config {
         api_key: String::new(),
+        auth_token: None,
         providers: Providers {
             openai_key: Some("private-key".into()),
             default: Provider::Openai,
@@ -280,6 +282,7 @@ fn debug_redacts_both_keys_and_openai_needs_https_or_loopback() {
 fn config_for_test() -> Config {
     Config {
         api_key: "unused".into(),
+        auth_token: None,
         providers: Providers::default(),
         base_url: "https://api.anthropic.com".into(),
         default_model: "opus".into(),
