@@ -1387,7 +1387,8 @@ mod tests {
             report(&resp).contains("known cost: $0.0120 (1200 tokens), 2 model calls have unknown or unsettled cost\n")
         );
         resp.uncounted_calls = 0;
-        resp.review = Some(Review { verdict: Verdict::Reject, findings: vec!["src/lib.rs:3 returns 42.".into()] });
+        resp.review =
+            Some(Review { verdict: Verdict::Reject, findings: vec!["src/lib.rs:3 returns 42.".into()], details: None });
         assert!(
             report(&resp).contains("review: reject\n  - src/lib.rs:3 returns 42.\nnot applied"),
             "{}",

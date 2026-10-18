@@ -10,7 +10,7 @@ use std::sync::Arc;
 use molt_api::fs::{Change, ChangeKind};
 use molt_api::model::{tool_result, user_blocks, user_text, ToolUse, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{SubmitReview, SUBMIT_REVIEW};
-use molt_api::planner::{CheckSpec, Requirement, Review, Verdict};
+use molt_api::planner::{CheckSpec, Requirement, Review, ReviewDetails, Verdict};
 use serde_json::Value;
 
 use crate::agent::{self, Meter, Stop};
@@ -37,13 +37,18 @@ pub(crate) struct Winner<'a> {
 pub(crate) async fn review(ctx: &Arc<Ctx>, winner: &Winner<'_>) -> Review {
     let mut findings = rules(winner.check, winner.changes, winner.patch);
     let mut verdict = if findings.is_empty() { Verdict::Approve } else { Verdict::Concern };
+    let mut details = ReviewDetails { rules: findings.clone(), ..ReviewDetails::default() };
     match model(ctx, winner, &findings).await {
         Ok(submit) => {
             verdict = verdict.max(submit.verdict);
-            findings.extend(submit.findings.into_iter().map(|f| f.trim().to_owned()).filter(|f| !f.is_empty()));
+            details.reviewer = Some(submit.verdict);
+            details.findings =
+                submit.findings.into_iter().map(|f| f.trim().to_owned()).filter(|f| !f.is_empty()).collect();
+            findings.extend(details.findings.iter().cloned());
         }
         // An unfinished review approves nothing.
         Err(why) => {
+            details.error = Some(why.clone());
             verdict = verdict.max(Verdict::Concern);
             findings.push(format!("The reviewer did not finish: {why}."));
         }
@@ -55,7 +60,7 @@ pub(crate) async fn review(ctx: &Arc<Ctx>, winner: &Winner<'_>) -> Review {
     };
     ctx.note(format!("review: {name}")).await;
     tracing::info!(run = %ctx.trace, verdict = name, findings = findings.len(), "reviewed the winner");
-    Review { verdict, findings }
+    Review { verdict, findings, details: Some(details) }
 }
 
 /// What the fixed rules find in the changes: deleted tests, new skip markers

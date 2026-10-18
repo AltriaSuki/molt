@@ -258,6 +258,14 @@ configuration or environment. `/log` opens up to 200 lines from the final 64 KiB
 `tui.log`, sanitizes terminal controls, redacts known credentials and omits lines
 with common credential patterns. A manual restart resets the automatic retry limit.
 
+While a check or result waits for confirmation, PgUp/PgDn and Ctrl+Home/Ctrl+End
+still scroll the conversation log. At apply confirmation, `v` opens the full
+review with fixed-rule findings, the independent reviewer verdict/findings and
+any review error. Stop reasons distinguish rules from the reviewer; older
+planner replies retain their combined findings without claiming a source.
+In diff and transcript viewers, `G`/End shows the final page with the last row
+at the bottom, including wrapped text.
+
 `/queue add TASK` submits a separate task while another runs. Plain input still
 adds a constraint to the current task. `/queue` opens the task list: `a` adds a
 multiline task, arrows select, `J`/`K` move it, `n` removes it, and Enter inspects
