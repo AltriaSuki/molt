@@ -32,6 +32,10 @@ pub struct RunResponse {
     /// Output was cut to the service's limit; the start and the end are kept.
     pub truncated: bool,
     pub duration_ms: u64,
+    /// The command ran without network and failed with output that looks
+    /// like a dependency it could not download.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub offline_failure: bool,
 }
 
 impl RunResponse {

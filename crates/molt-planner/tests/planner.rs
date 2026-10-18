@@ -517,6 +517,7 @@ fn exit(code: i32, stderr: &str) -> shell::RunResponse {
         stderr: stderr.to_owned(),
         truncated: false,
         duration_ms: 1,
+        offline_failure: false,
     }
 }
 

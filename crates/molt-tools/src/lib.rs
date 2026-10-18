@@ -8,13 +8,14 @@
 
 mod apply;
 mod build_dir;
+mod cargo_cache;
 mod error;
 mod files;
 mod fork;
 mod paths;
 pub mod sandbox;
 mod shell;
-pub use sandbox::{ExecutionPolicy, SandboxPolicy};
+pub use sandbox::{host_cargo_home, ExecutionPolicy, SandboxPolicy};
 mod walk;
 
 use std::future::Future;
@@ -181,6 +182,7 @@ pub struct Shell {
     program: PathBuf,
     running: Arc<shell::Groups>,
     policy: Option<Arc<SandboxPolicy>>,
+    cargo: Option<Arc<cargo_cache::CargoCache>>,
 }
 
 impl Shell {
@@ -199,7 +201,9 @@ impl Shell {
         if let Some(policy) = &policy {
             policy.probe()?;
         }
-        Ok(Self { roots, program: shell::find_shell(), running: Arc::default(), policy: policy.map(Arc::new) })
+        let cargo = policy.as_ref().and_then(|p| p.cargo_cache.as_deref()).map(cargo_cache::CargoCache::open);
+        let cargo = cargo.transpose()?.map(Arc::new);
+        Ok(Self { roots, program: shell::find_shell(), running: Arc::default(), policy: policy.map(Arc::new), cargo })
     }
 
     /// Kill every command still running, with everything it started. Call
@@ -230,8 +234,8 @@ impl Shell {
         match method {
             "run" => {
                 let req = parse("shell", method, payload)?;
-                let reply =
-                    shell::run(&self.roots, &self.program, &self.running, self.policy.as_deref(), req, cancel).await?;
+                let policy = self.policy.as_deref().map(|policy| (policy, self.cargo.clone()));
+                let reply = shell::run(&self.roots, &self.program, &self.running, policy, req, cancel).await?;
                 serde_json::to_value(reply).map_err(|e| failed(e.to_string()))
             }
             _ => Err(invalid(format!("unknown method shell.{method}"))),

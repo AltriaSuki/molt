@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::build_dir::BuildDir;
+use crate::cargo_cache::CargoCache;
 use crate::{fork, Roots};
 
 const MAX_POLICY_BYTES: usize = 64 * 1024;
@@ -33,6 +34,10 @@ pub struct SandboxPolicy {
     pub file_mb: u64,
     pub open_files: u64,
     pub processes: u64,
+    /// A host Cargo home whose `registry` and `git` caches commands build
+    /// from offline (`--deps-cache cargo`); see `cargo_cache`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cargo_cache: Option<PathBuf>,
 }
 
 impl Default for SandboxPolicy {
@@ -46,8 +51,40 @@ impl Default for SandboxPolicy {
             file_mb: 128,
             open_files: 256,
             processes: 2048,
+            cargo_cache: None,
         }
     }
+}
+
+/// The Cargo home of this process's user: `CARGO_HOME`, else `~/.cargo`.
+pub fn host_cargo_home() -> anyhow::Result<PathBuf> {
+    let set = |name| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
+    let home = match set("CARGO_HOME") {
+        Some(home) => home,
+        None => set("HOME")
+            .context("neither CARGO_HOME nor HOME is set, so the Cargo cache cannot be found")?
+            .join(".cargo"),
+    };
+    ensure!(home.is_absolute(), "CARGO_HOME must be an absolute path, not {}", home.display());
+    Ok(home)
+}
+
+/// A host path that may be mounted read-only into the sandbox.
+pub(crate) fn check_mount(path: &Path) -> anyhow::Result<()> {
+    ensure!(
+        ![
+            "/", "/proc", "/dev", "/sys", "/etc", "/run", "/tmp", "/home", "/root", "/var", "/usr", "/bin", "/lib",
+            "/lib64"
+        ]
+        .iter()
+        .any(|p| path == Path::new(p)),
+        "cannot expose a host root or replace a sandbox runtime mount"
+    );
+    ensure!(
+        !["/proc", "/dev", "/sys", "/run", "/home/molt"].iter().any(|p| path.starts_with(p)),
+        "cannot expose host processes, devices, IPC or the sandbox home"
+    );
+    Ok(())
 }
 
 impl SandboxPolicy {
@@ -75,19 +112,7 @@ impl SandboxPolicy {
                 path.is_absolute() && path.canonicalize()? == *path,
                 "dependency paths must be canonical and absolute"
             );
-            ensure!(
-                ![
-                    "/", "/proc", "/dev", "/sys", "/etc", "/run", "/tmp", "/home", "/root", "/var", "/usr", "/bin",
-                    "/lib", "/lib64"
-                ]
-                .iter()
-                .any(|p| path == Path::new(p)),
-                "cannot expose a host root or replace a sandbox runtime mount"
-            );
-            ensure!(
-                !["/proc", "/dev", "/sys", "/run", "/home/molt"].iter().any(|p| path.starts_with(p)),
-                "cannot expose host processes, devices, IPC or the sandbox home"
-            );
+            check_mount(path)?;
             let meta = std::fs::metadata(path)?;
             ensure!(meta.is_dir() || meta.is_file(), "dependencies must be regular files or directories");
         }
@@ -105,6 +130,13 @@ impl SandboxPolicy {
                     && name != "HOME",
                 "service secrets and host HOME cannot be passed to a sandbox"
             );
+        }
+        if let Some(home) = &self.cargo_cache {
+            ensure!(
+                !self.environment.iter().any(|name| name == "CARGO_HOME"),
+                "--deps-cache cargo gives commands a CARGO_HOME of their own: do not also pass CARGO_HOME"
+            );
+            CargoCache::open(home)?;
         }
         for n in [self.memory_mb, self.cpu_secs, self.file_mb, self.open_files, self.processes] {
             ensure!(n > 0 && n <= 1_000_000, "resource limits must be between 1 and 1000000");
@@ -166,7 +198,7 @@ impl SandboxPolicy {
             !base.starts_with(workspace) && !workspace.starts_with(&base),
             "sandbox scratch must be outside the original project"
         );
-        for path in &self.read_only {
+        for path in self.read_only.iter().map(PathBuf::as_path).chain(build.read_only()) {
             ensure!(
                 !workspace.starts_with(path) && !path.starts_with(workspace),
                 "dependency mounts cannot overlap the writable fork"
@@ -382,7 +414,7 @@ mod linux {
             "--dir",
             "/home/molt",
         ]);
-        for path in &policy.read_only {
+        for path in policy.read_only.iter().map(PathBuf::as_path).chain(build.iter().flat_map(|b| b.read_only())) {
             command.arg("--ro-bind").arg(path).arg(path);
         }
         if let Some(base) = base {

@@ -21,6 +21,7 @@ use molt_api::progress::{self, Progress};
 use molt_kernel::Kernel;
 use molt_proto::{Budget, CapId, Envelope, ErrorCode, Kind, ServiceId, Target, TraceId};
 use molt_sdk::{CallOpts, SdkError, Service};
+use molt_tools::SandboxPolicy;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -205,6 +206,127 @@ pub async fn web_warnings(cfg: &Config) -> anyhow::Result<Vec<String>> {
     anyhow::ensure!(!hosts.is_empty(), "the molt-web service needs at least one --allow host");
     let allow = molt_web::Allow::parse(&hosts).map_err(anyhow::Error::msg)?;
     molt_web::preflight(&allow, resolver).await
+}
+
+/// Whether `exec` starts Molt's own shell service, which the sandbox options are for.
+fn standard_shell(exec: &molt_proto::Exec) -> bool {
+    Path::new(&exec.command).file_name().is_some_and(|name| name == "molt-tools")
+}
+
+/// Have the standard shell's commands build offline from this user's
+/// dependency cache (`--deps-cache KIND`; `cargo` so far).
+pub fn deps_cache(cfg: &mut Config, kinds: &[String]) -> anyhow::Result<()> {
+    if kinds.is_empty() {
+        return Ok(());
+    }
+    let shell = cfg.service_mut("shell").context("--deps-cache needs the shell service")?;
+    let exec = shell.exec.as_mut().filter(|exec| standard_shell(exec));
+    let exec = exec.context("--deps-cache requires the molt-tools shell service")?;
+    for kind in kinds {
+        exec.args.extend(["--deps-cache".into(), kind.clone()]);
+    }
+    // The shell looks for the cache where Cargo would.
+    if !shell.pass_env.iter().any(|name| name == "CARGO_HOME") {
+        shell.pass_env.push("CARGO_HOME".into());
+    }
+    Ok(())
+}
+
+/// What the commands of a run in `workspace` will be missing, from cheap
+/// file checks, with the fix for each: nothing when the shell is unconfined
+/// or has network.
+pub fn dependency_warnings(cfg: &Config, workspace: &Path) -> Vec<String> {
+    let Some(exec) = cfg.service("shell").and_then(|shell| shell.exec.as_ref()).filter(|exec| standard_shell(exec))
+    else {
+        return Vec::new();
+    };
+    let mut cargo = false;
+    let mut args = exec.args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--no-sandbox" => return Vec::new(),
+            "--deps-cache" => cargo |= args.next().is_some_and(|kind| kind == "cargo"),
+            // The user arranged a Cargo home of their own.
+            "--sandbox-env" => cargo |= args.next().is_some_and(|name| name == "CARGO_HOME"),
+            "--sandbox-policy" => {
+                let policy = args.next().and_then(|path| std::fs::read(path).ok());
+                if let Some(policy) = policy.and_then(|bytes| serde_json::from_slice::<SandboxPolicy>(&bytes).ok()) {
+                    if policy.network {
+                        return Vec::new();
+                    }
+                    cargo |= policy.cargo_cache.is_some() || policy.environment.iter().any(|name| name == "CARGO_HOME");
+                }
+            }
+            _ => {}
+        }
+    }
+    missing_dependencies(workspace, cargo)
+}
+
+/// The dependencies of the project in `workspace` that commands without
+/// network cannot get, as one line each with what to do. `cargo` is whether
+/// they can build from a Cargo cache.
+pub fn missing_dependencies(workspace: &Path, cargo: bool) -> Vec<String> {
+    let read = |name: &str| std::fs::read_to_string(workspace.join(name)).ok();
+    let dir = |name: &str| workspace.join(name).is_dir();
+    let mut missing = Vec::new();
+    let remote_crates = read("Cargo.lock").is_some_and(|lock| {
+        lock.lines().any(|line| {
+            ["registry+", "sparse+", "git+"].iter().any(|kind| line.trim().starts_with(&format!("source = \"{kind}")))
+        })
+    });
+    let vendored = [".cargo/config.toml", ".cargo/config"]
+        .iter()
+        .any(|name| read(name).is_some_and(|c| c.contains("replace-with")));
+    if remote_crates && !vendored && !cargo {
+        missing.push(
+            "Rust: Cargo.lock lists crates from a registry or git, which commands cannot download without network. \
+             To build from the crates in your Cargo cache, run with --deps-cache cargo (after `cargo fetch` on this \
+             machine)."
+                .to_owned(),
+        );
+    }
+    if read("go.sum").is_some_and(|sum| !sum.trim().is_empty()) && !workspace.join("vendor/modules.txt").is_file() {
+        missing.push(
+            "Go: go.sum lists modules and there is no vendor directory, and commands cannot download them without \
+             network. Run `go mod vendor`, mount your module cache with --sandbox-policy, or choose --no-sandbox to \
+             run commands unconfined."
+                .to_owned(),
+        );
+    }
+    let node = read("package.json").and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let node_deps = node.is_some_and(|package| {
+        ["dependencies", "devDependencies"]
+            .iter()
+            .any(|key| package[key].as_object().is_some_and(|deps| !deps.is_empty()))
+    });
+    if node_deps && !dir("node_modules") {
+        missing.push(
+            "Node: package.json lists dependencies and there is no node_modules, and commands cannot install them \
+             without network. Run `npm install` in the project first (commands see node_modules read-only), or \
+             choose --no-sandbox to run commands unconfined."
+                .to_owned(),
+        );
+    }
+    let requirements = read("requirements.txt")
+        .is_some_and(|text| text.lines().map(str::trim).any(|line| !line.is_empty() && !line.starts_with('#')));
+    let pyproject = read("pyproject.toml").and_then(|text| text.parse::<toml::Table>().ok()).is_some_and(|table| {
+        table
+            .get("project")
+            .and_then(|p| p.get("dependencies"))
+            .and_then(|d| d.as_array())
+            .is_some_and(|d| !d.is_empty())
+    });
+    let venv = [".venv", "venv"].iter().any(|name| workspace.join(name).join("pyvenv.cfg").is_file());
+    if (requirements || pyproject) && !venv {
+        missing.push(
+            "Python: the project lists packages and has no virtual environment (.venv), and commands cannot install \
+             them without network, so only packages installed system-wide are there. Create .venv in the project \
+             and install into it first, or choose --no-sandbox to run commands unconfined."
+                .to_owned(),
+        );
+    }
+    missing
 }
 
 /// The directory of the running executable, where the services are.
@@ -1099,6 +1221,51 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn the_preflight_names_each_kind_of_dependency_commands_cannot_get_and_how_to_fix_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        assert!(missing_dependencies(ws, false).is_empty(), "an empty project needs nothing");
+        let lock = "[[package]]\nname = \"memchr\"\nversion = \"2.7.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+        std::fs::write(ws.join("Cargo.lock"), lock).unwrap();
+        std::fs::write(ws.join("go.sum"), "golang.org/x/text v0.3.0 h1:abc=\n").unwrap();
+        std::fs::write(ws.join("package.json"), r#"{"dependencies": {"left-pad": "1"}}"#).unwrap();
+        std::fs::write(ws.join("requirements.txt"), "# pinned\nrequests==2.0\n").unwrap();
+        let missing = missing_dependencies(ws, false);
+        assert_eq!(missing.len(), 4, "{missing:#?}");
+        assert!(missing[0].starts_with("Rust:") && missing[0].contains("--deps-cache cargo"), "{}", missing[0]);
+        assert!(missing[1].starts_with("Go:") && missing[1].contains("go mod vendor"), "{}", missing[1]);
+        assert!(missing[2].starts_with("Node:") && missing[2].contains("npm install"), "{}", missing[2]);
+        assert!(missing[3].starts_with("Python:") && missing[3].contains(".venv"), "{}", missing[3]);
+        // With the cache, or each kind's dependencies in the project, nothing is missing.
+        std::fs::create_dir_all(ws.join("vendor")).unwrap();
+        std::fs::write(ws.join("vendor/modules.txt"), "").unwrap();
+        std::fs::create_dir(ws.join("node_modules")).unwrap();
+        std::fs::create_dir(ws.join(".venv")).unwrap();
+        std::fs::write(ws.join(".venv/pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        assert!(missing_dependencies(ws, true).is_empty());
+        assert_eq!(missing_dependencies(ws, false).len(), 1);
+        // Path-only crates need nothing.
+        std::fs::write(ws.join("Cargo.lock"), "[[package]]\nname = \"local\"\nversion = \"0.1.0\"\n").unwrap();
+        assert!(missing_dependencies(ws, false).is_empty());
+    }
+
+    #[test]
+    fn the_preflight_is_quiet_when_commands_are_unconfined_and_counts_the_cargo_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("project");
+        std::fs::create_dir(&ws).unwrap();
+        std::fs::write(ws.join("Cargo.lock"), "source = \"sparse+https://index.crates.io/\"\n").unwrap();
+        let mut cfg = Config::agent(&ws, &tmp.path().join("data"), Path::new("/opt/molt/bin")).unwrap();
+        assert_eq!(dependency_warnings(&cfg, &ws).len(), 1);
+        let mut cached = cfg.clone();
+        deps_cache(&mut cached, &["cargo".into()]).unwrap();
+        assert!(dependency_warnings(&cached, &ws).is_empty());
+        assert!(cached.service("shell").unwrap().pass_env.iter().any(|name| name == "CARGO_HOME"));
+        cfg.service_mut("shell").unwrap().exec.as_mut().unwrap().args.push("--no-sandbox".into());
+        assert!(dependency_warnings(&cfg, &ws).is_empty());
+    }
 
     #[test]
     fn only_configuration_outside_the_project_can_install_hooks() {
