@@ -13,6 +13,17 @@ pub const SCHEMA: u32 = 1;
 
 /// The built-in workflow a run without one goes through: today's pipeline.
 pub const VERIFY: &str = "verify";
+/// The built-in workflow that answers a question: one attempt that only
+/// reads, in the workspace itself, and changes nothing.
+pub const ASK: &str = "ask";
+/// The built-in workflow for a small change: one attempt, no designed
+/// check (a given one is used), and only the review's fixed rules.
+pub const QUICK: &str = "quick";
+/// Not a workflow: the name that has the planner pick one of [`ROUTED`]
+/// for the task, with one model call, before the run starts.
+pub const AUTO: &str = "auto";
+/// The workflows [`AUTO`] picks from, lightest first.
+pub const ROUTED: [&str; 3] = [ASK, QUICK, VERIFY];
 
 /// A named set of stages, in the fixed order context, design, attempts,
 /// compare, review, deliver, learn.
@@ -40,13 +51,13 @@ pub struct Stages {
     pub design: Option<Design>,
     /// Run the attempts in forks, each checked by what the run goes by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attempts: Option<Stage>,
+    pub attempts: Option<Attempts>,
     /// Rank attempts that pass, when the request's `select` lets more than one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compare: Option<Stage>,
     /// Review a winner that passed its check before it is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review: Option<Stage>,
+    pub review: Option<Review>,
     /// Return the winner's changes and, with `apply`, merge them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deliver: Option<Stage>,
@@ -72,6 +83,32 @@ pub struct Design {
     pub budget_share: Option<f64>,
 }
 
+/// The attempts stage's parameters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attempts {
+    /// How many attempts run, 1 to 8, whatever the request asks. `None`:
+    /// the request's `attempts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    /// The attempt works in the workspace itself, without a fork, with
+    /// tools that only read: it answers and changes no file. Such a
+    /// workflow has no design, compare or review stage.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+}
+
+/// The review stage's parameters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Review {
+    /// Only the fixed rules look at the diff, with or without a check; no
+    /// reviewer model is asked. A result they find nothing in is applied,
+    /// one they question is kept.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rules_only: bool,
+}
+
 impl Workflow {
     /// The built-in `verify`: every stage, with the planner's defaults.
     pub fn verify() -> Self {
@@ -83,13 +120,50 @@ impl Workflow {
             stages: Stages {
                 context: on,
                 design: Some(Design::default()),
-                attempts: on,
+                attempts: Some(Attempts::default()),
                 compare: on,
-                review: on,
+                review: Some(Review::default()),
                 deliver: on,
                 learn: on,
             },
         }
+    }
+
+    /// The built-in `ask`: one read-only attempt answers, unverified.
+    pub fn ask() -> Self {
+        Self {
+            schema: SCHEMA,
+            name: ASK.to_owned(),
+            description: "Answer with tools that only read, without a fork; nothing is changed or verified.".into(),
+            stages: Stages {
+                context: Some(Stage {}),
+                attempts: Some(Attempts { count: Some(1), read_only: true }),
+                deliver: Some(Stage {}),
+                ..Stages::default()
+            },
+        }
+    }
+
+    /// The built-in `quick`: one attempt, the given check if any, the
+    /// review's fixed rules.
+    pub fn quick() -> Self {
+        Self {
+            schema: SCHEMA,
+            name: QUICK.to_owned(),
+            description: "One attempt with the given check or none, the fixed review rules, then apply.".into(),
+            stages: Stages {
+                context: Some(Stage {}),
+                attempts: Some(Attempts { count: Some(1), read_only: false }),
+                review: Some(Review { rules_only: true }),
+                deliver: Some(Stage {}),
+                ..Stages::default()
+            },
+        }
+    }
+
+    /// Its attempt only reads, in the workspace itself.
+    pub fn read_only(&self) -> bool {
+        self.stages.attempts.is_some_and(|a| a.read_only)
     }
 
     /// Why the planner cannot run this workflow, if it cannot.
@@ -108,6 +182,16 @@ impl Workflow {
         if self.stages.attempts.is_none() || self.stages.deliver.is_none() {
             return Some(format!("workflow {name:?} must enable the attempts and deliver stages"));
         }
+        if let Some(count) = self.stages.attempts.and_then(|a| a.count).filter(|n| !(1..=8).contains(n)) {
+            return Some(format!("workflow {name:?}: attempts.count must be 1 to 8, not {count}"));
+        }
+        let s = &self.stages;
+        if self.read_only() && (s.design.is_some() || s.compare.is_some() || s.review.is_some()) {
+            return Some(format!(
+                "workflow {name:?} only reads, so it has nothing to design a check for, compare or review: leave out \
+                 design, compare and review"
+            ));
+        }
         if let Some(share) = self.stages.design.and_then(|d| d.budget_share) {
             if !(share > 0.0 && share <= 1.0) {
                 return Some(format!(
@@ -123,6 +207,8 @@ impl Workflow {
 pub fn builtin(name: Option<&str>) -> Option<Workflow> {
     match name.unwrap_or(VERIFY) {
         VERIFY => Some(Workflow::verify()),
+        ASK => Some(Workflow::ask()),
+        QUICK => Some(Workflow::quick()),
         _ => None,
     }
 }
@@ -164,9 +250,47 @@ mod tests {
     }
 
     #[test]
-    fn verify_is_the_default_and_the_only_builtin() {
+    fn verify_is_the_default_and_ask_and_quick_are_the_light_builtins() {
         assert_eq!(builtin(None), Some(Workflow::verify()));
         assert_eq!(builtin(Some("verify")), Some(Workflow::verify()));
-        assert_eq!(builtin(Some("quick")), None);
+        assert_eq!(builtin(Some("ask")), Some(Workflow::ask()));
+        assert_eq!(builtin(Some("quick")), Some(Workflow::quick()));
+        assert_eq!(builtin(Some(AUTO)), None, "auto picks a workflow; it is not one");
+        for name in ROUTED {
+            let w = builtin(Some(name)).unwrap();
+            assert!(w.problem().is_none(), "{name}: {:?}", w.problem());
+        }
+    }
+
+    #[test]
+    fn the_light_builtins_read_and_write_as_their_schema_documents() {
+        assert_eq!(
+            serde_json::to_value(Workflow::ask()).unwrap()["stages"],
+            serde_json::json!({ "context": {}, "attempts": { "count": 1, "read_only": true }, "deliver": {} })
+        );
+        assert_eq!(
+            serde_json::to_value(Workflow::quick()).unwrap()["stages"],
+            serde_json::json!({
+                "context": {}, "attempts": { "count": 1 }, "review": { "rules_only": true }, "deliver": {}
+            })
+        );
+        let verify = serde_json::to_value(Workflow::verify()).unwrap();
+        assert_eq!(verify["stages"]["attempts"], serde_json::json!({}), "verify's stages take no parameters");
+    }
+
+    #[test]
+    fn a_read_only_workflow_that_designs_compares_or_reviews_is_refused() {
+        for stage in ["design", "compare", "review"] {
+            let mut w = Workflow::ask();
+            match stage {
+                "design" => w.stages.design = Some(Design::default()),
+                "compare" => w.stages.compare = Some(Stage {}),
+                _ => w.stages.review = Some(Review::default()),
+            }
+            assert!(w.problem().is_some_and(|p| p.contains("only reads")), "{stage}");
+        }
+        let mut many = Workflow::quick();
+        many.stages.attempts = Some(Attempts { count: Some(9), read_only: false });
+        assert!(many.problem().is_some_and(|p| p.contains("attempts.count")));
     }
 }
