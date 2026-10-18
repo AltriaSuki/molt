@@ -24,6 +24,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Screen::Memory(view) => draw_memory(frame, main, view, app.tick),
     }
     draw_status(frame, status, app);
+    if let Some(at) = app.kept_view {
+        let mut viewer = super::app::Viewer {
+            title: "kept results".into(),
+            lines: app.kept_lines(),
+            scroll: at.saturating_sub(2) * 3,
+        };
+        draw_viewer(frame, area, &mut viewer, " ↑/↓ select · d diff · enter apply · n discard · esc back ");
+    }
     if let Some(viewer) = &mut app.viewer {
         draw_viewer(frame, area, viewer, " j/k scroll · g/G ends · esc close ");
     }
@@ -579,6 +587,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let s = &app.settings;
     let model = s.model.as_deref().unwrap_or("default model");
     let mut parts = vec![model.to_owned()];
+    if !app.kept.is_empty() {
+        parts.insert(0, format!("{} kept", app.kept.len()));
+    }
     if let Some(effort) = s.effort {
         parts.push(serde_json::to_value(effort).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default());
     }

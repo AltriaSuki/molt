@@ -77,6 +77,7 @@ sender from that.
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
 | Issue CI rejects PR triggers and probes the sandbox before model spend | `scripts/ci/test_issue_to_pr.py::test_only_labelled_open_issues_are_eligible`, `test_sandbox_failure_posts_a_summary_and_never_starts_a_model` |
 | A skill source cannot approve itself; only the CLI manages activation and withdrawal preserves evidence | `skills::tests::drafts_need_independent_evidence_and_disable_cannot_be_undone_by_learning`, `tests/service.rs::an_agent_cannot_manage_or_promote_its_own_skills` |
+| Kept results survive restart; conflicting applies leave user edits and the fork intact | `tui::app::tests::plan_results_are_browsable_and_remain_available_until_apply_or_discard_succeeds`, `a_kept_session_result_survives_restart_and_refuses_workspace_conflicts` |
 | Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
 | Offline embedding models are hash-pinned and cannot reintroduce forgotten or cross-project notes | `semantic::tests::pinned_models_retrieve_synonyms_and_reject_changed_files`, `semantic::tests::synonyms_are_recalled_with_scores_and_snapshots_survive_forgetting` |
 
@@ -255,6 +256,16 @@ and commits first. Restart uses the configuration loaded at launch; relaunch to 
 configuration or environment. `/log` opens up to 200 lines from the final 64 KiB of
 `tui.log`, sanitizes terminal controls, redacts known credentials and omits lines
 with common credential patterns. A manual restart resets the automatic retry limit.
+
+`/kept` lists this workspace's retained results with their task, outcome, age and
+change counts. Select with arrows, `d` inspects the current diff, Enter applies,
+`n` discards, and Esc returns. Apply and discard wait for idle services; a failed
+operation leaves the result in the list. Apply uses the original fork baseline
+and refuses conflicting workspace edits, naming the files. Kept results survive
+interface restarts; missing fork directories are pruned. Private metadata is
+bounded to 1,000 entries / 4 MiB and filters task text like input history. Saved
+paths are checked by the fs service against the current workspace before use.
+Applying an older kept result does not create a git commit automatically.
 
 Input history is private to the workspace and survives restarts, even when two
 workspaces use the same data directory. ↑/↓ browses it; returning past the newest

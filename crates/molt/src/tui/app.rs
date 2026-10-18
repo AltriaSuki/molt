@@ -169,6 +169,9 @@ pub enum Action {
         trace: TraceId,
         action: Control,
     },
+    Diff {
+        fork: String,
+    },
     Apply {
         fork: String,
     },
@@ -307,6 +310,10 @@ pub enum Msg {
         trace: TraceId,
         action: Control,
         result: Result<ControlResponse, String>,
+    },
+    Diff {
+        fork: String,
+        result: Result<molt_api::fs::DiffResponse, String>,
     },
     Applied(Result<(), String>),
     /// `None`: the workspace's commit has the files as they are already.
@@ -849,8 +856,14 @@ pub struct App {
     pub uncounted_calls: u32,
     /// Runs memory is learning from.
     pub learning: HashSet<String>,
-    /// Results the user kept in their forks; never removed.
+    /// Results still available in their forks, including restored results.
     pub kept: Vec<String>,
+    kept_entries: Vec<super::kept::Entry>,
+    kept_changes: Vec<super::kept::Change>,
+    pub kept_view: Option<usize>,
+    kept_pending: Option<String>,
+    pending_result: Option<super::kept::Entry>,
+    interrupted_task: Option<String>,
     /// The result waiting to be applied, to commit once it is: `/commit on`.
     to_commit: Option<Action>,
     /// The diff of the last task that finished, for `/last`.
@@ -941,6 +954,12 @@ impl App {
             uncounted_calls: 0,
             learning: HashSet::new(),
             kept: Vec::new(),
+            kept_entries: Vec::new(),
+            kept_changes: Vec::new(),
+            kept_view: None,
+            kept_pending: None,
+            pending_result: None,
+            interrupted_task: None,
             to_commit: None,
             last: None,
             last_lanes: Vec::new(),
@@ -976,6 +995,7 @@ impl App {
 
     pub fn command_completions(&self) -> Vec<super::commands::Completion> {
         if !matches!(self.screen, Screen::Main)
+            || self.kept_view.is_some()
             || self.prompt.is_some()
             || self.viewer.is_some()
             || self.transcript.is_some()
@@ -1095,6 +1115,11 @@ impl App {
         if let Some(Prompt::Apply { fork, .. }) = &self.prompt {
             keep.push(fork.clone());
         }
+        if let Some(entry) = &self.pending_result {
+            if !keep.contains(&entry.fork) {
+                keep.push(entry.fork.clone());
+            }
+        }
         keep
     }
 
@@ -1118,6 +1143,11 @@ impl App {
         let input_before = matches!(&msg, Msg::Key(_) | Msg::Paste(_) | Msg::Edited(_))
             .then(|| (self.input.text.clone(), self.input.cursor));
         let mut actions = self.handle(msg);
+        if actions.iter().any(|a| matches!(a, Action::Quit { .. })) {
+            if let Some(entry) = self.pending_result.clone() {
+                self.keep_entry(entry);
+            }
+        }
         self.committing |= actions.iter().any(|a| matches!(a, Action::Commit { .. }));
         if self.reset_preferences {
             self.preference_changes.clear();
@@ -1382,7 +1412,10 @@ impl App {
                     for fork in &kept {
                         self.push(Line::from(span(format!("  kept in {}", clean_line(fork)), Tone::Dim)));
                     }
-                    self.kept.extend(kept);
+                    let task = self.interrupted_task.take().unwrap_or_else(|| "interrupted task".into());
+                    for fork in kept {
+                        self.keep_entry(super::kept::Entry::new(fork, &task, "interrupted"));
+                    }
                 }
                 self.session = SessionState::Starting;
                 vec![Action::StartSession]
@@ -1402,7 +1435,44 @@ impl App {
                 self.controlled(&trace, &action, result);
                 Vec::new()
             }
+            Msg::Diff { fork, result } => {
+                if self.viewer.as_ref().is_none_or(|v| v.title != format!("kept diff: {fork}")) {
+                    return Vec::new();
+                }
+                self.viewer = Some(match result {
+                    Ok(diff) => {
+                        if let Some(entry) = self.kept_entries.iter_mut().find(|entry| entry.fork == fork) {
+                            entry.diff(diff.changes.len(), &diff.patch);
+                            self.kept_changes.push(super::kept::Change::Save(entry.clone()));
+                        }
+                        let mut view = diff_viewer(&scrub(&diff.patch, &self.secrets), diff.truncated);
+                        view.title = format!("kept diff: {fork}");
+                        view
+                    }
+                    Err(error) => Viewer {
+                        title: "kept diff unavailable".into(),
+                        lines: block(&scrub(&error, &self.secrets), "", Tone::Bad),
+                        scroll: 0,
+                    },
+                });
+                Vec::new()
+            }
+            Msg::Applied(result) if self.kept_pending.is_some() => {
+                self.kept_finished(result, "applied");
+                Vec::new()
+            }
+            Msg::Discarded(result) if self.kept_pending.is_some() => {
+                self.kept_finished(result, "discarded");
+                Vec::new()
+            }
             Msg::Applied(result) => {
+                if result.is_err() {
+                    if let Some(entry) = self.pending_result.take() {
+                        self.keep_entry(entry);
+                    }
+                } else {
+                    self.pending_result = None;
+                }
                 let commit = self.to_commit.take().filter(|_| result.is_ok());
                 match result {
                     Ok(()) => {
@@ -1439,6 +1509,11 @@ impl App {
             Msg::Discarded(result) => {
                 if let Err(e) = result {
                     self.error("could not remove the result", &e);
+                    if let Some(entry) = self.pending_result.take() {
+                        self.keep_entry(entry);
+                    }
+                } else {
+                    self.pending_result = None;
                 }
                 Vec::new()
             }
@@ -1575,6 +1650,9 @@ impl App {
         if self.viewer.is_some() {
             self.viewer_key(&key);
             return Vec::new();
+        }
+        if self.kept_view.is_some() {
+            return self.kept_key(&key);
         }
         if self.transcript.is_some() {
             return self.transcript_key(&key);
@@ -1758,14 +1836,15 @@ impl App {
             return Vec::new();
         }
         let keep = self.keep();
-        if let Some(Prompt::Apply { fork, .. }) = self.prompt.take() {
-            self.kept.push(fork.clone());
-            self.push(Line::from(span(format!("  kept in {}", clean_line(&fork)), Tone::Dim)));
+        if let Some(entry) = self.pending_result.take() {
+            self.push(Line::from(span(format!("  kept in {}", clean_line(&entry.fork)), Tone::Dim)));
+            self.keep_entry(entry);
         }
         self.prompt = None;
         let mut attempts = Vec::new();
         let mut check_files = Vec::new();
         if let Some(mut task) = self.task.take() {
+            self.interrupted_task = Some(task.req.task.clone());
             if matches!(task.phase, Phase::Running) {
                 attempts = task.lanes.iter().filter_map(|l| l.fork.clone()).collect();
                 check_files = task.req.check_files.iter().map(|f| f.path.clone()).collect();
@@ -1824,6 +1903,11 @@ impl App {
     }
 
     fn submit_task(&mut self, line: String) -> Vec<Action> {
+        if self.kept_pending.is_some() {
+            self.flash = Some("wait for the kept result to be applied or discarded".into());
+            self.input = Input::with(&line);
+            return Vec::new();
+        }
         if self.task.as_ref().is_some_and(|t| t.phase == Phase::Running) {
             // Typed while the attempts run: more of what the task asks.
             self.echo_constraint(&line);
@@ -1895,7 +1979,7 @@ impl App {
         use super::commands::{builtin, Builtin};
         match builtin(name).map(|c| c.kind) {
             Some(Builtin::Restart) => {
-                if self.task.is_some() || !self.learning.is_empty() || self.committing {
+                if self.task.is_some() || !self.learning.is_empty() || self.committing || self.kept_pending.is_some() {
                     self.flash =
                         Some("finish or stop the task and wait for learning and commits before /restart".into());
                     return Vec::new();
@@ -1909,6 +1993,9 @@ impl App {
                 self.session = SessionState::Starting;
                 self.push(Line::from(span("restarting the services", Tone::Dim)));
                 return vec![Action::RestartSession { keep: self.kept.clone() }];
+            }
+            Some(Builtin::Kept) => {
+                self.kept_view = Some(0);
             }
             Some(Builtin::Log) => {
                 self.viewer = Some(Viewer {
@@ -2676,6 +2763,11 @@ impl App {
             (self.settings.commit && resp.outcome != Outcome::Failed && !resp.changes.is_empty()).then(|| {
                 Action::Commit { trace: trace.clone(), task: task.req.task.clone(), resp: Box::new(resp.clone()) }
             });
+        self.pending_result = resp.fork.as_ref().filter(|_| !resp.applied).map(|fork| {
+            let mut entry = super::kept::Entry::new(fork.clone(), &task.req.task, outcome_name(resp.outcome));
+            entry.diff(resp.changes.len(), &resp.patch);
+            entry
+        });
         if resp.applied {
             self.push(Line::from(span("  applied", Tone::Ok)));
             actions.extend(self.to_commit.take());
@@ -2694,7 +2786,9 @@ impl App {
                 }
             } else {
                 self.push(Line::from(span(format!("  kept in {}", clean_line(&fork)), Tone::Dim)));
-                self.kept.push(fork);
+                if let Some(entry) = self.pending_result.take() {
+                    self.keep_entry(entry);
+                }
             }
         }
         if !(deciding || applying) {
@@ -2761,7 +2855,9 @@ impl App {
                 self.to_commit = None;
                 self.task = None;
                 self.push(Line::from(span(format!("  kept in {}", clean_line(&fork)), Tone::Dim)));
-                self.kept.push(fork);
+                if let Some(entry) = self.pending_result.take() {
+                    self.keep_entry(entry);
+                }
                 Vec::new()
             }
             _ => Vec::new(),
@@ -2869,12 +2965,123 @@ impl App {
         }
     }
 
+    pub fn restore_kept(&mut self, entries: Vec<super::kept::Entry>) {
+        self.kept = entries.iter().map(|entry| entry.fork.clone()).collect();
+        self.kept_entries = entries;
+    }
+
+    pub fn take_kept_changes(&mut self) -> Vec<super::kept::Change> {
+        std::mem::take(&mut self.kept_changes)
+    }
+
+    fn keep_entry(&mut self, mut entry: super::kept::Entry) {
+        entry.task = scrub(&entry.task, &self.secrets);
+        if !self.kept.contains(&entry.fork) {
+            self.kept.push(entry.fork.clone());
+        }
+        self.kept_entries.retain(|old| old.fork != entry.fork);
+        self.kept_entries.push(entry.clone());
+        self.kept_changes.push(super::kept::Change::Save(entry));
+    }
+
+    fn kept_finished(&mut self, result: Result<(), String>, verb: &str) {
+        let fork = self.kept_pending.take().unwrap();
+        match result {
+            Ok(()) => {
+                self.kept.retain(|old| *old != fork);
+                self.kept_entries.retain(|entry| entry.fork != fork);
+                self.kept_changes.push(super::kept::Change::Remove(fork));
+                self.push(Line::from(span(format!("  {verb} kept result"), Tone::Ok)));
+                if let Some(at) = &mut self.kept_view {
+                    *at = (*at).min(self.kept_entries.len().saturating_sub(1));
+                }
+            }
+            Err(error) => {
+                self.error(&format!("kept result was not {verb}"), &error);
+                self.viewer = Some(Viewer {
+                    title: "kept result remains available".into(),
+                    lines: block(&scrub(&error, &self.secrets), "", Tone::Bad),
+                    scroll: 0,
+                });
+            }
+        }
+    }
+
+    fn kept_key(&mut self, key: &KeyEvent) -> Vec<Action> {
+        let at = self.kept_view.unwrap_or(0).min(self.kept_entries.len().saturating_sub(1));
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.kept_view = None,
+            KeyCode::Up | KeyCode::Char('k') => self.kept_view = Some(at.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.kept_view = Some((at + 1).min(self.kept_entries.len().saturating_sub(1)))
+            }
+            KeyCode::Char('d') if !self.kept_entries.is_empty() => {
+                if !matches!(self.session, SessionState::Up { .. }) {
+                    self.flash = Some("the services are not up".into());
+                    return Vec::new();
+                }
+                let fork = self.kept_entries[at].fork.clone();
+                self.viewer = Some(Viewer {
+                    title: format!("kept diff: {fork}"),
+                    lines: block("reading the result's diff", "", Tone::Dim),
+                    scroll: 0,
+                });
+                return vec![Action::Diff { fork }];
+            }
+            KeyCode::Enter | KeyCode::Char('n') if !self.kept_entries.is_empty() => {
+                if self.task.is_some()
+                    || self.pending_result.is_some()
+                    || !self.learning.is_empty()
+                    || self.committing
+                    || self.kept_pending.is_some()
+                    || !matches!(self.session, SessionState::Up { .. })
+                {
+                    self.flash = Some("wait for idle services before applying or discarding kept results".into());
+                    return Vec::new();
+                }
+                let fork = self.kept_entries[at].fork.clone();
+                self.kept_pending = Some(fork.clone());
+                return vec![if key.code == KeyCode::Enter {
+                    Action::Apply { fork }
+                } else {
+                    Action::Discard { fork }
+                }];
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    pub fn kept_lines(&self) -> Vec<Line<'static>> {
+        if self.kept_entries.is_empty() {
+            return block("no kept results in this workspace", "", Tone::Dim);
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        self.kept_entries
+            .iter()
+            .enumerate()
+            .flat_map(|(index, entry)| {
+                let mark = if Some(index) == self.kept_view { "›" } else { " " };
+                let size = entry.files.map_or_else(
+                    || "size unknown · d to inspect".into(),
+                    |files| format!("{files} files · +{} −{}", entry.added, entry.removed),
+                );
+                let age = text::duration(Duration::from_secs(now.saturating_sub(entry.time)));
+                vec![
+                    Line::from(span(format!("{mark} {}", clean_line(&entry.task)), Tone::Shell)),
+                    Line::from(span(format!("  {} · {size} · {age} ago", clean_line(&entry.outcome)), Tone::Dim)),
+                    Line::from(span(format!("  {}", clean_line(&entry.fork)), Tone::Dim)),
+                ]
+            })
+            .collect()
+    }
+
     fn viewer_key(&mut self, key: &KeyEvent) {
         viewer_key(&mut self.viewer, key);
     }
 
     fn can_show_shortcuts(&self) -> bool {
-        if self.viewer.is_some() || self.transcript.is_some() {
+        if self.viewer.is_some() || self.transcript.is_some() || self.kept_view.is_some() {
             return true;
         }
         match &self.screen {
@@ -2893,6 +3100,15 @@ impl App {
         if self.viewer.is_some() {
             context = "viewer";
             pairs.extend([("j/k, ↑/↓", "scroll"), ("g/G", "start / end"), ("esc / q", "close viewer")]);
+        } else if self.kept_view.is_some() {
+            context = "kept results";
+            pairs.extend([
+                ("j/k, ↑/↓", "select a result"),
+                ("d", "inspect its current diff"),
+                ("enter", "apply when idle"),
+                ("n", "discard when idle"),
+                ("esc / q", "back to tasks"),
+            ]);
         } else if self.transcript.is_some() {
             context = "transcript";
             pairs.extend([
@@ -3650,6 +3866,99 @@ mod tests {
             turn: 1,
             call: "fake-stream".into(),
             seq,
+        }
+    }
+
+    #[test]
+    fn plan_results_are_browsable_and_remain_available_until_apply_or_discard_succeeds() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        app.mode = Mode::Plan;
+        type_in(&mut app, "/check true");
+        type_in(&mut app, "fix parser");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/result"))) });
+        app.learning.clear();
+        type_in(&mut app, "/kept");
+        let shown = frame_text(&mut app);
+        assert!(shown.contains("fix parser") && shown.contains("1 files") && shown.contains("1 kept"), "{shown}");
+        assert_eq!(app.update(key(KeyCode::Char('d'))), [Action::Diff { fork: "/fork/result".into() }]);
+        app.update(Msg::Diff {
+            fork: "/fork/result".into(),
+            result: Ok(molt_api::fs::DiffResponse { changes: vec![], patch: "+new\n-old".into(), truncated: false }),
+        });
+        assert!(plain(&app.viewer.as_ref().unwrap().lines).join("\n").contains("+new"));
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.update(key(KeyCode::Enter)), [Action::Apply { fork: "/fork/result".into() }]);
+        app.update(Msg::Applied(Err("conflict: src/parser.rs".into())));
+        assert_eq!(app.kept, ["/fork/result"]);
+        assert!(frame_text(&mut app).contains("conflict: src/parser.rs"));
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.update(key(KeyCode::Enter)), [Action::Apply { fork: "/fork/result".into() }]);
+        app.update(Msg::Applied(Ok(())));
+        assert!(app.kept.is_empty());
+        let entry = super::super::kept::Entry::new("/fork/discard".into(), "another task", "passed");
+        app.restore_kept(vec![entry]);
+        assert_eq!(app.update(key(KeyCode::Char('n'))), [Action::Discard { fork: "/fork/discard".into() }]);
+        app.update(Msg::Discarded(Err("busy".into())));
+        assert_eq!(app.kept, ["/fork/discard"]);
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.update(key(KeyCode::Char('n'))), [Action::Discard { fork: "/fork/discard".into() }]);
+        app.update(Msg::Discarded(Ok(())));
+        assert!(app.kept.is_empty());
+    }
+
+    #[test]
+    fn restored_kept_results_apply_only_when_idle_and_late_diffs_do_not_reopen_a_viewer() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        app.restore_kept(vec![super::super::kept::Entry::new("/fork/old".into(), "old task", "passed")]);
+        type_in(&mut app, "new task");
+        type_in(&mut app, "/kept");
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert!(app.flash.as_ref().unwrap().contains("idle"));
+        assert!(app.update(key(KeyCode::Char('n'))).is_empty());
+        app.update(key(KeyCode::Char('d')));
+        app.update(key(KeyCode::Esc));
+        app.update(Msg::Diff { fork: "/fork/old".into(), result: Err("late".into()) });
+        assert!(app.viewer.is_none());
+        app.update(key(KeyCode::Esc));
+        app.task = None;
+        type_in(&mut app, "/kept");
+        assert_eq!(app.update(key(KeyCode::Enter)), [Action::Apply { fork: "/fork/old".into() }]);
+        app.update(key(KeyCode::Esc));
+        assert!(type_in(&mut app, "/restart").is_empty());
+        assert!(app.flash.as_ref().unwrap().contains("finish or stop"));
+        assert!(type_in(&mut app, "another task").is_empty());
+        assert!(app.flash.as_ref().unwrap().contains("kept result"));
+    }
+
+    #[test]
+    fn quitting_a_confirmed_result_records_it_and_failed_live_applies_keep_its_metadata() {
+        for exit in [0, 1, 2] {
+            let mut app = App::new("/work/project", None);
+            up(&mut app);
+            app.rules.always_ask = true;
+            type_in(&mut app, "/check true");
+            type_in(&mut app, "fix parser");
+            let trace = app.task.as_ref().unwrap().trace.clone();
+            app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/waiting"))) });
+            if exit == 0 {
+                app.update(key(KeyCode::Enter));
+                app.update(Msg::Applied(Err("conflict".into())));
+            } else {
+                if exit == 2 {
+                    app.update(key(KeyCode::Enter));
+                }
+                let actions = app.update(Msg::Signal);
+                assert!(actions
+                    .iter()
+                    .any(|action| matches!(action, Action::Quit { keep } if keep == &["/fork/waiting"])));
+            }
+            assert_eq!(app.kept, ["/fork/waiting"]);
+            assert!(
+                matches!(app.take_kept_changes().last(), Some(super::super::kept::Change::Save(entry)) if entry.task == "fix parser")
+            );
         }
     }
 
