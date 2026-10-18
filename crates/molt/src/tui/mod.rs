@@ -429,6 +429,18 @@ impl Runtime {
             Action::Apply { fork } => self.call(move |s| async move {
                 Msg::Applied(s.apply(&fork).await.map(|_| ()).map_err(|e| format!("{e:#}")))
             }),
+            Action::Undo { run } => {
+                let (session, tx) = (self.session.clone(), self.tx.clone());
+                // The interface waits for both Git and memory before quitting.
+                // Like commits, this is not among the interruptible attempt work.
+                tokio::spawn(async move {
+                    let result = match session {
+                        Some(session) => session.undo(run).await.map_err(|e| format!("{e:#}")),
+                        None => Err("the services are not up".into()),
+                    };
+                    let _ = tx.send(Msg::Undone(result));
+                });
+            }
             Action::PrepareCommit { trace } => {
                 self.before = Some((trace.to_string(), crate::git::Before::look(Path::new(&self.workspace))));
             }

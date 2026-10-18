@@ -981,6 +981,22 @@ fn commit_target(workspace: &str, branch: Option<&str>) -> anyhow::Result<anyhow
 
 async fn undo_cmd(config: Option<&Path>, args: UndoArgs) -> anyhow::Result<ExitCode> {
     let (workspace, project) = agent::locate(args.at.project.as_deref(), &args.at.workspace, config.is_some())?;
+    let cfg = agent::memory_config(config, &workspace, args.at.data_dir.as_deref(), project.as_ref())?;
+    // Refuse the common TUI-lock case before touching Git. Keep the lock through
+    // the revert; a later notification failure is still reported as partial.
+    let lock = match molt::DataDirLock::acquire(&cfg.kernel.data_dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                agent::printable(&format!(
+                    "undo did not change Git: {error:#}. If the interface is open, use /undo{} there",
+                    args.run.as_ref().map_or(String::new(), |run| format!(" {run}"))
+                ))
+            );
+            return Ok(ExitCode::from(4));
+        }
+    };
     let repo = git::Repo::open(&workspace)?;
     let run = match repo.undo(args.run.as_deref())? {
         git::Undo::Reverted { run, commit, sha } => {
@@ -992,7 +1008,7 @@ async fn undo_cmd(config: Option<&Path>, args: UndoArgs) -> anyhow::Result<ExitC
             run
         }
     };
-    let cfg = agent::memory_config(config, &workspace, args.at.data_dir.as_deref(), project.as_ref())?;
+    drop(lock);
     if !agent::memory_db(&cfg).is_some_and(|db| db.is_file()) {
         eprintln!("memory has nothing about this project, so nothing to take back there");
         return Ok(ExitCode::SUCCESS);
@@ -1008,8 +1024,8 @@ async fn undo_cmd(config: Option<&Path>, args: UndoArgs) -> anyhow::Result<ExitC
             Ok(ExitCode::SUCCESS)
         }
         Err(e) => {
-            eprintln!("the commit is taken back, but memory could not be told: {e:#}. Run `molt undo {run}` again");
-            Ok(ExitCode::FAILURE)
+            eprintln!("{}", agent::printable(&format!("the commit is taken back, but memory could not be told: {e:#}. Run `molt undo {run}` again; if the interface is open, use /undo {run} there")));
+            Ok(ExitCode::from(4))
         }
     }
 }

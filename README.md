@@ -79,6 +79,7 @@ sender from that.
 | Issue CI rejects PR triggers and probes the sandbox before model spend | `scripts/ci/test_issue_to_pr.py::test_only_labelled_open_issues_are_eligible`, `test_sandbox_failure_posts_a_summary_and_never_starts_a_model` |
 | A skill source cannot approve itself; only the CLI manages activation and withdrawal preserves evidence | `skills::tests::drafts_need_independent_evidence_and_disable_cannot_be_undone_by_learning`, `tests/service.rs::an_agent_cannot_manage_or_promote_its_own_skills` |
 | Queued tasks retain their submitted execution settings and wait for apply/discard/commit settlement | `tui::app::tests::queued_tasks_snapshot_execution_settings_and_plain_input_still_steers_the_current_task`, `tui::app::tests::a_queue_waits_for_apply_commit_and_discard_to_settle_before_starting_the_next_task` |
+| Idle TUI undo notifies the current memory service; locked CLI undo leaves Git untouched and incomplete notices stay retryable | `session_undo_notifies_memory_and_cli_undo_refuses_its_lock_before_changing_git`, `tui::app::tests::quitting_waits_for_an_uninterruptible_git_operation_to_settle` |
 | Kept results survive restart; conflicting applies leave user edits and the fork intact | `tui::app::tests::plan_results_are_browsable_and_remain_available_until_apply_or_discard_succeeds`, `a_kept_session_result_survives_restart_and_refuses_workspace_conflicts` |
 | Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
 | Offline embedding models are hash-pinned and cannot reintroduce forgotten or cross-project notes | `semantic::tests::pinned_models_retrieve_synonyms_and_reject_changed_files`, `semantic::tests::synonyms_are_recalled_with_scores_and_snapshots_survive_forgetting` |
@@ -259,6 +260,14 @@ configuration or environment. `/log` opens up to 200 lines from the final 64 KiB
 `tui.log`, sanitizes terminal controls, redacts known credentials and omits lines
 with common credential patterns. A manual restart resets the automatic retry limit.
 
+`/undo [RUN]` takes back the latest (or named) run commit through the idle TUI
+session and tells its existing memory service to stop counting the run. It
+refuses while a task, learning, apply/discard or another Git operation is active.
+A failed memory notice preserves the Git result and can be retried with the same
+run id without another revert. Quitting waits for Git and memory settlement;
+undo clears the earlier-task context so later tasks do not assume the reverted
+result is still present. Retained forks and queued task settings stay available.
+
 While a check or result waits for confirmation, PgUp/PgDn and Ctrl+Home/Ctrl+End
 still scroll the conversation log. At apply confirmation, `v` opens the full
 review with fixed-rule findings, the independent reviewer verdict/findings and
@@ -428,7 +437,10 @@ With `--commit`, an applied result is committed to git. The commit holds
 exactly the files the run merged, as the workspace has them: it is built in a
 scratch index from the current commit, so what you staged stays staged and
 out of it. Its subject is the first line of the winning attempt's summary, the
-rest of the summary is its body, and it ends with trailers:
+rest of the summary is its body. Subjects stay within 72 characters, using a
+word boundary when possible and no ellipsis; emphasis is removed while literal
+code is kept.
+The message ends with trailers:
 
 ```
 Molt-Run: trace_…
@@ -444,6 +456,10 @@ before it (the commit would take them in), or when the workspace is not in a
 git work tree; the result is still applied, the reason is printed, and the
 exit status is 4. A `--branch` name git refuses, or one that exists, stops the
 run before it starts.
+
+CLI undo checks the data-directory lock before changing Git; when the interface
+holds it, use `/undo` there. A later memory notification failure exits with status
+4 and prints the run id to retry.
 
 `molt undo [RUN]` takes back the commit of a run, by default the newest on the
 current branch not taken back yet. It makes a new commit that puts the run's
@@ -516,7 +532,7 @@ through its progress callback, with previews enabled by default.
 | 1 | No attempt passed, or molt failed. |
 | 2 | The command line was wrong (an unknown flag, `--attempts 9`, ...); nothing started. |
 | 3 | Passed (or finished unverified), but the changes could not be merged, e.g. because the workspace changed under them; they are kept in the fork the report names. |
-| 4 | Passed and applied, but `--commit` could not commit the changes; the reason is printed. |
+| 4 | A commit or undo could not fully complete. A partial undo may leave Git reverted with memory notification pending; retry the named run. The reason is printed. |
 | 128+N | Stopped by signal N: 130 for Ctrl-C, 129 for SIGHUP, 143 for SIGTERM. The services are stopped and the run's forks removed. |
 
 Status 3 also covers a passing result withheld by the review. The report explains
