@@ -2008,6 +2008,38 @@ async fn an_approved_winner_is_applied_and_the_review_reported() {
 }
 
 #[tokio::test]
+async fn an_approved_cli_with_a_process_exit_is_applied() {
+    let fake = Fake::new(
+        |req| {
+            if is_reviewer(req) {
+                return submit_review(req, "approve", &[]);
+            }
+            match turn(req) {
+                1 => use_tools(
+                    req,
+                    &[
+                        ("write_file", json!({"path":"hello.txt", "content":"hi\n"})),
+                        (
+                            "write_file",
+                            json!({"path":"main.go", "content":"package main\nimport \"os\"\nfunc main() { os.Exit(2) }\n"}),
+                        ),
+                    ],
+                ),
+                _ => done("Write a CLI with exit status 2."),
+            }
+        },
+        hello_check,
+    );
+    let response = run(&fake, RunRequest { review: true, ..request(Some("check"), 1) }).await;
+    assert_eq!(response.outcome, Outcome::Passed);
+    assert!(response.applied, "{response:#?}");
+    let review = response.review.unwrap();
+    assert_eq!(review.verdict, Verdict::Approve);
+    assert!(review.findings.is_empty());
+    assert!(fake.workspace()["main.go"].contains("os.Exit(2)"));
+}
+
+#[tokio::test]
 async fn a_rejected_winner_is_not_applied_and_stays_in_its_fork() {
     let fake = reviewed(|req| submit_review(req, "reject", &["hello.txt:1 hard-codes what the check expects."]));
     let resp = run(&fake, RunRequest { review: true, ..request(Some("check"), 1) }).await;
