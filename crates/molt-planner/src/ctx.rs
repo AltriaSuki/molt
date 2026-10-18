@@ -478,14 +478,15 @@ impl Ctx {
     }
 
     pub async fn diff(&self, fork: &str) -> Result<fs::DiffResponse, RemoteError> {
-        self.call(fs::DIFF, fs::DiffRequest { fork: fork.to_owned() }, Budget::new(0, TREE_MS, 0)).await
+        self.call(fs::DIFF, fs::DiffRequest { fork: fork.to_owned(), paths: Vec::new() }, Budget::new(0, TREE_MS, 0))
+            .await
     }
 
     /// Merge a fork into the workspace, then drop it. The drop is a separate
     /// best-effort call, so a fork that cannot be deleted does not make a
     /// merge that succeeded look failed.
     pub async fn merge(&self, fork: &str) -> Result<fs::MergeResponse, RemoteError> {
-        let req = fs::MergeRequest { fork: fork.to_owned(), drop: false };
+        let req = fs::MergeRequest { fork: fork.to_owned(), drop: false, paths: Vec::new() };
         let resp = self.call(fs::MERGE, req, Budget::new(0, TREE_MS, 0)).await?;
         self.drop_fork(fork).await;
         Ok(resp)

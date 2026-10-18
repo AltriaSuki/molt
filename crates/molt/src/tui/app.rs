@@ -181,6 +181,22 @@ pub enum Action {
     Apply {
         fork: String,
     },
+    /// Apply only `paths` of the result kept in `fork`.
+    ApplyOnly {
+        fork: String,
+        paths: Vec<String>,
+    },
+    /// Check the result kept in `fork` again, `only` some of its files or
+    /// all of them; the answer comes back as [`Msg::Rechecked`].
+    Recheck {
+        fork: String,
+        only: Option<Vec<String>>,
+        check: Option<molt_api::planner::CheckSpec>,
+    },
+    /// Open the result kept in `fork` in the user's editor; [`Msg::ForkEdited`] says when they are done.
+    EditFork {
+        fork: String,
+    },
     /// Look at the work tree before the task `trace` changes it, for `/commit on`.
     PrepareCommit {
         trace: TraceId,
@@ -327,6 +343,15 @@ pub enum Msg {
         result: Result<molt_api::fs::DiffResponse, String>,
     },
     Applied(Result<(), String>),
+    Rechecked {
+        fork: String,
+        only: Option<Vec<String>>,
+        result: Result<crate::session::Rechecked, String>,
+    },
+    ForkEdited {
+        fork: String,
+        result: Result<(), String>,
+    },
     /// `None`: the workspace's commit has the files as they are already.
     Committed(Result<Option<crate::git::Committed>, String>),
     Undone(Result<crate::session::Undone, String>),
@@ -504,6 +529,8 @@ pub enum Prompt {
     Apply {
         resp: Box<RunResponse>,
         fork: String,
+        /// What the user made of the result before applying it.
+        part: Part,
     },
     /// No attempt passed. The input stays live; with it empty, `r` runs the
     /// task again with the same check and `v` shows why each attempt ended.
@@ -516,6 +543,25 @@ pub enum Prompt {
         mode: Mode,
         settings: Box<Settings>,
     },
+}
+
+/// The part of a result the apply confirmation applies, once the user chose
+/// some of its files or edited it, and how it did when checked again.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Part {
+    /// Every change of the result as last checked; empty until then, when
+    /// they are the result's own.
+    pub all: Vec<molt_api::fs::Change>,
+    /// The paths to apply; `None`: every change.
+    pub only: Option<Vec<String>>,
+    /// The user edited the result.
+    pub edited: bool,
+    /// The file list, while it is open: a mark for each of `all`, and the cursor.
+    pub picking: Option<(Vec<bool>, usize)>,
+    /// The check is running again; the confirmation waits for it.
+    pub checking: bool,
+    /// What would be applied now did not pass when checked again, or could not be checked.
+    pub failed: bool,
 }
 
 /// A finished task's diff, kept after the task is applied, kept or discarded.
@@ -1208,8 +1254,10 @@ impl App {
             }
         }
         self.git_busy |= actions.iter().any(|a| matches!(a, Action::Commit { .. } | Action::Undo { .. }));
-        self.fork_operations +=
-            actions.iter().filter(|a| matches!(a, Action::Apply { .. } | Action::Discard { .. })).count();
+        self.fork_operations += actions
+            .iter()
+            .filter(|a| matches!(a, Action::Apply { .. } | Action::ApplyOnly { .. } | Action::Discard { .. }))
+            .count();
         if self.quit_after_git && !self.git_busy {
             self.quit = true;
             actions.push(Action::Quit { keep: self.keep() });
@@ -1638,6 +1686,24 @@ impl App {
                     self.pending_result = None;
                 }
                 Vec::new()
+            }
+            Msg::Rechecked { fork, only, result } => self.rechecked(&fork, only, result),
+            Msg::ForkEdited { fork, result } => {
+                let Some(Prompt::Apply { resp, fork: shown, part }) = &mut self.prompt else { return Vec::new() };
+                if *shown != fork {
+                    return Vec::new();
+                }
+                match result {
+                    Ok(()) => {
+                        part.edited = true;
+                        part.checking = true;
+                        vec![Action::Recheck { fork, only: part.only.clone(), check: resp.check.clone() }]
+                    }
+                    Err(e) => {
+                        self.flash = Some(format!("the editor failed: {}", clean_line(&e)));
+                        Vec::new()
+                    }
+                }
             }
             Msg::Edited(result) => {
                 match result {
@@ -3052,7 +3118,7 @@ impl App {
                 } else {
                     deciding = true;
                     task.stops = stops;
-                    self.prompt = Some(Prompt::Apply { resp: Box::new(resp.clone()), fork });
+                    self.prompt = Some(Prompt::Apply { resp: Box::new(resp.clone()), fork, part: Part::default() });
                 }
             } else {
                 self.push(Line::from(span(format!("  kept in {}", clean_line(&fork)), Tone::Dim)));
@@ -3107,16 +3173,49 @@ impl App {
     }
 
     fn apply_key(&mut self, key: &KeyEvent) -> Vec<Action> {
-        let Some(Prompt::Apply { resp, fork }) = &self.prompt else { return Vec::new() };
+        let Some(Prompt::Apply { resp, fork, part }) = &mut self.prompt else { return Vec::new() };
+        if part.checking {
+            self.flash = Some("checking again: wait for the check".into());
+            return Vec::new();
+        }
+        if part.picking.is_some() {
+            return self.pick_key(key);
+        }
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') => {
-                let fork = fork.clone();
+                if part.failed {
+                    self.flash = Some("not applied: it did not pass when checked again. s chooses other files, e edits it, k keeps it".into());
+                    return Vec::new();
+                }
+                let (fork, only) = (fork.clone(), part.only.clone());
+                let line = match (&only, part.edited) {
+                    (Some(only), _) => {
+                        Some(format!("  applying {} of {} files, checked again on them", only.len(), part.all.len()))
+                    }
+                    (None, true) => Some("  applying the result as you edited it, checked again".to_owned()),
+                    (None, false) => None,
+                };
                 self.prompt = None;
+                if let Some(line) = line {
+                    self.push(Line::from(span(line, Tone::Dim)));
+                }
                 if let Some(task) = &mut self.task {
                     task.phase = Phase::Applying;
                 }
-                vec![Action::Apply { fork }]
+                match only {
+                    Some(paths) => vec![Action::ApplyOnly { fork, paths }],
+                    None => vec![Action::Apply { fork }],
+                }
             }
+            KeyCode::Char('s') => {
+                if part.all.is_empty() {
+                    part.all = resp.changes.clone();
+                }
+                let marks = part.all.iter().map(|c| part.only.as_ref().is_none_or(|o| o.contains(&c.path))).collect();
+                part.picking = Some((marks, 0));
+                Vec::new()
+            }
+            KeyCode::Char('e') => vec![Action::EditFork { fork: fork.clone() }],
             KeyCode::Char('n') => {
                 let fork = fork.clone();
                 self.prompt = None;
@@ -3146,6 +3245,102 @@ impl App {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Keys while the apply confirmation's file list is open.
+    fn pick_key(&mut self, key: &KeyEvent) -> Vec<Action> {
+        let Some(Prompt::Apply { resp, fork, part }) = &mut self.prompt else { return Vec::new() };
+        let Some((marks, cursor)) = &mut part.picking else { return Vec::new() };
+        match key.code {
+            KeyCode::Up => *cursor = cursor.saturating_sub(1),
+            KeyCode::Down => *cursor = (*cursor + 1).min(marks.len().saturating_sub(1)),
+            KeyCode::Char(' ') => {
+                if let Some(mark) = marks.get_mut(*cursor) {
+                    *mark = !*mark;
+                }
+            }
+            KeyCode::Char('a') => {
+                let all = !marks.iter().all(|m| *m);
+                marks.iter_mut().for_each(|m| *m = all);
+            }
+            KeyCode::Esc => part.picking = None,
+            KeyCode::Enter => {
+                let chosen: Vec<String> =
+                    part.all.iter().zip(marks.iter()).filter(|(_, m)| **m).map(|(c, _)| c.path.clone()).collect();
+                if chosen.is_empty() {
+                    self.flash = Some("choose at least one file, or k to keep the result in its fork".into());
+                    return Vec::new();
+                }
+                let only = (chosen.len() < part.all.len()).then_some(chosen);
+                part.picking = None;
+                if only == part.only && !part.failed {
+                    return Vec::new();
+                }
+                part.checking = true;
+                return vec![Action::Recheck { fork: fork.clone(), only, check: resp.check.clone() }];
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// The apply confirmation after the result `fork` was checked again.
+    fn rechecked(
+        &mut self,
+        fork: &str,
+        only: Option<Vec<String>>,
+        result: Result<crate::session::Rechecked, String>,
+    ) -> Vec<Action> {
+        let Some(Prompt::Apply { resp, fork: shown, part }) = &mut self.prompt else { return Vec::new() };
+        if shown != fork {
+            return Vec::new();
+        }
+        part.checking = false;
+        let found = match result {
+            Ok(found) => found,
+            Err(e) => {
+                // Neither the choice nor an edit is applied without passing.
+                part.failed = true;
+                self.error("could not check it again", &e);
+                return Vec::new();
+            }
+        };
+        part.failed = found.failed();
+        part.only = only.map(|_| found.diff.changes.iter().map(|c| c.path.clone()).collect());
+        part.all = found.all;
+        resp.changes = found.diff.changes;
+        resp.patch = found.diff.patch;
+        resp.patch_truncated = found.diff.truncated;
+        resp.left_out = found.diff.left_out;
+        let what = match &part.only {
+            Some(only) => format!("{} of {} files", only.len(), part.all.len()),
+            None => "the whole result".to_owned(),
+        };
+        let mut stops = Vec::new();
+        let line = match &found.check {
+            Some(ran) if !ran.success() => {
+                let status = ran.exit_code.map_or_else(|| "stopped".to_owned(), |c| format!("exit {c}"));
+                stops.push(format!("check failed on {what} ({status})"));
+                (format!("  checked again on {what}: failed ({status})"), Tone::Bad)
+            }
+            Some(_) => (format!("  checked again on {what}: passed"), Tone::Ok),
+            None => {
+                stops.push("no check command to run again".to_owned());
+                (format!("  not checked again on {what}: no check command"), Tone::Warn)
+            }
+        };
+        stops.extend(found.rules.iter().map(|rule| format!("rule: {}", text::fit(&clean_line(rule), 90))));
+        stops.extend(apply_stops(resp, &self.rules));
+        let narrowed = resp.clone();
+        self.push(Line::from(span(clean_line(&line.0), line.1)));
+        if let Some(task) = &mut self.task {
+            task.stops = stops.iter().map(|line| scrub(line, &self.secrets)).collect();
+        }
+        // A commit takes what is applied, and nothing else.
+        if let Some(Action::Commit { resp, .. }) = &mut self.to_commit {
+            *resp = narrowed;
+        }
+        Vec::new()
     }
 
     /// Keys while a failed run offers a retry: the actions, or `None` to
@@ -3460,6 +3655,8 @@ impl App {
                     pairs.extend([
                         ("enter", "apply result"),
                         ("d", "view diff"),
+                        ("s", "choose which files to apply, then check them again"),
+                        ("e", "edit the result in $EDITOR, then check it again"),
                         ("v", "inspect rules and reviewer findings"),
                         ("k / esc", "keep result in its fork"),
                         ("n", "discard result"),
@@ -4651,6 +4848,72 @@ mod tests {
     }
 
     #[test]
+    fn the_apply_confirmation_applies_only_the_chosen_files_once_they_pass_their_check_again() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.rules.always_ask = true;
+        type_in(&mut app, "/check cargo test");
+        type_in(&mut app, "fix the parser");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let mut resp = passed(false, Some("/d/work/fork-1"));
+        resp.changes.push(Change { path: "target/out.bin".into(), kind: ChangeKind::Added });
+        let all = resp.changes.clone();
+        app.update(Msg::Ran { trace, result: Ok(resp) });
+        assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
+        assert!(frame_text(&mut app).contains("s choose files"));
+
+        assert!(app.update(key(KeyCode::Char('s'))).is_empty());
+        let shown = frame_text(&mut app);
+        assert!(shown.contains("apply which files?") && shown.contains("[x] target/out.bin"), "{shown}");
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Char(' ')));
+        let actions = app.update(key(KeyCode::Enter));
+        let fork = "/d/work/fork-1".to_owned();
+        let only = Some(vec!["src/parser.rs".to_owned()]);
+        let check = Some(CheckSpec { command: "cargo test".into(), files: vec![], designed: true, suite: None });
+        assert_eq!(actions, [Action::Recheck { fork: fork.clone(), only: only.clone(), check: check.clone() }]);
+        assert!(app.update(key(KeyCode::Enter)).is_empty(), "nothing is applied while the check runs");
+
+        let found = |exit: i32, rules: Vec<String>| crate::session::Rechecked {
+            all: all.clone(),
+            diff: molt_api::fs::DiffResponse {
+                changes: all[..1].to_vec(),
+                patch: "--- a/src/parser.rs\n+++ b/src/parser.rs\n@@\n-a\n+b\n".into(),
+                truncated: false,
+                left_out: None,
+            },
+            check: Some(
+                serde_json::from_value(serde_json::json!({
+                    "exit_code": exit, "timed_out": false, "stdout": "", "stderr": "", "truncated": false,
+                    "duration_ms": 5
+                }))
+                .unwrap(),
+            ),
+            rules,
+        };
+        app.update(Msg::Rechecked { fork: fork.clone(), only: only.clone(), result: Ok(found(1, vec![])) });
+        assert!(log(&app).contains("checked again on 1 of 2 files: failed (exit 1)"), "{}", log(&app));
+        assert!(app.update(key(KeyCode::Enter)).is_empty(), "a choice that fails its check is not applied");
+        assert!(app.flash.as_deref().unwrap().contains("not applied"));
+
+        // An edit by hand is checked again, on the same choice.
+        assert_eq!(app.update(key(KeyCode::Char('e'))), [Action::EditFork { fork: fork.clone() }]);
+        let actions = app.update(Msg::ForkEdited { fork: fork.clone(), result: Ok(()) });
+        assert_eq!(actions, [Action::Recheck { fork: fork.clone(), only: only.clone(), check }]);
+        let rule = "src/parser.rs adds a test skip".to_owned();
+        app.update(Msg::Rechecked { fork: fork.clone(), only, result: Ok(found(0, vec![rule])) });
+        assert!(log(&app).contains("checked again on 1 of 2 files: passed"));
+        let stops = &app.task.as_ref().unwrap().stops;
+        assert!(stops.iter().any(|s| s == "rule: src/parser.rs adds a test skip"), "{stops:?}");
+        let Some(Prompt::Apply { resp, .. }) = &app.prompt else { panic!() };
+        assert_eq!(resp.changes, all[..1]);
+
+        let actions = app.update(key(KeyCode::Enter));
+        assert_eq!(actions, [Action::ApplyOnly { fork, paths: vec!["src/parser.rs".into()] }]);
+        assert!(log(&app).contains("applying 1 of 2 files, checked again on them"));
+    }
+
+    #[test]
     fn plan_results_are_browsable_and_remain_available_until_apply_or_discard_succeeds() {
         let mut app = App::new("/work/project", None);
         up(&mut app);
@@ -5494,7 +5757,11 @@ mod tests {
         assert!(text.contains("check confirmation") && text.contains("edit check"));
         app.update(key(KeyCode::Esc));
         assert!(matches!(app.prompt, Some(Prompt::Check(_))));
-        app.prompt = Some(Prompt::Apply { resp: Box::new(passed(false, Some("/fork"))), fork: "/fork".into() });
+        app.prompt = Some(Prompt::Apply {
+            resp: Box::new(passed(false, Some("/fork"))),
+            fork: "/fork".into(),
+            part: Part::default(),
+        });
         app.update(key(KeyCode::Char('?')));
         let text = frame_text(&mut app);
         assert!(text.contains("apply confirmation") && text.contains("keep result in its fork"));

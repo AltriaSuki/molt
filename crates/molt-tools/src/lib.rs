@@ -170,6 +170,7 @@ impl Fs {
             "applies" => blocking(method, payload, move |req| apply::list(&roots, req).map(quiet)).await,
             "view" => blocking(method, payload, move |req| fork::view(&roots, &forks, req).map(quiet)).await,
             "drop" => blocking(method, payload, move |req| fork::drop_fork(&roots, &forks, req).map(quiet)).await,
+            "narrow" => blocking(method, payload, move |req| fork::narrow(&roots, &forks, req).map(quiet)).await,
             _ => Err(invalid(format!("unknown method fs.{method}"))),
         }
     }

@@ -35,7 +35,7 @@ pub(crate) struct Winner<'a> {
 }
 
 pub(crate) async fn review(ctx: &Arc<Ctx>, winner: &Winner<'_>) -> Review {
-    let mut findings = rules(winner.check, winner.changes, winner.patch);
+    let mut findings = rules(&winner.check.files, winner.changes, winner.patch);
     let mut verdict = if findings.is_empty() { Verdict::Approve } else { Verdict::Concern };
     let mut details = ReviewDetails { rules: findings.clone(), ..ReviewDetails::default() };
     match model(ctx, winner, &findings).await {
@@ -66,8 +66,8 @@ pub(crate) async fn review(ctx: &Arc<Ctx>, winner: &Winner<'_>) -> Review {
 /// What the fixed rules find in the changes: deleted tests, new skip markers
 /// and changed test configuration. The check's own files are left out: they
 /// are the designer's, restored before every check run.
-pub(crate) fn rules(check: &CheckSpec, changes: &[Change], patch: &str) -> Vec<String> {
-    let ours = |path: &str| check.files.iter().any(|f| f == path);
+pub(crate) fn rules(check_files: &[String], changes: &[Change], patch: &str) -> Vec<String> {
+    let ours = |path: &str| check_files.iter().any(|f| f == path);
     let mut findings = Vec::new();
     for c in changes.iter().filter(|c| !ours(&c.path)) {
         if c.kind == ChangeKind::Deleted && is_test(&c.path) {
@@ -248,6 +248,10 @@ mod tests {
         }
     }
 
+    fn spec_files(files: &[&str]) -> Vec<String> {
+        spec(files).files
+    }
+
     fn change(path: &str, kind: ChangeKind) -> Change {
         Change { path: path.into(), kind }
     }
@@ -262,7 +266,7 @@ mod tests {
             change("conftest.py", ChangeKind::Added),
             change("tests/check.rs", ChangeKind::Deleted),
         ];
-        let found = rules(&spec(&["tests/check.rs"]), &changes, "");
+        let found = rules(&spec_files(&["tests/check.rs"]), &changes, "");
         assert_eq!(
             found,
             [
@@ -292,7 +296,7 @@ mod tests {
 @@ -1 +1 @@
 +@pytest.mark.skip
 ";
-        let found = rules(&spec(&["tests/check.py"]), &[], patch);
+        let found = rules(&spec_files(&["tests/check.py"]), &[], patch);
         assert_eq!(
             found,
             [
@@ -315,13 +319,13 @@ mod tests {
                 "$xit(1)",
             ] {
                 let patch = format!("--- a/{path}\n+++ b/{path}\n@@\n+{line}\n");
-                assert!(rules(&spec(&[]), &[], &patch).is_empty(), "{path}: {line}");
+                assert!(rules(&spec_files(&[]), &[], &patch).is_empty(), "{path}: {line}");
             }
         }
         for line in ["xit('slow', () => {});", "process.exit(1); xit('slow', () => {});", "it.skip('slow', () => {});"]
         {
             let patch = format!("--- a/tests/api.test.js\n+++ b/tests/api.test.js\n@@\n+{line}\n");
-            assert_eq!(rules(&spec(&[]), &[], &patch).len(), 1, "{line}");
+            assert_eq!(rules(&spec_files(&[]), &[], &patch).len(), 1, "{line}");
         }
     }
 
@@ -329,7 +333,7 @@ mod tests {
     fn an_ordinary_change_finds_nothing() {
         let patch = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@\n-fn a() {}\n+fn a() { b() }\n";
         let changes = [change("src/lib.rs", ChangeKind::Modified), change("tests/new.rs", ChangeKind::Added)];
-        assert!(rules(&spec(&[]), &changes, patch).is_empty());
+        assert!(rules(&spec_files(&[]), &changes, patch).is_empty());
         assert!(!is_test("src/testing_utils.rs") && is_test("pkg/__tests__/a.js") && is_test("a/b.spec.ts"));
     }
 }

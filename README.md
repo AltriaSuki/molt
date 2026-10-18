@@ -76,6 +76,7 @@ sender from that.
 | A benchmark starts a run only while what it spent, plus the whole `--task-usd` of that run and of each run in flight, fits in `--max-usd`; it refuses models it has no price for | `crates/molt-bench/src/run.rs` (`runs_stop_before_they_could_pass_the_budget`, `a_run_of_unknown_cost_stops_the_benchmark`), `crates/molt-bench/src/cli.rs` (`a_model_without_a_price_is_refused`) |
 | A model with no price stays of unknown cost and stops the run; prices come only from the user's environment or data directory, never from a project, and a download that does not validate replaces nothing | `crates/molt-gateway/src/prices.rs` (`the_data_directory_holds_the_snapshot_and_nothing_else_is_read`, `a_download_that_does_not_validate_is_refused`, `malformed_declared_prices_stop_startup_and_name_the_item`), `crates/molt-gateway/tests/gateway.rs` (`a_snapshot_prices_a_third_party_model…`) |
 | `molt do --commit` commits exactly the files the run merged and leaves what the user staged alone; `molt undo` takes it back with a new commit, never touching later changes, and the undone run no longer lends any note confidence | `crates/molt/src/git.rs` (`a_run_commit_holds_only_the_merged_files…`, `undo_refuses_files_that_changed_since_the_run`), `crates/molt/tests/agent.rs` (`a_committed_run_can_be_undone_and_memory_stops_counting_it`), `crates/molt-memory/src/notes.rs` (`an_undone_run_lends_no_note_confidence…`) |
+| Part of a result, or one edited by hand, is applied only after its check and the review's fixed rules run again on just what is applied, in a fork of its own; the files chosen are in the audit log | `crates/molt-tools/tests/fs.rs` (`part_of_a_fork_can_be_diffed_narrowed…`), `crates/molt/tests/agent.rs` (`molt_apply_checks_the_chosen_files_or_a_hand_edit_again…`), `crates/molt/src/tui/app.rs` (`the_apply_confirmation_applies_only_the_chosen_files…`) |
 | The agent reads the web only when the user allows hosts: over https, from those hosts after every redirect, never from a loopback, private or link-local address; commands stay offline, and every page read is in the audit log | `crates/molt-web/src/allow.rs` (`only_https_urls_on_allowed_hosts_pass`, `only_public_addresses_are_public`), `crates/molt-web/tests/web.rs` (`hosts_off_the_list_are_refused_before_any_request_and_on_every_redirect`), `crates/molt/tests/agent.rs` (`allowed_web_hosts_start_the_web_service_and_offer_fetch_url_only_then`), `crates/molt-planner/tests/planner.rs` (`fetch_url_is_offered_only_to_a_planner_that_may_read_the_web`) |
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
 | Issue CI rejects PR triggers and probes the sandbox before model spend | `scripts/ci/test_issue_to_pr.py::test_only_labelled_open_issues_are_eligible`, `test_sandbox_failure_posts_a_summary_and_never_starts_a_model` |
@@ -151,7 +152,10 @@ with `--config` can change these in a `[confirm]` section (`max_lines`,
    against its budget (`task $0.52 / $2.00`, in yellow from 80%). A call of
    unknown cost makes the figure a lower bound (`≥ $0.18`). When one passes,
    you see its message, the files it changed and, with `d`, the diff. Enter applies
-   it; `k` keeps it in its fork, `n` discards it. `/last` opens the diff of
+   it; `s` lists its files to choose which to apply, and `e` opens it in
+   `$EDITOR`. Either way its check and the review's fixed rules run again on
+   just what would be applied before Enter takes it, and a choice or an edit
+   that fails is not applied. `k` keeps it in its fork, `n` discards it. `/last` opens the diff of
    the last finished task again, whatever was done with it. When no attempt
    passes, each one shows the end of why it stopped, and a failed check shows
    its last lines in its box; `v` opens the whole story and `r` runs the task
@@ -552,6 +556,23 @@ the run gave is voided, so it no longer lends any note confidence. Notes only
 it showed are forgotten, the notes it bore out or disputed are worked out
 again without it, and it is not learned from again. If memory cannot be
 reached, `molt undo RUN` again tells it without a second revert.
+
+### Applying a kept result: `molt apply`
+
+```
+molt apply FORK [--only PATH...] [--check CMD [--check-file PATH...] | --no-check] [--workspace DIR] [--data-dir DIR]
+```
+
+applies a result kept in its fork, such as one `molt do --no-apply` printed,
+and drops the fork. `--only` applies just those of its files; since that is not
+what was checked, it needs `--check CMD` to run the check again first, in a
+fork of the workspace with only the chosen files (and the `--check-file`s the
+check needs, which are not applied), or `--no-check` to apply them unchecked.
+`--check` without `--only` checks the whole result again, as after you edited
+the fork by hand. When the check fails, nothing is applied, the fork stays,
+and the exit status is 1. What the review's fixed rules find (a deleted test,
+a new skip marker) is printed. The merge request names the chosen files, so
+the audit log has them.
 
 ### Checkpoints and `molt resume`
 

@@ -24,6 +24,7 @@ pub const DIFF: &str = "fs.diff";
 pub const VIEW: &str = "fs.view";
 pub const MERGE: &str = "fs.merge";
 pub const DROP: &str = "fs.drop";
+pub const NARROW: &str = "fs.narrow";
 pub const APPLIES: &str = "fs.applies";
 pub const RECOVER: &str = "fs.recover";
 
@@ -261,6 +262,10 @@ pub struct Change {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffRequest {
     pub fork: String,
+    /// Only these of the fork's changes; empty: all of them. A path that is
+    /// not among its changes is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +292,16 @@ pub struct LeftOut {
     pub count: u64,
     /// The first few of them, sorted.
     #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+/// A new fork of the workspace `fork` was copied from, as that workspace is
+/// now, with `paths` of the fork's changes carried over: to run a check on
+/// part of a result before only that part is merged. Every path must be
+/// among the fork's changes. Reply: [`ForkResponse`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NarrowRequest {
+    pub fork: String,
     pub paths: Vec<String>,
 }
 
@@ -318,6 +333,10 @@ pub struct MergeRequest {
     /// Delete the fork after a successful merge.
     #[serde(default)]
     pub drop: bool,
+    /// Only these of the fork's changes; empty: all of them. A path that is
+    /// not among its changes is refused, and nothing is written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

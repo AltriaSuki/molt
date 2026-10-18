@@ -6,7 +6,8 @@
 //! same capabilities as in `molt do`, plus `planner.design` to show the
 //! check before the attempts start, `planner.control` to steer a run that is
 //! going, `fs.merge` and `fs.drop` to apply or discard a result the user has
-//! looked at, `memory.recall`, `memory.forget`, `memory.review`,
+//! looked at, `fs.narrow` and `shell.run` to check part of a result, or one
+//! the user edited, again before it is applied, `memory.recall`, `memory.forget`, `memory.review`,
 //! `memory.correct` and `memory.promote` for the memory screen, and
 //! `memory.remember` for notes the user writes down.
 
@@ -15,13 +16,17 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use anyhow::Context;
-use molt_api::fs::{self, DiffRequest, DiffResponse, DropRequest, DropResponse, MergeRequest, MergeResponse};
+use molt_api::fs::{
+    self, DiffRequest, DiffResponse, DropRequest, DropResponse, MergeRequest, MergeResponse, NarrowRequest,
+};
 use molt_api::memory::{
     self, ConsolidateRequest, ConsolidateResponse, CorrectRequest, ForgetRequest, ForgetResponse, Note, NoteKind,
     PromoteRequest, PromoteResponse, RecallRequest, RecallResponse, RecallSnapshot, Recalled, RememberRequest,
     RememberResponse, RetractResponse, ReviewRequest, ReviewResponse, UndoRequest,
 };
-use molt_api::planner::{self, Control, ControlRequest, ControlResponse, DesignResponse, RunRequest, RunResponse};
+use molt_api::planner::{
+    self, CheckSpec, Control, ControlRequest, ControlResponse, DesignResponse, RunRequest, RunResponse,
+};
 use molt_api::progress::{self, Progress};
 use molt_proto::{Budget, ServiceId, TraceId};
 use molt_sdk::{CallOpts, Service};
@@ -44,6 +49,8 @@ const LEARN_MS: u64 = 600_000;
 const DIFF_MS: u64 = 10_000;
 /// Reply deadline for a change to a running run, which the planner answers at once.
 const CONTROL_MS: u64 = 10_000;
+/// Deadline for running a result's check again, as the planner's own default.
+const CHECK_MS: u64 = 900_000;
 /// Reply deadline for memory's notes.
 const NOTES_MS: u64 = 60_000;
 
@@ -57,6 +64,26 @@ pub struct Session {
     forks: Mutex<Option<RunForks>>,
     versions: Vec<(String, String)>,
     hooks: Vec<molt_planner::hooks::Hook>,
+}
+
+/// What checking a kept result again found.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Rechecked {
+    /// Every change of the result as it is now, chosen or not.
+    pub all: Vec<fs::Change>,
+    /// The changes that were checked, and their diff.
+    pub diff: DiffResponse,
+    /// How the check did on them; `None` without a check command.
+    pub check: Option<molt_api::shell::RunResponse>,
+    /// What the review's fixed rules found in them.
+    pub rules: Vec<String>,
+}
+
+impl Rechecked {
+    /// The check ran and failed.
+    pub fn failed(&self) -> bool {
+        self.check.as_ref().is_some_and(|c| !c.success())
+    }
 }
 
 /// Git settlement is retained even when memory could not be notified; retry by run id is safe.
@@ -109,10 +136,19 @@ impl Session {
             Some(_) => Some(agent::wait_until_up(kernel, &cli, MEMORY, deadline).await.map_err(|e| format!("{e:#}"))),
         };
         let budget = Budget::new(0, 0, CALLS);
-        let mut targets =
-            vec![planner::RUN, planner::DESIGN, planner::CONTROL, fs::DIFF, fs::VIEW, fs::MERGE, fs::DROP];
+        let mut targets = vec![
+            planner::RUN,
+            planner::DESIGN,
+            planner::CONTROL,
+            fs::DIFF,
+            fs::VIEW,
+            fs::MERGE,
+            fs::DROP,
+            fs::NARROW,
+            molt_api::shell::RUN,
+        ];
         if !cfg.hooks.is_empty() {
-            targets.extend([fs::FORK, molt_api::shell::RUN]);
+            targets.push(fs::FORK);
         }
         if memory.is_some() {
             targets.extend([
@@ -193,10 +229,67 @@ impl Session {
 
     /// Merge a result kept in `fork` into the workspace, and drop the fork.
     pub async fn apply(&self, fork: &str) -> anyhow::Result<MergeResponse> {
+        self.apply_only(fork, &[]).await
+    }
+
+    /// Merge `paths` of a result kept in `fork` into the workspace, or all
+    /// of it when `paths` is empty, and drop the fork. The request names the
+    /// paths, so the audit log has what was chosen.
+    pub async fn apply_only(&self, fork: &str, paths: &[String]) -> anyhow::Result<MergeResponse> {
         self.validate_fork(fork).await?;
-        let result = self.call(fs::MERGE, MergeRequest { fork: fork.to_owned(), drop: true }, TREE_MS, None).await?;
+        let req = MergeRequest { fork: fork.to_owned(), drop: true, paths: paths.to_vec() };
+        let result = self.call(fs::MERGE, req, TREE_MS, None).await?;
         self.notify_applied().await;
         Ok(result)
+    }
+
+    /// Check a result kept in `fork` again as it is now: `only` of its
+    /// changes (all of them when `None`), after the user chose some or
+    /// edited it. `check` runs in a fork of the workspace with just those
+    /// changes and the check's own files, which is dropped after; the
+    /// review's fixed rules look at their diff.
+    pub async fn recheck(
+        &self,
+        fork: &str,
+        only: Option<&[String]>,
+        check: Option<&CheckSpec>,
+    ) -> anyhow::Result<Rechecked> {
+        let all = self.diff(fork).await?;
+        let paths: Vec<String> = match only {
+            None => all.changes.iter().map(|c| c.path.clone()).collect(),
+            // A file the user put back as it was is no longer a change to apply.
+            Some(only) => only.iter().filter(|p| all.changes.iter().any(|c| &c.path == *p)).cloned().collect(),
+        };
+        anyhow::ensure!(!paths.is_empty(), "none of the chosen files is changed in the result any more");
+        let diff: DiffResponse = if paths.len() == all.changes.len() {
+            all.clone()
+        } else {
+            self.call(fs::DIFF, DiffRequest { fork: fork.to_owned(), paths: paths.clone() }, DIFF_MS, None).await?
+        };
+        let check_files = check.map_or(&[][..], |c| &c.files[..]);
+        let rules = molt_planner::review_rules(check_files, &diff.changes, &diff.patch);
+        let ran = match check {
+            None => None,
+            Some(check) => {
+                // The check needs its own files even where they are not applied.
+                let extra =
+                    check_files.iter().filter(|f| !paths.contains(f) && all.changes.iter().any(|c| &c.path == *f));
+                let take: Vec<String> = paths.iter().chain(extra).cloned().collect();
+                let narrowed: fs::ForkResponse =
+                    self.call(fs::NARROW, NarrowRequest { fork: fork.to_owned(), paths: take }, TREE_MS, None).await?;
+                let req = molt_api::shell::RunRequest {
+                    workspace: narrowed.fork.clone(),
+                    command: check.command.clone(),
+                    timeout_ms: Some(CHECK_MS),
+                };
+                let ran: anyhow::Result<molt_api::shell::RunResponse> =
+                    self.call(molt_api::shell::RUN, req, CHECK_MS.saturating_add(5000), None).await;
+                let _: anyhow::Result<DropResponse> =
+                    self.call(fs::DROP, DropRequest { fork: narrowed.fork }, TREE_MS, None).await;
+                Some(ran?)
+            }
+        };
+        Ok(Rechecked { all: all.changes, diff, check: ran, rules })
     }
 
     async fn notify_applied(&self) {
@@ -240,7 +333,7 @@ impl Session {
     /// Read a kept result through the service, without mounting or trusting its saved path.
     pub async fn diff(&self, fork: &str) -> anyhow::Result<DiffResponse> {
         self.validate_fork(fork).await?;
-        self.call(fs::DIFF, DiffRequest { fork: fork.to_owned() }, DIFF_MS, None).await
+        self.call(fs::DIFF, DiffRequest { fork: fork.to_owned(), paths: Vec::new() }, DIFF_MS, None).await
     }
 
     async fn validate_fork(&self, fork: &str) -> anyhow::Result<()> {

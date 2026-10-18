@@ -56,6 +56,10 @@ enum Cmd {
     /// commit that puts its files back, and have memory no longer count
     /// what the run showed.
     Undo(UndoArgs),
+    /// Apply a result kept in its fork, such as one of `molt do --no-apply`,
+    /// or only some of its files. With --check, the check runs again first,
+    /// on just what is applied; a fork you edited by hand is checked the same way.
+    Apply(ApplyArgs),
     /// See and correct what memory holds about a project.
     Memory {
         #[command(subcommand)]
@@ -279,6 +283,33 @@ struct UndoArgs {
     /// The run to take back, as its commit's `Molt-Run:` trailer names it.
     /// Default: the newest run on the current branch not taken back yet.
     run: Option<String>,
+    #[command(flatten)]
+    at: MemoryAt,
+}
+
+#[derive(Args)]
+#[command(after_help = "Exit status: 0 when the result is applied; 1 when the check failed on it, or on an error, \
+                        and then nothing is applied and the fork stays; 2 for a usage error.")]
+#[command(group(clap::ArgGroup::new("verify").args(["check", "no_check"])))]
+struct ApplyArgs {
+    /// The fork the result is in, as the report of the run names it.
+    fork: String,
+    /// Apply only this file of the result (repeatable). The rest is not
+    /// applied, and the fork is dropped. Give --check or --no-check with it:
+    /// part of a result is not what was checked.
+    #[arg(long, value_name = "PATH", requires = "verify")]
+    only: Vec<String>,
+    /// Run this check first, in a fork of the workspace with only what
+    /// would be applied, and apply nothing if it fails.
+    #[arg(long, value_name = "CMD")]
+    check: Option<String>,
+    /// A file of the result the check needs, which is put beside the chosen
+    /// files for the check even when it is not applied (repeatable).
+    #[arg(long, value_name = "PATH", requires = "check")]
+    check_file: Vec<String>,
+    /// Apply the chosen files without running a check on them.
+    #[arg(long, conflicts_with = "check")]
+    no_check: bool,
     #[command(flatten)]
     at: MemoryAt,
 }
@@ -561,6 +592,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             Cmd::Do(_)
                 | Cmd::Resume(_)
                 | Cmd::Undo(_)
+                | Cmd::Apply(_)
                 | Cmd::Memory { .. }
                 | Cmd::Bench { .. }
                 | Cmd::Prices { .. }
@@ -631,6 +663,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         Cmd::Do(args) => return do_task(cli.config.as_deref(), args).await,
         Cmd::Resume(args) => return resume_task(cli.config.as_deref(), args).await,
         Cmd::Undo(args) => return undo_cmd(cli.config.as_deref(), args).await,
+        Cmd::Apply(args) => return apply_cmd(cli.config.as_deref(), args).await,
         Cmd::Memory { cmd } => memory_cmd(cli.config.as_deref(), cmd).await?,
         Cmd::Project { cmd } => project_cmd(cmd)?,
         Cmd::Bench { cmd } => return molt_bench::cli::main(cmd).await,
@@ -1082,6 +1115,60 @@ async fn undo_cmd(config: Option<&Path>, args: UndoArgs) -> anyhow::Result<ExitC
             Ok(ExitCode::from(4))
         }
     }
+}
+
+async fn apply_cmd(config: Option<&Path>, args: ApplyArgs) -> anyhow::Result<ExitCode> {
+    let (workspace, project) = agent::locate(args.at.project.as_deref(), &args.at.workspace, config.is_some())?;
+    let cfg = agent::resolve_config(config, &workspace, args.at.data_dir.as_deref(), project.as_ref())?;
+    let workspace = workspace.to_str().context("the workspace path is not UTF-8")?.to_owned();
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    let session = molt::session::Session::start(&cfg, &workspace, events).await?;
+    let result = apply_kept(&session, &args).await;
+    session.shutdown(std::slice::from_ref(&args.fork)).await;
+    result
+}
+
+async fn apply_kept(session: &molt::session::Session, args: &ApplyArgs) -> anyhow::Result<ExitCode> {
+    let fork = &args.fork;
+    let mut paths = args.only.clone();
+    if args.check.is_some() || !args.only.is_empty() {
+        let check = args.check.clone().map(|command| molt_api::planner::CheckSpec {
+            command,
+            files: args.check_file.clone(),
+            designed: false,
+            suite: None,
+        });
+        let only = (!args.only.is_empty()).then_some(&args.only[..]);
+        let found = session.recheck(fork, only, check.as_ref()).await?;
+        for rule in &found.rules {
+            eprintln!("{}", agent::printable(&format!("the review's fixed rules: {rule}")));
+        }
+        let chosen = found.diff.changes.len();
+        match &found.check {
+            Some(ran) if !ran.success() => {
+                let status = ran.exit_code.map_or_else(|| "it was stopped".to_owned(), |c| format!("exit {c}"));
+                eprintln!(
+                    "{}",
+                    agent::printable(&format!(
+                        "the check failed on the {chosen} chosen files ({status}); nothing is applied, and the \
+                         result stays in {fork}"
+                    ))
+                );
+                let output = format!("{}{}", ran.stdout, ran.stderr);
+                eprint!("{}", agent::printable(&output));
+                return Ok(ExitCode::FAILURE);
+            }
+            Some(_) => eprintln!("the check passed on the {chosen} chosen files"),
+            None => eprintln!("not checked: --no-check"),
+        }
+        if !args.only.is_empty() {
+            paths = found.diff.changes.iter().map(|c| c.path.clone()).collect();
+        }
+    }
+    let merged = session.apply_only(fork, &paths).await?;
+    let names: Vec<&str> = merged.changes.iter().map(|c| c.path.as_str()).collect();
+    println!("{}", agent::printable(&format!("applied {} files: {}", names.len(), names.join(", "))));
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()> {

@@ -48,6 +48,8 @@ const LEARNED_TEXT: &str = "The done-check greps greeting.txt for hello.";
 enum Fake {
     /// Attempts write greeting.txt and say they are done.
     Greets,
+    /// Attempts write greeting.txt and notes.txt, then say they are done.
+    GreetsWithNotes,
     ConcurrentEdit(PathBuf),
     /// The designer writes check.sh and submits it; attempts then greet.
     DesignsThenGreets,
@@ -156,6 +158,11 @@ impl Respond for FakeApi {
             (Fake::GreetsAtLength(len), false, Turn::First) => {
                 let greeting = format!("hello{}\n", "o".repeat(len - "hello\n".len()));
                 (vec![write("greeting.txt", &greeting)], "tool_use")
+            }
+            (Fake::GreetsWithNotes, false, Turn::First) => {
+                let mut notes = write("notes.txt", "scratch\n");
+                notes["id"] = json!(format!("toolu_{n:03}_notes"));
+                (vec![write("greeting.txt", "hello\n"), notes], "tool_use")
             }
             (_, false, Turn::First | Turn::Feedback) => (vec![write("greeting.txt", "hello\n")], "tool_use"),
             (_, false, Turn::AfterTools) => {
@@ -469,9 +476,15 @@ async fn exits(pid: i32) -> bool {
 
 /// `molt do` in `workspace` with state in `data`, using the fake API.
 fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) -> tokio::process::Command {
+    let mut all = vec!["do", "Write a greeting into greeting.txt."];
+    all.extend(args);
+    molt(server, workspace, data, &all)
+}
+
+/// `molt ARGS` in `workspace` with state in `data`, using the fake API.
+fn molt(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_molt"));
-    cmd.args(["do", "Write a greeting into greeting.txt."])
-        .args(args)
+    cmd.args(args)
         .arg("--data-dir")
         .arg(data)
         // The project registry, kept out of the developer's own.
@@ -1491,6 +1504,65 @@ async fn a_result_that_cannot_be_applied_exits_3_and_is_kept() {
     assert_eq!(std::fs::read_to_string(fork.join("greeting.txt")).unwrap(), "hello\n");
     assert_eq!(std::fs::read_to_string(&original).unwrap(), "theirs\n");
     assert_requests_valid(&server).await;
+}
+
+#[tokio::test]
+async fn molt_apply_checks_the_chosen_files_or_a_hand_edit_again_and_applies_only_those() {
+    let server = fake_api(Fake::GreetsWithNotes).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let w = workspace.path();
+    let args = ["--check", CHECK, "--attempts", "1", "--no-apply", "--json", "--no-learn"];
+    let out = tokio::time::timeout(RUN_LIMIT, molt_do(&server, w, data.path(), &args).output())
+        .await
+        .expect("molt do hung")
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let resp: RunResponse = serde_json::from_slice(&out.stdout).unwrap();
+    let paths: Vec<&str> = resp.changes.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(paths, ["greeting.txt", "notes.txt"]);
+    let fork = resp.fork.expect("the result is kept");
+    let apply = |args: &[&str]| {
+        let mut all = vec!["apply", fork.as_str()];
+        all.extend(args);
+        let mut cmd = molt(&server, w, data.path(), &all);
+        async move { tokio::time::timeout(RUN_LIMIT, cmd.output()).await.expect("molt apply hung").unwrap() }
+    };
+
+    // Part of a result is not what was checked: the CLI wants a check, or to be told there is none.
+    let out = apply(&["--only", "greeting.txt"]).await;
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--no-check"));
+
+    // The check runs on the chosen files alone: without greeting.txt it fails, and nothing is applied.
+    let out = apply(&["--only", "notes.txt", "--check", CHECK]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("the check failed on the 1 chosen files"), "{stderr}");
+    assert!(!w.join("notes.txt").exists() && !w.join("greeting.txt").exists());
+
+    // A hand edit to the fork is checked again too.
+    std::fs::write(Path::new(&fork).join("greeting.txt"), "goodbye\n").unwrap();
+    let out = apply(&["--check", CHECK]).await;
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!w.join("greeting.txt").exists());
+    std::fs::write(Path::new(&fork).join("greeting.txt"), "hello, edited\n").unwrap();
+
+    let out = apply(&["--only", "greeting.txt", "--check", CHECK]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("the check passed on the 1 chosen files"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "applied 1 files: greeting.txt\n");
+    assert_eq!(std::fs::read_to_string(w.join("greeting.txt")).unwrap(), "hello, edited\n");
+    assert!(!w.join("notes.txt").exists(), "the file not chosen is not applied");
+    assert!(!Path::new(&fork).exists(), "the fork is dropped once part of it is applied");
+
+    // What was chosen is in the audit log, with the merge that applied it.
+    let audit = molt_kernel::audit::read_all(&data.path().join("audit.jsonl")).await.unwrap();
+    assert!(audit.iter().any(|e| matches!(&e.event, AuditEvent::Message { envelope }
+        if envelope.to.to_string() == MERGE && envelope.payload["paths"] == json!(["greeting.txt"]))));
+    assert_requests_valid(&server).await;
+    assert_forks_dropped(data.path());
 }
 
 #[tokio::test]

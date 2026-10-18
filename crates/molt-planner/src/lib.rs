@@ -210,6 +210,14 @@ impl Config {
     }
 }
 
+/// What the review's fixed rules find in `changes` and their `patch`:
+/// deleted tests, new skip markers and changed test configuration, leaving
+/// out the check's own `check_files`. For a result changed after its run,
+/// such as only part of it or one the user edited.
+pub fn review_rules(check_files: &[String], changes: &[molt_api::fs::Change], patch: &str) -> Vec<String> {
+    review::rules(check_files, changes, patch)
+}
+
 /// How the planner reaches other services.
 #[async_trait]
 pub trait Bus: Send + Sync + 'static {
