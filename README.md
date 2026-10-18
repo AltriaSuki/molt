@@ -184,6 +184,14 @@ passed and its result is being applied, it is too late, and the addition is
 refused. `/pause` starts no new model call, command or check until `/resume`;
 the status bar says what is still finishing (`pausing; waiting for attempt 1:
 a model call`) and then `paused`.
+An attempt can also ask you something only you can decide
+(`? attempt 0 asks  Tabs or spaces?`, with numbered options when it has
+some). It waits for the answer while the other attempts go on; what you type
+next answers it, an option by its number or in your own words, and becomes
+the next version of the requirements, which every attempt follows. A run asks
+at most three questions, and an attempt left unanswered for ten minutes
+decides itself and says so in its reply. `molt do` has no one to ask, and its
+attempts are not offered the question at all.
 
 The tasks you give one after another make a conversation: each new task is
 told what the last five asked, how they ended, what they said and which

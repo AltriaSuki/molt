@@ -99,6 +99,7 @@ async fn resume_run(
     let mut run_req = saved.request.clone();
     run_req.apply = req.apply;
     run_req.stream = req.stream;
+    run_req.interactive = req.interactive;
     run_req.keep_cancelled_forks = req.keep_cancelled_forks;
     run_req.budget_usd = req.budget_usd.or(run_req.budget_usd);
     run_req.design_budget_usd = req.design_budget_usd.or(run_req.design_budget_usd);

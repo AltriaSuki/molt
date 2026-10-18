@@ -2289,7 +2289,12 @@ async fn finished(run: tokio::task::JoinHandle<Result<RunResponse, RemoteError>>
 }
 
 fn protect(path: &str) -> Control {
-    Control::Constrain(Constraint { text: "Leave the README alone.".into(), protect: vec![path.into()], check: None })
+    Control::Constrain(Constraint {
+        text: "Leave the README alone.".into(),
+        protect: vec![path.into()],
+        check: None,
+        answers: None,
+    })
 }
 
 #[tokio::test]
@@ -2466,6 +2471,119 @@ async fn earlier_tasks_of_the_conversation_come_before_the_task() {
     assert!(
         first.contains("<task>Add a README.</task>") && first.contains("its changes are in the workspace: README.md")
     );
+}
+
+// --- Asking the user (#161) ----------------------------------------------------
+
+fn ask_user(req: &CompleteRequest, question: &str, options: &[&str]) -> Reply {
+    use_tools(req, &[("ask_user", json!({ "question": question, "options": options }))])
+}
+
+fn offers(req: &CompleteRequest, tool: &str) -> bool {
+    req.tools.iter().any(|t| t["name"] == tool)
+}
+
+/// Wait until the run has published `n` questions.
+async fn questions(fake: &Arc<Fake>, n: usize) -> Vec<Progress> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let asked: Vec<Progress> =
+                fake.events().into_iter().filter(|e| matches!(e, Progress::Asked { .. })).collect();
+            if asked.len() >= n {
+                return asked;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("no question was asked in time")
+}
+
+#[tokio::test]
+async fn an_attempts_question_waits_for_the_answer_which_comes_back_as_the_next_requirements() {
+    let model = scripted(|n, req| match n {
+        1 => {
+            assert!(offers(req, "ask_user"));
+            ask_user(req, "Should hello.txt end with a newline?", &["yes", "no"])
+        }
+        2 => {
+            let said = last_text(req);
+            assert!(said.contains("The user answered: yes") && said.contains("version 1"), "{said}");
+            write_hello(req, "hi\n")
+        }
+        _ => done("Wrote hello.txt with a newline, as asked."),
+    });
+    let fake = Fake::new(model, hello_check);
+    let req = RunRequest { interactive: true, ..request(Some("check"), 1) };
+    let run = start_run(&fake, req, "trace_ask", 1).await;
+    let asked = questions(&fake, 1).await;
+    let [Progress::Asked { attempt: 0, question: 1, text, options, .. }] = asked.as_slice() else {
+        panic!("{asked:?}")
+    };
+    assert_eq!(text, "Should hello.txt end with a newline?");
+    assert_eq!(options, &["yes", "no"]);
+    // The attempt waits: the model is not asked again before the answer.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(fake.requests().len(), 1);
+
+    let answer = Constraint { text: "yes".into(), answers: Some(1), ..Constraint::default() };
+    assert_eq!(steer(&fake, "trace_ask", Control::Constrain(answer.clone())).await.unwrap().version, 1);
+    let again = steer(&fake, "trace_ask", Control::Constrain(answer)).await.unwrap_err();
+    assert!(again.message.contains("answered already"), "{again:?}");
+
+    let resp = finished(run).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert_eq!(resp.requirements.len(), 1);
+    assert_eq!((resp.requirements[0].constraint.answers, resp.attempts[0].requirements), (Some(1), 1));
+    let events = fake.events();
+    assert!(events.iter().any(|e| matches!(e, Progress::Required { requirement, .. }
+        if requirement.version == 1 && requirement.constraint.answers == Some(1))));
+}
+
+#[tokio::test]
+async fn a_run_nobody_can_answer_offers_no_ask_user() {
+    let model = scripted(|n, req| match n {
+        1 => {
+            assert!(!offers(req, "ask_user"));
+            ask_user(req, "Tabs or spaces?", &[])
+        }
+        2 => {
+            let result = &req.messages[2]["content"][0];
+            assert_eq!(result["is_error"], json!(true));
+            assert!(result["content"].as_str().unwrap().contains("There is no tool named \"ask_user\""));
+            write_hello(req, "hi\n")
+        }
+        _ => done("Done."),
+    });
+    let fake = Fake::new(model, hello_check);
+    let resp = run(&fake, request(Some("check"), 1)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert!(!fake.events().iter().any(|e| matches!(e, Progress::Asked { .. })));
+}
+
+#[tokio::test]
+async fn questions_are_capped_and_one_left_unanswered_has_the_attempt_decide() {
+    let model = scripted(|n, req| match n {
+        1 => ask_user(req, "Tabs or spaces?", &[]),
+        2 => {
+            let said = last_text(req);
+            assert!(said.starts_with("No answer: decide yourself"), "{said}");
+            ask_user(req, "And the file name?", &[])
+        }
+        3 => {
+            let said = last_text(req);
+            assert!(said.contains("not asked: the run has asked as many questions as it may (1)"), "{said}");
+            write_hello(req, "hi\n")
+        }
+        _ => done("Used spaces: nobody answered."),
+    });
+    let fake = Fake::new(model, hello_check);
+    let cfg = Config { max_questions: 1, ask_timeout: Duration::from_millis(50), ..config() };
+    let resp = run_with(&fake, cfg, RunRequest { interactive: true, ..request(Some("check"), 1) }).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    let events = fake.events();
+    assert_eq!(events.iter().filter(|e| matches!(e, Progress::Asked { .. })).count(), 1);
+    assert!(resp.requirements.is_empty());
 }
 
 // --- Picking among passing attempts (#40) --------------------------------------

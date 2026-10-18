@@ -676,6 +676,8 @@ async fn a_second_run_starts_with_what_the_first_learned_and_a_map_of_the_code()
     assert!(context.contains("def greet(name):"), "{context}");
     let tools: Vec<&str> = attempt["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(tools.contains(&"find_symbol") && tools.contains(&"recall"), "{tools:?}");
+    // A run like `molt do`'s has no one to answer: its attempts are not offered the question.
+    assert!(!tools.contains(&"ask_user"), "{tools:?}");
     // Learning the same thing again confirms the note rather than adding a copy.
     let again = second.learned.unwrap().unwrap();
     assert!(again.added.is_empty() && again.reinforced == vec![note.id.clone()], "{again:#?}");

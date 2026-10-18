@@ -5,6 +5,7 @@
 //! scripted fakes.
 
 mod agent;
+mod ask;
 mod attempt;
 pub mod checkpoint;
 mod control;
@@ -53,6 +54,11 @@ pub struct Config {
     pub model_timeout: Duration,
     /// Deadline for one done-check run.
     pub check_timeout: Duration,
+    /// Questions the attempts of an interactive run may ask the person, in all.
+    pub max_questions: u32,
+    /// How long an attempt waits for the answer to its question before it
+    /// decides itself.
+    pub ask_timeout: Duration,
     /// Runs handled at once.
     pub max_concurrent_runs: usize,
     /// Size of the project map at the start of a run, in estimated tokens.
@@ -92,6 +98,8 @@ impl Default for Config {
             max_tokens: 32_000,
             model_timeout: Duration::from_secs(1200),
             check_timeout: Duration::from_secs(900),
+            max_questions: 3,
+            ask_timeout: Duration::from_secs(600),
             max_concurrent_runs: 4,
             map_tokens: 3_000,
             late_reply_wait: Duration::from_secs(2),
@@ -180,6 +188,8 @@ impl Config {
             max_tokens: small("MOLT_MAX_TOKENS", d.max_tokens)?,
             model_timeout: Duration::from_secs(number("MOLT_MODEL_TIMEOUT_S", d.model_timeout.as_secs())?),
             check_timeout: Duration::from_secs(number("MOLT_CHECK_TIMEOUT_S", d.check_timeout.as_secs())?),
+            max_questions: d.max_questions,
+            ask_timeout: d.ask_timeout,
             map_tokens: small("MOLT_MAP_TOKENS", d.map_tokens)?.min(32_000),
             max_concurrent_runs: d.max_concurrent_runs,
             late_reply_wait: d.late_reply_wait,

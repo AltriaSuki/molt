@@ -298,6 +298,7 @@ impl Attempt {
             Some(_) => prompts::checked_attempt_tools(self.memory_tools, self.web_tools),
             None => prompts::attempt_tools(self.memory_tools, self.web_tools),
         });
+        let tools = if ctx.interactive { Arc::new(prompts::with_ask_user(&tools)) } else { tools };
         // A final reply the model gave before the run stopped, still to be checked.
         let mut given = None;
         let (fork, mut conv) = match resume {

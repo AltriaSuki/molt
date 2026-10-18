@@ -126,6 +126,12 @@ pub struct RunRequest {
     /// Publish model text previews while calls are in flight.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stream: bool,
+    /// A person follows the run and can answer: attempts are offered
+    /// [`tools::ASK_USER`], whose question the planner publishes as
+    /// [`crate::progress::Progress::Asked`]. The answer comes back on
+    /// [`CONTROL`] as a [`Constraint`] that [`Constraint::answers`] it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interactive: bool,
     /// Have a reviewer look at a winner that passed its check, for changes
     /// that game the check, before it is applied. With `apply`, only an
     /// approved result is merged.
@@ -262,6 +268,7 @@ impl RunRequest {
             design_budget_usd: None,
             apply: true,
             stream: false,
+            interactive: false,
             checkpoint: false,
             keep_cancelled_forks: false,
             resume: None,
@@ -310,6 +317,10 @@ pub struct Constraint {
     /// A new done-check command, in place of the one the run had.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<String>,
+    /// The question (of a [`crate::progress::Progress::Asked`]) that `text`
+    /// answers. The attempt that asked waits for it; every attempt follows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<u32>,
 }
 
 /// One version of a run's requirements after the task itself, which is
@@ -699,6 +710,9 @@ pub mod tools {
     pub const FIND_SYMBOL: &str = "find_symbol";
     pub const RECALL: &str = "recall";
     pub const FETCH_URL: &str = "fetch_url";
+    /// Offered only to attempts of an interactive run: ask the person a
+    /// question, and wait a while for the answer.
+    pub const ASK_USER: &str = "ask_user";
     /// Offered only to the check designer: the check it settled on.
     pub const SUBMIT_CHECK: &str = "submit_check";
     /// Offered only to the reviewer: its verdict.
@@ -778,6 +792,14 @@ pub mod tools {
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct FetchUrl {
         pub url: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AskUser {
+        pub question: String,
+        /// Answers to pick from; the person may answer otherwise.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub options: Vec<String>,
     }
 
     /// `command` is `None` when no automated check fits the task (a
