@@ -574,6 +574,7 @@ mod tests {
             winner: Some(1),
             summary: "Added the --verbose flag.".into(),
             changes: vec![Change { path: "src/main.rs".into(), kind: ChangeKind::Modified }],
+            left_out: None,
             patch: "diff".into(),
             patch_truncated: false,
             applied: true,

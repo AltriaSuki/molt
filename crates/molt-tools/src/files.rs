@@ -180,6 +180,19 @@ pub(crate) fn changed(roots: &Roots, workspace: &str, path: &str) -> Option<File
     Some(FilesChanged { workspace: ws.to_string_lossy().into_owned(), paths: vec![paths::slash(&ws, &file)] })
 }
 
+/// Note that a successful write or edit made `path` in `workspace`, when
+/// that is a fork, so the result never leaves the file out as a build artifact.
+pub(crate) fn note_written(roots: &Roots, workspace: &str, path: &str) {
+    let Ok(ws) = roots.workspace(workspace) else { return };
+    if !ws.starts_with(&roots.scratch) {
+        return;
+    }
+    let Ok(file) = paths::relative(path).and_then(|rel| paths::existing(&ws, &rel, path)) else { return };
+    if let Err(e) = crate::fork::record_written(roots, &ws, &file) {
+        tracing::warn!(error = %e, "could not note a write in the fork; a build artifact by that name would be left out");
+    }
+}
+
 pub(crate) fn edit(roots: &Roots, req: EditRequest) -> Result<EditResponse, RemoteError> {
     if req.old.is_empty() {
         return Err(invalid("old is empty; give the exact text to replace"));

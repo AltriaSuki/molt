@@ -23,7 +23,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::failed;
-use crate::{sandbox, Roots, SandboxPolicy};
+use crate::{build_dir, sandbox, Roots, SandboxPolicy};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 3_600_000;
@@ -89,11 +89,16 @@ pub(crate) async fn run(
     req: RunRequest,
     cancel: CancellationToken,
 ) -> Result<RunResponse, RemoteError> {
-    let ws = {
+    // Held until the command is done, so no other command builds into its directory.
+    let (ws, build) = {
         let (roots, ws) = (roots.clone(), req.workspace.clone());
-        tokio::task::spawn_blocking(move || roots.workspace(&ws))
-            .await
-            .map_err(|e| failed(format!("shell.run failed: {e}")))??
+        tokio::task::spawn_blocking(move || {
+            let ws = roots.workspace(&ws)?;
+            let build = build_dir::acquire(&roots, &ws)?;
+            Ok::<_, RemoteError>((ws, build))
+        })
+        .await
+        .map_err(|e| failed(format!("shell.run failed: {e}")))??
     };
     if cancel.is_cancelled() {
         return Err(RemoteError { code: ErrorCode::Cancelled, message: "command cancelled before start".into() });
@@ -102,7 +107,8 @@ pub(crate) async fn run(
 
     let (mut cmd, guard) = match policy {
         Some(policy) => {
-            let (cmd, guard) = policy.prepare(roots, &ws, program).map_err(|e| failed(format!("sandbox: {e:#}")))?;
+            let (cmd, guard) =
+                policy.prepare(roots, &ws, program, &build).map_err(|e| failed(format!("sandbox: {e:#}")))?;
             (cmd, Some(guard))
         }
         None => (Command::new(program), None),
@@ -116,6 +122,13 @@ pub(crate) async fn run(
         .process_group(0);
     if policy.is_none() {
         cmd.env_clear().envs(child_env());
+        // Unconfined, the same private directories, unless the user's
+        // environment already chose where builds go.
+        for (name, value) in build.env() {
+            if std::env::var_os(name).is_none() {
+                cmd.env(name, value);
+            }
+        }
     }
     let started = Instant::now();
     let (mut child, group) = Group::spawn(&mut cmd, groups, &cancel, guard.as_ref().map(|guard| guard.info.clone()))?;
@@ -141,6 +154,7 @@ pub(crate) async fn run(
     // Whatever escaped the group (a daemon that called setsid) may still hold a pipe.
     readers.abort_all();
 
+    drop(build);
     let (stdout, out_cut) = take(&stdout).finish();
     let (stderr, err_cut) = take(&stderr).finish();
     Ok(RunResponse {

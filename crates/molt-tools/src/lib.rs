@@ -7,6 +7,7 @@
 //! one, when `scratch` does. Forks are created in `scratch`.
 
 mod apply;
+mod build_dir;
 mod error;
 mod files;
 mod fork;
@@ -139,6 +140,9 @@ impl Fs {
                 blocking(method, payload, move |req: api::WriteRequest| {
                     let (workspace, path) = (req.workspace.clone(), req.path.clone());
                     let reply = files::write(&roots, req)?;
+                    if !files::rejected(&reply.syntax) {
+                        files::note_written(&roots, &workspace, &path);
+                    }
                     let changed =
                         if files::rejected(&reply.syntax) { None } else { files::changed(&roots, &workspace, &path) };
                     Ok((reply, changed))
@@ -149,6 +153,9 @@ impl Fs {
                 blocking(method, payload, move |req: api::EditRequest| {
                     let (workspace, path) = (req.workspace.clone(), req.path.clone());
                     let reply = files::edit(&roots, req)?;
+                    if !files::rejected(&reply.syntax) {
+                        files::note_written(&roots, &workspace, &path);
+                    }
                     let changed =
                         if files::rejected(&reply.syntax) { None } else { files::changed(&roots, &workspace, &path) };
                     Ok((reply, changed))

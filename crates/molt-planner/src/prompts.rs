@@ -23,6 +23,8 @@ Your workspace:
 - It is a private copy of the user's workspace, without .git. Do not run git commands.
 - Ignored dependency and build directories (such as target/ or node_modules/) are links to the user's originals. \
 Use them, but never modify or delete anything inside them.
+- Build output already goes to a private writable directory outside the workspace (CARGO_TARGET_DIR and GOCACHE \
+are set, and Python writes no bytecode), so do not set CARGO_TARGET_DIR yourself or build into the workspace.
 - Paths in tool calls are relative to the workspace root, and commands run there.
 
 How to work:
@@ -96,6 +98,8 @@ Your workspace:
 - It is a private copy of the user's workspace, without .git. Do not run git commands.
 - Ignored dependency and build directories (such as target/ or node_modules/) are links to the user's originals. \
 Use them, but never modify or delete anything inside them.
+- Build output already goes to a private writable directory outside the workspace (CARGO_TARGET_DIR and GOCACHE \
+are set, and Python writes no bytecode), so do not set CARGO_TARGET_DIR yourself or build into the workspace.
 - Paths in tool calls are relative to the workspace root, and commands run there.
 
 How to design the check:
