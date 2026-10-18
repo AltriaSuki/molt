@@ -158,6 +158,11 @@ pub struct RunRequest {
     /// project data; a file too large is named with its size only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    /// The workflow to run, by name: one the planner defines (see
+    /// [`crate::workflow`]). A request names one and never defines one.
+    /// `None`: [`crate::workflow::VERIFY`], which the fields above configure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
 }
 
 /// A task done before this one in the same conversation.
@@ -263,6 +268,7 @@ impl RunRequest {
             review: true,
             earlier: Vec::new(),
             files: Vec::new(),
+            workflow: None,
         }
     }
 }
@@ -605,6 +611,43 @@ pub struct RunResponse {
     /// to keep the reply small where it is rarely set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispute: Option<Box<CheckDispute>>,
+    /// How the result was verified, or would have been had an attempt
+    /// passed. `None` only in a reply from an older planner, which did not
+    /// say: unknown, not unverified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<Verification>,
+}
+
+/// What a result was held to: the level of evidence behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verification {
+    /// A done-check command, run by the planner in the result's fork.
+    Command,
+    /// A rubric: an independent model judge, and the criteria's own commands.
+    Judged,
+    /// Only the review's fixed rules over the diff. No workflow of schema 1
+    /// produces it yet; it is named so that readers know it.
+    Rules,
+    /// Nothing checked the result.
+    None,
+}
+
+impl Verification {
+    pub fn name(self) -> &'static str {
+        match self {
+            Verification::Command => "command",
+            Verification::Judged => "judged",
+            Verification::Rules => "rules",
+            Verification::None => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for Verification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 /// How the passing attempts were compared.
@@ -881,6 +924,32 @@ mod tests {
         assert!(wire.get("verify").is_none() && wire.get("check_files").is_none(), "{wire}");
         assert!(wire.get("review").is_none(), "{wire}");
         assert!(wire.get("select").is_none() && wire.get("suite").is_none(), "{wire}");
+    }
+
+    #[test]
+    fn a_request_without_a_workflow_reads_and_writes_as_before() {
+        let wire = serde_json::json!({"task": "t", "workspace": "/w"});
+        let req: RunRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(req.workflow, None);
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::json!({"task": "t", "workspace": "/w", "attempts": 2, "apply": true})
+        );
+        let req = RunRequest { workflow: Some("verify".into()), ..req };
+        assert_eq!(serde_json::to_value(&req).unwrap()["workflow"], "verify");
+    }
+
+    #[test]
+    fn verification_levels_have_their_wire_names() {
+        for (level, name) in [
+            (Verification::Command, "command"),
+            (Verification::Judged, "judged"),
+            (Verification::Rules, "rules"),
+            (Verification::None, "none"),
+        ] {
+            assert_eq!(serde_json::to_value(level).unwrap(), name);
+            assert_eq!(level.to_string(), name);
+        }
     }
 
     #[test]

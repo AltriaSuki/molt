@@ -11,7 +11,7 @@ use molt_api::memory;
 use molt_api::model::{CompleteRequest, CompleteResponse, Usage};
 use molt_api::planner::{
     AttemptStatus, CheckSpec, Constraint, Control, ControlRequest, ControlResponse, Criterion, Earlier, Outcome,
-    Requirement, Review, RunRequest, RunResponse, RunState, Select, Verdict,
+    Requirement, Review, RunRequest, RunResponse, RunState, Select, Verdict, Verification,
 };
 use molt_api::progress::Progress;
 use molt_api::shell;
@@ -3248,4 +3248,149 @@ async fn a_dispute_saved_in_a_checkpoint_is_reported_after_the_resume() {
     assert_eq!(resp.outcome, Outcome::Failed, "{}", resp.summary);
     assert_eq!(resp.dispute, Some(Box::new(disputed)));
     assert_eq!(resp.attempts[0].status, AttemptStatus::Cancelled);
+}
+
+// --- Workflows -----------------------------------------------------------------
+
+/// A workflow of the planner's own configuration with only `enabled` stages.
+fn workflow(name: &str, enabled: &[&str]) -> molt_api::workflow::Workflow {
+    use molt_api::workflow::{Design, Stage, Stages, Workflow, SCHEMA};
+    let on = |stage: &str| enabled.contains(&stage).then_some(Stage {});
+    let stages = Stages {
+        context: on("context"),
+        design: enabled.contains(&"design").then_some(Design::default()),
+        attempts: on("attempts"),
+        compare: on("compare"),
+        review: on("review"),
+        deliver: on("deliver"),
+        learn: on("learn"),
+    };
+    Workflow { schema: SCHEMA, name: name.into(), description: String::new(), stages }
+}
+
+fn with_workflows(workflows: Vec<molt_api::workflow::Workflow>) -> Config {
+    Config { workflows, ..config() }
+}
+
+#[tokio::test]
+async fn a_workflow_of_only_context_attempts_and_deliver_runs_end_to_end() {
+    let fake = Fake::new(
+        |req| {
+            assert!(!is_designer(req) && !is_reviewer(req), "the workflow designs and reviews nothing");
+            match turn(req) {
+                1 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            }
+        },
+        |_, _| panic!("no command should run"),
+    );
+    fake.set(|st| {
+        st.workspace.insert("AGENTS.md".into(), "Say hi.\n".into());
+    });
+    let cfg = with_workflows(vec![workflow("bare", &["context", "attempts", "deliver"])]);
+    let req = RunRequest { workflow: Some("bare".into()), review: true, ..request(None, 3) };
+    let resp = run_with(&fake, cfg, req).await;
+
+    assert_eq!(resp.outcome, Outcome::Unverified, "{}", resp.summary);
+    assert_eq!(resp.verification, Some(Verification::None));
+    assert_eq!((resp.check, resp.winner, resp.applied, resp.review), (None, Some(0), true, None));
+    assert_eq!(resp.attempts.len(), 1, "without a check there is nothing to race on");
+    assert_eq!(fake.workspace().get("hello.txt").map(String::as_str), Some("hi\n"));
+    // The context stage ran: the project's instructions open the conversation.
+    let first = fake.requests()[0].messages[0]["content"][0]["text"].as_str().unwrap().to_owned();
+    assert!(first.contains("<file path=\"AGENTS.md\">\nSay hi.\n"), "{first}");
+    assert!(fake.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
+        if message == "running without a done-check: workflow bare designs none")));
+    assert!(fake.forks_alive().is_empty());
+}
+
+#[tokio::test]
+async fn a_workflow_without_context_or_review_takes_the_given_check_and_skips_both() {
+    let fake = Fake::new(
+        |req| {
+            assert!(!is_reviewer(req), "the workflow has no review stage");
+            match turn(req) {
+                1 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            }
+        },
+        hello_check,
+    );
+    fake.set(|st| {
+        st.workspace.insert("AGENTS.md".into(), "Say hi.\n".into());
+    });
+    let cfg = with_workflows(vec![workflow("lean", &["attempts", "deliver"])]);
+    let req = RunRequest { workflow: Some("lean".into()), review: true, ..request(Some("check"), 1) };
+    let resp = run_with(&fake, cfg, req).await;
+
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert_eq!(resp.verification, Some(Verification::Command));
+    assert!(resp.applied && resp.review.is_none());
+    for req in fake.requests() {
+        let first = req.messages[0]["content"][0]["text"].as_str().unwrap();
+        assert!(!first.contains("<project_instructions>"), "{first}");
+    }
+}
+
+#[tokio::test]
+async fn every_result_carries_its_verification_level() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        },
+        hello_check,
+    );
+    let resp = run(&fake, request(Some("check"), 1)).await;
+    assert_eq!((resp.outcome, resp.verification), (Outcome::Passed, Some(Verification::Command)));
+    // Naming the default changes nothing.
+    let resp = run(&fake, RunRequest { workflow: Some("verify".into()), ..request(Some("check"), 1) }).await;
+    assert_eq!((resp.outcome, resp.verification), (Outcome::Passed, Some(Verification::Command)));
+    let resp = run(&fake, RunRequest { verify: false, ..request(None, 1) }).await;
+    assert_eq!((resp.outcome, resp.verification), (Outcome::Unverified, Some(Verification::None)));
+    let wire = serde_json::to_value(&resp).unwrap();
+    assert_eq!(wire["verification"], "none");
+
+    let fails = Fake::new(|_| done("Gave up."), hello_check);
+    let resp = run(&fails, request(Some("check"), 1)).await;
+    assert_eq!((resp.outcome, resp.verification), (Outcome::Failed, Some(Verification::Command)));
+}
+
+#[tokio::test]
+async fn a_request_can_name_a_workflow_but_only_one_the_planner_has() {
+    let fake = Fake::new(|_| panic!("no model call"), |_, _| panic!("no command"));
+    let cfg = Arc::new(with_workflows(vec![
+        workflow("bare", &["context", "attempts", "deliver"]),
+        workflow("broken", &["context", "attempts"]),
+    ]));
+    let refused = |req: RunRequest| {
+        let (fake, cfg) = (fake.clone(), cfg.clone());
+        async move {
+            let bus: Arc<dyn Bus> = fake;
+            molt_planner::run(bus, cfg, req, TraceId::from_raw("trace_test")).await.unwrap_err()
+        }
+    };
+    let unknown = refused(RunRequest { workflow: Some("mine".into()), ..request(None, 1) }).await;
+    assert_eq!(unknown.code, ErrorCode::Invalid);
+    assert!(
+        unknown.message.contains("no workflow is named \"mine\": this planner has verify, bare"),
+        "{}",
+        unknown.message
+    );
+    let broken = refused(RunRequest { workflow: Some("broken".into()), ..request(None, 1) }).await;
+    assert!(broken.message.contains("must enable the attempts and deliver stages"), "{}", broken.message);
+    let select =
+        refused(RunRequest { workflow: Some("bare".into()), select: Select::All, ..request(Some("check"), 2) }).await;
+    assert!(select.message.contains("no compare stage"), "{}", select.message);
+    let bus: Arc<dyn Bus> = fake.clone();
+    let design = molt_planner::design(
+        bus,
+        cfg.clone(),
+        RunRequest { workflow: Some("bare".into()), ..request(None, 1) },
+        TraceId::from_raw("trace_test"),
+    )
+    .await
+    .unwrap_err();
+    assert!(design.message.contains("has no design stage"), "{}", design.message);
+    assert!(fake.calls().is_empty());
 }

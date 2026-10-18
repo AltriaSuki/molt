@@ -75,6 +75,9 @@ pub struct Config {
     /// What the model's file writes and edits do about syntax errors they
     /// introduce, for runs that do not say.
     pub syntax_check: molt_api::fs::SyntaxCheck,
+    /// Workflows a run may name besides the built-ins. They come from
+    /// whoever starts the planner, never from a request or a project.
+    pub workflows: Vec<molt_api::workflow::Workflow>,
 }
 
 impl Default for Config {
@@ -97,6 +100,7 @@ impl Default for Config {
             state_dir: None,
             instruction_files: vec!["AGENTS.md".into(), "CLAUDE.md".into()],
             syntax_check: molt_api::fs::SyntaxCheck::Report,
+            workflows: Vec::new(),
         }
     }
 }
@@ -201,6 +205,7 @@ impl Config {
                 Some(v) => serde_json::from_value(Value::String(v.clone()))
                     .map_err(|_| anyhow::anyhow!("MOLT_SYNTAX_CHECK={v:?}: use report, reject or off"))?,
             },
+            workflows: d.workflows,
         })
     }
 }

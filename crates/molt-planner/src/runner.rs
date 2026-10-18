@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use molt_api::planner::{
     AttemptStatus, Candidate, CheckDispute, CheckFile, CheckSpec, Criterion, DesignResponse, Outcome, Resume, Review,
-    RunRequest, RunResponse, Select, Selection, Verdict,
+    RunRequest, RunResponse, Select, Selection, Verdict, Verification,
 };
 use molt_api::progress::Progress;
+use molt_api::workflow::{self, Workflow};
 use molt_proto::{ErrorCode, RemoteError, TraceId};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -53,21 +54,22 @@ pub(crate) async fn run_cancellable(
     let mut ctx = Ctx::new(bus, cfg, trace, &req);
     ctx.cancel = cancel.clone();
     ctx.run_cancel = cancel;
-    ctx.memory = memory::prepare(&ctx).await;
     if let Some(dir) = &state {
         let store = Store::create(dir, Saved::new(ctx.trace.as_str(), req.clone())).map_err(failed)?;
         ctx.checkpoint = Some(Arc::new(store));
     }
-    ctx.instructions = instructions::gather(&ctx).await;
-    ctx.referenced = referenced::gather(&ctx).await;
+    gather_context(&mut ctx).await;
     let ctx = Arc::new(ctx);
     let _steer = steer(&ctx);
     if let Some(dir) = &state {
         prune(&ctx, dir).await;
     }
-    tracing::info!(run = %ctx.trace, workspace = %ctx.workspace, attempts = req.attempts, "run started");
+    tracing::info!(
+        run = %ctx.trace, workspace = %ctx.workspace, attempts = req.attempts, workflow = %ctx.workflow.name,
+        "run started"
+    );
 
-    let designed = designed_here(&req);
+    let designed = designed_here(&req, &ctx.workflow);
     let settled = match settle_check(&ctx, &req).await? {
         Ok(settled) => settled,
         Err(reason) => return Ok(finish_early(&ctx, not_designed(&ctx, &reason)).await),
@@ -107,9 +109,7 @@ async fn resume_run(
     let mut ctx = Ctx::new(bus, cfg, trace, &run_req);
     ctx.cancel = cancel.clone();
     ctx.run_cancel = cancel;
-    ctx.memory = memory::prepare(&ctx).await;
-    ctx.instructions = instructions::gather(&ctx).await;
-    ctx.referenced = referenced::gather(&ctx).await;
+    gather_context(&mut ctx).await;
     ctx.restore(&saved.spend, saved.open_calls);
     ctx.control = Control::new(saved.requirements.clone());
     let mut next = saved.clone();
@@ -144,7 +144,7 @@ async fn resume_run(
         (Settled { check, rubric: saved.rubric.clone() }, designed)
     } else {
         // Stopped while the check was being designed: design it again.
-        let designed = designed_here(&run_req);
+        let designed = designed_here(&run_req, &ctx.workflow);
         match settle_check(&ctx, &run_req).await? {
             Ok(settled) => {
                 save_check(&ctx, &settled, designed);
@@ -215,9 +215,48 @@ fn failed(message: impl Into<String>) -> RemoteError {
 }
 
 /// Whether this run designs its check: it is given none (a check with files
-/// came from `planner.design`, and so did a rubric).
-fn designed_here(req: &RunRequest) -> bool {
-    req.verify && ((req.check.is_none() && req.rubric.is_empty()) || !req.check_files.is_empty())
+/// came from `planner.design`, and so did a rubric), and its workflow designs.
+fn designed_here(req: &RunRequest, workflow: &Workflow) -> bool {
+    workflow.stages.design.is_some()
+        && req.verify
+        && ((req.check.is_none() && req.rubric.is_empty()) || !req.check_files.is_empty())
+}
+
+/// The workflow `name` names: a built-in, or one of the planner's own
+/// configuration. `None` is [`workflow::VERIFY`].
+pub(crate) fn workflow(cfg: &Config, name: Option<&str>) -> Result<Workflow, String> {
+    let found = match workflow::builtin(name) {
+        Some(builtin) => builtin,
+        None => {
+            let name = name.unwrap_or_default();
+            let known = || {
+                std::iter::once(workflow::VERIFY)
+                    .chain(cfg.workflows.iter().map(|w| w.name.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            cfg.workflows
+                .iter()
+                .find(|w| w.name == name)
+                .cloned()
+                .ok_or_else(|| format!("no workflow is named {name:?}: this planner has {}", known()))?
+        }
+    };
+    match found.problem() {
+        Some(problem) => Err(problem),
+        None => Ok(found),
+    }
+}
+
+/// The context stage: what the model is given besides the task. A workflow
+/// without it gives the model the task, the earlier tasks and the tools only.
+async fn gather_context(ctx: &mut Ctx) {
+    if ctx.workflow.stages.context.is_none() {
+        return;
+    }
+    ctx.memory = memory::prepare(ctx).await;
+    ctx.instructions = instructions::gather(ctx).await;
+    ctx.referenced = referenced::gather(ctx).await;
 }
 
 /// How a run accepts a result: by its done-check, by a rubric an
@@ -249,6 +288,10 @@ async fn settle_check(ctx: &Arc<Ctx>, req: &RunRequest) -> Result<Result<Settled
         None if !req.rubric.is_empty() => Settled { check: None, rubric: req.rubric.clone() },
         None if !req.verify => {
             ctx.note("running without a done-check, as asked").await;
+            none
+        }
+        None if ctx.workflow.stages.design.is_none() => {
+            ctx.note(format!("running without a done-check: workflow {} designs none", ctx.workflow.name)).await;
             none
         }
         None => match designer::design(ctx, false).await? {
@@ -408,11 +451,13 @@ pub(crate) async fn design_cancellable(
         return Err(RemoteError { code: ErrorCode::Invalid, message });
     }
     let mut ctx = Ctx::new(bus, cfg, trace, &req);
+    if ctx.workflow.stages.design.is_none() {
+        let message = format!("workflow {:?} has no design stage: planner.design has nothing to do", ctx.workflow.name);
+        return Err(RemoteError { code: ErrorCode::Invalid, message });
+    }
     ctx.cancel = cancel.clone();
     ctx.run_cancel = cancel;
-    ctx.memory = memory::prepare(&ctx).await;
-    ctx.instructions = instructions::gather(&ctx).await;
-    ctx.referenced = referenced::gather(&ctx).await;
+    gather_context(&mut ctx).await;
     let ctx = Arc::new(ctx);
     let design = designer::design(&ctx, true).await;
     // A failed or cancelled design still issued billable calls. Settle it
@@ -476,7 +521,13 @@ fn inside(path: &str) -> bool {
 /// Whether the planner can carry out `req`, with `cfg`'s default budget for one that sets none.
 fn validate(req: &RunRequest, cfg: &Config) -> Result<(), RemoteError> {
     let budget = req.budget_usd.unwrap_or(cfg.budget_usd);
-    let problem = if req.task.trim().is_empty() {
+    let flow = workflow(cfg, req.workflow.as_deref()).map_err(invalid)?;
+    let problem = if flow.stages.compare.is_none() && !req.select.is_first() {
+        format!(
+            "select {} compares attempts that pass, and workflow {:?} has no compare stage: leave select out",
+            req.select, flow.name
+        )
+    } else if req.task.trim().is_empty() {
         "task is empty".to_owned()
     } else if req.workspace.trim().is_empty() {
         "workspace is empty".to_owned()
@@ -664,6 +715,7 @@ async fn conclude(
         rubric: rubric.to_vec(),
         judgement: Vec::new(),
         dispute: None,
+        verification: Some(verification(spec.as_ref(), rubric)),
     };
     let outcome = match (&spec, rubric.is_empty()) {
         (Some(_), _) => Outcome::Passed,
@@ -742,7 +794,8 @@ async fn review_of(
     diff: &molt_api::fs::DiffResponse,
 ) -> Option<Review> {
     // Reviewed against the check it passed and the requirements it followed.
-    let check = check.filter(|_| req.review && !diff.changes.is_empty())?;
+    let reviews = req.review && ctx.workflow.stages.review.is_some();
+    let check = check.filter(|_| reviews && !diff.changes.is_empty())?;
     let requirements = ctx.control.upto(done.report.requirements);
     let winner = Winner {
         fork,
@@ -1002,6 +1055,16 @@ fn not_designed(ctx: &Ctx, reason: &str) -> RunResponse {
         rubric: Vec::new(),
         judgement: Vec::new(),
         dispute: None,
+        verification: Some(Verification::None),
+    }
+}
+
+/// What a run's result is held to: its check, else its rubric, else nothing.
+fn verification(check: Option<&CheckSpec>, rubric: &[Criterion]) -> Verification {
+    match (check, rubric.is_empty()) {
+        (Some(_), _) => Verification::Command,
+        (None, false) => Verification::Judged,
+        (None, true) => Verification::None,
     }
 }
 

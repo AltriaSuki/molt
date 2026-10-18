@@ -24,3 +24,4 @@ pub mod progress;
 pub mod shell;
 pub mod skills;
 pub mod web;
+pub mod workflow;

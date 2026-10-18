@@ -545,6 +545,11 @@ pub async fn run_task_as(
     if req.stream {
         require_stream_capability(cfg)?;
     }
+    // Learning is the workflow's last stage, and this side runs it. A
+    // workflow defined in the planner's own configuration is not known
+    // here: it learns as asked.
+    let learns = molt_api::workflow::builtin(req.workflow.as_deref()).is_none_or(|w| w.stages.learn.is_some());
+    let learn = learn.filter(|_| learns);
     let running = crate::start(cfg).await?;
     // Before planner.run, the only caller that makes forks.
     let forks = RunForks::before(cfg);
@@ -1022,6 +1027,9 @@ pub fn report_at(resp: &RunResponse, workspace: Option<&str>) -> String {
         Some(_) => format!("outcome: {}, the check was disputed", outcome_name(resp.outcome)),
         None => format!("outcome: {}", outcome_name(resp.outcome)),
     }];
+    if let Some(level) = resp.verification {
+        lines.push(format!("verification: {level}"));
+    }
     if let Some(check) = &resp.check {
         let by = if check.designed { " (designed by the planner)" } else { "" };
         lines.push(format!("check: {}{by}", check.command));
@@ -1611,6 +1619,18 @@ mod tests {
     }
 
     #[test]
+    fn the_report_says_how_the_result_was_verified_when_the_planner_does() {
+        let resp: RunResponse = serde_json::from_value(serde_json::json!({
+            "outcome": "unverified", "summary": "", "changes": [], "patch": "", "applied": false,
+            "attempts": [], "usage": {}, "cost_usd": 0.0, "verification": "none"
+        }))
+        .unwrap();
+        assert!(report(&resp).starts_with("outcome: unverified\nverification: none\n"), "{}", report(&resp));
+        let older = RunResponse { verification: None, ..resp };
+        assert!(!report(&older).contains("verification"), "{}", report(&older));
+    }
+
+    #[test]
     fn report_lines() {
         let mut resp = RunResponse {
             outcome: Outcome::Passed,
@@ -1634,6 +1654,7 @@ mod tests {
             rubric: vec![],
             judgement: vec![],
             dispute: None,
+            verification: None,
         };
         assert_eq!(
             report(&resp),
