@@ -405,7 +405,11 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 span(format!("  $ {}", clean_line(req.check.as_deref().unwrap_or_default())), Tone::Dim),
             ]),
             if *stopped {
-                keys(&[("r", "start again with the same check"), ("v", "what the attempts did"), ("esc", "dismiss")])
+                keys(&[
+                    ("r", "start again with the same check, on a budget of its own"),
+                    ("v", "what the attempts did"),
+                    ("esc", "dismiss"),
+                ])
             } else {
                 keys(&[("r", "retry with the same check"), ("v", "why"), ("esc", "dismiss")])
             },
@@ -665,8 +669,16 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         parts.push("previews off".into());
     }
     let mut cost = format!("${:.2}", app.spent_usd);
+    if app.uncounted_calls > 0 || app.uncounted_stops > 0 {
+        cost.push_str(" known");
+    }
     if app.uncounted_calls > 0 {
-        cost.push_str(&format!(" known · {} calls uncounted", app.uncounted_calls));
+        cost.push_str(&format!(" · {} calls uncounted", app.uncounted_calls));
+    }
+    match app.uncounted_stops {
+        0 => {}
+        1 => cost.push_str(" · 1 stopped task uncounted"),
+        n => cost.push_str(&format!(" · {n} stopped tasks uncounted")),
     }
     // Without previews no call's cost arrives before the reply.
     let task = app.task.as_ref().filter(|t| t.req.stream && matches!(t.phase, Phase::Designing | Phase::Running));

@@ -136,6 +136,12 @@ pub struct RunRequest {
     /// `resume`. Needs a planner that keeps checkpoints.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub checkpoint: bool,
+    /// When the caller cancels the run, leave the attempts' forks where they
+    /// are instead of dropping them: the caller looks at what they changed,
+    /// keeps the ones that hold work and drops the rest itself. A run that
+    /// ends any other way, out of budget included, still drops them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_cancelled_forks: bool,
     /// Go on with the checkpointed run named here rather than start one. The
     /// task, check, attempts, model and limits are the checkpoint's; `apply`,
     /// `stream`, and a `budget_usd` or `design_budget_usd` given here replace
@@ -252,6 +258,7 @@ impl RunRequest {
             apply: true,
             stream: false,
             checkpoint: false,
+            keep_cancelled_forks: false,
             resume: None,
             review: true,
             earlier: Vec::new(),
