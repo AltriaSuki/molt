@@ -3372,14 +3372,14 @@ async fn a_dispute_saved_in_a_checkpoint_is_reported_after_the_resume() {
 
 /// A workflow of the planner's own configuration with only `enabled` stages.
 fn workflow(name: &str, enabled: &[&str]) -> molt_api::workflow::Workflow {
-    use molt_api::workflow::{Design, Stage, Stages, Workflow, SCHEMA};
+    use molt_api::workflow::{Attempts, Design, Review, Stage, Stages, Workflow, SCHEMA};
     let on = |stage: &str| enabled.contains(&stage).then_some(Stage {});
     let stages = Stages {
         context: on("context"),
         design: enabled.contains(&"design").then_some(Design::default()),
-        attempts: on("attempts"),
+        attempts: enabled.contains(&"attempts").then_some(Attempts::default()),
         compare: on("compare"),
-        review: on("review"),
+        review: enabled.contains(&"review").then_some(Review::default()),
         deliver: on("deliver"),
         learn: on("learn"),
     };
@@ -3491,7 +3491,7 @@ async fn a_request_can_name_a_workflow_but_only_one_the_planner_has() {
     let unknown = refused(RunRequest { workflow: Some("mine".into()), ..request(None, 1) }).await;
     assert_eq!(unknown.code, ErrorCode::Invalid);
     assert!(
-        unknown.message.contains("no workflow is named \"mine\": this planner has verify, bare"),
+        unknown.message.contains("no workflow is named \"mine\": this planner has verify, ask, quick, bare"),
         "{}",
         unknown.message
     );
@@ -3511,4 +3511,279 @@ async fn a_request_can_name_a_workflow_but_only_one_the_planner_has() {
     .unwrap_err();
     assert!(design.message.contains("has no design stage"), "{}", design.message);
     assert!(fake.calls().is_empty());
+}
+
+// --- Light workflows -----------------------------------------------------------
+
+fn is_router(req: &CompleteRequest) -> bool {
+    req.tools.iter().any(|t| t["name"] == "submit_route")
+}
+
+fn submit_route(req: &CompleteRequest, workflow: &str) -> Reply {
+    use_tools(req, &[("submit_route", json!({ "workflow": workflow, "reason": "a small local change" }))])
+}
+
+fn tool_names(req: &CompleteRequest) -> Vec<String> {
+    req.tools.iter().filter_map(|t| t["name"].as_str().map(str::to_owned)).collect()
+}
+
+fn routed(fake: &Fake) -> Vec<String> {
+    fake.events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Progress::Routed { workflow, .. } => Some(workflow),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_question_is_answered_in_the_workspace_without_a_fork_a_design_or_a_change() {
+    let fake = Fake::new(
+        |req| {
+            assert!(!is_designer(req) && !is_reviewer(req) && !is_router(req), "asking designs and reviews nothing");
+            let tools = tool_names(req);
+            assert!(tools.iter().all(|t| ["read_file", "list_files", "search"].contains(&t.as_str())), "{tools:?}");
+            match turn(req) {
+                1 => use_tools(req, &[("read_file", json!({ "path": "README.md" }))]),
+                // Not offered, and refused unrun all the same.
+                2 => write_hello(req, "hi\n"),
+                _ => done("It is a project with a README."),
+            }
+        },
+        |_, _| panic!("asking runs no command"),
+    );
+    let req = RunRequest { workflow: Some("ask".into()), review: true, ..request(None, 3) };
+    let resp = run(&fake, req).await;
+
+    assert_eq!((resp.outcome, resp.verification), (Outcome::Unverified, Some(Verification::None)), "{}", resp.summary);
+    assert_eq!(resp.summary, "It is a project with a README.");
+    assert_eq!(resp.workflow.as_deref(), Some("ask"));
+    assert_eq!((resp.attempts.len(), resp.winner, resp.applied, resp.fork), (1, Some(0), false, None));
+    assert!(resp.changes.is_empty() && resp.check.is_none() && resp.review.is_none());
+    assert!(fake.calls_to(fs::FORK).is_empty(), "an answer needs no fork");
+    assert!(fake.calls_to(fs::WRITE).is_empty() && !fake.workspace().contains_key("hello.txt"));
+    let read = &fake.calls_to(fs::READ)[0];
+    assert_eq!(read.payload["workspace"], WORKSPACE, "it reads the workspace itself");
+    let refused = last_text(&fake.requests()[2]);
+    assert!(refused.contains("write_file is not available: this task only reads"), "{refused}");
+    assert!(fake.requests()[0].system.as_deref().unwrap().contains("tools that only read"));
+}
+
+#[tokio::test]
+async fn asking_refuses_a_check_and_a_checkpoint() {
+    let fake = Fake::new(|_| panic!("no model call"), |_, _| panic!("no command"));
+    let state = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(Config { state_dir: Some(state.path().into()), ..config() });
+    for req in [
+        RunRequest { workflow: Some("ask".into()), ..request(Some("check"), 1) },
+        RunRequest { workflow: Some("ask".into()), checkpoint: true, ..request(None, 1) },
+    ] {
+        let bus: Arc<dyn Bus> = fake.clone();
+        let err = molt_planner::run(bus, cfg.clone(), req, TraceId::from_raw("trace_test")).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid, "{}", err.message);
+    }
+    assert!(fake.calls().is_empty());
+}
+
+#[tokio::test]
+async fn quick_runs_exactly_one_attempt_without_designing_and_reviews_by_the_fixed_rules() {
+    let fake = Fake::new(
+        |req| {
+            assert!(
+                !is_designer(req) && !is_reviewer(req) && !is_router(req),
+                "quick designs no check, asks no reviewer"
+            );
+            match turn(req) {
+                1 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            }
+        },
+        |_, _| panic!("no check was given"),
+    );
+    let req = RunRequest { workflow: Some("quick".into()), review: true, ..request(None, 3) };
+    let resp = run(&fake, req).await;
+
+    assert_eq!((resp.outcome, resp.verification), (Outcome::Unverified, Some(Verification::Rules)), "{}", resp.summary);
+    assert_eq!(resp.workflow.as_deref(), Some("quick"));
+    assert_eq!(resp.attempts.len(), 1, "quick runs one attempt whatever the request asks");
+    assert_eq!(fake.calls_to(fs::FORK).len(), 1);
+    let review = resp.review.as_ref().expect("the fixed rules looked at the diff");
+    assert_eq!(review.verdict, Verdict::Approve);
+    assert!(review.details.as_ref().is_some_and(|d| d.rules.is_empty() && d.reviewer.is_none()));
+    assert!(resp.applied && fake.workspace().get("hello.txt").is_some_and(|t| t == "hi\n"));
+    assert!(!resp.conversation.is_empty(), "the winner's conversation comes back for a task that goes on");
+}
+
+#[tokio::test]
+async fn quick_keeps_a_change_the_fixed_rules_question_and_runs_a_given_check_once() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => use_tools(
+                req,
+                &[("write_file", json!({ "path": "tests/api.rs", "content": "#[ignore]\n#[test]\nfn t() {}\n" }))],
+            ),
+            _ => done("Skipped the slow test."),
+        },
+        |_, _| panic!("no check was given"),
+    );
+    let req = RunRequest { workflow: Some("quick".into()), review: true, ..request(None, 1) };
+    let resp = run(&fake, req).await;
+    assert_eq!(resp.review.as_ref().map(|r| r.verdict), Some(Verdict::Concern), "{}", resp.summary);
+    assert!(!resp.applied && resp.fork.is_some(), "{}", resp.summary);
+    assert!(!fake.workspace().contains_key("tests/api.rs"));
+
+    let fake = Fake::new(
+        |req| {
+            assert!(!is_reviewer(req) && !is_designer(req));
+            match turn(req) {
+                1 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            }
+        },
+        hello_check,
+    );
+    let req = RunRequest { workflow: Some("quick".into()), review: true, ..request(Some("check"), 4) };
+    let resp = run(&fake, req).await;
+    assert_eq!((resp.outcome, resp.verification), (Outcome::Passed, Some(Verification::Command)), "{}", resp.summary);
+    assert_eq!(resp.attempts.len(), 1);
+    assert!(resp.applied && resp.review.is_some_and(|r| r.verdict == Verdict::Approve));
+}
+
+#[tokio::test]
+async fn a_task_that_goes_on_sends_the_previous_conversation_to_the_model() {
+    let fake = Fake::new(
+        |req| {
+            let second = req.messages.iter().any(|m| m.to_string().contains("Now add bye.txt too."));
+            match (second, turn(req)) {
+                (false, 1) => write_hello(req, "hi\n"),
+                (false, _) => done("Wrote hello.txt."),
+                (true, _) if last_text(req).contains("bye.txt (created)") => done("Wrote bye.txt."),
+                (true, _) => use_tools(req, &[("write_file", json!({ "path": "bye.txt", "content": "bye\n" }))]),
+            }
+        },
+        |_, _| panic!("no check"),
+    );
+    let first = run(&fake, RunRequest { workflow: Some("quick".into()), apply: false, ..request(None, 1) }).await;
+    let kept = first.fork.clone().expect("kept, as asked");
+    assert!(!first.conversation.is_empty());
+    let asked = fake.requests().len();
+
+    let next = RunRequest {
+        continues: Some(molt_api::planner::Continuation {
+            conversation: first.conversation.clone(),
+            fork: Some(kept.clone()),
+        }),
+        workflow: Some("quick".into()),
+        ..RunRequest { task: "Now add bye.txt too.".into(), ..request(None, 3) }
+    };
+    let resp = run(&fake, next).await;
+    assert!(resp.applied, "{}", resp.summary);
+    let sent = &fake.requests()[asked];
+    assert_eq!(sent.messages[..first.conversation.len()], first.conversation[..], "the whole earlier conversation");
+    let opening = sent.messages[first.conversation.len()].to_string();
+    assert!(opening.contains("Now add bye.txt too.") && opening.contains("goes on from the task above"), "{opening}");
+    assert_eq!(fake.calls_to(fs::FORK).len(), 1, "it worked in the kept result rather than a new fork");
+    assert_eq!(resp.attempts.len(), 1, "one kept result, one attempt");
+    let workspace = fake.workspace();
+    assert_eq!((workspace.get("hello.txt"), workspace.get("bye.txt")), (Some(&"hi\n".into()), Some(&"bye\n".into())));
+}
+
+#[tokio::test]
+async fn auto_picks_a_light_workflow_says_so_first_and_runs_it() {
+    let fake = Fake::new(
+        |req| {
+            if is_router(req) {
+                assert!(req.tools.len() == 1 && req.messages.len() == 1, "the pick is one small call");
+                let offered = last_text(req);
+                assert!(offered.contains("The workflows you may pick: ask, quick, verify."), "{offered}");
+                return submit_route(req, "quick");
+            }
+            assert!(!is_designer(req));
+            match turn(req) {
+                1 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            }
+        },
+        |_, _| panic!("no check"),
+    );
+    let resp = run(&fake, RunRequest { workflow: Some("auto".into()), ..request(None, 2) }).await;
+    assert_eq!(resp.workflow.as_deref(), Some("quick"), "{}", resp.summary);
+    assert_eq!(routed(&fake), ["quick"]);
+    assert!(
+        matches!(&fake.events()[0], Progress::Routed { reason, .. } if reason == "a small local change"),
+        "the pick is the run's first word: {:?}",
+        fake.events()[0]
+    );
+    assert_eq!(resp.attempts.len(), 1);
+    assert!(close(resp.cost_usd, 0.125 * 3.0), "the pick is paid for like any call: {}", resp.cost_usd);
+}
+
+#[tokio::test]
+async fn with_a_check_auto_never_picks_ask_and_a_failed_pick_is_the_full_workflow() {
+    // The model asks for what it was not offered: the heaviest offered runs.
+    let fake = Fake::new(
+        |req| {
+            if is_router(req) {
+                let offered = last_text(req);
+                assert!(offered.contains("The workflows you may pick: quick, verify."), "{offered}");
+                return submit_route(req, "ask");
+            }
+            match turn(req) {
+                1 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            }
+        },
+        hello_check,
+    );
+    let resp = run(&fake, RunRequest { workflow: Some("auto".into()), ..request(Some("check"), 1) }).await;
+    assert_eq!(resp.workflow.as_deref(), Some("verify"));
+    assert_eq!((resp.outcome, resp.verification), (Outcome::Passed, Some(Verification::Command)));
+
+    // A pick that never comes is no pick.
+    let fake = Fake::new(
+        |req| match (is_router(req), turn(req)) {
+            (true, _) => done("Hmm."),
+            (false, 1) => write_hello(req, "hi\n"),
+            (false, _) => done("Wrote hello.txt."),
+        },
+        hello_check,
+    );
+    let resp = run(&fake, RunRequest { workflow: Some("auto".into()), ..request(Some("check"), 1) }).await;
+    assert_eq!(resp.workflow.as_deref(), Some("verify"));
+    assert_eq!(routed(&fake), ["verify"]);
+    let routing = fake.requests().iter().filter(|r| is_router(r)).count();
+    assert_eq!(routing, 2, "the pick asked once more, then gave up");
+}
+
+#[tokio::test]
+async fn a_named_workflow_is_never_rerouted_and_design_says_which_workflow_auto_picked() {
+    let fake = Fake::new(
+        |req| {
+            assert!(!is_router(req), "a request that names its workflow is not routed");
+            match turn(req) {
+                1 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            }
+        },
+        hello_check,
+    );
+    let resp = run(&fake, RunRequest { workflow: Some("verify".into()), ..request(Some("check"), 1) }).await;
+    assert_eq!(resp.workflow.as_deref(), Some("verify"));
+    assert!(routed(&fake).is_empty());
+
+    let fake = Fake::new(
+        |req| {
+            assert!(is_router(req), "designing nothing, the only call is the pick");
+            submit_route(req, "ask")
+        },
+        |_, _| panic!("no command"),
+    );
+    let bus: Arc<dyn Bus> = fake.clone();
+    let req = RunRequest { workflow: Some("auto".into()), ..request(None, 1) };
+    let design = molt_planner::design(bus, Arc::new(config()), req, TraceId::from_raw("trace_design")).await.unwrap();
+    assert_eq!(design.workflow.as_deref(), Some("ask"));
+    assert!(design.command.is_none() && design.error.is_none());
+    assert!(close(design.cost_usd, 0.125) && design.uncounted_calls == 0);
+    assert!(fake.calls_to(fs::FORK).is_empty());
 }

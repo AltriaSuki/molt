@@ -49,6 +49,9 @@ pub(crate) struct Finished {
     pub summary: String,
     /// How a passing result did on the run's rubric, when it has one.
     pub findings: Vec<Finding>,
+    /// Its conversation with the model, when it passed, for a task that
+    /// goes on from it.
+    pub conversation: Vec<Value>,
 }
 
 impl Finished {
@@ -65,7 +68,13 @@ impl Finished {
             requirements: saved.requirements,
             dispute: end.dispute.clone(),
         };
-        Self { report, fork: saved.fork.clone(), summary: end.summary.clone(), findings: end.findings.clone() }
+        Self {
+            report,
+            fork: saved.fork.clone(),
+            summary: end.summary.clone(),
+            findings: end.findings.clone(),
+            conversation: saved.messages.clone(),
+        }
     }
 
     /// The report for an attempt whose task died without returning one.
@@ -81,7 +90,7 @@ impl Finished {
             requirements: 0,
             dispute: None,
         };
-        Self { report, fork: None, summary: String::new(), findings: Vec::new() }
+        Self { report, fork: None, summary: String::new(), findings: Vec::new(), conversation: Vec::new() }
     }
 }
 
@@ -147,6 +156,8 @@ pub(crate) async fn run(
         memory_tools: ctx.memory.up,
         web_tools: ctx.web,
         version: ctx.control.version(),
+        read_only: ctx.workflow.read_only(),
+        conversation: Vec::new(),
     };
     if let Some(saved) = &resume {
         attempt.meter = Meter {
@@ -198,7 +209,8 @@ pub(crate) async fn run(
         requirements: attempt.version,
         dispute,
     };
-    Finished { report, fork: attempt.fork, summary, findings }
+    let conversation = if status == AttemptStatus::Passed { attempt.conversation } else { Vec::new() };
+    Finished { report, fork: attempt.fork, summary, findings, conversation }
 }
 
 struct Attempt {
@@ -219,6 +231,10 @@ struct Attempt {
     web_tools: bool,
     /// The version of the run's requirements it works to.
     version: u32,
+    /// It works in the workspace itself with tools that only read.
+    read_only: bool,
+    /// Its conversation once it passed, fitted to go back over the bus.
+    conversation: Vec<Value>,
 }
 
 impl Attempt {
@@ -290,11 +306,13 @@ impl Attempt {
     async fn work(&mut self, resume: Option<SavedAttempt>) -> Result<String, End> {
         let ctx = self.ctx.clone();
         let system = match (&self.check, self.rubric.is_empty()) {
+            _ if self.read_only => prompts::ASK_SYSTEM,
             (Some(_), _) => prompts::ATTEMPT_SYSTEM,
             (None, false) => prompts::RUBRIC_SYSTEM,
             (None, true) => prompts::UNVERIFIED_SYSTEM,
         };
         let tools = Arc::new(match self.check {
+            _ if self.read_only => prompts::ask_tools(self.memory_tools, self.web_tools),
             Some(_) => prompts::checked_attempt_tools(self.memory_tools, self.web_tools),
             None => prompts::attempt_tools(self.memory_tools, self.web_tools),
         });
@@ -316,13 +334,22 @@ impl Attempt {
                 (fork, conv)
             }
             None => {
-                // Not raced against cancellation: a fork created after we stopped waiting would never be dropped.
-                let fork = ctx.fork().await;
+                let kept = ctx.continues.as_ref().and_then(|c| c.fork.clone());
+                let fork = match (self.read_only, kept) {
+                    // It only reads: where the result it goes on from is, which is never its to drop.
+                    (true, kept) => Ok(kept.unwrap_or_else(|| ctx.workspace.clone())),
+                    // The kept result it goes on from: not tracked, so a run that fails leaves it to the user.
+                    (false, Some(kept)) => ctx.diff(&kept).await.map(|_| kept),
+                    // Not raced against cancellation: a fork created after we stopped waiting would never be dropped.
+                    (false, None) => ctx.fork().await,
+                };
                 // Started once it has a fork, so a caller that stops the run can keep what the attempt did there.
-                let started = fork.as_ref().ok().cloned();
+                let started = fork.as_ref().ok().filter(|_| !self.read_only).cloned();
                 ctx.progress(Progress::AttemptStarted { run: ctx.run_id(), attempt: self.index, fork: started }).await;
                 let fork = fork.map_err(|e| End::error(format!("could not fork the workspace: {e}")))?;
-                self.fork = Some(fork.clone());
+                if !self.read_only {
+                    self.fork = Some(fork.clone());
+                }
                 if self.cancel.is_cancelled() {
                     return Err(if ctx.over_budget() { End::from(Stop::Budget) } else { End::cancelled() });
                 }
@@ -342,7 +369,23 @@ impl Attempt {
                     &ctx.preamble(),
                     &ctx.control.upto(self.version),
                 );
-                (fork, Conversation::new(system, tools, first, Some(self.index)))
+                let mut conv = Conversation::new(system, tools, first, Some(self.index));
+                if let Some(earlier) =
+                    ctx.continues.as_ref().map(|c| continued(&c.conversation)).filter(|c| !c.is_empty())
+                {
+                    // The earlier conversation opens with the project's context: only the task and its check are new.
+                    let first = prompts::attempt_first_message(
+                        &ctx.task,
+                        self.check.as_ref().map(|c| (c.command.as_str(), paths.as_slice())),
+                        &self.rubric,
+                        self.index,
+                        &[],
+                        &ctx.control.upto(self.version),
+                    );
+                    conv.messages = earlier;
+                    conv.push(prompts::continued_message(&ctx.task, first));
+                }
+                (fork, conv)
             }
         };
         self.save(&conv);
@@ -431,6 +474,7 @@ impl Attempt {
                     }
                 }
                 if ctx.control.claim(self.version) {
+                    self.keep(&conv);
                     return Ok(summary);
                 }
                 self.adopt(&fork, &mut conv, true).await;
@@ -452,6 +496,7 @@ impl Attempt {
             if passed {
                 // Only a result found under the latest requirements can be the run's.
                 if ctx.control.claim(self.version) {
+                    self.keep(&conv);
                     return Ok(summary);
                 }
                 self.adopt(&fork, &mut conv, true).await;
@@ -487,15 +532,37 @@ impl Attempt {
         })
     }
 
+    /// Keep the conversation of a result that passed, fitted to what a model
+    /// call can take and to a quarter of a frame, so a reply and the request
+    /// that goes on from it both carry it.
+    fn keep(&mut self, conv: &Conversation) {
+        let mut kept = Conversation::new(conv.system, conv.tools.clone(), Value::Null, conv.attempt);
+        kept.messages = conv.messages.clone();
+        kept.known = conv.known;
+        let limits = self.ctx.limits();
+        let bound = crate::fit::Limits { tokens: limits.tokens, bytes: self.ctx.cfg.frame_bytes / 4 };
+        if let Err(why) = kept.fit(bound) {
+            tracing::warn!(run = %self.ctx.trace, attempt = self.index, %why, "its conversation is not kept");
+            return;
+        }
+        self.conversation = kept.messages;
+    }
+
     /// Results for a turn's calls, in order. A dispute_check that reaches
-    /// here was not well formed, and gets an error saying why.
+    /// here was not well formed, and gets an error saying why. An attempt
+    /// that only reads runs nothing else: the calls are refused unrun.
     async fn execute(&self, fork: &str, calls: &[ToolUse], cut_off: Option<&str>, actor: Actor) -> Vec<Value> {
         let is_dispute = |c: &ToolUse| self.check.is_some() && c.name == DISPUTE_CHECK;
-        let others: Vec<ToolUse> = calls.iter().filter(|c| !is_dispute(c)).cloned().collect();
+        let refused = |c: &ToolUse| self.read_only && !prompts::ASK_READS.contains(&c.name.as_str());
+        let others: Vec<ToolUse> = calls.iter().filter(|c| !is_dispute(c) && !refused(c)).cloned().collect();
         let mut results = tools::execute(&self.ctx, fork, &others, cut_off, actor).await.into_iter();
         calls
             .iter()
             .map(|call| {
+                if refused(call) {
+                    let why = format!("{} is not available: this task only reads, and changes nothing.", call.name);
+                    return tool_result(&call.id, why, true);
+                }
                 if !is_dispute(call) {
                     return results
                         .next()
@@ -618,6 +685,20 @@ impl Attempt {
             }
         }
     }
+}
+
+/// The conversation a task goes on from, as far as it can go on: without a
+/// last turn of tool calls that have no results.
+fn continued(conversation: &[Value]) -> Vec<Value> {
+    let mut messages = conversation.to_vec();
+    let calls = |m: &Value| m["content"].as_array().is_some_and(|c| c.iter().any(|b| b["type"] == "tool_use"));
+    if messages.last().is_some_and(|m| m["role"] == "assistant" && calls(m)) {
+        messages.pop();
+    }
+    if messages.first().is_some_and(|m| m["role"] != "user") {
+        return Vec::new();
+    }
+    messages
 }
 
 /// A dispute_check call's input, trimmed, or what is wrong with it.

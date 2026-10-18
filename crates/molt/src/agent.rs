@@ -548,8 +548,11 @@ pub async fn run_task_as(
     // Learning is the workflow's last stage, and this side runs it. A
     // workflow defined in the planner's own configuration is not known
     // here: it learns as asked.
-    let learns = molt_api::workflow::builtin(req.workflow.as_deref()).is_none_or(|w| w.stages.learn.is_some());
-    let learn = learn.filter(|_| learns);
+    let learns = |name: Option<&str>| match name {
+        Some(molt_api::workflow::AUTO) => true,
+        name => molt_api::workflow::builtin(name).is_none_or(|w| w.stages.learn.is_some()),
+    };
+    let learn = learn.filter(|_| learns(req.workflow.as_deref()));
     let running = crate::start(cfg).await?;
     // Before planner.run, the only caller that makes forks.
     let forks = RunForks::before(cfg);
@@ -566,6 +569,8 @@ pub async fn run_task_as(
     };
     let done = match result {
         Ok(ran) => {
+            // A run that named `auto` learns as the workflow picked for it does.
+            let learn = learn.filter(|_| ran.resp.workflow.is_none() || learns(ran.resp.workflow.as_deref()));
             let learned = match (learn, ran.memory) {
                 (None, _) | (Some(_), None) => None,
                 (Some(_), Some(Err(e))) => Some(Err(e)),
@@ -967,6 +972,7 @@ pub fn describe(event: &Progress) -> String {
         }
         Progress::AttemptFinished { attempt, status, .. } => format!("attempt {attempt}: {}", status_name(*status)),
         Progress::Note { message, .. } => message.clone(),
+        Progress::Routed { workflow, reason, .. } => routed_line(workflow, reason, "--workflow verify"),
         Progress::Required { requirement, .. } => requirement_line(requirement),
         Progress::Adopted { attempt, version, turn, .. } => {
             format!("attempt {attempt}: follows requirements v{version} from turn {turn}")
@@ -1036,9 +1042,22 @@ pub fn report(resp: &RunResponse) -> String {
 }
 
 /// Report a result with the resolved output directory, including virtual projects.
+/// What the planner picked for a run that named `auto`, and how to have
+/// the full workflow instead (`full`, in the caller's words).
+pub fn routed_line(workflow: &str, reason: &str, full: &str) -> String {
+    let why = if reason.is_empty() { String::new() } else { format!(" ({reason})") };
+    if workflow == molt_api::workflow::VERIFY {
+        format!("handled as verify{why}")
+    } else {
+        format!("handled as {workflow}{why} · {full} for the full workflow")
+    }
+}
+
 pub fn report_at(resp: &RunResponse, workspace: Option<&str>) -> String {
+    let answer = resp.workflow.as_deref() == Some(molt_api::workflow::ASK) && resp.outcome == Outcome::Unverified;
     let mut lines = vec![match &resp.dispute {
         Some(_) => format!("outcome: {}, the check was disputed", outcome_name(resp.outcome)),
+        None if answer => "outcome: unverified answer".to_owned(),
         None => format!("outcome: {}", outcome_name(resp.outcome)),
     }];
     if let Some(level) = resp.verification {
@@ -1648,6 +1667,21 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_is_reported_as_unverified_and_a_pick_says_how_to_have_the_full_workflow() {
+        let resp: RunResponse = serde_json::from_value(serde_json::json!({
+            "outcome": "unverified", "summary": "It parses JSON.", "changes": [], "patch": "", "applied": false,
+            "attempts": [], "usage": {}, "cost_usd": 0.0, "verification": "none", "workflow": "ask"
+        }))
+        .unwrap();
+        assert!(report(&resp).starts_with("outcome: unverified answer\nverification: none\n"), "{}", report(&resp));
+        let quick = RunResponse { workflow: Some("quick".into()), ..resp };
+        assert!(report(&quick).starts_with("outcome: unverified\n"));
+        let event = Progress::Routed { run: "r".into(), workflow: "quick".into(), reason: "a comment".into() };
+        assert_eq!(describe(&event), "handled as quick (a comment) · --workflow verify for the full workflow");
+        assert_eq!(routed_line("verify", "", "/verify"), "handled as verify");
+    }
+
+    #[test]
     fn the_report_says_how_the_result_was_verified_when_the_planner_does() {
         let resp: RunResponse = serde_json::from_value(serde_json::json!({
             "outcome": "unverified", "summary": "", "changes": [], "patch": "", "applied": false,
@@ -1684,6 +1718,8 @@ mod tests {
             judgement: vec![],
             dispute: None,
             verification: None,
+            workflow: None,
+            conversation: Vec::new(),
         };
         assert_eq!(
             report(&resp),
@@ -1726,10 +1762,10 @@ mod tests {
             truncated: false,
             verdict,
         };
-        resp.selection = Some(planner::Selection {
+        resp.selection = Some(Box::new(planner::Selection {
             rule: "fewer lines".into(),
             candidates: vec![candidate(0, Some(true), 3, Some(Verdict::Approve)), candidate(1, Some(false), 1, None)],
-        });
+        }));
         assert!(
             report(&resp).contains(
                 "picked among 2 passing attempts:\n * attempt 0: suite passed, 3 lines in 1 files, review: approve\n   \

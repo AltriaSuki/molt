@@ -886,6 +886,8 @@ mod tests {
             judgement: vec![],
             dispute: None,
             verification: None,
+            workflow: None,
+            conversation: Vec::new(),
         };
         let trace = TraceId::random();
         rt.exec(Action::PrepareCommit { trace: trace.clone() });

@@ -601,6 +601,8 @@ mod tests {
             judgement: vec![],
             dispute: None,
             verification: None,
+            workflow: None,
+            conversation: Vec::new(),
         }
     }
 

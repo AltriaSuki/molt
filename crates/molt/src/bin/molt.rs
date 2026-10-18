@@ -48,6 +48,10 @@ enum Cmd {
                             stopped by signal N (130 for Ctrl-C, 129 for SIGHUP, 143 for SIGTERM)."
     )]
     Do(DoArgs),
+    /// Answer a question about a workspace: one attempt with tools that only
+    /// read, in the workspace itself. Nothing is changed, and the answer is
+    /// unverified.
+    Ask(AskArgs),
     /// Go on with a run of `molt do --checkpoint` that stopped before it
     /// finished, from its last checkpoint. Its attempts keep their forks and
     /// conversations, and the cost so far counts against its budget.
@@ -137,6 +141,30 @@ struct DoArgs {
     /// finishes (interrupted, out of budget, killed) can go on with `molt resume`.
     #[arg(long)]
     checkpoint: bool,
+    /// The workflow to run: verify (design or take a check, race the
+    /// attempts, review), quick (one attempt, the given check or none, the
+    /// fixed review rules), ask (answer, change nothing), auto (the planner
+    /// picks one of those; never ask with --check), or one the planner's
+    /// configuration defines. Default: verify.
+    #[arg(long, value_name = "NAME")]
+    workflow: Option<String>,
+    #[command(flatten)]
+    common: RunArgs,
+}
+
+#[derive(Args)]
+struct AskArgs {
+    /// The question, in plain words.
+    question: String,
+    /// Model for the answer: opus, sonnet, haiku or a model id.
+    #[arg(long)]
+    model: Option<String>,
+    /// How hard the model thinks: low, medium, high, xhigh or max.
+    #[arg(long)]
+    effort: Option<Effort>,
+    /// Model turns for the answer.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    max_turns: Option<u32>,
     #[command(flatten)]
     common: RunArgs,
 }
@@ -559,6 +587,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         if matches!(
             cmd,
             Cmd::Do(_)
+                | Cmd::Ask(_)
                 | Cmd::Resume(_)
                 | Cmd::Undo(_)
                 | Cmd::Memory { .. }
@@ -629,6 +658,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             running.shutdown().await;
         }
         Cmd::Do(args) => return do_task(cli.config.as_deref(), args).await,
+        Cmd::Ask(args) => return ask(cli.config.as_deref(), args).await,
         Cmd::Resume(args) => return resume_task(cli.config.as_deref(), args).await,
         Cmd::Undo(args) => return undo_cmd(cli.config.as_deref(), args).await,
         Cmd::Memory { cmd } => memory_cmd(cli.config.as_deref(), cmd).await?,
@@ -839,6 +869,22 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     req.stream = args.common.stream;
     req.checkpoint = args.checkpoint;
     req.review = !args.common.no_review;
+    req.workflow = args.workflow.filter(|w| !w.trim().is_empty());
+    execute(&cfg, req, TraceId::random(), &args.common, stop).await
+}
+
+async fn ask(config: Option<&Path>, args: AskArgs) -> anyhow::Result<ExitCode> {
+    let stop = molt::stop_signal()?;
+    let (cfg, workspace) = prepare(config, &args.common)?;
+    let mut req = RunRequest::new(args.question, workspace);
+    req.workflow = Some(molt_api::workflow::ASK.to_owned());
+    req.attempts = 1;
+    req.model = args.model;
+    req.effort = args.effort;
+    req.max_turns = args.max_turns;
+    req.budget_usd = args.common.budget_usd;
+    req.apply = !args.common.no_apply;
+    req.stream = args.common.stream;
     execute(&cfg, req, TraceId::random(), &args.common, stop).await
 }
 
@@ -963,6 +1009,10 @@ async fn execute(
     };
     if args.json {
         let mut out = serde_json::to_value(&resp)?;
+        // The model conversation is for a task that goes on from this one, in the interface; it is long.
+        if let Some(out) = out.as_object_mut() {
+            out.remove("conversation");
+        }
         out["run"] = serde_json::json!(run);
         out["workspace"] = serde_json::json!(workspace);
         if let Some(committed) = &committed {

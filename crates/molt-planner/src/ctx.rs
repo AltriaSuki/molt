@@ -128,6 +128,8 @@ pub(crate) struct Ctx {
     pub earlier: Option<String>,
     /// The stages the run goes through.
     pub workflow: Arc<Workflow>,
+    /// The task before this one that the run goes on from.
+    pub continues: Option<Arc<molt_api::planner::Continuation>>,
 }
 
 /// A conversation that grows until it no longer fits a model call (see
@@ -230,6 +232,7 @@ impl Ctx {
             control: Control::new(Vec::new()),
             earlier: crate::prompts::earlier_tasks(&req.earlier),
             workflow: Arc::new(workflow),
+            continues: req.continues.clone().map(Arc::new),
         }
     }
 
@@ -400,6 +403,7 @@ impl Ctx {
             Some(n) => format!("attempt {n}"),
             None if conv.system == crate::prompts::REVIEWER_SYSTEM => "the reviewer".to_owned(),
             None if conv.system == crate::prompts::JUDGE_SYSTEM => "the judge".to_owned(),
+            None if conv.system == crate::prompts::ROUTE_SYSTEM => "picking a workflow".to_owned(),
             None => "the check's designer".to_owned(),
         };
         let busy = self.control.busy(format!("{who}: a model call"));

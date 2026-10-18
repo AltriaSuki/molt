@@ -19,6 +19,7 @@ mod memory;
 mod prompts;
 mod referenced;
 mod review;
+mod route;
 mod runner;
 mod select;
 mod tools;
@@ -84,6 +85,9 @@ pub struct Config {
     /// Workflows a run may name besides the built-ins. They come from
     /// whoever starts the planner, never from a request or a project.
     pub workflows: Vec<molt_api::workflow::Workflow>,
+    /// Model for the one call that picks a workflow for a run that names
+    /// `auto`; `None` uses the run's model.
+    pub route_model: Option<String>,
 }
 
 impl Default for Config {
@@ -109,6 +113,7 @@ impl Default for Config {
             instruction_files: vec!["AGENTS.md".into(), "CLAUDE.md".into()],
             syntax_check: molt_api::fs::SyntaxCheck::Report,
             workflows: Vec::new(),
+            route_model: None,
         }
     }
 }
@@ -117,8 +122,8 @@ impl Config {
     /// [`Config::default`] overridden by `MOLT_PLANNER_MODEL`,
     /// `MOLT_MAX_TURNS`, `MOLT_MAX_CHECK_ROUNDS`, `MOLT_BUDGET_USD`,
     /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_MAX_TOKENS`, `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
-    /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES` and
-    /// `MOLT_SYNTAX_CHECK`.
+    /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES`,
+    /// `MOLT_SYNTAX_CHECK` and `MOLT_ROUTE_MODEL`.
     ///
     /// | Variable | Default |
     /// |---|---|
@@ -134,6 +139,7 @@ impl Config {
     /// | `MOLT_CONTEXT_TOKENS` | unset: 200000 for Claude models, 128000 for others |
     /// | `MOLT_INSTRUCTION_FILES` | `AGENTS.md,CLAUDE.md`; `none` reads none |
     /// | `MOLT_SYNTAX_CHECK` | `report`; or `reject`, or `off` |
+    /// | `MOLT_ROUTE_MODEL` | unset: the run's model picks the workflow of a run that names `auto` |
     ///
     /// An empty variable counts as unset. A value that does not parse is an
     /// error, and so is a zero: none of these limits has a "no limit" value.
@@ -216,6 +222,7 @@ impl Config {
                     .map_err(|_| anyhow::anyhow!("MOLT_SYNTAX_CHECK={v:?}: use report, reject or off"))?,
             },
             workflows: d.workflows,
+            route_model: get("MOLT_ROUTE_MODEL"),
         })
     }
 }
