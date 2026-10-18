@@ -110,8 +110,13 @@ tests inside existing source files (for a Rust crate, write an integration test 
 are restored before every check run, so an existing file among them would undo the other agents' work on it.
 - Run the check. If the task is not done yet, confirm that the check fails, and fails for the right reason.
 - The check must not need network access, and must be deterministic and reasonably fast.
-- Do not implement the task itself. Only the new files you list in submit_check reach the other agents; \
-any other change you make is thrown away.
+- Do not implement the task itself, not even to try out your check: writing the task's deliverables (the code, \
+documents or other files the task asks for) is out of bounds for you. Only the new files you list in submit_check \
+reach the other agents; any other change you make is thrown away, is reported to the user as overreach, and spends \
+the budget designing has, which is only a share of the task's. Confirm that the check fails on the workspace as it \
+is; that it would pass on a correct result is for you to reason out, not to try by doing the task.
+- Designing has a budget of its own. When it runs out before you call submit_check, the task stops with no check, \
+so submit as soon as the check is sound.
 - If no command can check the task (research to do, prose to write, a plan to make), call submit_check with \
 command null and give a rubric instead: the few criteria the result must meet, each a single statement that can be \
 decided true or false by reading the result, such as \"every claim cites a source link\" or \"no day has more than \

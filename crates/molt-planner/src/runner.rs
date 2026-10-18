@@ -44,7 +44,7 @@ pub(crate) async fn run_cancellable(
     if let Some(resume) = req.resume.clone() {
         return resume_run(bus, cfg, req, resume, trace, cancel).await;
     }
-    validate(&req)?;
+    validate(&req, &cfg)?;
     let state = match (req.checkpoint, &cfg.state_dir) {
         (false, _) => None,
         (true, Some(dir)) => Some(dir.clone()),
@@ -98,9 +98,10 @@ async fn resume_run(
     run_req.apply = req.apply;
     run_req.stream = req.stream;
     run_req.budget_usd = req.budget_usd.or(run_req.budget_usd);
+    run_req.design_budget_usd = req.design_budget_usd.or(run_req.design_budget_usd);
     run_req.checkpoint = true;
     run_req.resume = None;
-    validate(&run_req)?;
+    validate(&run_req, &cfg)?;
 
     let mut ctx = Ctx::new(bus, cfg, trace, &run_req);
     ctx.cancel = cancel.clone();
@@ -396,7 +397,7 @@ pub(crate) async fn design_cancellable(
     trace: TraceId,
     cancel: CancellationToken,
 ) -> Result<DesignResponse, RemoteError> {
-    validate(&req)?;
+    validate(&req, &cfg)?;
     if req.check.is_some() || !req.rubric.is_empty() || !req.verify {
         let message = "planner.design designs a check: leave out check and rubric, and keep verify".to_owned();
         return Err(RemoteError { code: ErrorCode::Invalid, message });
@@ -467,7 +468,9 @@ fn inside(path: &str) -> bool {
         && path.components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir))
 }
 
-fn validate(req: &RunRequest) -> Result<(), RemoteError> {
+/// Whether the planner can carry out `req`, with `cfg`'s default budget for one that sets none.
+fn validate(req: &RunRequest, cfg: &Config) -> Result<(), RemoteError> {
+    let budget = req.budget_usd.unwrap_or(cfg.budget_usd);
     let problem = if req.task.trim().is_empty() {
         "task is empty".to_owned()
     } else if req.workspace.trim().is_empty() {
@@ -500,6 +503,13 @@ fn validate(req: &RunRequest) -> Result<(), RemoteError> {
         "max_check_rounds must be at least 1".to_owned()
     } else if req.budget_usd.is_some_and(|b| !(b.is_finite() && b > 0.0)) {
         "budget_usd must be a positive amount".to_owned()
+    } else if req.design_budget_usd.is_some_and(|b| !(b.is_finite() && b > 0.0)) {
+        "design_budget_usd must be a positive amount".to_owned()
+    } else if let Some(design) = req.design_budget_usd.filter(|d| *d > budget) {
+        format!(
+            "design_budget_usd (${design:.2}) is more than the run's budget (${budget:.2}): designing is paid out of \
+             the run's budget, so give at most that, or raise the budget"
+        )
     } else if let Some(f) = req.files.iter().find(|f| !inside(f)) {
         format!("file {f:?} is not a path inside the workspace")
     } else {
@@ -1106,8 +1116,9 @@ mod tests {
 
     #[test]
     fn requests_are_validated() {
+        let cfg = Config::default();
         let ok = RunRequest::new("add a flag", "/w");
-        assert!(validate(&ok).is_ok());
+        assert!(validate(&ok, &cfg).is_ok());
         let bad = [
             RunRequest { task: " ".into(), ..ok.clone() },
             RunRequest { workspace: String::new(), ..ok.clone() },
@@ -1128,11 +1139,18 @@ mod tests {
             RunRequest { files: vec!["../outside".into()], ..ok.clone() },
             RunRequest { files: vec!["/etc/passwd".into()], ..ok.clone() },
             RunRequest { files: vec![String::new()], ..ok.clone() },
+            RunRequest { design_budget_usd: Some(0.0), ..ok.clone() },
+            RunRequest { design_budget_usd: Some(f64::NAN), ..ok.clone() },
+            // A design budget can only split the run's, never grow it.
+            RunRequest { budget_usd: Some(1.0), design_budget_usd: Some(1.5), ..ok.clone() },
+            RunRequest { design_budget_usd: Some(cfg.budget_usd + 0.01), ..ok.clone() },
         ];
         for req in bad {
-            assert_eq!(validate(&req).unwrap_err().code, ErrorCode::Invalid, "{req:?}");
+            assert_eq!(validate(&req, &cfg).unwrap_err().code, ErrorCode::Invalid, "{req:?}");
         }
-        assert!(validate(&RunRequest { files: vec!["src/lexer.rs".into(), "./a".into()], ..ok.clone() }).is_ok());
-        assert!(validate(&RunRequest { attempts: 8, ..ok }).is_ok());
+        assert!(validate(&RunRequest { files: vec!["src/lexer.rs".into(), "./a".into()], ..ok.clone() }, &cfg).is_ok());
+        let all = RunRequest { budget_usd: Some(1.0), design_budget_usd: Some(1.0), ..ok.clone() };
+        assert!(validate(&all, &cfg).is_ok());
+        assert!(validate(&RunRequest { attempts: 8, ..ok }, &cfg).is_ok());
     }
 }

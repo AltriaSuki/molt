@@ -115,6 +115,8 @@ pub struct Settings {
     pub model: Option<String>,
     pub effort: Option<Effort>,
     pub budget_usd: Option<f64>,
+    /// The most designing a task's check may spend, out of its budget.
+    pub design_budget_usd: Option<f64>,
     /// A check command of the user's, used instead of a designed one.
     pub check: Option<String>,
     /// The model memory learns with: a model, [`agent::SAME_MODEL`], or
@@ -133,6 +135,7 @@ impl Default for Settings {
             model: None,
             effort: None,
             budget_usd: None,
+            design_budget_usd: None,
             check: None,
             stream: true,
             memory_model: None,
@@ -2068,6 +2071,7 @@ impl App {
         req.model = settings.model.clone();
         req.effort = settings.effort;
         req.budget_usd = settings.budget_usd;
+        req.design_budget_usd = settings.design_budget_usd;
         req.apply = mode == Mode::Auto;
         req.earlier = self.earlier.clone();
         req.stream = settings.stream;
@@ -2340,6 +2344,17 @@ impl App {
                 }
                 _ => self.flash = Some("budget: a positive amount of US dollars".into()),
             },
+            Some(Builtin::DesignBudget) => match arg.trim_start_matches('$').parse::<f64>() {
+                Ok(usd) if usd.is_finite() && usd > 0.0 => {
+                    self.settings.design_budget_usd = Some(usd);
+                    self.flash = Some(format!("design budget: ${usd:.2} per task, out of its budget"));
+                }
+                _ if arg == "default" || arg.is_empty() => {
+                    self.settings.design_budget_usd = None;
+                    self.flash = Some(set("design budget", "default"));
+                }
+                _ => self.flash = Some("design budget: a positive amount of US dollars".into()),
+            },
             Some(Builtin::Lanes) => {
                 if self.last_lanes.is_empty() {
                     self.flash = Some("no task has finished yet".into());
@@ -2486,7 +2501,7 @@ impl App {
 
     /// What a finished run leaves for the next tasks of the conversation.
     fn remember(&mut self, task: &str, resp: &RunResponse) {
-        let summary = scrub(&resp.summary, &self.secrets);
+        let summary = scrub(&tui_next_steps(&resp.summary), &self.secrets);
         let (summary, _) = bounded(summary.trim(), EARLIER_SUMMARY_BYTES);
         self.earlier.push(Earlier {
             task: task.to_owned(),
@@ -2668,7 +2683,7 @@ impl App {
                         "no check",
                         &format!(
                             "{} · ${:.2} known · {} calls uncounted",
-                            d.error.as_deref().unwrap_or("design cancelled"),
+                            d.error.as_deref().map_or_else(|| "design cancelled".to_owned(), tui_next_steps),
                             d.cost_usd,
                             d.uncounted_calls
                         ),
@@ -2747,6 +2762,8 @@ impl App {
             return Vec::new();
         }
         task.req.budget_usd = remaining;
+        // The check is settled: what designing could spend is spent, and it must not exceed what is left.
+        task.req.design_budget_usd = None;
         task.phase = Phase::Running;
         task.check_shown = true;
         let mut lines = Vec::new();
@@ -3837,6 +3854,16 @@ fn disputed_check(req: &RunRequest, resp: &RunResponse) -> Option<DesignResponse
         error: None,
         cancelled: false,
     })
+}
+
+/// A planner's message with `molt do`'s next steps after the design budget
+/// ran out put in this interface's terms.
+fn tui_next_steps(message: &str) -> String {
+    message.replace(
+        molt_api::planner::DESIGN_BUDGET_NEXT,
+        "Give the check yourself with /check CMD, or allow more for designing with /design-budget USD (at most \
+         the task's /budget), then send the task again.",
+    )
 }
 
 fn check_stops(d: &DesignResponse, existing: &[String]) -> Vec<String> {
@@ -6280,6 +6307,57 @@ mod tests {
         assert!(frame_text(&mut app).contains("1 calls uncounted"));
         app.update(Msg::Designed { trace, result: Ok(design()), existing: vec![] });
         assert_eq!(app.spent_usd, 0.25, "late replies are not counted twice");
+    }
+
+    #[test]
+    fn a_design_out_of_its_budget_stops_confirm_mode_and_says_what_to_do_here() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/budget 1");
+        type_in(&mut app, "/design-budget 0.4");
+        let actions = type_in(&mut app, "write the docs");
+        assert!(matches!(&actions[0], Action::Design { req, .. }
+            if req.budget_usd == Some(1.0) && req.design_budget_usd == Some(0.4)));
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let error = format!(
+            "could not design a done-check: the design budget ran out before the designer submitted a check: \
+             designing spent $0.40 of the $0.40 it may use, and $0.60 of the run's $1.00 budget is left. {}",
+            molt_api::planner::DESIGN_BUDGET_NEXT
+        );
+        let d = DesignResponse {
+            command: None,
+            files: vec![],
+            cost_usd: 0.4,
+            remaining_budget_usd: Some(0.6),
+            error: Some(error),
+            ..design()
+        };
+        assert!(app.update(Msg::Designed { trace, result: Ok(d), existing: vec![] }).is_empty());
+        assert!(app.task.is_none() && app.prompt.is_none(), "no attempt starts");
+        let shown = log(&app);
+        assert!(shown.contains("the design budget ran out"), "{shown}");
+        assert!(shown.contains("$0.60 of the run's $1.00 budget is left"), "{shown}");
+        assert!(shown.contains("/check CMD") && shown.contains("/design-budget USD"), "{shown}");
+        assert!(!shown.contains("--check"), "{shown}");
+    }
+
+    #[test]
+    fn a_designed_check_starts_the_attempts_without_the_design_budget() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/budget 1");
+        type_in(&mut app, "/design-budget 1");
+        type_in(&mut app, "task");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let d = DesignResponse { remaining_budget_usd: Some(0.75), ..design() };
+        let actions = app.update(Msg::Designed { trace, result: Ok(d), existing: vec![] });
+        let actions = if actions.is_empty() { app.update(key(KeyCode::Enter)) } else { actions };
+        // Designing is over: what is left is the attempts', and no design budget can exceed it.
+        assert!(
+            matches!(&actions[0], Action::Run { req, .. }
+            if req.budget_usd == Some(0.75) && req.design_budget_usd.is_none()),
+            "{actions:?}"
+        );
     }
 
     #[test]

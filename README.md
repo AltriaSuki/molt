@@ -56,6 +56,7 @@ sender from that.
 | No service can grant itself a capability or raise its own budget | `crates/molt-kernel/tests/invariants.rs` (`a_service_cannot_use…`, `delegation_can_split…`, `budgets_are_enforced…`) |
 | Topic subscriptions cannot publish or delegate broader rights; denied events are audited, and revoked subscription leases stop future events on both transports | `crates/molt-kernel/tests/topic_rights.rs` (`unix_topic_subscribers_cannot_publish_or_widen_their_rights`, `nats_topic_subscribers_cannot_publish_or_widen_their_rights`), `crates/molt-kernel/src/caps.rs` (`topic_delegation_cannot_upgrade_subscription_to_publication`) |
 | Check design retains unknown and cancelled model settlement; attempts cannot receive a fabricated remaining budget | `crates/molt-planner/src/runner.rs` (`design_preserves_missing_usage_unknown_prices_and_failed_call_settlement`, `cancelled_designs_return_pending_or_late_settlement_and_drop_their_fork`), `crates/molt/src/tui/app.rs` (`incomplete_design_cost_is_shown_and_cannot_be_spent_as_free`, `attempts_use_the_remaining_effective_budget_without_a_minimum_top_up`) |
+| Designing the check stops at its share of the run's budget (one call past it at most, as the run's budget allows), a design budget can split the run's but never grow it, and no attempt starts when it runs out | `crates/molt-planner/tests/planner.rs` (`a_designer_that_never_submits_stops_within_its_share_and_says_what_to_do`, `a_design_budget_given_or_set_as_a_share_caps_designing_and_one_call_can_pass_it`), `crates/molt/tests/agent.rs` (`molt_do_stops_a_designer_that_never_submits_at_its_budget_and_says_what_to_do`) |
 | No service can promote a kernel or protected component, change a tier, or add capabilities without a human | `only_humans_promote_protected_and_kernel_components` |
 | No service can delete or rewrite audit entries; every message is on the record before delivery | `every_message_is_logged_before_it_is_delivered`, `the_audit_log_has_no_write_path_and_detects_tampering` |
 | Audit verification and startup retain one bounded record; tail retains only the requested entries, independent of total log size | `audit_readers_keep_memory_bounded_as_the_log_grows`, `malformed_oversized_and_unterminated_records_are_never_discarded` |
@@ -201,8 +202,8 @@ Ordinary planner recall still excludes notes awaiting review.
 project, defaulting to the latest task. The task's memory log shows this command;
 `u` in the memory screen opens the latest task's context. Later corrections do
 not alter those recorded notes. `/remember TEXT` keeps a preference of yours
-for every project. `/attempts`, `/model`, `/effort`, `/budget` and
-`/check` set the next tasks' options (`/check` while a task runs changes only
+for every project. `/attempts`, `/model`, `/effort`, `/budget`,
+`/design-budget` and `/check` set the next tasks' options (`/check` while a task runs changes only
 that task); `/memory-model NAME` sets the model
 memory learns with (`same` for the attempts' model, `default` for
 `MOLT_MEMORY_MODEL` or `sonnet`), and when learning finds nothing the log
@@ -228,7 +229,7 @@ title follows what it is doing (`molt · running 2/4`, `molt · waiting:
 apply`, `molt · idle`), and the terminal's own title is put back on exit.
 
 Interface settings are saved automatically for each workspace: mode, model,
-attempts, effort, budget, check, memory model, previews, notifications and commit.
+attempts, effort, budget, design budget, check, memory model, previews, notifications and commit.
 The next launch restores them, and `/reset` removes saved settings and restores
 the defaults from the explicitly selected config, or built-in defaults. The auto
 mode label stays yellow. A malformed or unsupported saved file is ignored with a
@@ -354,11 +355,11 @@ the same project is refused until it closes.
 ## `molt do`
 
 ```
-molt do TASK [--check CMD | --no-check] [--attempts N] [--select MODE] [--model M] [--effort E] [--max-turns N]
-        [--budget-usd X] [--no-apply | --commit [--branch NAME]] [--no-review] [--json] [--stream]
+molt do TASK [--check CMD | --no-check | --criterion TEXT...] [--attempts N] [--select MODE] [--model M] [--effort E] [--max-turns N]
+        [--budget-usd X] [--design-budget-usd X] [--no-apply | --commit [--branch NAME]] [--no-review] [--json] [--stream]
         [--workspace DIR] [--data-dir DIR] [--pass-env NAME]... [--no-memory] [--no-learn]
         [--memory-model MODEL] [--judge-model MODEL] [--checkpoint] [--config FILE]
-molt resume [RUN] [--retry] [--list] [--budget-usd X] [--no-apply] [--commit] [--json] [--workspace DIR] ...
+molt resume [RUN] [--retry] [--list] [--budget-usd X] [--design-budget-usd X] [--no-apply] [--commit] [--json] [--workspace DIR] ...
 molt undo [RUN] [--workspace DIR] [--data-dir DIR]
 ```
 
@@ -366,10 +367,12 @@ molt undo [RUN] [--workspace DIR] [--data-dir DIR]
 | --- | --- |
 | `--check CMD` | Shell command that exits 0 once the task is done, run in each attempt's fork. Default: the planner designs one. |
 | `--no-check` | Design no check: one attempt does the task and its result is applied unverified. This is the plain agent loop `molt bench` compares Molt with. |
+| `--criterion TEXT` | A criterion the result must meet, for a task no command can check (repeatable, at most 12): the criteria are the run's rubric, an independent judge decides each, and no check is designed (see [Tasks no command can check](#tasks-no-command-can-check)). Not with `--check` or `--no-check`. |
 | `--attempts N` | Parallel attempts, 1 to 8 (default 2). The first to pass wins and the others are cancelled, unless `--select` says otherwise. |
 | `--select MODE` | How to pick among attempts that pass: `first` (default) takes the first; `wait:<seconds>` gives the others that long after the first passes; `all` lets every attempt finish. Then the passing ones are compared (see below). |
 | `--model`, `--effort` | Model for the attempts (`opus`, `sonnet`, `haiku` or an id) and how hard it thinks. |
 | `--max-turns`, `--budget-usd` | Model turns per attempt, and the spending limit for the whole run. |
+| `--design-budget-usd X` | The most designing the check may spend, out of the run's budget and at most all of it (see [Designing has a budget](#designing-has-a-budget)). Default: a quarter of the run's budget, or the share `MOLT_DESIGN_BUDGET_SHARE` sets. |
 | `--no-apply` | Keep the result in its fork and print its path instead of merging it. |
 | `--commit` | Commit the applied result to git (see below). |
 | `--branch NAME` | With `--commit`, commit on a new branch made from the current commit and switched to. |
@@ -431,7 +434,35 @@ criterion with what the judge said and whether a command decided it. A rubric
 works without any network access beyond the model API. Memory learns less
 from a judged run than from a checked one. `planner.design` returns the
 rubric in place of a check when it designs one, and a run given a rubric
-designs nothing.
+designs nothing. To give the criteria yourself and skip designing, pass
+`--criterion TEXT` once for each:
+
+```sh
+molt do 'Write docs/errors.md listing every error message with an input that triggers it' \
+  --criterion 'docs/errors.md lists every error message the lexer and parser can report' \
+  --criterion 'each message has an example input and the line and column it reports'
+```
+
+### Designing has a budget
+
+The designer, and the vetter that checks its work, may spend only a share of
+the run's budget: a quarter by default, `MOLT_DESIGN_BUDGET_SHARE` for another
+share (such as `0.4`), or `--design-budget-usd X` for an amount, which can be
+at most the run's budget (with `molt resume`, it replaces the stopped run's).
+It is checked before each of their model calls, as the run's budget is, so the
+last call can take designing past it. The attempts keep what is left of the
+run's budget, as before. When the share runs out before the designer has
+submitted a check, the run stops before any attempt with a failure that says
+so, what designing spent, how much of the run's budget is left, and what to
+do next: give the check with `--check CMD` or the criteria with `--criterion
+TEXT`, run unverified with `--no-check`, or allow more with
+`--design-budget-usd`. `molt do` prints it and exits with status 1; confirm
+mode in the TUI stops with it and names `/check` and `/design-budget` instead.
+
+Designing does not do the task: only the check files the designer lists reach
+the attempts. When it changes other files in its fork anyway, such as writing
+the task's own document to try its check on, the run's progress says which,
+since that work is thrown away and only spent the budget.
 
 ### When the check is wrong
 
@@ -624,6 +655,7 @@ Defaults come from the environment:
 | `MOLT_MODEL_TIMEOUT_S`, `MOLT_MODEL_RETRIES`, `MOLT_MODEL_CONCURRENCY`, `MOLT_FALLBACKS` | gateway | `1200`, `4`, `16`, `1` |
 | `MOLT_MODEL_PRICES`, `MOLT_PRICES_FILE` | gateway | unset, `~/.local/share/molt/prices.json` (see [Model prices](#model-prices)) |
 | `MOLT_PLANNER_MODEL`, `MOLT_MAX_TURNS`, `MOLT_BUDGET_USD` | planner | the gateway's model, `50`, `10` |
+| `MOLT_DESIGN_BUDGET_SHARE` | planner | `0.25`: the share of a run's budget designing its check may spend, more than 0 and at most 1 (see [Designing has a budget](#designing-has-a-budget)) |
 | `MOLT_MAX_CHECK_ROUNDS`, `MOLT_CHECK_TIMEOUT_S` | planner | `3` check runs per attempt, `900` |
 | `MOLT_MAP_TOKENS` | planner | `3000` (the project map a run starts with; at most `32000`) |
 | `MOLT_CONTEXT_TOKENS` | planner | the model's context window: `200000` for Claude models, `128000` for others |
@@ -1141,6 +1173,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - Reading one trace back from the audit log scans the log from the start: there is no index yet. One read looks through at most 256 MiB and keeps to its deadline, and two run at once.
 - The kernel drops a message nested more than 100 levels deep, so every logged message can be read back.
 - After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none. A run with `--checkpoint` that stops keeps its forks for `molt resume`.
+- The check's designer is only told not to do the task, and told afterwards when it changed files beyond its check files: nothing stops it from spending its share of the budget that way. When its share runs out without a check, the run stops rather than falling back to a rubric, since a designer that submitted none has none to fall back to. `--criterion` gives criteria without commands; only a designed rubric can have criteria a command decides.
 - A rubric's model-judged criteria are a model's reading, not a proof: the judge can be wrong, and nothing but the criteria with a command checks the result. In the interface, a constraint that adds a check is refused while a run is being judged by a rubric.
 - Only `molt do --commit`, `molt resume --commit` and the interface's `/commit on` commit a result, always on the current branch (`--branch` is for `molt do` only). `molt undo` takes back only those commits, and refuses a file changed after the run rather than merging the revert into it (use `git revert` then).
 - A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet. Its task queue lives in memory: normal exit prints unexecuted tasks, while a crash loses them.

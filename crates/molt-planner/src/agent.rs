@@ -12,7 +12,8 @@ use crate::ctx::{Conversation, Ctx, Spend};
 #[derive(Debug)]
 pub(crate) enum Stop {
     Cancelled,
-    /// The run's spend reached its budget.
+    /// The run's spend reached its budget, or the cap on what this part of
+    /// the run may spend (see [`Ctx::capped`]).
     Budget,
     OutOfTurns,
     Model(RemoteError),
@@ -51,7 +52,8 @@ pub(crate) async fn turn(
     if meter.turns >= max_turns {
         return Err(Stop::OutOfTurns);
     }
-    if ctx.over_budget() {
+    // The run's budget, or the share of it this part of the run may spend.
+    if ctx.over_budget() || ctx.over_cap() {
         return Err(Stop::Budget);
     }
     match conv.fit(ctx.limits()) {

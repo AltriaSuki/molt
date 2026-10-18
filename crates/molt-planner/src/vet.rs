@@ -36,6 +36,7 @@ pub(crate) async fn vet(
         let resp =
             agent::turn(ctx, &mut conv, MAX_TURNS, &mut meter, &ctx.cancel).await.map_err(|stop| match stop {
                 Stop::OutOfTurns => "it ran out of turns".to_owned(),
+                Stop::Budget if !ctx.over_budget() => "the design budget ran out".to_owned(),
                 Stop::Budget => "the budget ran out".to_owned(),
                 Stop::Model(e) => format!("the model call failed: {}", e.message),
                 Stop::Refused => "the model declined".to_owned(),

@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use molt_api::fs::ChangeKind;
+use molt_api::fs::{Change, ChangeKind};
 use molt_api::model::{tool_result, user_blocks, user_text, ToolUse, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{Conflict, SubmitCheck, SUBMIT_CHECK};
 use molt_api::planner::{Baseline, Criterion};
@@ -52,10 +52,14 @@ pub(crate) enum Design {
 }
 
 /// Design the done-check, and with `baseline` run it once on the workspace
-/// as it is. Errors only when the workspace cannot be forked.
+/// as it is. The designer and the vetter together spend at most the run's
+/// design budget, checked before each of their model calls as the run's
+/// budget is. Errors only when the workspace cannot be forked.
 pub(crate) async fn design(ctx: &Arc<Ctx>, baseline: bool) -> Result<Design, RemoteError> {
     let fork = ctx.fork().await?;
-    let mut design = work(ctx, &fork).await;
+    let capped = ctx.capped(ctx.tally().spend.cost_usd + ctx.design_budget_usd);
+    let mut design = work(&capped, &fork).await;
+    note_overreach(ctx, &fork, &design).await;
     if let (true, Design::Check { command, files, baseline, .. }) = (baseline, &mut design) {
         *baseline = run_baseline(ctx, &fork, command, files).await;
     }
@@ -100,6 +104,7 @@ async fn work(ctx: &Arc<Ctx>, fork: &str) -> Design {
             Err(Stop::OutOfTurns) => {
                 return Design::Failed("the check designer ran out of turns without submitting a check".into())
             }
+            Err(Stop::Budget) if !ctx.over_budget() => return Design::Failed(out_of_share(ctx)),
             Err(Stop::Budget) => return Design::Failed("budget exhausted".into()),
             Err(Stop::Model(e)) => return Design::Failed(format!("model call failed: {e}")),
             Err(Stop::Refused) => return Design::Failed("the model declined".into()),
@@ -162,6 +167,63 @@ async fn work(ctx: &Arc<Ctx>, fork: &str) -> Design {
             .collect();
         conv.push(user_blocks(results));
     }
+}
+
+/// Why the design failed when it used up its share of the budget: what it
+/// spent, what the run has left, and what to do next.
+fn out_of_share(ctx: &Ctx) -> String {
+    let spent_total = ctx.tally().spend.cost_usd;
+    let start = ctx.spend_cap.unwrap_or(spent_total) - ctx.design_budget_usd;
+    format!(
+        "the design budget ran out before the designer submitted a check: designing spent ${:.2} of the ${:.2} \
+         it may use, and ${:.2} of the run's ${:.2} budget is left. {}",
+        spent_total - start,
+        ctx.design_budget_usd,
+        (ctx.budget_usd - spent_total).max(0.0),
+        ctx.budget_usd,
+        molt_api::planner::DESIGN_BUDGET_NEXT,
+    )
+}
+
+/// Tell the user, in the run's progress, about files the designer changed
+/// in its fork beyond the check files it submitted, such as the task's own
+/// deliverable: designing does not do the task, and that work is thrown
+/// away with the fork. Best effort: a fork that cannot be listed says nothing.
+async fn note_overreach(ctx: &Ctx, fork: &str, design: &Design) {
+    let listed: Vec<&str> = match design {
+        Design::Check { files, .. } => files.iter().map(|(path, _)| path.as_str()).collect(),
+        _ => Vec::new(),
+    };
+    let changes = match ctx.diff(fork).await {
+        Ok(diff) => diff.changes,
+        Err(e) => {
+            tracing::debug!(run = %ctx.trace, error = %e, "could not list what the designer changed");
+            return;
+        }
+    };
+    let beyond = overreach(&changes, &listed);
+    if beyond.is_empty() {
+        return;
+    }
+    tracing::warn!(run = %ctx.trace, files = ?beyond, "the check designer changed files beyond its check files");
+    let n = beyond.len();
+    let shown: Vec<&str> = beyond.iter().take(MAX_SHOWN).map(String::as_str).collect();
+    let more = if n > MAX_SHOWN { format!(" and {} more", n - MAX_SHOWN) } else { String::new() };
+    ctx.note(format!(
+        "the check's designer changed {n} {} ({}{more}): designing does not do the task, so that work is \
+         thrown away and only spent the budget",
+        if n == 1 { "file that is not a check file" } else { "files that are not check files" },
+        shown.join(", "),
+    ))
+    .await;
+}
+
+/// Most files beyond the check named in that note.
+const MAX_SHOWN: usize = 5;
+
+/// The paths in `changes` that are not among `listed`, in order.
+fn overreach(changes: &[Change], listed: &[&str]) -> Vec<String> {
+    changes.iter().filter(|c| !listed.contains(&c.path.as_str())).map(|c| c.path.clone()).collect()
 }
 
 /// What the vetter made of a submitted design.
@@ -280,4 +342,24 @@ fn rubric(criteria: Vec<Criterion>) -> Result<Vec<Criterion>, String> {
         ));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn files_the_designer_changed_beyond_its_check_files_are_overreach() {
+        let change = |path: &str, kind| Change { path: path.into(), kind };
+        let changes = [
+            change("docs/errors.md", ChangeKind::Added),
+            change("scripts/check_docs.py", ChangeKind::Added),
+            change("src/lib.rs", ChangeKind::Modified),
+            change("old.txt", ChangeKind::Deleted),
+        ];
+        assert_eq!(overreach(&changes, &["scripts/check_docs.py"]), ["docs/errors.md", "src/lib.rs", "old.txt"]);
+        assert!(overreach(&changes[1..2], &["scripts/check_docs.py"]).is_empty());
+        // A rubric or no check lists no files: any change is beyond it.
+        assert_eq!(overreach(&changes[..1], &[]), ["docs/errors.md"]);
+    }
 }
