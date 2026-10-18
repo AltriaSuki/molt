@@ -447,6 +447,33 @@ impl Config {
         Ok(())
     }
 
+    /// An explicit user choice; attempts cannot select a resolver.
+    pub fn web_resolver(&mut self, spec: &str) -> anyhow::Result<()> {
+        molt_web::validate_resolver(spec).map_err(anyhow::Error::msg)?;
+        let web = self.service_mut(WEB).context("--web-resolver requires --allow-web or a configured web service")?;
+        let exec = web
+            .exec
+            .as_mut()
+            .filter(|exec| Path::new(&exec.command).file_name().is_some_and(|name| name == "molt-web"))
+            .context("--web-resolver requires the molt-web service")?;
+        let mut kept = Vec::new();
+        let mut skip = false;
+        for arg in &exec.args {
+            if skip {
+                skip = false;
+                continue;
+            }
+            if arg == "--resolver" {
+                skip = true;
+            } else if !arg.starts_with("--resolver=") {
+                kept.push(arg.clone());
+            }
+        }
+        kept.extend(["--resolver".into(), spec.into()]);
+        exec.args = kept;
+        Ok(())
+    }
+
     pub fn service(&self, name: &str) -> Option<&ServiceSection> {
         self.services.iter().find(|s| s.name.as_str() == name)
     }
@@ -513,6 +540,20 @@ impl Secrets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_explicit_web_resolver_does_not_change_hosts_or_capabilities() {
+        let mut cfg = Config::agent(Path::new("/project"), Path::new("/data"), Path::new("/bin")).unwrap();
+        assert!(cfg.web_resolver("doh:https://1.1.1.1/dns-query").is_err());
+        cfg.allow_web(&["docs.rs".into()], Path::new("/bin")).unwrap();
+        let requests = serde_json::to_value(&cfg.service("planner").unwrap().requests).unwrap();
+        cfg.web_resolver("doh:https://1.1.1.1/dns-query").unwrap();
+        cfg.web_resolver("system").unwrap();
+        let args = &cfg.service("web").unwrap().exec.as_ref().unwrap().args;
+        assert_eq!(args, &["--allow", "docs.rs", "--resolver", "system"]);
+        assert_eq!(serde_json::to_value(&cfg.service("planner").unwrap().requests).unwrap(), requests);
+        assert!(cfg.web_resolver("doh:https://127.0.0.1/dns-query").is_err());
+    }
 
     #[test]
     fn interface_defaults_are_optional_and_validate_before_startup() {

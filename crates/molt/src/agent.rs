@@ -171,6 +171,42 @@ pub fn allow_web(cfg: &mut Config, hosts: &[String]) -> anyhow::Result<()> {
     cfg.allow_web(hosts, &bin_dir()?)
 }
 
+/// Bounded DNS diagnostics for the standard web service, before any model work.
+pub async fn web_warnings(cfg: &Config) -> anyhow::Result<Vec<String>> {
+    let Some(exec) = cfg.service("web").and_then(|service| service.exec.as_ref()) else { return Ok(Vec::new()) };
+    if Path::new(&exec.command).file_name().is_none_or(|name| name != "molt-web") {
+        return Ok(Vec::new());
+    }
+    let mut hosts = Vec::new();
+    let mut resolver = "system";
+    let mut args = exec.args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--allow" => {
+                if let Some(value) = args.next() {
+                    hosts.push(value.clone());
+                }
+            }
+            "--resolver" => {
+                if let Some(value) = args.next() {
+                    resolver = value;
+                }
+            }
+            _ => {
+                if let Some(value) = arg.strip_prefix("--allow=") {
+                    hosts.push(value.to_owned());
+                }
+                if let Some(value) = arg.strip_prefix("--resolver=") {
+                    resolver = value;
+                }
+            }
+        }
+    }
+    anyhow::ensure!(!hosts.is_empty(), "the molt-web service needs at least one --allow host");
+    let allow = molt_web::Allow::parse(&hosts).map_err(anyhow::Error::msg)?;
+    molt_web::preflight(&allow, resolver).await
+}
+
 /// The directory of the running executable, where the services are.
 fn bin_dir() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe().context("finding the molt executable")?;

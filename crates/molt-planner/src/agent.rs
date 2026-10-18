@@ -39,6 +39,11 @@ pub(crate) async fn turn(
     meter: &mut Meter,
     cancel: &CancellationToken,
 ) -> Result<CompleteResponse, Stop> {
+    if !ctx.web_available() && conv.tools.iter().any(|tool| tool["name"] == molt_api::planner::tools::FETCH_URL) {
+        conv.tools = Arc::new(
+            conv.tools.iter().filter(|tool| tool["name"] != molt_api::planner::tools::FETCH_URL).cloned().collect(),
+        );
+    }
     // A paused run starts no new call.
     if cancel.is_cancelled() || !ctx.control.wait_go(cancel, &ctx.cancel).await {
         return Err(if ctx.over_budget() { Stop::Budget } else { Stop::Cancelled });

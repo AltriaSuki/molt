@@ -14,6 +14,9 @@ struct Cli {
     /// `*.python.org` for the hosts below python.org.
     #[arg(long = "allow", value_name = "HOST", required = true)]
     allow: Vec<String>,
+    /// system, or a public-IP HTTPS endpoint returning application/dns-json.
+    #[arg(long, default_value = "system")]
+    resolver: String,
 }
 
 #[tokio::main]
@@ -21,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     molt::init_tracing("info");
     let cli = Cli::parse();
     let allow = Allow::parse(&cli.allow).map_err(anyhow::Error::msg)?;
-    let web = Arc::new(Web::new(allow)?);
+    let web = Arc::new(Web::with_resolver(allow, &cli.resolver)?);
     let svc = Arc::new(Service::connect_from_env().await?);
     molt_web::serve(svc, web).await;
     Ok(())

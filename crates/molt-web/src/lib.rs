@@ -14,8 +14,8 @@
 
 mod allow;
 pub mod html;
+mod resolver;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,11 +23,12 @@ use async_trait::async_trait;
 use molt_api::web::{FetchRequest, FetchResponse};
 use molt_proto::{ErrorCode, RemoteError, Target};
 use molt_sdk::Service;
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use reqwest::dns::{Name, Resolve, Resolving};
 use reqwest::Url;
 use serde_json::Value;
 
 pub use allow::{public, Allow};
+pub use resolver::{preflight, validate_resolver};
 
 /// Most bytes of a response read.
 pub const MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -65,7 +66,11 @@ pub struct Web {
 impl Web {
     /// The service for `allow`, fetching over the network.
     pub fn new(allow: Allow) -> anyhow::Result<Self> {
-        Ok(Self::with_transport(allow, Box::new(Https::new()?)))
+        Self::with_resolver(allow, "system")
+    }
+
+    pub fn with_resolver(allow: Allow, resolver: &str) -> anyhow::Result<Self> {
+        Ok(Self::with_transport(allow, Box::new(Https::with_resolver(resolver)?)))
     }
 
     pub fn with_transport(allow: Allow, transport: Box<dyn Transport>) -> Self {
@@ -91,7 +96,13 @@ impl Web {
         self.allow.check(&url).map_err(invalid)?;
         let mut redirects = 0;
         loop {
-            let hop = self.transport.get(&url, MAX_BYTES).await.map_err(|e| failed(format!("fetching {url}: {e}")))?;
+            let hop = self.transport.get(&url, MAX_BYTES).await.map_err(|error| {
+                if error.starts_with(molt_api::web::ENVIRONMENT_UNAVAILABLE) {
+                    RemoteError { code: ErrorCode::Unavailable, message: error }
+                } else {
+                    failed(format!("fetching {url}: {error}"))
+                }
+            })?;
             match hop.location.as_deref().filter(|_| (300..400).contains(&hop.status)) {
                 Some(location) => {
                     let mut next =
@@ -139,29 +150,46 @@ fn render(url: Url, hop: Hop) -> Result<FetchResponse, RemoteError> {
 
 /// [`Transport`] over HTTPS, connecting only to public addresses.
 pub struct Https {
-    client: reqwest::Client,
+    resolver: resolver::Resolver,
 }
 
 impl Https {
     pub fn new() -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .https_only(true)
-            // A proxy would resolve names itself, past the address check.
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .dns_resolver(Arc::new(PublicOnly))
-            .timeout(TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .user_agent(concat!("molt-web/", env!("CARGO_PKG_VERSION")))
-            .build()?;
-        Ok(Self { client })
+        Self::with_resolver("system")
+    }
+
+    pub fn with_resolver(spec: &str) -> anyhow::Result<Self> {
+        Ok(Self { resolver: resolver::Resolver::new(spec)? })
+    }
+}
+
+/// Every page destination is pinned first. An unexpected resolver fallback must fail closed.
+struct NoFallback;
+impl Resolve for NoFallback {
+    fn resolve(&self, _name: Name) -> Resolving {
+        Box::pin(async { Err("web destination was not pinned to public addresses".into()) })
     }
 }
 
 #[async_trait]
 impl Transport for Https {
     async fn get(&self, url: &Url, max_bytes: usize) -> Result<Hop, String> {
-        let mut resp = self.client.get(url.clone()).send().await.map_err(|e| error_chain(&e))?;
+        let host = url.domain().ok_or("web destination must name a host")?.trim_end_matches('.');
+        let addresses = self.resolver.lookup(host).await?;
+        let mut destination = url.clone();
+        destination.set_host(Some(host)).map_err(|_| "invalid web destination")?;
+        let client = reqwest::Client::builder()
+            .https_only(true)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(Arc::new(NoFallback))
+            .resolve_to_addrs(host, &addresses)
+            .timeout(TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .user_agent(concat!("molt-web/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|error| error.to_string())?;
+        let mut resp = client.get(destination).send().await.map_err(|e| error_chain(&e))?;
         let header = |name| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
         let location = header(reqwest::header::LOCATION);
         let content_type = header(reqwest::header::CONTENT_TYPE).unwrap_or_default();
@@ -192,28 +220,6 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     out
 }
 
-/// Resolves names with the system resolver, keeping only public addresses.
-struct PublicOnly;
-
-impl Resolve for PublicOnly {
-    fn resolve(&self, name: Name) -> Resolving {
-        let host = name.as_str().to_owned();
-        Box::pin(async move {
-            let found: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
-            let kept: Vec<SocketAddr> = found.iter().copied().filter(|a| public(a.ip())).collect();
-            if kept.is_empty() {
-                let err: Box<dyn std::error::Error + Send + Sync> = if found.is_empty() {
-                    format!("{host} has no address").into()
-                } else {
-                    format!("{host} resolves only to addresses that are not public").into()
-                };
-                return Err(err);
-            }
-            Ok(Box::new(kept.into_iter()) as Addrs)
-        })
-    }
-}
-
 /// Serve `web.*` on `svc` until its link closes.
 pub async fn serve(svc: Arc<Service>, web: Arc<Web>) {
     svc.serve_concurrent(8, move |req| {
@@ -241,13 +247,24 @@ fn failed(message: impl Into<String>) -> RemoteError {
 mod tests {
     use super::*;
 
+    struct RefusedTransport;
+    #[async_trait]
+    impl Transport for RefusedTransport {
+        async fn get(&self, _url: &Url, _max_bytes: usize) -> Result<Hop, String> {
+            Err(format!("{}fake-IP DNS; do not retry", molt_api::web::ENVIRONMENT_UNAVAILABLE))
+        }
+    }
+    #[tokio::test]
+    async fn a_dns_configuration_failure_is_a_structured_unavailable_reply() {
+        let web = Web::with_transport(Allow::parse(&["docs.rs"]).unwrap(), Box::new(RefusedTransport));
+        let error = web.fetch("https://docs.rs/example").await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unavailable);
+        assert!(error.message.starts_with(molt_api::web::ENVIRONMENT_UNAVAILABLE));
+    }
+
     #[tokio::test]
     async fn names_that_resolve_only_to_local_addresses_are_not_connected_to() {
-        let name: Name = "localhost".parse().unwrap();
-        let err = match PublicOnly.resolve(name).await {
-            Ok(addrs) => panic!("resolved to {:?}", addrs.collect::<Vec<_>>()),
-            Err(e) => e.to_string(),
-        };
+        let err = resolver::Resolver::new("system").unwrap().lookup("localhost").await.unwrap_err();
         assert!(err.contains("not public") || err.contains("no address"), "{err}");
     }
 }

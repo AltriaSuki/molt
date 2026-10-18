@@ -190,6 +190,10 @@ struct RunArgs {
     /// commands still have no network.
     #[arg(long, value_name = "HOST")]
     allow_web: Vec<String>,
+    /// DNS for web pages: system (default), or doh:https://PUBLIC_IP/dns-query
+    /// using a DNS JSON HTTPS endpoint such as Cloudflare's 1.1.1.1.
+    #[arg(long, value_name = "RESOLVER")]
+    web_resolver: Option<String>,
     /// Run without memory: no project map or notes for the model, and
     /// nothing learned from the run.
     #[arg(long)]
@@ -244,6 +248,10 @@ struct UiArgs {
     /// or `*.python.org` for the hosts below it.
     #[arg(long, value_name = "HOST")]
     allow_web: Vec<String>,
+    /// DNS for web pages: system (default), or doh:https://PUBLIC_IP/dns-query
+    /// using a DNS JSON HTTPS endpoint such as Cloudflare's 1.1.1.1.
+    #[arg(long, value_name = "RESOLVER")]
+    web_resolver: Option<String>,
 }
 
 #[derive(Args)]
@@ -552,6 +560,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                 data_dir: args.data_dir,
                 pass_env: args.pass_env,
                 allow_web: args.allow_web,
+                web_resolver: args.web_resolver,
             };
             for fork in molt::tui::run(opts).await? {
                 eprintln!("kept: {}", agent::printable(&fork));
@@ -764,6 +773,9 @@ fn prepare(config: Option<&Path>, args: &RunArgs) -> anyhow::Result<(Config, Str
         cfg.services.retain(|s| s.name.as_str() != agent::MEMORY);
     }
     agent::allow_web(&mut cfg, &args.allow_web)?;
+    if let Some(resolver) = &args.web_resolver {
+        cfg.web_resolver(resolver)?;
+    }
     if std::env::var_os("RUST_LOG").is_none() {
         for svc in &mut cfg.services {
             svc.env.entry("RUST_LOG".into()).or_insert_with(|| "warn".into());
@@ -871,6 +883,9 @@ async fn execute(
 ) -> anyhow::Result<ExitCode> {
     let workspace = req.workspace.clone();
     let apply = req.apply;
+    for warning in agent::web_warnings(cfg).await? {
+        eprintln!("{}", agent::printable(&format!("web DNS preflight: {warning}")));
+    }
     let checkpointed = req.checkpoint;
     let run = trace.to_string();
     let task = req.task.clone();
