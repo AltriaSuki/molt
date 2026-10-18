@@ -9,6 +9,7 @@ use anyhow::{bail, ensure, Context};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Builtin {
     Help,
+    HistoryClear,
     Remember,
     Theme,
     Memory,
@@ -60,6 +61,7 @@ macro_rules! definitions {
 
 definitions! {
     Help, "help", "", "commands and keyboard help", &[];
+    HistoryClear, "history-clear", "", "clear saved input history for this workspace", &[];
     Remember, "remember", "TEXT", "a preference of yours, for every project", &[];
     Theme, "theme", "NAME", "dark, light or terminal ANSI colors; saved for next time", &["dark", "light", "ansi"];
     Memory, "memory", "[query]", "list, inspect and forget notes", &[];
