@@ -17,6 +17,7 @@ fn config(base_url: String) -> Config {
     Config {
         providers: Default::default(),
         api_key: "test-key".into(),
+        auth_token: None,
         base_url,
         default_model: "opus".into(),
         max_tokens: 32000,

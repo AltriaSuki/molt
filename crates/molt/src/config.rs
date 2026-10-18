@@ -253,6 +253,7 @@ const GATEWAY_ENV: &[&str] = &[
     "MOLT_MODEL_ALIASES",
     "MOLT_OPENAI_MODELS",
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
     "MOLT_MODEL",
     "MOLT_EFFORT",
@@ -677,9 +678,10 @@ mod tests {
         assert_eq!(model.tier, Tier::Protected);
         assert_eq!(model.requests.iter().map(|r| r.target.to_string()).collect::<Vec<_>>(), ["topic:publish:progress"]);
         assert!(model.pass_env.iter().any(|v| v == "ANTHROPIC_API_KEY"));
+        assert!(model.pass_env.iter().any(|v| v == "ANTHROPIC_AUTH_TOKEN"));
         assert!(model.pass_env.iter().any(|v| v == "OPENAI_API_KEY"));
         for service in cfg.services.iter().filter(|s| s.name.as_str() != "model") {
-            assert!(!service.pass_env.iter().any(|v| v.starts_with("OPENAI_")));
+            assert!(!service.pass_env.iter().any(|v| v.starts_with("OPENAI_") || v.starts_with("ANTHROPIC_")));
         }
         assert!(model.pass_env.iter().any(|v| v == "ANTHROPIC_BASE_URL"));
 

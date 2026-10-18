@@ -88,12 +88,12 @@ pub fn resolve_config(
         }
         return Ok(cfg);
     }
-    if ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+    if ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"]
         .iter()
-        .all(|name| std::env::var_os(name).is_none_or(|key| key.is_empty()))
+        .all(|name| std::env::var(name).ok().is_none_or(|key| key.trim().is_empty()))
     {
         bail!(
-            "ANTHROPIC_API_KEY or OPENAI_API_KEY is not set: export your provider API key, or pass --config with services of your own"
+            "ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or OPENAI_API_KEY is not set: export your provider credential, or pass --config with services of your own"
         );
     }
     let data_dir = match (data_dir, project) {

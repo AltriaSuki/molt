@@ -61,6 +61,7 @@ sender from that.
 | Audit verification and startup retain one bounded record; tail retains only the requested entries, independent of total log size | `audit_readers_keep_memory_bounded_as_the_log_grows`, `malformed_oversized_and_unterminated_records_are_never_discarded` |
 | A failing service never takes the kernel down | `a_service_that_never_replies…`, `a_crashed_and_reconnected…`, `a_flooding_service…`, `garbage_on_the_wire_is_ignored`, `crates/molt/tests/e2e.rs` |
 | Both transports behave the same: ordering, at-most-once, sender stamping, isolation, bounded inboxes | `crates/molt-transport/src/testkit.rs`, run by `conformance_unix.rs` and `conformance_nats.rs` |
+| A Bearer-only gateway run works and sandbox commands cannot read its token | `crates/molt/tests/agent.rs` (`a_token_only_cli_run_keeps_bearer_credentials_out_of_sandbox_commands`), `crates/molt-gateway/tests/gateway.rs` (`anthropic_auth_token_uses_bearer_and_api_key_takes_precedence`) |
 | `molt do` never runs a config the project ships, and the API key never reaches the commands it runs | `crates/molt/tests/agent.rs` (`the_cli_carries_out_a_task`) |
 | Only trusted external configuration installs hooks; formatting cannot bypass a protected done-check | `agent::tests::only_configuration_outside_the_project_can_install_hooks`, `tests/agent.rs::lifecycle_formatting_is_rechecked_and_cannot_weaken_the_protected_check` |
 | A conversation sent whole every turn grows the log by its new messages, and reads back byte for byte; a changed or missing referenced value fails verification | `a_conversation_sent_whole_every_turn_is_logged_once_and_read_back_exactly`, `a_changed_or_missing_blob_is_found` |
@@ -550,9 +551,9 @@ the planner, using the service binaries installed next to `molt`. Data dirs that
 an existing one that others can read.
 
 Services start with a scrubbed environment: `PATH`, `HOME`, the locale and a
-few more, plus what each is configured to receive. `ANTHROPIC_API_KEY` goes to
-the gateway only, and the commands the agent runs never see `MOLT_*` or
-`ANTHROPIC_*` variables. Add what your builds and tests need with
+few more, plus what each is configured to receive. `ANTHROPIC_API_KEY` and
+`ANTHROPIC_AUTH_TOKEN` go to the gateway only, and the commands the agent runs
+never see `MOLT_*` or `ANTHROPIC_*` variables. Add what your builds and tests need with
 `--pass-env` (or `pass_env` in a config).
 
 A fork directory set with `--scratch` in a config must be private: the
@@ -578,11 +579,19 @@ give model/planner publication on progress, fs publication on fs.changed, memory
 subscription on fs.changed, and CLI/TUI subscription on progress. Older kernels
 and SDKs do not recognize the new permission spellings.
 
+For Claude Code or a compatible proxy, the same `ANTHROPIC_AUTH_TOKEN` and
+`ANTHROPIC_BASE_URL` work here. Without `ANTHROPIC_API_KEY`, the gateway sends
+`Authorization: Bearer <token>`; with an API key it sends only `x-api-key`.
+If both are set, a startup warning explains that the API key takes precedence.
+Empty or whitespace-only values count as unset. These credentials never reach
+sandbox commands, including when `--pass-env` is requested.
+
 Defaults come from the environment:
 
 | Variable | Read by | Default |
 | --- | --- | --- |
-| `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` | gateway | required, `https://api.anthropic.com` |
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` | gateway | API key preferred; Bearer token fallback (or use `OPENAI_API_KEY`) |
+| `ANTHROPIC_BASE_URL` | gateway | `https://api.anthropic.com` |
 | `MOLT_MODEL`, `MOLT_EFFORT`, `MOLT_MAX_TOKENS` | gateway | `opus`, unset, `32000` |
 | `MOLT_MODEL_TIMEOUT_S`, `MOLT_MODEL_RETRIES`, `MOLT_MODEL_CONCURRENCY`, `MOLT_FALLBACKS` | gateway | `1200`, `4`, `16`, `1` |
 | `MOLT_MODEL_PRICES`, `MOLT_PRICES_FILE` | gateway | unset, `~/.local/share/molt/prices.json` (see [Model prices](#model-prices)) |

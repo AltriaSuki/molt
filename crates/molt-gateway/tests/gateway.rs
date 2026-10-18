@@ -14,6 +14,7 @@ fn config(server: &MockServer) -> Config {
     Config {
         providers: Default::default(),
         api_key: "test-key".into(),
+        auth_token: None,
         base_url: server.uri(),
         default_model: "opus".into(),
         max_tokens: 32_000,
@@ -75,6 +76,23 @@ fn header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
 
 fn body(req: &Request) -> Value {
     req.body_json().unwrap()
+}
+
+#[tokio::test]
+async fn anthropic_auth_token_uses_bearer_and_api_key_takes_precedence() {
+    let server = MockServer::start().await;
+    answer_with(&server, ok(message("claude-opus-5-5"))).await;
+    for api_key in ["", "test-key"] {
+        let cfg = Config { api_key: api_key.into(), auth_token: Some("token-test".into()), ..config(&server) };
+        Gateway::new(cfg).unwrap().complete(request()).await.unwrap();
+    }
+    let requests = sent(&server).await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(header(&requests[0], "authorization"), Some("Bearer token-test"));
+    assert_eq!(header(&requests[0], "x-api-key"), None);
+    assert_eq!(header(&requests[0], "anthropic-version"), Some("2023-06-01"));
+    assert_eq!(header(&requests[1], "x-api-key"), Some("test-key"));
+    assert_eq!(header(&requests[1], "authorization"), None);
 }
 
 #[tokio::test]
@@ -421,6 +439,7 @@ async fn an_unreachable_api_is_unavailable() {
     let cfg = Config {
         providers: Default::default(),
         api_key: "test-key".into(),
+        auth_token: None,
         base_url: format!("http://{addr}"),
         default_model: "opus".into(),
         max_tokens: 1000,
