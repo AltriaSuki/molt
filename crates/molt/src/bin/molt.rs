@@ -456,6 +456,11 @@ enum ProjectCmd {
     },
     /// List the projects, with their ids, directories and data dirs.
     List,
+    /// Print the absolute working directory of a project, for cd or finding its output.
+    Path {
+        /// The project's id or name.
+        project: String,
+    },
     /// Tell molt a project's directory moved to NEW_DIR. Its notes, audit
     /// log and stopped runs stay with it.
     Move {
@@ -864,6 +869,7 @@ async fn execute(
     args: &RunArgs,
     stop: impl std::future::Future<Output = i32>,
 ) -> anyhow::Result<ExitCode> {
+    let workspace = req.workspace.clone();
     let apply = req.apply;
     let checkpointed = req.checkpoint;
     let run = trace.to_string();
@@ -904,6 +910,7 @@ async fn execute(
     if args.json {
         let mut out = serde_json::to_value(&resp)?;
         out["run"] = serde_json::json!(run);
+        out["workspace"] = serde_json::json!(workspace);
         if let Some(committed) = &committed {
             out["commit"] = match committed {
                 Ok(Some(c)) => serde_json::json!({ "sha": c.sha, "branch": c.branch, "ignored": c.ignored }),
@@ -915,7 +922,7 @@ async fn execute(
         out["learning"] = done.learned.as_ref().map_or(serde_json::Value::Null, agent::learning_json);
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
-        print!("{}", agent::report(&resp));
+        print!("{}", agent::report_at(&resp, Some(&workspace)));
     }
     if let Some(learned) = &done.learned {
         eprintln!("{}", agent::learned(learned));
@@ -1146,30 +1153,44 @@ fn project_cmd(cmd: ProjectCmd) -> anyhow::Result<()> {
         anyhow::ensure!(d.is_dir(), "{} is not a directory", d.display());
         Ok(d)
     };
-    let show = |p: &molt::project::Project| {
+    let show = |p: &molt::project::Project| -> anyhow::Result<()> {
         let dirs = if p.paths.is_empty() {
             "no folder".to_owned()
         } else {
             p.paths.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
         };
-        println!("{}", agent::printable(&format!("{}  {}  {dirs}\n    data: {}", p.id, p.name, p.data_dir.display())));
+        let files = if p.paths.is_empty() {
+            format!("\n    files: {}", registry.workspace(p)?.display())
+        } else {
+            String::new()
+        };
+        println!(
+            "{}",
+            agent::printable(&format!("{}  {}  {dirs}{files}\n    data: {}", p.id, p.name, p.data_dir.display()))
+        );
+        Ok(())
     };
     match cmd {
         ProjectCmd::New { name, path } => {
             let path = path.as_deref().map(dir).transpose()?;
-            show(&registry.create(&name, path.as_deref(), |id| agent::project_data_dir(&name, id))?);
+            show(&registry.create(&name, path.as_deref(), |id| agent::project_data_dir(&name, id))?)?;
         }
         ProjectCmd::List => {
             let projects = registry.list()?;
             if projects.is_empty() {
                 eprintln!("no projects yet; one is registered the first time molt runs in a directory");
             }
-            projects.iter().for_each(show);
+            for project in &projects {
+                show(project)?;
+            }
+        }
+        ProjectCmd::Path { project } => {
+            println!("{}", registry.workspace(&registry.find(&project)?)?.display());
         }
         ProjectCmd::Move { project, new_dir, from } => {
-            show(&registry.move_path(&project, &dir(&new_dir)?, from.as_deref())?);
+            show(&registry.move_path(&project, &dir(&new_dir)?, from.as_deref())?)?;
         }
-        ProjectCmd::Add { project, dir: d } => show(&registry.add_path(&project, &dir(&d)?)?),
+        ProjectCmd::Add { project, dir: d } => show(&registry.add_path(&project, &dir(&d)?)?)?,
     }
     Ok(())
 }

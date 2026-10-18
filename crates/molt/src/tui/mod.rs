@@ -93,7 +93,8 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
     }));
     let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableFocusChange);
     emit(notice::PUSH_TITLE);
-    let home = std::env::var("HOME").ok();
+    // A virtual project's output directory is otherwise hard to discover.
+    let home = std::env::var("HOME").ok().filter(|_| !project.as_ref().is_some_and(|p| p.paths.is_empty()));
     let mut unexecuted = Vec::new();
     let result = event_loop(&mut terminal, cfg, path, home.as_deref(), stop, &mut unexecuted).await;
     emit(notice::POP_TITLE);
