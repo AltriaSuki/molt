@@ -948,6 +948,42 @@ async fn a_token_only_cli_run_keeps_bearer_credentials_out_of_sandbox_commands()
 }
 
 #[tokio::test]
+async fn molt_do_says_before_the_run_which_dependencies_commands_cannot_get_and_how_to_fix_it() {
+    let server = fake_api(Fake::Greets).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let lock = "[[package]]\nname = \"memchr\"\nversion = \"2.7.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    std::fs::write(workspace.path().join("Cargo.lock"), lock).unwrap();
+    let args = ["--check", CHECK, "--attempts", "1", "--no-memory", "--no-review"];
+    let out = tokio::time::timeout(RUN_LIMIT, molt_do(&server, workspace.path(), data.path(), &args).output())
+        .await
+        .expect("molt do hung")
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let notice = stderr.find("dependency preflight: Rust: Cargo.lock lists crates").expect(&stderr);
+    assert!(stderr[notice..].lines().next().unwrap().contains("--deps-cache cargo"), "{stderr}");
+    assert!(notice < stderr.find("check passed").expect(&stderr), "the notice comes before the run: {stderr}");
+
+    // With the Cargo cache, there is nothing to say.
+    let cargo = tempfile::tempdir().unwrap();
+    std::fs::create_dir(cargo.path().join("registry")).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::remove_file(workspace.path().join("greeting.txt")).unwrap();
+    let cached = [&args[..], &["--deps-cache", "cargo"]].concat();
+    let cmd = molt_do(&server, workspace.path(), data.path(), &cached).env("CARGO_HOME", cargo.path()).output();
+    let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("dependency preflight"), "{stderr}");
+    // Unconfined by choice is not offered a cache.
+    let err = molt_do(&server, workspace.path(), data.path(), &["--deps-cache", "cargo", "--no-sandbox"]).output();
+    let err = tokio::time::timeout(RUN_LIMIT, err).await.expect("molt do hung").unwrap();
+    assert!(!err.status.success());
+    assert!(String::from_utf8_lossy(&err.stderr).contains("cannot be used with"), "{err:?}");
+}
+
+#[tokio::test]
 async fn the_cli_carries_out_a_task() {
     let server = fake_api(Fake::Greets).await;
     let workspace = tempfile::tempdir().unwrap();

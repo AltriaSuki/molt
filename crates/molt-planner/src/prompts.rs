@@ -438,6 +438,11 @@ or a short summary of what you changed. Otherwise, carry on.";
 pub(crate) const NUDGE: &str = "You have not called submit_check. Call it now with the done-check command and the \
 files it depends on, or with command null if no automated check fits this task.";
 
+/// After the output of a command that failed for want of network.
+pub(crate) const OFFLINE: &str = "Commands here have no network, so missing dependencies cannot be downloaded and \
+retrying will not help: work with what is installed, or stop and tell the user they can run Molt with \
+`--deps-cache cargo` (Rust) or a `--sandbox-policy` that provides the dependencies.";
+
 /// How a command ended, e.g. `exit code 1`.
 pub(crate) fn ending(run: &RunResponse) -> String {
     if run.timed_out {
@@ -472,8 +477,9 @@ pub(crate) fn output_tail(run: &RunResponse, max: usize) -> String {
 }
 
 pub(crate) fn check_failed(command: &str, run: &RunResponse) -> String {
+    let offline = if run.offline_failure { format!("{OFFLINE}\n\n") } else { String::new() };
     format!(
-        "The done-check failed.\n\nCommand: `{command}`\nResult: {}\n\nEnd of its output:\n{}\n\n\
+        "The done-check failed.\n\nCommand: `{command}`\nResult: {}\n\nEnd of its output:\n{}\n\n{offline}\
          Fix the problem, then reply when you are done. The check's files are restored before every run, \
          so change the code, not the check.",
         ending(run),
@@ -798,6 +804,7 @@ mod tests {
             stderr: "error: boom\n".into(),
             truncated: false,
             duration_ms: 1,
+            offline_failure: false,
         };
         let out = output_tail(&run, 4000);
         assert!(out.len() < 4100);

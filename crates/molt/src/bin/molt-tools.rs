@@ -64,6 +64,10 @@ struct ShellArgs {
     /// Explicit environment names allowed inside the sandbox (repeatable).
     #[arg(long)]
     sandbox_env: Vec<String>,
+    /// Build offline from this user's dependency cache: `cargo` mounts
+    /// $CARGO_HOME/registry and git (default ~/.cargo) read-only.
+    #[arg(long, value_name = "KIND", value_parser = ["cargo"], conflicts_with = "no_sandbox")]
+    deps_cache: Vec<String>,
 }
 
 #[derive(Args)]
@@ -127,6 +131,9 @@ async fn main() -> anyhow::Result<()> {
                     None => SandboxPolicy::default(),
                 };
                 policy.environment.extend(args.sandbox_env);
+                if args.deps_cache.iter().any(|kind| kind == "cargo") {
+                    policy.cargo_cache = Some(molt_tools::host_cargo_home()?);
+                }
                 ExecutionPolicy::Configured(policy)
             };
             let shell = Arc::new(Shell::with_policy(roots, policy)?);

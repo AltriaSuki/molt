@@ -184,6 +184,11 @@ struct RunArgs {
     /// Trusted shell sandbox JSON policy outside the project and scratch.
     #[arg(long)]
     sandbox_policy: Option<PathBuf>,
+    /// Let commands build offline from your dependency cache. `cargo`
+    /// mounts $CARGO_HOME/registry and git (default ~/.cargo) read-only and
+    /// gives commands a private CARGO_HOME over them, with CARGO_NET_OFFLINE.
+    #[arg(long, value_name = "KIND", value_parser = ["cargo"], conflicts_with = "no_sandbox")]
+    deps_cache: Vec<String>,
     /// Let the agent read web pages from this host (repeatable): `docs.rs`,
     /// or `*.python.org` for the hosts below it. Pages are fetched over
     /// https by a service of their own and recorded in the audit log;
@@ -244,6 +249,10 @@ struct UiArgs {
     /// runs (repeatable).
     #[arg(long, value_name = "NAME", value_parser = env_name)]
     pass_env: Vec<String>,
+    /// Let commands build offline from your dependency cache: `cargo` mounts
+    /// $CARGO_HOME/registry and git (default ~/.cargo) read-only.
+    #[arg(long, value_name = "KIND", value_parser = ["cargo"])]
+    deps_cache: Vec<String>,
     /// Let the agent read web pages from this host (repeatable): `docs.rs`,
     /// or `*.python.org` for the hosts below it.
     #[arg(long, value_name = "HOST")]
@@ -559,6 +568,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                 project: args.project,
                 data_dir: args.data_dir,
                 pass_env: args.pass_env,
+                deps_cache: args.deps_cache,
                 allow_web: args.allow_web,
                 web_resolver: args.web_resolver,
             };
@@ -750,7 +760,11 @@ fn prepare(config: Option<&Path>, args: &RunArgs) -> anyhow::Result<(Config, Str
             .as_ref()
             .is_some_and(|exec| Path::new(&exec.command).file_name().is_some_and(|name| name == "molt-tools"));
         anyhow::ensure!(
-            standard || (!args.no_sandbox && args.sandbox_policy.is_none() && args.pass_env.is_empty()),
+            standard
+                || (!args.no_sandbox
+                    && args.sandbox_policy.is_none()
+                    && args.pass_env.is_empty()
+                    && args.deps_cache.is_empty()),
             "shell policy flags require the molt-tools shell service"
         );
         if let Some(exec) = shell.exec.as_mut().filter(|_| standard) {
@@ -769,6 +783,7 @@ fn prepare(config: Option<&Path>, args: &RunArgs) -> anyhow::Result<(Config, Str
         }
         shell.pass_env.extend(args.pass_env.iter().cloned());
     }
+    agent::deps_cache(&mut cfg, &args.deps_cache)?;
     if args.no_memory {
         cfg.services.retain(|s| s.name.as_str() != agent::MEMORY);
     }
@@ -885,6 +900,9 @@ async fn execute(
     let apply = req.apply;
     for warning in agent::web_warnings(cfg).await? {
         eprintln!("{}", agent::printable(&format!("web DNS preflight: {warning}")));
+    }
+    for missing in agent::dependency_warnings(cfg, Path::new(&workspace)) {
+        eprintln!("{}", agent::printable(&format!("dependency preflight: {missing}")));
     }
     let checkpointed = req.checkpoint;
     let run = trace.to_string();

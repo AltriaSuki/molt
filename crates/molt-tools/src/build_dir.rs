@@ -11,6 +11,9 @@
 //! Cargo's directory is one of a few slots, each held by one command at a
 //! time: two forks building the same package into one directory would replace
 //! each other's binaries while their tests run. Go's cache is safe to share.
+//!
+//! With `--deps-cache cargo` the directory also holds the private Cargo home
+//! those commands share (see `cargo_cache`); Cargo locks it itself.
 
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -18,10 +21,12 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use molt_proto::RemoteError;
 use sha2::{Digest, Sha256};
 
+use crate::cargo_cache::CargoCache;
 use crate::error::failed;
 use crate::{fork, Roots};
 
@@ -34,27 +39,46 @@ const MAX_FORK_DEPTH: usize = 8;
 pub(crate) struct BuildDir {
     cargo: PathBuf,
     go: PathBuf,
+    /// The private Cargo home and the host cache it reads.
+    cargo_home: Option<(PathBuf, Arc<CargoCache>)>,
     _slot: File,
 }
 
 impl BuildDir {
     /// The directories to make writable, each mounted at its own path.
-    pub(crate) fn mounts(&self) -> [&Path; 2] {
-        [&self.cargo, &self.go]
+    pub(crate) fn mounts(&self) -> Vec<&Path> {
+        let mut mounts = vec![self.cargo.as_path(), self.go.as_path()];
+        mounts.extend(self.cargo_home.as_ref().map(|(home, _)| home.as_path()));
+        mounts
+    }
+
+    /// The host directories to mount read-only, each at its own path.
+    pub(crate) fn read_only(&self) -> Vec<&Path> {
+        self.cargo_home.iter().flat_map(|(_, cache)| cache.mounts()).collect()
     }
 
     /// The variables that send build output there.
-    pub(crate) fn env(&self) -> [(&'static str, OsString); 3] {
-        [
+    pub(crate) fn env(&self) -> Vec<(&'static str, OsString)> {
+        let mut env = vec![
             ("CARGO_TARGET_DIR", self.cargo.clone().into_os_string()),
             ("GOCACHE", self.go.clone().into_os_string()),
             ("PYTHONDONTWRITEBYTECODE", "1".into()),
-        ]
+        ];
+        if let Some((home, _)) = &self.cargo_home {
+            env.extend([
+                ("CARGO_HOME", home.clone().into_os_string()),
+                ("CARGO_NET_OFFLINE", "true".into()),
+                // Cleaning would delete from the read-only host cache.
+                ("CARGO_CACHE_AUTO_CLEAN_FREQUENCY", "never".into()),
+            ]);
+        }
+        env
     }
 }
 
-/// The private build directories for a command in the canonical workspace `ws`.
-pub(crate) fn acquire(roots: &Roots, ws: &Path) -> Result<BuildDir, RemoteError> {
+/// The private build directories for a command in the canonical workspace
+/// `ws`, with a private Cargo home reading `cargo` when given.
+pub(crate) fn acquire(roots: &Roots, ws: &Path, cargo: Option<&Arc<CargoCache>>) -> Result<BuildDir, RemoteError> {
     let error = |e: io::Error| failed(format!("private build directory: {e}"));
     let key = hex::encode(&Sha256::digest(origin(roots, ws).as_os_str().as_encoded_bytes())[..8]);
     let data = roots.scratch.join(".molt");
@@ -64,6 +88,15 @@ pub(crate) fn acquire(roots: &Roots, ws: &Path) -> Result<BuildDir, RemoteError>
     }
     let go = dir.join("go");
     private_dir(&go).map_err(error)?;
+    let cargo_home = match cargo {
+        Some(cache) => {
+            let home = dir.join("cargo-home");
+            private_dir(&home).map_err(error)?;
+            cache.prepare(&home).map_err(|e| failed(format!("private Cargo home {}: {e}", home.display())))?;
+            Some((home, cache.clone()))
+        }
+        None => None,
+    };
     for n in 0..SLOTS {
         let lock = OpenOptions::new()
             .read(true)
@@ -84,7 +117,7 @@ pub(crate) fn acquire(roots: &Roots, ws: &Path) -> Result<BuildDir, RemoteError>
         }
         let cargo = dir.join(format!("cargo-{n}"));
         private_dir(&cargo).map_err(error)?;
-        return Ok(BuildDir { cargo, go, _slot: lock });
+        return Ok(BuildDir { cargo, go, cargo_home, _slot: lock });
     }
     Err(failed(format!(
         "every private build directory of this workspace is in use ({SLOTS} commands are building); retry when one finishes"
@@ -137,14 +170,14 @@ mod tests {
     fn commands_at_once_get_separate_cargo_directories_and_reuse_them_later() {
         let tmp = tempfile::tempdir().unwrap();
         let roots = roots(tmp.path());
-        let first = acquire(&roots, &roots.root).unwrap();
-        let second = acquire(&roots, &roots.root).unwrap();
+        let first = acquire(&roots, &roots.root, None).unwrap();
+        let second = acquire(&roots, &roots.root, None).unwrap();
         assert_ne!(first.cargo, second.cargo);
         assert_eq!(first.go, second.go);
         assert!(first.cargo.starts_with(roots.scratch.join(".molt/build")));
         let (cargo, go) = (first.cargo.clone(), first.go.clone());
         drop(first);
-        let again = acquire(&roots, &roots.root).unwrap();
+        let again = acquire(&roots, &roots.root, None).unwrap();
         assert_eq!((again.cargo.clone(), again.go.clone()), (cargo, go));
         assert_eq!(fs::metadata(&again.cargo).unwrap().permissions().mode() & 0o777, 0o700);
     }
@@ -157,7 +190,7 @@ mod tests {
         fs::create_dir(&elsewhere).unwrap();
         fs::create_dir(roots.scratch.join(".molt")).unwrap();
         std::os::unix::fs::symlink(&elsewhere, roots.scratch.join(".molt/build")).unwrap();
-        let err = acquire(&roots, &roots.root).err().unwrap();
+        let err = acquire(&roots, &roots.root, None).err().unwrap();
         assert!(err.message.contains("private build directory"), "{}", err.message);
         assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
     }

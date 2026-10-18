@@ -476,6 +476,9 @@ fn show_run(r: &shell::RunResponse, timeout_s: u64) -> String {
     if r.stdout.is_empty() && r.stderr.is_empty() {
         out.push_str("\n(no output)");
     }
+    if r.offline_failure {
+        out.push_str(&format!("\n{}", prompts::OFFLINE));
+    }
     out
 }
 
@@ -524,8 +527,33 @@ mod tests {
             stderr: String::new(),
             truncated: false,
             duration_ms: 3,
+            offline_failure: false,
         };
         assert_eq!(show_run(&run, 120), "Exit code 2\nstdout:\nout\n");
+    }
+
+    #[test]
+    fn a_command_that_failed_for_want_of_network_says_so_once_after_its_output() {
+        let stderr = "error: no matching package named `memchr` found\nlocation searched: crates.io index\n";
+        let run = shell::RunResponse {
+            exit_code: Some(101),
+            signal: None,
+            timed_out: false,
+            cancelled: false,
+            stdout: String::new(),
+            stderr: stderr.into(),
+            truncated: false,
+            duration_ms: 3,
+            offline_failure: true,
+        };
+        let shown = show_run(&run, 120);
+        assert_eq!(shown, format!("Exit code 101\nstderr:\n{stderr}\n{}", prompts::OFFLINE));
+        assert!(prompts::OFFLINE.contains("--deps-cache cargo"));
+        let check = prompts::check_failed("cargo test", &run);
+        assert_eq!(check.matches(prompts::OFFLINE).count(), 1, "{check}");
+        let quiet = shell::RunResponse { offline_failure: false, ..run };
+        assert!(!show_run(&quiet, 120).contains(prompts::OFFLINE));
+        assert!(!prompts::check_failed("cargo test", &quiet).contains(prompts::OFFLINE));
     }
 
     #[test]

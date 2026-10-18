@@ -22,6 +22,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
+use crate::cargo_cache::CargoCache;
 use crate::error::failed;
 use crate::{build_dir, sandbox, Roots, SandboxPolicy};
 
@@ -85,16 +86,20 @@ pub(crate) async fn run(
     roots: &Arc<Roots>,
     program: &Path,
     groups: &Arc<Groups>,
-    policy: Option<&SandboxPolicy>,
+    sandbox: Option<(&SandboxPolicy, Option<Arc<CargoCache>>)>,
     req: RunRequest,
     cancel: CancellationToken,
 ) -> Result<RunResponse, RemoteError> {
+    let (policy, cargo) = match sandbox {
+        Some((policy, cargo)) => (Some(policy), cargo),
+        None => (None, None),
+    };
     // Held until the command is done, so no other command builds into its directory.
     let (ws, build) = {
         let (roots, ws) = (roots.clone(), req.workspace.clone());
         tokio::task::spawn_blocking(move || {
             let ws = roots.workspace(&ws)?;
-            let build = build_dir::acquire(&roots, &ws)?;
+            let build = build_dir::acquire(&roots, &ws, cargo.as_ref())?;
             Ok::<_, RemoteError>((ws, build))
         })
         .await
@@ -157,6 +162,9 @@ pub(crate) async fn run(
     drop(build);
     let (stdout, out_cut) = take(&stdout).finish();
     let (stderr, err_cut) = take(&stderr).finish();
+    let success = status.code() == Some(0) && !timed_out && !cancelled;
+    let offline_failure =
+        policy.is_some_and(|policy| !policy.network) && !success && (looks_offline(&stdout) || looks_offline(&stderr));
     Ok(RunResponse {
         exit_code: status.code(),
         signal: status.signal(),
@@ -166,7 +174,39 @@ pub(crate) async fn run(
         stderr,
         truncated: out_cut || err_cut,
         duration_ms: duration.as_millis() as u64,
+        offline_failure,
     })
+}
+
+/// What package managers and network clients print when they cannot reach
+/// the network or a registry, lowercased.
+const OFFLINE_SIGNS: &[&str] = &[
+    // cargo
+    "as a dependency of package",
+    "no matching package named",
+    "crates.io index",
+    "failed to download",
+    "--offline was specified",
+    "you're using offline mode",
+    // curl, git, and resolvers in general
+    "could not resolve host",
+    "temporary failure in name resolution",
+    "network is unreachable",
+    "network unreachable",
+    // npm
+    "enotfound",
+    "eai_again",
+    // pip
+    "failed to establish a new connection",
+    "no matching distribution found",
+    // go
+    "dial tcp",
+];
+
+/// Whether `output` shows a download that failed for want of network.
+fn looks_offline(output: &str) -> bool {
+    let output = output.to_lowercase();
+    OFFLINE_SIGNS.iter().any(|sign| output.contains(sign))
 }
 
 async fn terminate(group: &Group, child: &mut tokio::process::Child) -> std::io::Result<std::process::ExitStatus> {
@@ -315,6 +355,21 @@ impl Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_and_network_failures_are_recognized_and_other_failures_are_not() {
+        for output in [
+            "error: failed to get `memchr` as a dependency of package `lines v0.1.0`",
+            "error: no matching package named `memchr` found\nlocation searched: crates.io index",
+            "fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com",
+            "npm ERR! code ENOTFOUND\nnpm ERR! errno ENOTFOUND",
+            "WARNING: Retrying ... Failed to establish a new connection: [Errno -3] Temporary failure",
+            "go: github.com/x/y@v1.0.0: Get \"https://proxy.golang.org/...\": dial tcp: lookup proxy.golang.org",
+        ] {
+            assert!(looks_offline(output), "{output}");
+        }
+        assert!(!looks_offline("test tests::adds ... FAILED\nassertion failed: left == right"));
+    }
 
     #[test]
     fn capture_keeps_head_and_tail() {
