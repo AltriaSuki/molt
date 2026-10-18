@@ -297,10 +297,13 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         Some(Prompt::Check(d)) | Some(Prompt::EditCheck(d)) => {
             let editing = matches!(app.prompt, Some(Prompt::EditCheck(_)));
             let attempts = app.task.as_ref().map_or(2, |t| t.req.attempts);
-            let mut lines = vec![Line::from(vec![
-                span("◆ check", Tone::Shell),
-                span(format!("  designed · ${:.2}", d.cost_usd), Tone::Dim),
-            ])];
+            let disputed = app.task.as_ref().is_some_and(|t| t.stops.iter().any(|s| s == super::app::DISPUTED));
+            let head = if disputed {
+                span("  disputed by an attempt", Tone::Warn)
+            } else {
+                span(format!("  designed · ${:.2}", d.cost_usd), Tone::Dim)
+            };
+            let mut lines = vec![Line::from(vec![span("◆ check", Tone::Shell), head])];
             if d.uncounted_calls > 0 {
                 lines.push(Line::from(span(
                     format!("  cost incomplete · {} calls uncounted · remaining budget unknown", d.uncounted_calls),

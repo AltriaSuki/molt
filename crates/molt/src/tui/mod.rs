@@ -806,6 +806,7 @@ mod tests {
             selection: Default::default(),
             rubric: vec![],
             judgement: vec![],
+            dispute: None,
         };
         let trace = TraceId::random();
         rt.exec(Action::PrepareCommit { trace: trace.clone() });

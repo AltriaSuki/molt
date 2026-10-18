@@ -529,6 +529,17 @@ fn is_designer(req: &CompleteRequest) -> bool {
     req.tools.iter().any(|t| t["name"] == "submit_check")
 }
 
+fn is_vetter(req: &CompleteRequest) -> bool {
+    req.tools.iter().any(|t| t["name"] == "submit_vetting")
+}
+
+/// The vetter's answer: these conflicts, as (assertion, task quote, why).
+fn submit_vetting(req: &CompleteRequest, conflicts: &[(&str, &str, &str)]) -> Reply {
+    let conflicts: Vec<Value> =
+        conflicts.iter().map(|(a, q, w)| json!({ "assertion": a, "task_quote": q, "why": w })).collect();
+    use_tools(req, &[("submit_vetting", json!({ "conflicts": conflicts }))])
+}
+
 fn is_reviewer(req: &CompleteRequest) -> bool {
     req.tools.iter().any(|t| t["name"] == "submit_review")
 }
@@ -803,6 +814,9 @@ fn script_check(command: &str, files: &Files) -> shell::RunResponse {
 async fn an_attempt_cannot_pass_by_editing_a_check_file() {
     let fake = Fake::new(
         |req| {
+            if is_vetter(req) {
+                return submit_vetting(req, &[]);
+            }
             if is_designer(req) {
                 return match turn(req) {
                     1 => use_tools(
@@ -843,6 +857,9 @@ async fn designed_check_files_are_written_into_every_attempt_fork() {
     let check_script = script.clone();
     let fake = Fake::new(
         move |req| {
+            if is_vetter(req) {
+                return submit_vetting(req, &[]);
+            }
             if is_designer(req) {
                 return match turn(req) {
                     1 => use_tools(
@@ -915,7 +932,7 @@ async fn designed_check_files_are_written_into_every_attempt_fork() {
         })
     );
     // The attempts were told about the check and its files.
-    let first = &fake.requests().into_iter().find(|r| !is_designer(r)).unwrap().messages[0];
+    let first = &fake.requests().into_iter().find(|r| !is_designer(r) && !is_vetter(r)).unwrap().messages[0];
     let text = first["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("`sh tests/feature.sh`") && text.contains("tests/feature.sh."), "{text}");
     assert!(fake.forks_alive().is_empty());
@@ -1398,6 +1415,9 @@ async fn an_empty_final_reply_is_asked_for_once() {
 async fn only_new_files_can_be_check_files() {
     let fake = Fake::new(
         |req| {
+            if is_vetter(req) {
+                return submit_vetting(req, &[]);
+            }
             if !is_designer(req) {
                 return match turn(req) {
                     1 => write_hello(req, "hi\n"),
@@ -1576,7 +1596,8 @@ async fn memory_gives_every_conversation_the_project_context_and_its_tools() {
     assert_eq!(run(&plain, request(Some("check"), 1)).await.outcome, Outcome::Passed);
     let first = &plain.requests()[0];
     assert!(first.messages[0]["content"][0]["text"].as_str().unwrap().starts_with("<task>"));
-    assert_eq!(first.tools.len(), 6);
+    // The file and shell tools, and dispute_check for an attempt run against a check.
+    assert_eq!(first.tools.len(), 7);
     assert_eq!(plain.calls_to("memory.recall").len(), 1, "asked once, then left alone");
     assert!(plain.calls_to("memory.index").is_empty() && plain.calls_to("memory.map").is_empty());
 
@@ -1592,7 +1613,7 @@ async fn memory_gives_every_conversation_the_project_context_and_its_tools() {
     assert_eq!(run(&hung, request(Some("check"), 1)).await.outcome, Outcome::Passed);
     assert_eq!(hung.calls().iter().filter(|c| c.target.starts_with("memory.")).count(), 1);
     assert_eq!(hung.calls_to("memory.recall")[0].budget.ms, 10_000);
-    assert_eq!(hung.requests()[0].tools.len(), 6);
+    assert_eq!(hung.requests()[0].tools.len(), 7);
     assert!(hung.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
         if message == "running without memory: memory.recall did not answer")));
 }
@@ -2748,4 +2769,274 @@ async fn design_returns_the_rubric_and_a_run_given_it_designs_nothing() {
         let err = molt_planner::run(bus, Arc::new(config()), bad, TraceId::random()).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Invalid, "{}", err.message);
     }
+}
+
+// --- Checks that contradict the task (#136) ----------------------------------
+
+/// The check the designer writes: one that wants "hello" where the task says "hi", or one that follows it.
+const WRONG_CHECK: &str = "grep -qx hello hello.txt\n";
+const RIGHT_CHECK: &str = "grep -qx hi hello.txt\n";
+
+/// A designer that writes `tests/check.sh` and submits it: the wrong check
+/// first, and the right one once a vetter sent it back, unless `stubborn`.
+fn designs_check(req: &CompleteRequest, stubborn: bool) -> Reply {
+    let sent_back = req.messages.iter().any(|m| m.to_string().contains("Not accepted: an independent vetter"));
+    let script = if sent_back && !stubborn { RIGHT_CHECK } else { WRONG_CHECK };
+    let wrote = req.messages.last().is_some_and(|m| m.to_string().contains("Wrote"));
+    if wrote {
+        let submit = json!({ "command": "sh tests/check.sh", "files": ["tests/check.sh"], "rationale": "greps it" });
+        use_tools(req, &[("submit_check", submit)])
+    } else {
+        use_tools(req, &[("write_file", json!({ "path": "tests/check.sh", "content": script }))])
+    }
+}
+
+/// The vetter: a conflict when the check it is shown wants "hello".
+fn vets_greeting(req: &CompleteRequest) -> Reply {
+    let shown = req.messages[0]["content"][0]["text"].as_str().unwrap();
+    assert!(shown.contains("<task>\nAdd hello.txt saying hi.\n</task>"), "{shown}");
+    assert!(shown.contains("The done-check is `sh tests/check.sh`."), "{shown}");
+    if shown.contains("grep -qx hello") {
+        submit_vetting(req, &[("tests/check.sh expects hello.txt to hold hello", "saying hi", "The task asks for hi.")])
+    } else {
+        submit_vetting(req, &[])
+    }
+}
+
+fn greeting_check(command: &str, files: &Files) -> shell::RunResponse {
+    match (command, files.get("tests/check.sh").map(String::as_str), files.get("hello.txt").map(String::as_str)) {
+        ("sh tests/check.sh", Some(RIGHT_CHECK), Some("hi\n")) => exit(0, ""),
+        ("sh tests/check.sh", Some(WRONG_CHECK), Some("hello\n")) => exit(0, ""),
+        _ => exit(1, "no match\n"),
+    }
+}
+
+#[tokio::test]
+async fn a_check_that_contradicts_the_task_goes_back_to_the_designer() {
+    let fake = Fake::new(
+        |req| {
+            if is_vetter(req) {
+                return vets_greeting(req);
+            }
+            if is_designer(req) {
+                return designs_check(req, false);
+            }
+            match turn(req) {
+                1 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            }
+        },
+        greeting_check,
+    );
+    let resp = run(&fake, request(None, 1)).await;
+
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert_eq!(fake.workspace()["tests/check.sh"], RIGHT_CHECK);
+    let requests = fake.requests();
+    assert_eq!(requests.iter().filter(|r| is_vetter(r)).count(), 2, "each submission is vetted");
+    // The conflict reached the designer as the error result of its submit_check.
+    let designer: Vec<&CompleteRequest> = requests.iter().filter(|r| is_designer(r)).collect();
+    let sent_back = designer.iter().find_map(|r| {
+        let result = &r.messages.last().unwrap()["content"][0];
+        (result["is_error"] == true).then(|| result["content"].as_str().unwrap().to_owned())
+    });
+    let sent_back = sent_back.expect("the designer was told about the conflict");
+    assert!(sent_back.contains("The check asserts: tests/check.sh expects hello.txt to hold hello"), "{sent_back}");
+    assert!(sent_back.contains("The task says: \"saying hi\"") && sent_back.contains("Why: The task asks for hi."));
+    // The vetter only reads, and its calls are paid for like any other.
+    let vetter = requests.iter().find(|r| is_vetter(r)).unwrap();
+    let names: Vec<&str> = vetter.tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert_eq!(names, ["read_file", "list_files", "search", "submit_vetting"]);
+    assert!(close(resp.cost_usd, 0.125 * requests.len() as f64), "{}", resp.cost_usd);
+    assert!(fake.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
+        if message == "check vetter: 1 conflict with the task; back to the designer")));
+}
+
+#[tokio::test]
+async fn a_designer_that_keeps_contradicting_the_task_stops_the_run_before_any_attempt() {
+    let fake = Fake::new(
+        |req| {
+            if is_vetter(req) {
+                return vets_greeting(req);
+            }
+            assert!(is_designer(req), "no attempt may start");
+            designs_check(req, true)
+        },
+        greeting_check,
+    );
+    let resp = run(&fake, request(None, 2)).await;
+
+    assert_eq!((resp.outcome, resp.attempts.len(), resp.applied), (Outcome::Failed, 0, false));
+    assert!(resp.summary.starts_with("Could not design a done-check: an independent vetter found the check in conflict with the task in 2 submissions"), "{}", resp.summary);
+    assert!(
+        resp.summary.contains("The check asserts: tests/check.sh expects hello.txt to hold hello"),
+        "{}",
+        resp.summary
+    );
+    assert!(resp.summary.contains("The task says: \"saying hi\""), "{}", resp.summary);
+    let requests = fake.requests();
+    assert_eq!(requests.iter().filter(|r| is_vetter(r)).count(), 2);
+    // The design's spend is the run's, vetter included.
+    assert!(close(resp.cost_usd, 0.125 * requests.len() as f64), "{}", resp.cost_usd);
+    assert!(!fake.events().iter().any(|e| matches!(e, Progress::AttemptStarted { .. })));
+    assert!(fake.forks_alive().is_empty());
+
+    // planner.design reports the same failure, which the TUI's confirm mode shows.
+    let bus: Arc<dyn Bus> = fake.clone();
+    let design = molt_planner::design(bus, Arc::new(config()), request(None, 1), TraceId::from_raw("trace_design"))
+        .await
+        .unwrap();
+    let error = design.error.expect("the design failed");
+    assert!(error.starts_with("could not design a done-check: an independent vetter found"), "{error}");
+    assert!(design.command.is_none() && design.files.is_empty());
+}
+
+#[tokio::test]
+async fn a_vetter_that_does_not_finish_lets_the_check_through_and_says_it_was_not_vetted() {
+    let fake = Fake::new(
+        |req| {
+            if is_vetter(req) {
+                return Reply {
+                    resp: Err(RemoteError { code: ErrorCode::Unavailable, message: "overloaded".into() }),
+                    delay: Duration::ZERO,
+                };
+            }
+            designs_check(req, false)
+        },
+        greeting_check,
+    );
+    let bus: Arc<dyn Bus> = fake.clone();
+    let design = molt_planner::design(bus, Arc::new(config()), request(None, 1), TraceId::from_raw("trace_design"))
+        .await
+        .unwrap();
+    assert!(design.error.is_none(), "{:?}", design.error);
+    assert_eq!(design.command.as_deref(), Some("sh tests/check.sh"));
+    assert!(
+        design
+            .rationale
+            .ends_with("Not vetted against the task: the vetter did not finish (the model call failed: overloaded)."),
+        "{}",
+        design.rationale
+    );
+    // A failed call's cost is unknown, never free.
+    assert_eq!(design.uncounted_calls, 1);
+    assert!(fake.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
+        if message.starts_with("check vetter: did not finish (the model call failed: overloaded)"))));
+}
+
+fn dispute(req: &CompleteRequest) -> Reply {
+    let input = json!({
+        "assertion": "check wants hello.txt to say hello",
+        "task_quote": "Add hello.txt saying hi.",
+        "reproduce": "sh tests/check.sh",
+    });
+    use_tools(req, &[("dispute_check", input)])
+}
+
+#[tokio::test]
+async fn an_attempt_that_disputes_the_check_ends_the_run_with_the_dispute_not_a_failure() {
+    let fake = Fake::new(
+        |req| match (attempt_of(req), turn(req)) {
+            // A dispute without its evidence is sent back.
+            (0, 1) => {
+                use_tools(req, &[("dispute_check", json!({ "assertion": "x", "task_quote": "", "reproduce": "" }))])
+            }
+            (0, 2) => {
+                let said = last_text(req);
+                assert!(said.contains("dispute_check needs task_quote, reproduce"), "{said}");
+                dispute(req)
+            }
+            (_, 1) => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        },
+        |_, _| exit(1, "expected hello\n"),
+    );
+    let resp = run(&fake, RunRequest { max_check_rounds: Some(1), ..request(Some("check"), 2) }).await;
+
+    assert_eq!((resp.outcome, resp.applied, resp.winner), (Outcome::Failed, false, None));
+    let dispute = *resp.dispute.clone().expect("the run carries the dispute");
+    assert_eq!(dispute.attempt, 0);
+    assert_eq!(dispute.assertion, "check wants hello.txt to say hello");
+    assert_eq!(dispute.task_quote, "Add hello.txt saying hi.");
+    assert_eq!(dispute.reproduce, "sh tests/check.sh");
+    assert!(
+        resp.summary.starts_with("The done-check was disputed: attempt 0 found that it contradicts the task."),
+        "{}",
+        resp.summary
+    );
+    assert!(resp.summary.contains("To reproduce: `sh tests/check.sh`"), "{}", resp.summary);
+    assert!(resp.summary.contains("- attempt 0: disputed"), "{}", resp.summary);
+    // The disputing attempt stopped without a check run and is not a failed attempt; the other failed as usual.
+    let (a, b) = (&resp.attempts[0], &resp.attempts[1]);
+    assert_eq!((a.status, a.check_runs, a.turns), (AttemptStatus::Cancelled, 0, 2));
+    assert_eq!(a.dispute.as_ref(), Some(&dispute));
+    assert_eq!((b.status, b.dispute.as_ref()), (AttemptStatus::Failed, None));
+    assert!(fake.forks_alive().is_empty());
+    // Only attempts run against a check are offered the tool.
+    let attempt = fake.requests().into_iter().find(|r| attempt_of(r) == 0).unwrap();
+    assert_eq!(attempt.tools.last().unwrap()["name"], "dispute_check");
+    let system = attempt.system.as_deref().unwrap();
+    assert!(system.contains("call dispute_check") && system.contains("do not bend the code to it"), "{system}");
+}
+
+#[tokio::test]
+async fn a_dispute_is_only_noted_when_another_attempt_passes_and_unchecked_runs_cannot_dispute() {
+    let fake = Fake::new(
+        |req| match (attempt_of(req), turn(req)) {
+            (0, _) => dispute(req),
+            (_, 1) => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        },
+        hello_check,
+    );
+    let resp = run(&fake, RunRequest { select: Select::All, ..request(Some("check"), 2) }).await;
+    assert_eq!((resp.outcome, resp.winner), (Outcome::Passed, Some(1)), "{}", resp.summary);
+    assert!(resp.dispute.is_none());
+    assert!(resp.attempts[0].dispute.is_some());
+
+    let fake = Fake::new(|_| done("The answer is 42."), |_, _| panic!("no command should run"));
+    let resp = run(&fake, RunRequest { verify: false, ..request(None, 1) }).await;
+    assert_eq!(resp.outcome, Outcome::Unverified);
+    assert!(fake.requests()[0].tools.iter().all(|t| t["name"] != "dispute_check"));
+}
+
+#[tokio::test]
+async fn a_dispute_saved_in_a_checkpoint_is_reported_after_the_resume() {
+    let fake = Fake::new(scripted(|_, req| write_hello(req, "bye\n")), hello_check);
+    let state = tempfile::tempdir().unwrap();
+    let cfg = Config { state_dir: Some(state.path().into()), max_check_rounds: 1, ..config() };
+    let mut saved = molt_planner::checkpoint::Saved::new(
+        "trace_test",
+        RunRequest { checkpoint: true, ..request(Some("check"), 2) },
+    );
+    saved.settled = true;
+    saved.check = Some(molt_planner::checkpoint::SavedCheck {
+        command: "check".into(),
+        files: vec![],
+        designed: false,
+        suite: None,
+    });
+    let disputed = molt_api::planner::CheckDispute {
+        attempt: 0,
+        assertion: "check wants bye".into(),
+        task_quote: "saying hi".into(),
+        reproduce: "check".into(),
+    };
+    saved.attempt(0).end = Some(molt_planner::checkpoint::SavedEnd {
+        status: AttemptStatus::Cancelled,
+        note: "disputed".into(),
+        summary: String::new(),
+        findings: vec![],
+        dispute: Some(disputed.clone()),
+    });
+    // Saved and read back as JSON, as a resume does; an end without a dispute reads as before.
+    std::fs::write(state.path().join("trace_test.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+    let old: molt_planner::checkpoint::SavedEnd =
+        serde_json::from_value(json!({ "status": "failed", "note": "n" })).unwrap();
+    assert!(old.dispute.is_none());
+
+    let resp = run_with(&fake, cfg, resume("trace_test", true)).await;
+    assert_eq!(resp.outcome, Outcome::Failed, "{}", resp.summary);
+    assert_eq!(resp.dispute, Some(Box::new(disputed)));
+    assert_eq!(resp.attempts[0].status, AttemptStatus::Cancelled);
 }
