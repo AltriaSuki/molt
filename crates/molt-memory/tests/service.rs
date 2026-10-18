@@ -158,6 +158,30 @@ async fn notes_are_recalled_forgotten_and_retracted() {
 }
 
 #[tokio::test]
+async fn a_task_in_chinese_recalls_the_chinese_notes_it_is_about() {
+    let s = Setup::new();
+    let sandbox: RememberResponse = s
+        .call(
+            "memory.remember",
+            remember("app", "测试命令是 CARGO_TARGET_DIR=/tmp/ct cargo test，target/ 在沙箱里只读。"),
+        )
+        .await;
+    let _: RememberResponse = s.call("memory.remember", remember("app", "发布前要更新变更日志。")).await;
+    let _: RememberResponse = s.call("memory.remember", remember("app", "The parser lives in src/lib.rs.")).await;
+    // The request the planner makes at the start of a run, the task as its query.
+    let start = json!({
+        "query": "修复测试：在沙箱里运行时报错说目录只读",
+        "workspace": "app",
+        "k": 12,
+        "min_confidence": 0.25,
+        "capture": "context",
+    });
+    let found: RecallResponse = s.call("memory.recall", start).await;
+    let ids: Vec<&str> = found.notes.iter().map(|r| r.note.id.as_str()).collect();
+    assert_eq!(ids, [sandbox.note.id.as_str()]);
+}
+
+#[tokio::test]
 async fn notes_about_a_project_follow_it_across_its_directories() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
