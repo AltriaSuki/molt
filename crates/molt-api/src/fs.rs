@@ -271,6 +271,23 @@ pub struct DiffResponse {
     pub patch: String,
     /// The patch was cut to the service's size limit.
     pub truncated: bool,
+    /// Build artifacts left out of `changes` and `patch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_out: Option<LeftOut>,
+}
+
+/// Build artifacts a fork's result leaves out: files that commands created
+/// in build or cache directories (`target-*/`, `__pycache__/`, a directory
+/// with a `CACHEDIR.TAG`, ...), or compiled files (`.pyc`, `.o`, `.rlib`,
+/// binary executables), that no write or edit made and the original does not
+/// have. Diff does not list them and merge does not copy them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeftOut {
+    /// How many files were left out.
+    pub count: u64,
+    /// The first few of them, sorted.
+    #[serde(default)]
+    pub paths: Vec<String>,
 }
 
 /// Validate a service-created fork and identify its complete current contents.
@@ -309,6 +326,9 @@ pub struct MergeResponse {
     /// Durable recovery record, when the merge wrote any files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<String>,
+    /// Build artifacts the merge did not copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_out: Option<LeftOut>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

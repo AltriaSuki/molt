@@ -530,6 +530,43 @@ async fn a_given_check_passes_and_the_result_is_applied() {
 }
 
 #[tokio::test]
+async fn build_output_of_the_check_is_left_out_of_the_result_and_the_workspace() {
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    // A check that builds into a directory of its own in the workspace, as a
+    // designer reaching for a writable target directory did, and leaves
+    // bytecode behind, with no .gitignore to hide either.
+    let check = "mkdir -p target-done-check/debug __pycache__ && echo x > target-done-check/debug/libgreet.rlib \
+                 && echo x > __pycache__/greet.cpython-312.pyc && echo built > \"$CARGO_TARGET_DIR/marker\" \
+                 && grep -q hello greeting.txt";
+    let (resp, _) = setup.run(setup.request(Some(check), 1)).await;
+
+    assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
+    assert!(resp.applied, "{resp:#?}");
+    let changes: Vec<_> = resp.changes.iter().map(|c| (c.path.as_str(), c.kind)).collect();
+    assert_eq!(changes, [("greeting.txt", ChangeKind::Added)], "{resp:#?}");
+    assert!(!resp.patch.contains("target-done-check"), "{}", resp.patch);
+    let left_out = resp.left_out.as_ref().expect("the artifacts are reported");
+    assert_eq!(left_out.count, 2);
+    assert_eq!(left_out.paths, ["__pycache__/greet.cpython-312.pyc", "target-done-check/debug/libgreet.rlib"]);
+    assert_eq!(setup.files(), ["README.txt", "greeting.txt"]);
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    assert!(molt::agent::report(&resp).contains("left out 2 build artifacts"), "{}", molt::agent::report(&resp));
+
+    // The check's own build output went to a private directory in the data dir.
+    let build = setup.data.path().join("work/.molt/build");
+    let marker = std::fs::read_dir(&build)
+        .unwrap()
+        .flat_map(|key| std::fs::read_dir(key.unwrap().path()).unwrap())
+        .map(|slot| slot.unwrap().path().join("marker"))
+        .find(|marker| marker.is_file())
+        .expect("CARGO_TARGET_DIR is writable and kept");
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "built\n");
+    setup.assert_forks_dropped();
+    assert_requests_valid(&server).await;
+}
+
+#[tokio::test]
 async fn a_second_run_starts_with_what_the_first_learned_and_a_map_of_the_code() {
     let server = fake_api(Fake::Greets).await;
     let mut setup = Setup::new(&server);

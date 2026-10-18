@@ -632,6 +632,7 @@ async fn conclude(
         winner: None,
         summary: String::new(),
         changes: Vec::new(),
+        left_out: None,
         patch: String::new(),
         patch_truncated: false,
         applied: false,
@@ -752,6 +753,7 @@ async fn deliver(
     match diff {
         Ok(diff) => {
             resp.changes = diff.changes;
+            resp.left_out = diff.left_out;
             resp.patch = diff.patch;
             resp.patch_truncated = diff.truncated;
             resp.review = review;
@@ -946,6 +948,7 @@ fn not_designed(ctx: &Ctx, reason: &str) -> RunResponse {
         winner: None,
         summary: format!("Could not design a done-check: {reason}."),
         changes: Vec::new(),
+        left_out: None,
         patch: String::new(),
         patch_truncated: false,
         applied: false,

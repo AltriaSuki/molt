@@ -5,6 +5,7 @@ use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use crate::build_dir::BuildDir;
 use crate::{fork, Roots};
 
 const MAX_POLICY_BYTES: usize = 64 * 1024;
@@ -113,7 +114,7 @@ impl SandboxPolicy {
 
     pub fn probe(&self) -> anyhow::Result<()> {
         self.validate()?;
-        let (mut command, _guard) = self.command(Path::new("/bin/true"), None, None)?;
+        let (mut command, _guard) = self.command(Path::new("/bin/true"), None, None, None)?;
         let command = command.as_std_mut();
         command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
         let mut child = command.spawn().context("starting /usr/bin/bwrap; install bubblewrap 0.9 or newer")?;
@@ -152,7 +153,13 @@ impl SandboxPolicy {
         Ok(())
     }
 
-    pub(crate) fn prepare(&self, roots: &Roots, workspace: &Path, program: &Path) -> anyhow::Result<(Command, Guard)> {
+    pub(crate) fn prepare(
+        &self,
+        roots: &Roots,
+        workspace: &Path,
+        program: &Path,
+        build: &BuildDir,
+    ) -> anyhow::Result<(Command, Guard)> {
         let base = fork::base(roots, &workspace.to_string_lossy())
             .context("isolated commands require an fs.fork workspace")?;
         ensure!(
@@ -165,7 +172,13 @@ impl SandboxPolicy {
                 "dependency mounts cannot overlap the writable fork"
             );
         }
-        self.command(program, Some(workspace), Some(&base))
+        for path in build.mounts() {
+            ensure!(
+                !path.starts_with(&base) && !base.starts_with(path) && !path.starts_with(workspace),
+                "the private build directory must be outside the project and the fork"
+            );
+        }
+        self.command(program, Some(workspace), Some(&base), Some(build))
     }
 
     fn command(
@@ -173,14 +186,15 @@ impl SandboxPolicy {
         program: &Path,
         workspace: Option<&Path>,
         base: Option<&Path>,
+        build: Option<&BuildDir>,
     ) -> anyhow::Result<(Command, Guard)> {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            linux::command(self, program, workspace, base)
+            linux::command(self, program, workspace, base, build)
         }
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         {
-            let _ = (program, workspace, base);
+            let _ = (program, workspace, base, build);
             anyhow::bail!("sandbox requires Linux x86_64; explicit unconfined mode is required on this platform")
         }
     }
@@ -319,6 +333,7 @@ mod linux {
         program: &Path,
         workspace: Option<&Path>,
         base: Option<&Path>,
+        build: Option<&BuildDir>,
     ) -> anyhow::Result<(Command, Guard)> {
         let mut seccomp = memfd(c"molt-seccomp")?;
         let filter = filter();
@@ -379,11 +394,22 @@ mod linux {
         if let Some(ws) = workspace {
             command.arg("--bind").arg(ws).arg(ws).arg("--chdir").arg(ws);
         }
+        // Build output goes to private directories outside the fork, which
+        // persist for the workspace (see `build_dir`).
+        for path in build.iter().flat_map(|b| b.mounts()) {
+            command.arg("--bind").arg(path).arg(path);
+        }
         command.arg("--seccomp").arg(filter_fd.to_string()).arg("--info-fd").arg(info_fd.to_string());
         // Keep loader and shell variables away from the host-side backend.
         // The env helper runs only after entering every isolation boundary.
         command.env_clear().env("PATH", "/usr/bin:/bin").env("LC_ALL", "C");
         command.args(["--", "/usr/bin/env", "-i"]);
+        // Before the passed variables, so a variable the user passes wins.
+        for (name, value) in build.iter().flat_map(|b| b.env()) {
+            let mut entry = std::ffi::OsString::from(format!("{name}="));
+            entry.push(value);
+            command.arg(entry);
+        }
         for name in
             ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"].iter().map(|s| s.to_string()).chain(policy.environment.clone())
         {

@@ -533,7 +533,7 @@ impl RunForks {
         let keep: Vec<&str> =
             keep.iter().filter_map(|fork| Path::new(fork).file_name()).filter_map(|name| name.to_str()).collect();
         for name in fork_entries(&self.scratch).difference(&self.before) {
-            let fork = name.to_str().map(|n| n.strip_suffix(".json").unwrap_or(n));
+            let fork = name.to_str().map(|n| n.strip_suffix(".json").or(n.strip_suffix(".written")).unwrap_or(n));
             if fork.is_some_and(|fork| keep.contains(&fork)) {
                 continue;
             }
@@ -549,7 +549,7 @@ impl RunForks {
     }
 }
 
-/// The names in `scratch` that belong to forks: `fork-<id>` and `fork-<id>.json`.
+/// The names in `scratch` that belong to forks: `fork-<id>`, `fork-<id>.json` and `fork-<id>.written`.
 fn fork_entries(scratch: &Path) -> HashSet<OsString> {
     let Ok(entries) = std::fs::read_dir(scratch) else { return HashSet::new() };
     entries
@@ -922,6 +922,9 @@ pub fn report_at(resp: &RunResponse, workspace: Option<&str>) -> String {
         lines.push("changes:".to_owned());
         lines.extend(resp.changes.iter().map(|c| format!("  {:<9}{}", change_name(c.kind), c.path)));
     }
+    if let Some(line) = resp.left_out.as_ref().and_then(left_out_line) {
+        lines.push(line);
+    }
     if let Some(review) = &resp.review {
         lines.push(format!("review: {}", verdict_name(review.verdict)));
         lines.extend(review.findings.iter().map(|f| format!("  - {f}")));
@@ -943,6 +946,22 @@ pub fn report_at(resp: &RunResponse, workspace: Option<&str>) -> String {
         lines.push(summary.to_owned());
     }
     printable(&(lines.join("\n") + "\n"))
+}
+
+/// The build artifacts a result leaves out, in one line: how many, and the
+/// first few. `None` when there were none.
+pub fn left_out_line(left_out: &molt_api::fs::LeftOut) -> Option<String> {
+    let count = left_out.count;
+    if count == 0 {
+        return None;
+    }
+    let what = if count == 1 { "build artifact" } else { "build artifacts" };
+    let mut line = format!("left out {count} {what} the commands made: {}", left_out.paths.join(", "));
+    let more = count.saturating_sub(left_out.paths.len() as u64);
+    if more > 0 {
+        line.push_str(&format!(", and {more} more"));
+    }
+    Some(line)
 }
 
 /// How the winner was picked among several passing attempts: one line per
@@ -1162,6 +1181,7 @@ mod tests {
             std::fs::create_dir_all(work.join(id).join("src")).unwrap();
             std::fs::write(work.join(id).join("src/lib.rs"), "").unwrap();
             std::fs::write(work.join(format!("{id}.json")), "{}").unwrap();
+            std::fs::write(work.join(format!("{id}.written")), "\"src/lib.rs\"\n").unwrap();
         }
         std::fs::create_dir_all(work.join(".molt/applies/apply-0000000000000001")).unwrap();
         std::fs::write(work.join(".molt/applies/apply-0000000000000001/journal.json"), "recovery material").unwrap();
@@ -1175,7 +1195,14 @@ mod tests {
         left.sort();
         assert_eq!(
             left,
-            [".molt", "fork-000000000001", "fork-000000000001.json", "fork-000000000003", "fork-000000000003.json"]
+            [
+                ".molt",
+                "fork-000000000001",
+                "fork-000000000001.json",
+                "fork-000000000003",
+                "fork-000000000003.json",
+                "fork-000000000003.written"
+            ]
         );
 
         // A scratch dir outside the data dir may be shared with other runs.
@@ -1400,6 +1427,7 @@ mod tests {
             winner: Some(0),
             summary: "Fixed the parser.\n".into(),
             changes: vec![Change { path: "src/lib.rs".into(), kind: ChangeKind::Modified }],
+            left_out: None,
             patch: String::new(),
             patch_truncated: false,
             applied: true,
@@ -1422,6 +1450,15 @@ mod tests {
         );
         assert!(report_at(&resp, Some("/user-data/molt/projects/trip/files"))
             .contains("applied to /user-data/molt/projects/trip/files\n"));
+        resp.left_out = Some(molt_api::fs::LeftOut {
+            count: 7,
+            paths: ["target-x/CACHEDIR.TAG", "target-x/debug/app"].map(String::from).to_vec(),
+        });
+        assert!(report(&resp).contains(
+            "  modified src/lib.rs\nleft out 7 build artifacts the commands made: target-x/CACHEDIR.TAG, \
+             target-x/debug/app, and 5 more\napplied"
+        ));
+        resp.left_out = None;
         resp.applied = false;
         resp.fork = Some("/cache/work/fork_1".into());
         resp.uncounted_calls = 2;

@@ -515,6 +515,10 @@ pub struct RunResponse {
     /// The winning attempt's final message, or why the run failed.
     pub summary: String,
     pub changes: Vec<Change>,
+    /// Build artifacts the winner's commands left in its fork, which are not
+    /// among `changes` and are not applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_out: Option<crate::fs::LeftOut>,
     /// Unified diff of the winner's changes.
     pub patch: String,
     /// `patch` was cut to the fs service's size limit; `changes` is complete.

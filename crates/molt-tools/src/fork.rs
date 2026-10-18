@@ -6,8 +6,12 @@
 //! and merge compare three states of each path: the state at fork time, the
 //! fork now and the original now. Forks and their metadata are private to
 //! the service's user: they copy private source, and merge trusts them.
+//!
+//! `scratch/fork-<id>.written` lists the paths writes and edits made in the
+//! fork. A file a command created that looks like build output, and that no
+//! write or edit made, is left out of the result (see [`artifacts`]).
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, DirBuilder, File, Permissions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
@@ -16,8 +20,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use molt_api::fs::{
-    Change, ChangeKind, DiffRequest, DiffResponse, DropRequest, DropResponse, ForkRequest, ForkResponse, MergeRequest,
-    MergeResponse, ViewRequest, ViewResponse,
+    Change, ChangeKind, DiffRequest, DiffResponse, DropRequest, DropResponse, ForkRequest, ForkResponse, LeftOut,
+    MergeRequest, MergeResponse, ViewRequest, ViewResponse,
 };
 use molt_proto::RemoteError;
 use serde::{Deserialize, Serialize};
@@ -38,6 +42,14 @@ const NOT_A_FILE: &str = "not-a-file";
 const EXECUTABLE: &str = "+x";
 /// The metadata format. Version 0 recorded content hashes only.
 const META_VERSION: u32 = 1;
+/// How many left-out paths a reply names.
+const LEFT_OUT_SHOWN: usize = 5;
+/// Directories that only tools write: caches, bytecode and installed packages.
+const BUILD_DIRS: [&str; 6] = ["__pycache__", ".pytest_cache", "node_modules", ".mypy_cache", ".ruff_cache", ".tox"];
+/// Compiled files: bytecode, objects, Rust libraries, shared libraries and Java classes.
+const BUILD_EXTENSIONS: [&str; 9] = ["pyc", "pyo", "o", "rlib", "rmeta", "so", "dylib", "dll", "class"];
+/// What a `CACHEDIR.TAG` starts with (https://bford.info/cachedir/); Cargo writes one in every target directory.
+const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 
 #[derive(Serialize, Deserialize)]
 struct ForkMeta {
@@ -353,7 +365,7 @@ fn changes(before: &BTreeMap<String, String>, now: &BTreeMap<String, String>) ->
 pub(crate) fn diff(roots: &Roots, req: DiffRequest) -> Result<DiffResponse, RemoteError> {
     let fork = open(roots, &req.fork)?;
     let now = current(&fork, &roots.scratch)?;
-    let changes = changes(&fork.meta.files, &now);
+    let (changes, left_out) = artifacts(&fork, changes(&fork.meta.files, &now), &now);
     let mut patch = String::new();
     let mut truncated = false;
     for change in &changes {
@@ -368,7 +380,7 @@ pub(crate) fn diff(roots: &Roots, req: DiffRequest) -> Result<DiffResponse, Remo
         }
         patch.push_str(&section);
     }
-    Ok(DiffResponse { changes, patch, truncated })
+    Ok(DiffResponse { changes, patch, truncated, left_out })
 }
 
 pub(crate) fn view(roots: &Roots, lock: &Mutex<()>, req: ViewRequest) -> Result<ViewResponse, RemoteError> {
@@ -517,7 +529,7 @@ pub(crate) fn merge(
     let _process_lock = apply::lock(roots)?;
     let fork = open(roots, &req.fork)?;
     let now = current(&fork, &roots.scratch)?;
-    let changes = changes(&fork.meta.files, &now);
+    let (changes, left_out) = artifacts(&fork, changes(&fork.meta.files, &now), &now);
     let base = &fork.meta.base;
 
     // Every check comes before the first write, so a conflict leaves the original untouched.
@@ -567,7 +579,7 @@ pub(crate) fn merge(
             None => failed(format!("the merge succeeded, but dropping the fork failed: {e}")),
         })?;
     }
-    Ok(MergeResponse { changes, operation })
+    Ok(MergeResponse { changes, operation, left_out })
 }
 
 /// `mode` made executable or not by its owner. Making it executable also
@@ -602,10 +614,122 @@ fn remove(dir: &Path) -> io::Result<()> {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
         _ => {}
     }
-    match fs::remove_file(meta_path(dir)) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
+    for path in [written_path(dir), meta_path(dir)] {
+        match fs::remove_file(path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
     }
+    Ok(())
+}
+
+fn written_path(dir: &Path) -> PathBuf {
+    let mut name = dir.file_name().unwrap_or_default().to_owned();
+    name.push(".written");
+    dir.with_file_name(name)
+}
+
+/// Note that a write or edit made `file` (absolute, canonical) in the
+/// canonical workspace `ws`, when `ws` is a fork or inside one.
+pub(crate) fn record_written(roots: &Roots, ws: &Path, file: &Path) -> io::Result<()> {
+    let Ok(rel) = ws.strip_prefix(&roots.scratch) else { return Ok(()) };
+    let Some(name) = rel.components().next().and_then(|c| c.as_os_str().to_str()).filter(|n| is_fork_name(n)) else {
+        return Ok(());
+    };
+    let dir = roots.scratch.join(name);
+    if !file.starts_with(&dir) || !fs::symlink_metadata(meta_path(&dir)).is_ok_and(|m| m.is_file()) {
+        return Ok(());
+    }
+    let mut line = serde_json::to_string(&paths::slash(&dir, file)).map_err(io::Error::other)?;
+    line.push('\n');
+    use std::os::unix::fs::OpenOptionsExt;
+    // One short append per write: concurrent writes cannot interleave it.
+    fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(written_path(&dir))?
+        .write_all(line.as_bytes())
+}
+
+/// The paths writes and edits made in `fork`.
+fn written(fork: &Fork) -> HashSet<String> {
+    let Ok(text) = fs::read_to_string(written_path(&fork.dir)) else { return HashSet::new() };
+    text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect()
+}
+
+/// `changes` without the build artifacts, and what was left out. An
+/// artifact is a regular file that a command added: the original does not
+/// have it and no write or edit made it. It sits in a build or cache
+/// directory, or is compiled code. Files the original has, ignored files and
+/// every modification or deletion stay in the result.
+fn artifacts(fork: &Fork, changes: Vec<Change>, now: &BTreeMap<String, String>) -> (Vec<Change>, Option<LeftOut>) {
+    if !changes.iter().any(|c| c.kind == ChangeKind::Added) {
+        return (changes, None);
+    }
+    let written = written(fork);
+    let mut tagged = HashMap::new();
+    let (mut kept, mut left) = (Vec::new(), Vec::new());
+    for change in changes {
+        let path = &change.path;
+        let artifact = change.kind == ChangeKind::Added
+            && !written.contains(path)
+            && now.get(path).is_some_and(|s| !s.starts_with("link:"))
+            && matches!(fork.state(&fork.meta.base, path), Ok(None))
+            && is_artifact(&fork.dir, path, now.get(path).is_some_and(|s| is_executable(s)), &mut tagged);
+        if artifact {
+            left.push(change.path);
+        } else {
+            kept.push(change);
+        }
+    }
+    let left_out = (!left.is_empty())
+        .then(|| LeftOut { count: left.len() as u64, paths: left.into_iter().take(LEFT_OUT_SHOWN).collect() });
+    (kept, left_out)
+}
+
+/// Whether the file `rel` in `dir` looks like build output. `tagged`
+/// remembers which directories hold a `CACHEDIR.TAG`.
+fn is_artifact(dir: &Path, rel: &str, executable: bool, tagged: &mut HashMap<String, bool>) -> bool {
+    let parts: Vec<&str> = rel.split('/').collect();
+    let Some((file, dirs)) = parts.split_last() else { return false };
+    if dirs.iter().any(|d| BUILD_DIRS.contains(d)) {
+        return true;
+    }
+    // Cargo's output when CARGO_TARGET_DIR points into the workspace. Only at
+    // the top, where a source directory is rarely named so.
+    if dirs.first().is_some_and(|d| *d == "target" || d.starts_with("target-") || d.starts_with("target_")) {
+        return true;
+    }
+    for i in 1..=dirs.len() {
+        let sub = dirs[..i].join("/");
+        let tag = *tagged.entry(sub).or_insert_with_key(|sub| cache_dir(&dir.join(sub)));
+        if tag {
+            return true;
+        }
+    }
+    if Path::new(file).extension().and_then(|e| e.to_str()).is_some_and(|e| BUILD_EXTENSIONS.contains(&e)) {
+        return true;
+    }
+    // A compiled program; a script is text.
+    executable && sniff(&dir.join(rel)).is_some_and(|bytes| is_binary(&bytes))
+}
+
+/// Whether `dir` is marked as a cache directory.
+fn cache_dir(dir: &Path) -> bool {
+    let tag = dir.join("CACHEDIR.TAG");
+    fs::symlink_metadata(&tag).is_ok_and(|m| m.is_file())
+        && sniff(&tag).is_some_and(|bytes| bytes.starts_with(CACHEDIR_SIGNATURE))
+}
+
+/// The start of a regular file, without following a symlink.
+fn sniff(path: &Path) -> Option<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(8 * 1024).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 #[cfg(test)]

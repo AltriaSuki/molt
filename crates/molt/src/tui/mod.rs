@@ -792,6 +792,7 @@ mod tests {
             winner: Some(0),
             summary: "Write b".into(),
             changes: vec![Change { path: path.into(), kind: ChangeKind::Added }],
+            left_out: None,
             patch: String::new(),
             patch_truncated: false,
             applied: true,

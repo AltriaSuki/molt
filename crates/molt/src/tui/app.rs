@@ -2905,6 +2905,9 @@ impl App {
                     };
                     self.push(Line::from(span(format!("  {kind} {}", clean_line(&c.path)), Tone::Dim)));
                 }
+                if let Some(line) = resp.left_out.as_ref().and_then(agent::left_out_line) {
+                    self.push(Line::from(span(format!("  {}", clean_line(&line)), Tone::Dim)));
+                }
                 for f in &resp.judgement {
                     let (mark, tone) = if f.met { ("✓", Tone::Ok) } else { ("✗", Tone::Bad) };
                     self.push(Line::from(vec![
@@ -3852,6 +3855,11 @@ fn apply_stops(resp: &RunResponse, rules: &ConfirmSection) -> Vec<String> {
     if resp.changes.len() > rules.max_files {
         stops.push(format!("{} files", resp.changes.len()));
     }
+    match resp.left_out.as_ref().map_or(0, |l| l.count) {
+        0 => {}
+        1 => stops.push("1 build artifact left out".into()),
+        n => stops.push(format!("{n} build artifacts left out")),
+    }
     let deleted = resp.changes.iter().filter(|c| c.kind == ChangeKind::Deleted).count();
     match deleted {
         0 => {}
@@ -4492,7 +4500,12 @@ mod tests {
         assert_eq!(app.update(key(KeyCode::Char('d'))), [Action::Diff { fork: "/fork/result".into() }]);
         app.update(Msg::Diff {
             fork: "/fork/result".into(),
-            result: Ok(molt_api::fs::DiffResponse { changes: vec![], patch: "+new\n-old".into(), truncated: false }),
+            result: Ok(molt_api::fs::DiffResponse {
+                changes: vec![],
+                patch: "+new\n-old".into(),
+                truncated: false,
+                left_out: None,
+            }),
         });
         assert!(plain(&app.viewer.as_ref().unwrap().lines).join("\n").contains("+new"));
         app.update(key(KeyCode::Esc));
@@ -5529,6 +5542,7 @@ mod tests {
             winner: Some(1),
             summary: "Trailing commas parse.".into(),
             changes: vec![Change { path: "src/parser.rs".into(), kind: ChangeKind::Modified }],
+            left_out: None,
             patch: "--- a/src/parser.rs\n+++ b/src/parser.rs\n@@\n-a\n+b\n+c\n".into(),
             patch_truncated: false,
             applied: apply,
@@ -6607,6 +6621,8 @@ mod tests {
         let changes = vec![Change { path: "crates/a/Cargo.toml".into(), kind: ChangeKind::Modified }];
         assert_eq!(apply_stop(RunResponse { changes, ..ok() }), ["touches crates/a/Cargo.toml"]);
         assert_eq!(apply_stop(RunResponse { patch_truncated: true, ..ok() }), ["diff cut short"]);
+        let left_out = Some(molt_api::fs::LeftOut { count: 32, paths: vec!["target-x/debug/app".into()] });
+        assert_eq!(apply_stop(RunResponse { left_out, ..ok() }), ["32 build artifacts left out"]);
         let review = |verdict| Some(molt_api::planner::Review { verdict, findings: vec![], details: None });
         assert_eq!(apply_stop(RunResponse { review: review(Verdict::Reject), ..ok() }), ["review rejected"]);
         assert_eq!(apply_stop(RunResponse { review: review(Verdict::Concern), ..ok() }), ["review questioned"]);
