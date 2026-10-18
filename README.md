@@ -77,6 +77,7 @@ sender from that.
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
 | Issue CI rejects PR triggers and probes the sandbox before model spend | `scripts/ci/test_issue_to_pr.py::test_only_labelled_open_issues_are_eligible`, `test_sandbox_failure_posts_a_summary_and_never_starts_a_model` |
 | A skill source cannot approve itself; only the CLI manages activation and withdrawal preserves evidence | `skills::tests::drafts_need_independent_evidence_and_disable_cannot_be_undone_by_learning`, `tests/service.rs::an_agent_cannot_manage_or_promote_its_own_skills` |
+| Queued tasks retain their submitted execution settings and wait for apply/discard/commit settlement | `tui::app::tests::queued_tasks_snapshot_execution_settings_and_plain_input_still_steers_the_current_task`, `tui::app::tests::a_queue_waits_for_apply_commit_and_discard_to_settle_before_starting_the_next_task` |
 | Kept results survive restart; conflicting applies leave user edits and the fork intact | `tui::app::tests::plan_results_are_browsable_and_remain_available_until_apply_or_discard_succeeds`, `a_kept_session_result_survives_restart_and_refuses_workspace_conflicts` |
 | Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
 | Offline embedding models are hash-pinned and cannot reintroduce forgotten or cross-project notes | `semantic::tests::pinned_models_retrieve_synonyms_and_reject_changed_files`, `semantic::tests::synonyms_are_recalled_with_scores_and_snapshots_survive_forgetting` |
@@ -256,6 +257,25 @@ and commits first. Restart uses the configuration loaded at launch; relaunch to 
 configuration or environment. `/log` opens up to 200 lines from the final 64 KiB of
 `tui.log`, sanitizes terminal controls, redacts known credentials and omits lines
 with common credential patterns. A manual restart resets the automatic retry limit.
+
+`/queue add TASK` submits a separate task while another runs. Plain input still
+adds a constraint to the current task. `/queue` opens the task list: `a` adds a
+multiline task, arrows select, `J`/`K` move it, `n` removes it, and Enter inspects
+its complete text. `/queue remove N` and `/queue move FROM TO` use one-based
+positions. Each task captures its mode, model, effort, attempts, check, budget,
+stream, memory-model and commit setting when submitted. Later setting changes
+apply to later submissions. Its workspace and earlier-task context are read when
+it starts, after the preceding apply/discard and optional commit have settled.
+Check and apply confirmations hold the queue; failure or keeping a result lets
+the next task start. A failed task's optional retry offer yields to the queue.
+
+`/queue pause` leaves the current task running; `/queue resume` continues queued
+work. Esc stops the current task and pauses its queue, preserving every queued
+task. `/queue clear` removes only queued tasks. Limits are 100 tasks, 64 KiB per
+task and 4 MiB total; rejected drafts are retained. Invalid `@paths` pause the
+queue without losing the task; the planner reads files when the queued task starts. Queued tasks live in this interface session:
+quitting shows their full text for confirmation and prints it after the terminal
+is restored, with known credentials redacted. A crash does not save the queue.
 
 `/kept` lists this workspace's retained results with their task, outcome, age and
 change counts. Select with arrows, `d` inspects the current diff, Enter applies,
@@ -1036,7 +1056,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none. A run with `--checkpoint` that stops keeps its forks for `molt resume`.
 - A rubric's model-judged criteria are a model's reading, not a proof: the judge can be wrong, and nothing but the criteria with a command checks the result. In the interface, a constraint that adds a check is refused while a run is being judged by a rubric.
 - Only `molt do --commit`, `molt resume --commit` and the interface's `/commit on` commit a result, always on the current branch (`--branch` is for `molt do` only). `molt undo` takes back only those commits, and refuses a file changed after the run rather than merging the revert into it (use `git revert` then).
-- A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet.
+- A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet. Its task queue lives in memory: normal exit prints unexecuted tasks, while a crash loses them.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.
 - Default recall matches keywords with stemming, so differently worded notes can be missed. Optional offline word-vector recall needs a reviewed hash-pinned local model; its mean-pooling backend does not understand word order or supply a pretrained vocabulary.

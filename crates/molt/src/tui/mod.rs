@@ -94,12 +94,16 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
     let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableFocusChange);
     emit(notice::PUSH_TITLE);
     let home = std::env::var("HOME").ok();
-    let result = event_loop(&mut terminal, cfg, path, home.as_deref(), stop).await;
+    let mut unexecuted = Vec::new();
+    let result = event_loop(&mut terminal, cfg, path, home.as_deref(), stop, &mut unexecuted).await;
     emit(notice::POP_TITLE);
     let _ = execute!(std::io::stdout(), DisableFocusChange, DisableBracketedPaste);
     ratatui::restore();
     drop(stderr);
     let _ = std::panic::take_hook();
+    for (index, task) in unexecuted.iter().enumerate() {
+        println!("not run (queued {}):\n{task}", index + 1);
+    }
     result.with_context(|| format!("the services' log is in {}", log.display()))
 }
 
@@ -109,6 +113,7 @@ async fn event_loop(
     workspace: String,
     home: Option<&str>,
     stop: impl Future<Output = i32> + Send + 'static,
+    unexecuted: &mut Vec<String>,
 ) -> anyhow::Result<Vec<String>> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let pause = Arc::new(Pause::default());
@@ -272,6 +277,7 @@ async fn event_loop(
             break;
         }
     }
+    *unexecuted = app.unexecuted();
     backend.shutdown(&keep).await?;
     Ok(keep)
 }
