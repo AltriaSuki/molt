@@ -72,13 +72,20 @@ pub(crate) fn rules(check: &CheckSpec, changes: &[Change], patch: &str) -> Vec<S
         }
     }
     for (path, line) in added_lines(patch).filter(|(path, _)| !ours(path)) {
-        if let Some(marker) = SKIP_MARKERS.iter().find(|m| line.contains(*m)) {
+        if let Some(marker) = SKIP_MARKERS.iter().find(|m| has_marker(line, m)) {
             findings.push(format!("{path} adds `{marker}`, which skips or narrows tests: `{}`.", line.trim()));
         } else if is_test_manifest(path) && TEST_CONFIG_WORDS.iter().any(|w| line.contains(w)) {
             findings.push(format!("{path} changes test settings: `{}`.", line.trim()));
         }
     }
     findings
+}
+
+/// A framework name must start at an identifier boundary: exit is not xit.
+fn has_marker(line: &str, marker: &str) -> bool {
+    let identifier = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let named = marker.chars().next().is_some_and(identifier);
+    line.match_indices(marker).any(|(at, _)| !named || line[..at].chars().next_back().is_none_or(|c| !identifier(c)))
 }
 
 /// Text that skips, disables or narrows tests, in the common test frameworks.
@@ -288,6 +295,29 @@ mod tests {
                 "package.json changes test settings: `\"testPathIgnorePatterns\": [\"slow\"],`.",
             ]
         );
+    }
+
+    #[test]
+    fn process_exit_and_larger_identifiers_are_not_skip_markers_but_real_xit_still_is() {
+        for path in ["src/main.rs", "main.py", "main.go", "src/main.js", "tests/cli.test.js"] {
+            for line in [
+                "std::process::exit(1);",
+                "sys.exit(2)",
+                "os.Exit(2)",
+                "process.exit(1);",
+                "myxit(1)",
+                "_xit(1)",
+                "$xit(1)",
+            ] {
+                let patch = format!("--- a/{path}\n+++ b/{path}\n@@\n+{line}\n");
+                assert!(rules(&spec(&[]), &[], &patch).is_empty(), "{path}: {line}");
+            }
+        }
+        for line in ["xit('slow', () => {});", "process.exit(1); xit('slow', () => {});", "it.skip('slow', () => {});"]
+        {
+            let patch = format!("--- a/tests/api.test.js\n+++ b/tests/api.test.js\n@@\n+{line}\n");
+            assert_eq!(rules(&spec(&[]), &[], &patch).len(), 1, "{line}");
+        }
     }
 
     #[test]
