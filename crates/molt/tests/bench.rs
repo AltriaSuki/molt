@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::process::Output;
 
-use molt_api::planner::tools::{SUBMIT_CHECK, SUBMIT_REVIEW, WRITE_FILE};
+use molt_api::planner::tools::{SUBMIT_CHECK, SUBMIT_REVIEW, SUBMIT_VETTING, WRITE_FILE};
 use molt_api::planner::Outcome;
 use molt_bench::record::{self, Record};
 use serde_json::{json, Value};
@@ -28,12 +28,13 @@ impl Respond for FakeApi {
         let messages = body["messages"].as_array().cloned().unwrap_or_default();
         let n = messages.len();
         let has = |name: &str| body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == name));
-        let (designer, reviewer) = (has(SUBMIT_CHECK), has(SUBMIT_REVIEW));
+        let (designer, reviewer, vetter) = (has(SUBMIT_CHECK), has(SUBMIT_REVIEW), has(SUBMIT_VETTING));
         let last = messages.last().cloned().unwrap_or(Value::Null);
         let after_tools = last["content"].as_array().is_some_and(|c| c.iter().any(|b| b["type"] == "tool_result"));
         let tool = |name: &str, input: Value| json!({ "type": "tool_use", "id": format!("toolu_{n:03}"), "name": name, "input": input });
         let (content, stop) = match (designer, n == 1, after_tools) {
             _ if reviewer => (tool(SUBMIT_REVIEW, json!({ "verdict": "approve", "findings": [] })), "tool_use"),
+            _ if vetter => (tool(SUBMIT_VETTING, json!({ "conflicts": [] })), "tool_use"),
             (true, true, _) => (tool(WRITE_FILE, json!({ "path": "check.sh", "content": self.check })), "tool_use"),
             (true, false, _) => {
                 let input = json!({ "command": "sh check.sh", "files": ["check.sh"], "rationale": "The file exists." });
@@ -136,8 +137,8 @@ async fn both_arms_run_every_task_and_the_report_compares_them() {
     let molt = find("py-hi", "molt");
     assert!(molt.passed && molt.claimed_done && molt.error.is_none(), "{molt:#?}");
     assert_eq!((molt.outcome, molt.attempts), (Some(Outcome::Passed), 2));
-    // The designer's two turns, two of each attempt and the reviewer's one.
-    assert_eq!(molt.model_calls, 7, "{molt:#?}");
+    // The designer's two turns, the vetter's one, two of each attempt and the reviewer's one.
+    assert_eq!(molt.model_calls, 8, "{molt:#?}");
     assert!(molt.cost_usd > 0.0 && molt.reported_cost_usd.is_some());
 
     let plain = find("py-hi", "plain");

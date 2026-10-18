@@ -4,8 +4,9 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use molt_api::model::{tool_result, user_blocks, user_text, STOP_MAX_TOKENS};
-use molt_api::planner::{AttemptReport, AttemptStatus, Criterion, Finding};
+use molt_api::model::{tool_result, user_blocks, user_text, ToolUse, STOP_MAX_TOKENS};
+use molt_api::planner::tools::{DisputeCheck, DISPUTE_CHECK};
+use molt_api::planner::{AttemptReport, AttemptStatus, CheckDispute, Criterion, Finding};
 use molt_api::progress::Progress;
 use molt_api::shell;
 use serde_json::Value;
@@ -62,6 +63,7 @@ impl Finished {
             cost_usd: saved.cost_usd,
             note: end.note.clone(),
             requirements: saved.requirements,
+            dispute: end.dispute.clone(),
         };
         Self { report, fork: saved.fork.clone(), summary: end.summary.clone(), findings: end.findings.clone() }
     }
@@ -77,6 +79,7 @@ impl Finished {
             cost_usd: 0.0,
             note,
             requirements: 0,
+            dispute: None,
         };
         Self { report, fork: None, summary: String::new(), findings: Vec::new() }
     }
@@ -85,11 +88,18 @@ impl Finished {
 struct End {
     status: AttemptStatus,
     note: String,
+    dispute: Option<CheckDispute>,
 }
 
 impl End {
     fn new(status: AttemptStatus, note: impl Into<String>) -> Self {
-        Self { status, note: note.into() }
+        Self { status, note: note.into(), dispute: None }
+    }
+
+    /// Stopped on its own dispute of the check: not a failure of the attempt.
+    fn disputed(dispute: CheckDispute) -> Self {
+        let note = format!("disputed the check, which asserts {}, against the task", dispute.assertion);
+        Self { status: AttemptStatus::Cancelled, note, dispute: Some(dispute) }
     }
 
     fn error(note: impl Into<String>) -> Self {
@@ -150,12 +160,12 @@ pub(crate) async fn run(
         attempt.version = saved.requirements;
     }
     attempt.check = attempt.check_at(attempt.version);
-    let (status, note, summary) = match attempt.work(resume).await {
-        Ok(summary) => (AttemptStatus::Passed, String::new(), summary),
-        Err(end) => (end.status, end.note, String::new()),
+    let (status, note, summary, dispute) = match attempt.work(resume).await {
+        Ok(summary) => (AttemptStatus::Passed, String::new(), summary, None),
+        Err(end) => (end.status, end.note, String::new(), end.dispute),
     };
-    // Stopped with the run, it can go on when the run is resumed.
-    let resumable = status == AttemptStatus::Cancelled && ctx.run_cancel.is_cancelled();
+    // Stopped with the run, it can go on when the run is resumed; a dispute is its own end.
+    let resumable = status == AttemptStatus::Cancelled && ctx.run_cancel.is_cancelled() && dispute.is_none();
     let (meter, check_runs, version) = (attempt.meter, attempt.check_runs, attempt.version);
     let findings = if status == AttemptStatus::Passed { std::mem::take(&mut attempt.findings) } else { Vec::new() };
     ctx.save(|s| {
@@ -166,8 +176,13 @@ pub(crate) async fn run(
         saved.usage = meter.spend.usage;
         saved.cost_usd = meter.spend.cost_usd;
         if !resumable {
-            saved.end =
-                Some(SavedEnd { status, note: note.clone(), summary: summary.clone(), findings: findings.clone() });
+            saved.end = Some(SavedEnd {
+                status,
+                note: note.clone(),
+                summary: summary.clone(),
+                findings: findings.clone(),
+                dispute: dispute.clone(),
+            });
         }
     });
     tracing::info!(run = %ctx.trace, attempt = index, ?status, turns = attempt.meter.turns, %note, "attempt finished");
@@ -181,6 +196,7 @@ pub(crate) async fn run(
         cost_usd: attempt.meter.spend.cost_usd,
         note,
         requirements: attempt.version,
+        dispute,
     };
     Finished { report, fork: attempt.fork, summary, findings }
 }
@@ -278,7 +294,10 @@ impl Attempt {
             (None, false) => prompts::RUBRIC_SYSTEM,
             (None, true) => prompts::UNVERIFIED_SYSTEM,
         };
-        let tools = Arc::new(prompts::attempt_tools(self.memory_tools, self.web_tools));
+        let tools = Arc::new(match self.check {
+            Some(_) => prompts::checked_attempt_tools(self.memory_tools, self.web_tools),
+            None => prompts::attempt_tools(self.memory_tools, self.web_tools),
+        });
         // A final reply the model gave before the run stopped, still to be checked.
         let mut given = None;
         let (fork, mut conv) = match resume {
@@ -344,9 +363,13 @@ impl Attempt {
                         // Saved before they run: a run stopped now does not know what they did.
                         self.save(&conv);
                         self.go().await?;
+                        let cut_off = agent::cut_off(&resp);
+                        if let Some(dispute) = self.dispute(&calls, cut_off) {
+                            ctx.note(format!("attempt {} disputed the check: {}", self.index, dispute.assertion)).await;
+                            return Err(End::disputed(dispute));
+                        }
                         let actor = Actor::Attempt { index: self.index, turn: self.meter.turns };
-                        let results =
-                            self.or_cancel(tools::execute(&ctx, &fork, &calls, agent::cut_off(&resp), actor)).await?;
+                        let results = self.or_cancel(self.execute(&fork, &calls, cut_off, actor)).await?;
                         conv.push(user_blocks(results));
                         self.save(&conv);
                         continue;
@@ -446,6 +469,45 @@ impl Attempt {
             conv.push(user_text(prompts::check_failed(&check.command, &ran)));
             self.save(&conv);
         }
+    }
+
+    /// The first well-formed dispute_check among `calls`, when the attempt
+    /// runs against a check.
+    fn dispute(&self, calls: &[ToolUse], cut_off: Option<&str>) -> Option<CheckDispute> {
+        self.check.as_ref()?;
+        calls.iter().filter(|c| c.name == DISPUTE_CHECK && cut_off != Some(c.id.as_str())).find_map(|c| {
+            let d = disputed(c).ok()?;
+            Some(CheckDispute {
+                attempt: self.index,
+                assertion: d.assertion,
+                task_quote: d.task_quote,
+                reproduce: d.reproduce,
+            })
+        })
+    }
+
+    /// Results for a turn's calls, in order. A dispute_check that reaches
+    /// here was not well formed, and gets an error saying why.
+    async fn execute(&self, fork: &str, calls: &[ToolUse], cut_off: Option<&str>, actor: Actor) -> Vec<Value> {
+        let is_dispute = |c: &ToolUse| self.check.is_some() && c.name == DISPUTE_CHECK;
+        let others: Vec<ToolUse> = calls.iter().filter(|c| !is_dispute(c)).cloned().collect();
+        let mut results = tools::execute(&self.ctx, fork, &others, cut_off, actor).await.into_iter();
+        calls
+            .iter()
+            .map(|call| {
+                if !is_dispute(call) {
+                    return results
+                        .next()
+                        .unwrap_or_else(|| tool_result(&call.id, "The tool failed unexpectedly.", true));
+                }
+                let why = if cut_off == Some(call.id.as_str()) {
+                    prompts::CUT_OFF.to_owned()
+                } else {
+                    disputed(call).err().unwrap_or_else(|| "The tool failed unexpectedly.".to_owned())
+                };
+                tool_result(&call.id, why, true)
+            })
+            .collect()
     }
 
     /// Have the judge decide the result against the rubric, and say how it
@@ -554,5 +616,46 @@ impl Attempt {
                 Err(if self.ctx.over_budget() { End::from(Stop::Budget) } else { End::cancelled() })
             }
         }
+    }
+}
+
+/// A dispute_check call's input, trimmed, or what is wrong with it.
+fn disputed(call: &ToolUse) -> Result<DisputeCheck, String> {
+    let d: DisputeCheck = serde_json::from_value(call.input.clone())
+        .map_err(|e| format!("Invalid input for dispute_check: {e}. Check the tool's input schema and try again."))?;
+    let d = DisputeCheck {
+        assertion: d.assertion.trim().to_owned(),
+        task_quote: d.task_quote.trim().to_owned(),
+        reproduce: d.reproduce.trim().to_owned(),
+    };
+    let missing = [("assertion", &d.assertion), ("task_quote", &d.task_quote), ("reproduce", &d.reproduce)]
+        .into_iter()
+        .filter(|(_, v)| v.is_empty())
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "dispute_check needs {}: name the check's assertion, quote the task's words it contradicts, and give a \
+             command that shows it.",
+            missing.join(", ")
+        ));
+    }
+    Ok(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn a_dispute_needs_an_assertion_a_quote_and_a_command() {
+        let call = |input| ToolUse { id: "toolu_1".into(), name: DISPUTE_CHECK.into(), input };
+        let ok = disputed(&call(json!({ "assertion": " col 20 ", "task_quote": "q", "reproduce": "cargo test" })));
+        assert_eq!(ok.unwrap().assertion, "col 20");
+        let err = disputed(&call(json!({ "assertion": "a", "task_quote": " ", "reproduce": "" }))).unwrap_err();
+        assert!(err.starts_with("dispute_check needs task_quote, reproduce:"), "{err}");
+        assert!(disputed(&call(json!({ "assertion": "a" }))).unwrap_err().starts_with("Invalid input"));
     }
 }

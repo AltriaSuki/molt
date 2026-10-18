@@ -481,7 +481,8 @@ pub enum AttemptStatus {
     Passed,
     /// Finished without passing the check, or ran out of turns or check rounds.
     Failed,
-    /// Stopped because another attempt won or the budget ran out.
+    /// Stopped because another attempt won or the budget ran out, or because
+    /// it disputed the check (its report's `dispute` says so).
     Cancelled,
     /// A model refusal, or a model or tool error the attempt could not recover from.
     Error,
@@ -502,6 +503,24 @@ pub struct AttemptReport {
     /// The version of the run's requirements it last worked to.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub requirements: u32,
+    /// It stopped because it found the check contradicting the task. Such
+    /// an attempt is reported as cancelled, not failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispute: Option<CheckDispute>,
+}
+
+/// An attempt's claim that the done-check contradicts the task, with what a
+/// person needs to decide it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckDispute {
+    /// The attempt that raised it.
+    pub attempt: u32,
+    /// The check's assertion, as specific as the attempt could make it.
+    pub assertion: String,
+    /// The words of the task (or of a file it points to) the assertion contradicts.
+    pub task_quote: String,
+    /// A command that shows the contradiction.
+    pub reproduce: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -555,6 +574,11 @@ pub struct RunResponse {
     /// How the winner did on each criterion.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub judgement: Vec<Finding>,
+    /// No attempt passed and one disputed the check: the first such dispute.
+    /// The check needs a person's look before the task is run again. Boxed
+    /// to keep the reply small where it is rarely set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispute: Option<Box<CheckDispute>>,
 }
 
 /// How the passing attempts were compared.
@@ -612,6 +636,12 @@ pub mod tools {
     pub const SUBMIT_REVIEW: &str = "submit_review";
     /// Offered only to the judge of a rubric: its finding on each criterion.
     pub const SUBMIT_JUDGEMENT: &str = "submit_judgement";
+    /// Offered only to the vetter of a designed check: where the check
+    /// conflicts with the task.
+    pub const SUBMIT_VETTING: &str = "submit_vetting";
+    /// Offered only to attempts that run against a done-check: say the check
+    /// contradicts the task, which ends the attempt.
+    pub const DISPUTE_CHECK: &str = "dispute_check";
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ReadFile {
@@ -714,6 +744,30 @@ pub mod tools {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SubmitVetting {
+        #[serde(default)]
+        pub conflicts: Vec<Conflict>,
+    }
+
+    /// One assertion of a designed check that the task contradicts or gives
+    /// no basis for.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Conflict {
+        pub assertion: String,
+        /// The task's words it conflicts with; empty when the task says nothing about it.
+        #[serde(default)]
+        pub task_quote: String,
+        pub why: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct DisputeCheck {
+        pub assertion: String,
+        pub task_quote: String,
+        pub reproduce: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SubmitReview {
         pub verdict: super::Verdict,
         #[serde(default)]
@@ -753,6 +807,29 @@ mod tests {
         for key in ["uncounted_calls", "error", "remaining_budget_usd", "cancelled"] {
             assert!(wire.get(key).is_none());
         }
+    }
+
+    #[test]
+    fn replies_without_a_dispute_read_and_write_as_before() {
+        let report = serde_json::json!({
+            "index": 0, "status": "failed", "turns": 1, "check_runs": 1, "usage": {}, "cost_usd": 0.5
+        });
+        let read: AttemptReport = serde_json::from_value(report.clone()).unwrap();
+        assert!(read.dispute.is_none());
+        assert!(serde_json::to_value(&read).unwrap().get("dispute").is_none());
+        let disputed = AttemptReport {
+            status: AttemptStatus::Cancelled,
+            dispute: Some(CheckDispute {
+                attempt: 0,
+                assertion: "the error names column 20".into(),
+                task_quote: "columns count Unicode characters".into(),
+                reproduce: "cargo test --test spec".into(),
+            }),
+            ..read
+        };
+        let wire = serde_json::to_value(&disputed).unwrap();
+        assert_eq!(wire["dispute"]["task_quote"], "columns count Unicode characters");
+        assert_eq!(serde_json::from_value::<AttemptReport>(wire).unwrap(), disputed);
     }
 
     #[test]

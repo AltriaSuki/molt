@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use molt_api::planner::{
-    AttemptStatus, Candidate, CheckFile, CheckSpec, Criterion, DesignResponse, Outcome, Resume, Review, RunRequest,
-    RunResponse, Select, Selection, Verdict,
+    AttemptStatus, Candidate, CheckDispute, CheckFile, CheckSpec, Criterion, DesignResponse, Outcome, Resume, Review,
+    RunRequest, RunResponse, Select, Selection, Verdict,
 };
 use molt_api::progress::Progress;
 use molt_proto::{ErrorCode, RemoteError, TraceId};
@@ -169,6 +169,7 @@ async fn resume_run(
                     note: why.into(),
                     summary: String::new(),
                     findings: Vec::new(),
+                    dispute: None,
                 };
                 ctx.save(|s| s.attempt(attempt.index).end = Some(end.clone()));
                 slots.push(Slot::Done(Finished::saved(attempt, &end)));
@@ -646,6 +647,7 @@ async fn conclude(
         selection: None,
         rubric: rubric.to_vec(),
         judgement: Vec::new(),
+        dispute: None,
     };
     let outcome = match (&spec, rubric.is_empty()) {
         (Some(_), _) => Outcome::Passed,
@@ -654,6 +656,11 @@ async fn conclude(
     };
     let Some((first, _)) = candidates.first() else {
         resp.summary = failure_summary(spec.as_ref(), rubric, &finished);
+        // A check an attempt found contradicting the task needs a person before anything runs to it again.
+        resp.dispute = finished.iter().find_map(|f| f.report.dispute.clone()).map(Box::new);
+        if let Some(d) = &resp.dispute {
+            resp.summary = format!("{}\n\n{}", dispute_summary(d), resp.summary);
+        }
         // A stopped run's forks are its checkpoint's: kept for the resume.
         if !stopped {
             ctx.drop_forks_except(None).await;
@@ -920,12 +927,23 @@ fn failure_summary(spec: Option<&CheckSpec>, rubric: &[Criterion], finished: &[F
         None => "The attempt did not finish.".to_owned(),
     };
     for f in finished {
-        summary.push_str(&format!("\n- attempt {}: {}", f.report.index, status_name(f.report.status)));
+        let status = if f.report.dispute.is_some() { "disputed" } else { status_name(f.report.status) };
+        summary.push_str(&format!("\n- attempt {}: {status}", f.report.index));
         if !f.report.note.is_empty() {
             summary.push_str(&format!(": {}", f.report.note));
         }
     }
     summary
+}
+
+/// What a dispute says, for the run's summary.
+fn dispute_summary(d: &CheckDispute) -> String {
+    format!(
+        "The done-check was disputed: attempt {} found that it contradicts the task.\n\
+         The check asserts: {}\nThe task says: \"{}\"\nTo reproduce: `{}`\n\
+         Look at the check, change it if it is wrong, and run the task again.",
+        d.attempt, d.assertion, d.task_quote, d.reproduce
+    )
 }
 
 fn status_name(status: AttemptStatus) -> &'static str {
@@ -960,6 +978,7 @@ fn not_designed(ctx: &Ctx, reason: &str) -> RunResponse {
         selection: None,
         rubric: Vec::new(),
         judgement: Vec::new(),
+        dispute: None,
     }
 }
 

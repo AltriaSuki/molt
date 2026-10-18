@@ -588,6 +588,7 @@ mod tests {
                 cost_usd: 0.1,
                 note: String::new(),
                 requirements: 0,
+                dispute: None,
             }],
             usage: Usage::default(),
             cost_usd: 0.2,
@@ -597,6 +598,7 @@ mod tests {
             selection: None,
             rubric: vec![],
             judgement: vec![],
+            dispute: None,
         }
     }
 

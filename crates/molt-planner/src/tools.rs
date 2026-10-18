@@ -40,6 +40,7 @@ pub(crate) enum Actor {
     Attempt { index: u32, turn: u32 },
     Reviewer,
     Judge,
+    Vetter,
 }
 
 #[derive(Debug)]
@@ -358,6 +359,7 @@ async fn report(ctx: &Ctx, actor: Actor, tool: &str, detail: &str) {
         Actor::Designer => ctx.note(format!("check designer: {detail}")).await,
         Actor::Reviewer => ctx.note(format!("reviewer: {detail}")).await,
         Actor::Judge => ctx.note(format!("judge: {detail}")).await,
+        Actor::Vetter => ctx.note(format!("check vetter: {detail}")).await,
     }
 }
 

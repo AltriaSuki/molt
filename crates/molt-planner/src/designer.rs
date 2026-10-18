@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use molt_api::fs::ChangeKind;
 use molt_api::model::{tool_result, user_blocks, user_text, ToolUse, STOP_MAX_TOKENS};
-use molt_api::planner::tools::{SubmitCheck, SUBMIT_CHECK};
+use molt_api::planner::tools::{Conflict, SubmitCheck, SUBMIT_CHECK};
 use molt_api::planner::{Baseline, Criterion};
 use molt_proto::RemoteError;
 use serde_json::Value;
@@ -16,6 +16,7 @@ use crate::agent::{self, Meter, Stop};
 use crate::ctx::{Conversation, Ctx};
 use crate::prompts;
 use crate::tools::{self, Actor};
+use crate::vet;
 
 /// The designer's turn limit. The run's `max_turns` counts an attempt's
 /// turns; a small one must not starve the designer.
@@ -24,6 +25,9 @@ const MAX_TURNS: u32 = 25;
 pub(crate) const MAX_CRITERIA: usize = 12;
 /// Bytes of the baseline check's output kept.
 const BASELINE_TAIL: usize = 2000;
+/// Submissions the vetter may find in conflict with the task before the
+/// design fails.
+const MAX_CONFLICTED: u32 = 2;
 
 pub(crate) enum Design {
     Check {
@@ -89,6 +93,7 @@ async fn work(ctx: &Arc<Ctx>, fork: &str) -> Design {
     let mut conv = Conversation::new(prompts::DESIGNER_SYSTEM, tools, first, None);
     let mut meter = Meter::default();
     let mut nudged = false;
+    let mut conflicted = 0;
     loop {
         let resp = match agent::turn(ctx, &mut conv, MAX_TURNS, &mut meter, &ctx.cancel).await {
             Ok(resp) => resp,
@@ -125,9 +130,26 @@ async fn work(ctx: &Arc<Ctx>, fork: &str) -> Design {
             } else {
                 submitted(ctx, fork, call).await
             };
-            match checked {
-                Ok(design) => return design,
-                Err(msg) => submit_results.push(tool_result(&call.id, msg, true)),
+            let design = match checked {
+                Ok(design) => design,
+                Err(msg) => {
+                    submit_results.push(tool_result(&call.id, msg, true));
+                    continue;
+                }
+            };
+            match vetted(ctx, fork, design).await {
+                Vetted::Accepted(design) => return design,
+                Vetted::Conflicts(conflicts) => {
+                    conflicted += 1;
+                    if conflicted >= MAX_CONFLICTED {
+                        return Design::Failed(format!(
+                            "an independent vetter found the check in conflict with the task in {conflicted} \
+                             submissions; the last one:{}",
+                            prompts::conflict_lines(&conflicts)
+                        ));
+                    }
+                    submit_results.push(tool_result(&call.id, prompts::check_conflicts(&conflicts), true));
+                }
             }
         }
         let mut submit_results = submit_results.into_iter();
@@ -139,6 +161,49 @@ async fn work(ctx: &Arc<Ctx>, fork: &str) -> Design {
             })
             .collect();
         conv.push(user_blocks(results));
+    }
+}
+
+/// What the vetter made of a submitted design.
+enum Vetted {
+    Accepted(Design),
+    /// The check conflicts with the task: it goes back to the designer.
+    Conflicts(Vec<Conflict>),
+}
+
+/// Have a check with files of its own vetted against the task. A vetter
+/// that does not finish holds nothing back: the check is used, and the
+/// rationale says it was not vetted.
+async fn vetted(ctx: &Arc<Ctx>, fork: &str, design: Design) -> Vetted {
+    let Design::Check { command, files, suite, mut rationale, baseline } = design else {
+        return Vetted::Accepted(design);
+    };
+    if files.is_empty() {
+        return Vetted::Accepted(Design::Check { command, files, suite, rationale, baseline });
+    }
+    match vet::vet(ctx, fork, &command, &files).await {
+        Ok(conflicts) if conflicts.is_empty() => ctx.note("check vetter: the check fits the task").await,
+        Ok(conflicts) => {
+            let n = conflicts.len();
+            ctx.note(format!("check vetter: {n} conflict{} with the task; back to the designer", plural(n))).await;
+            tracing::info!(run = %ctx.trace, conflicts = n, "the vetter sent the check back");
+            return Vetted::Conflicts(conflicts);
+        }
+        Err(why) => {
+            tracing::warn!(run = %ctx.trace, %why, "the check vetter did not finish; the check is used unvetted");
+            ctx.note(format!("check vetter: did not finish ({why}); the check is used without vetting")).await;
+            rationale =
+                format!("{}\n\nNot vetted against the task: the vetter did not finish ({why}).", rationale.trim_end());
+        }
+    }
+    Vetted::Accepted(Design::Check { command, files, suite, rationale, baseline })
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
     }
 }
 
