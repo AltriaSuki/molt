@@ -245,6 +245,17 @@ values, which override built-in defaults. Project command templates still affect
 only their own task and do not overwrite saved preferences. Changing defaults does not rewrite a run request already submitted for a task. Configuration
 files are still loaded only when explicitly selected.
 
+If service startup fails transiently, the interface retries up to three times,
+after approximately 2, 5 and 15 seconds, and shows the countdown. Recognized
+configuration, credential, executable and permission errors stop immediately with
+an action to take. A backend disconnect leaves pending settlement unknown and is
+not retried automatically. `/restart` restarts idle services while preserving the
+log, settings, history and kept forks; finish or stop a task and wait for learning
+and commits first. Restart uses the configuration loaded at launch; relaunch to change that
+configuration or environment. `/log` opens up to 200 lines from the final 64 KiB of
+`tui.log`, sanitizes terminal controls, redacts known credentials and omits lines
+with common credential patterns. A manual restart resets the automatic retry limit.
+
 Input history is private to the workspace and survives restarts, even when two
 workspaces use the same data directory. ↑/↓ browses it; returning past the newest
 entry restores the unfinished draft. Ctrl+R searches newest first without duplicate

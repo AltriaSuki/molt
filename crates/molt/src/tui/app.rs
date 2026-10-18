@@ -44,6 +44,9 @@ const EARLIER_SUMMARY_BYTES: usize = 4000;
 /// Ticks after a key within which the user is taken to be looking: about
 /// five seconds.
 const LOOKING_TICKS: u64 = 33;
+pub const TICK_MS: u64 = 150;
+const STARTUP_RETRY_TICKS: [u64; 3] = [14, 34, 100];
+
 /// Suggestions shown for an `@path` being typed.
 const SUGGESTIONS: usize = 8;
 /// Workspace files listed for `@` completion; past this, a path is not
@@ -141,6 +144,10 @@ impl Default for Settings {
 #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     StartSession,
+    RestartSession {
+        keep: Vec<String>,
+    },
+    ShowLog,
     Redraw,
     Suspend,
     SaveTheme(text::Theme),
@@ -269,6 +276,13 @@ pub enum Msg {
         memory_problem: Option<String>,
     },
     SessionFailed(String),
+    BackendFailed(String),
+    /// The UI drops messages from a backend replaced by a manual restart.
+    Backend {
+        generation: u64,
+        message: Box<Msg>,
+    },
+    ServiceLog(Result<Vec<String>, String>),
     /// The services of an interrupted session have stopped; `kept` are the
     /// forks of interrupted attempts kept for their changes.
     Stopped {
@@ -809,6 +823,10 @@ pub struct App {
     pub commands: std::collections::BTreeMap<String, super::commands::Command>,
     pub theme: text::Theme,
     pub session: SessionState,
+    pub backend_generation: u64,
+    startup_retries: usize,
+    retry_at: Option<u64>,
+    committing: bool,
     pub log: Vec<Line<'static>>,
     /// Lines scrolled up from the end of the log; 0 follows it.
     pub scroll: usize,
@@ -900,6 +918,10 @@ impl App {
             commands: Default::default(),
             theme: text::Theme::detect(std::env::var("COLORTERM").ok().as_deref()),
             session: SessionState::Starting,
+            backend_generation: 0,
+            startup_retries: 0,
+            retry_at: None,
+            committing: false,
             log: Vec::new(),
             scroll: 0,
             input: Input::default(),
@@ -966,6 +988,10 @@ impl App {
             return Vec::new();
         }
         super::commands::completions(&self.input.text, &self.commands)
+    }
+
+    pub fn retry_seconds(&self) -> Option<u64> {
+        self.retry_at.map(|at| (at.saturating_sub(self.tick) * TICK_MS / 1000).max(1))
     }
 
     pub fn memory_up(&self) -> bool {
@@ -1073,6 +1099,12 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
+        let msg = match msg {
+            Msg::Backend { generation, message } if generation == self.backend_generation => *message,
+            Msg::Backend { .. } => return Vec::new(),
+            msg => msg,
+        };
+
         let before = self.attention();
         if matches!(msg, Msg::Ran { .. } | Msg::Applied(_) | Msg::Stopped { .. }) {
             self.files_stale = true;
@@ -1086,6 +1118,7 @@ impl App {
         let input_before = matches!(&msg, Msg::Key(_) | Msg::Paste(_) | Msg::Edited(_))
             .then(|| (self.input.text.clone(), self.input.cursor));
         let mut actions = self.handle(msg);
+        self.committing |= actions.iter().any(|a| matches!(a, Action::Commit { .. }));
         if self.reset_preferences {
             self.preference_changes.clear();
             self.preference_changes.push(super::settings::Change::Reset);
@@ -1269,6 +1302,14 @@ impl App {
             }
             Msg::Tick => {
                 self.tick = self.tick.wrapping_add(1);
+                if self.retry_at.is_some_and(|at| self.tick >= at) {
+                    self.retry_at = None;
+                    if matches!(self.session, SessionState::Down(_)) && self.task.is_none() && self.learning.is_empty()
+                    {
+                        self.session = SessionState::Starting;
+                        return vec![Action::StartSession];
+                    }
+                }
                 Vec::new()
             }
             Msg::Signal => {
@@ -1276,6 +1317,8 @@ impl App {
                 vec![Action::Quit { keep: self.keep() }]
             }
             Msg::SessionUp { versions, memory_problem } => {
+                self.startup_retries = 0;
+                self.retry_at = None;
                 if let Some(problem) = &memory_problem {
                     self.push(Line::from(span(format!("running without memory: {}", clean_line(problem)), Tone::Dim)));
                 }
@@ -1283,8 +1326,54 @@ impl App {
                 Vec::new()
             }
             Msg::SessionFailed(e) => {
-                self.error("the services did not start", &e);
-                self.session = SessionState::Down(clean_line(&e));
+                let starting = matches!(self.session, SessionState::Starting);
+                let error = scrub(&e, &self.secrets);
+                self.error("the services did not start", &error);
+                self.session = SessionState::Down(clean_line(&error));
+                if starting && self.task.is_none() && self.learning.is_empty() {
+                    if retryable_startup_error(&e) && self.startup_retries < STARTUP_RETRY_TICKS.len() {
+                        self.retry_at = Some(self.tick + STARTUP_RETRY_TICKS[self.startup_retries]);
+                        self.startup_retries += 1;
+                    } else {
+                        self.retry_at = None;
+                        self.flash = Some(if retryable_startup_error(&e) {
+                            "startup retries exhausted; /log shows the service output, /restart tries again".into()
+                        } else {
+                            "check the configuration or credentials and relaunch; /log shows the service output".into()
+                        });
+                    }
+                }
+                Vec::new()
+            }
+            Msg::BackendFailed(error) => {
+                self.retry_at = None;
+                let error = scrub(&error, &self.secrets);
+                self.error("the interface backend stopped", &error);
+                self.session = SessionState::Down(clean_line(&error));
+                self.flash =
+                    Some("backend unavailable; pending operations have unknown settlement; /restart when idle".into());
+                Vec::new()
+            }
+            Msg::Backend { .. } => Vec::new(),
+            Msg::ServiceLog(result) => {
+                if self.viewer.as_ref().is_some_and(|v| v.title == "service log") {
+                    let lines = match result {
+                        Ok(lines) => lines
+                            .into_iter()
+                            .map(|line| {
+                                let line = clean_line(&scrub(&line, &self.secrets));
+                                if !line.trim().is_empty() && !super::state::keep_history(&line, &[]) {
+                                    "[log line omitted: credential-like or oversized content]".into()
+                                } else {
+                                    line
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                        Err(e) => vec![format!("could not read the service log: {}", clean_line(&e))],
+                    };
+                    self.viewer.as_mut().unwrap().lines =
+                        lines.into_iter().flat_map(|l| block(&l, "", Tone::Plain)).collect();
+                }
                 Vec::new()
             }
             Msg::Stopped { kept } => {
@@ -1330,6 +1419,7 @@ impl App {
                 commit.into_iter().collect()
             }
             Msg::Committed(result) => {
+                self.committing = false;
                 match result {
                     Ok(Some(c)) => {
                         let on =
@@ -1804,6 +1894,31 @@ impl App {
         let set = |what: &str, value: &str| format!("{what}: {value}");
         use super::commands::{builtin, Builtin};
         match builtin(name).map(|c| c.kind) {
+            Some(Builtin::Restart) => {
+                if self.task.is_some() || !self.learning.is_empty() || self.committing {
+                    self.flash =
+                        Some("finish or stop the task and wait for learning and commits before /restart".into());
+                    return Vec::new();
+                }
+                if matches!(self.session, SessionState::Starting) {
+                    self.flash = Some("the services are already starting; /log shows their output".into());
+                    return Vec::new();
+                }
+                self.retry_at = None;
+                self.startup_retries = 0;
+                self.session = SessionState::Starting;
+                self.push(Line::from(span("restarting the services", Tone::Dim)));
+                return vec![Action::RestartSession { keep: self.kept.clone() }];
+            }
+            Some(Builtin::Log) => {
+                self.viewer = Some(Viewer {
+                    title: "service log".into(),
+                    lines: block("reading the service log", "", Tone::Dim),
+                    scroll: 0,
+                });
+                return vec![Action::ShowLog];
+            }
+
             Some(Builtin::Reset) => {
                 self.mode = self.preference_defaults.mode;
                 self.settings = self.preference_defaults.settings.clone();
@@ -2717,7 +2832,13 @@ impl App {
             Err(e) => self.push(head(format!("learned nothing: {}", clean_line(&e)))),
             Ok(r) => {
                 self.spent_usd += r.cost_usd;
-                let count = |n: usize| if n == 1 { "1 note".to_owned() } else { format!("{n} notes") };
+                let count = |n: usize| {
+                    if n == 1 {
+                        "1 note".to_owned()
+                    } else {
+                        format!("{n} notes")
+                    }
+                };
                 let mut parts = Vec::new();
                 if !r.added.is_empty() {
                     parts.push(format!("learned {}", count(r.added.len())));
@@ -3387,6 +3508,28 @@ fn task_budget(settings: &Settings) -> Option<f64> {
     settings.budget_usd
 }
 
+fn retryable_startup_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    ![
+        "not set",
+        "missing api",
+        "api key is missing",
+        "invalid api key",
+        "authentication failed",
+        "unauthorized",
+        "invalid credentials",
+        "invalid config",
+        "invalid configuration",
+        "no such file",
+        "permission denied",
+        "unknown provider",
+        "unknown model",
+        "unsupported",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+}
+
 fn viewer_key(view: &mut Option<Viewer>, key: &KeyEvent) {
     let Some(viewer) = view else { return };
     let last = viewer.lines.len().saturating_sub(1);
@@ -3798,6 +3941,112 @@ mod tests {
         assert_eq!(app.input.text, "/effort medium ");
         app.update(key(KeyCode::Enter));
         assert_eq!(app.settings.effort, Some(Effort::Medium));
+    }
+
+    #[test]
+    fn startup_retries_back_off_three_times_and_success_cancels_the_timer() {
+        let mut app = App::new("/w", None);
+        for delay in STARTUP_RETRY_TICKS {
+            assert_eq!(
+                app.update(Msg::SessionFailed("connection refused".into())),
+                [Action::Alert { text: "molt: services down".into() }]
+            );
+            assert!(app.retry_seconds().is_some());
+            assert!(frame_text(&mut app).contains("retrying in"));
+            for _ in 1..delay {
+                assert!(app.update(Msg::Tick).is_empty());
+            }
+            assert_eq!(app.update(Msg::Tick), [Action::StartSession]);
+            assert!(app.update(Msg::Tick).is_empty());
+        }
+        app.update(Msg::SessionFailed("connection refused".into()));
+        for _ in 0..200 {
+            assert!(app.update(Msg::Tick).is_empty());
+        }
+        assert!(app.retry_seconds().is_none());
+        assert!(app.flash.as_ref().is_some_and(|s| s.contains("exhausted")));
+        up(&mut app);
+        app.session = SessionState::Starting;
+        app.update(Msg::SessionFailed("connection refused".into()));
+        assert!(app.retry_seconds().is_some());
+        up(&mut app);
+        for _ in 0..200 {
+            assert!(app.update(Msg::Tick).is_empty());
+        }
+        assert!(matches!(app.session, SessionState::Up { .. }));
+    }
+
+    #[test]
+    fn configuration_errors_and_a_closed_backend_do_not_retry_automatically() {
+        for error in ["ANTHROPIC_API_KEY is not set", "invalid configuration", "permission denied", "unknown provider"]
+        {
+            let mut app = App::new("/w", None);
+            app.update(Msg::SessionFailed(error.into()));
+            assert!(app.retry_seconds().is_none(), "{error}");
+            assert!(app.flash.as_ref().unwrap().contains("configuration or credentials"));
+            for _ in 0..200 {
+                assert!(app.update(Msg::Tick).is_empty());
+            }
+        }
+        let mut app = App::new("/w", None);
+        app.update(Msg::BackendFailed("pipe closed".into()));
+        assert!(app.retry_seconds().is_none());
+        for _ in 0..200 {
+            assert!(app.update(Msg::Tick).is_empty());
+        }
+    }
+
+    #[test]
+    fn manual_restart_preserves_settings_logs_and_kept_results_and_rejects_busy_tasks() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/attempts 4");
+        app.kept = vec!["/fork/kept".into()];
+        app.committing = true;
+        assert!(type_in(&mut app, "/restart").is_empty());
+        app.update(Msg::Committed(Ok(None)));
+        app.push(Line::from("existing log"));
+        assert_eq!(type_in(&mut app, "/restart"), [Action::RestartSession { keep: vec!["/fork/kept".into()] }]);
+        assert_eq!(app.settings.attempts, Some(4));
+        assert_eq!(app.kept, ["/fork/kept"]);
+        assert!(log(&app).contains("existing log"));
+        assert!(type_in(&mut app, "/restart").is_empty());
+        up(&mut app);
+        type_in(&mut app, "implement it");
+        assert!(type_in(&mut app, "/restart").is_empty());
+        assert!(app.flash.as_ref().unwrap().contains("finish or stop"));
+        assert!(app.task.is_some());
+    }
+
+    #[test]
+    fn messages_from_a_replaced_backend_cannot_take_down_the_new_session() {
+        let mut app = App::new("/w", None);
+        app.backend_generation = 2;
+        up(&mut app);
+        app.update(Msg::Backend { generation: 1, message: Box::new(Msg::BackendFailed("old EOF".into())) });
+        assert!(matches!(app.session, SessionState::Up { .. }));
+        app.update(Msg::Backend { generation: 1, message: Box::new(Msg::SessionFailed("old startup failure".into())) });
+        assert!(matches!(app.session, SessionState::Up { .. }));
+        app.update(Msg::Backend { generation: 2, message: Box::new(Msg::BackendFailed("current EOF".into())) });
+        assert!(matches!(app.session, SessionState::Down(_)));
+    }
+
+    #[test]
+    fn log_inspection_redacts_credentials_and_does_not_reopen_a_closed_viewer() {
+        let mut app = App::new("/w", None);
+        app.secrets = vec!["known-sensitive-value".into()];
+        assert_eq!(type_in(&mut app, "/log"), [Action::ShowLog]);
+        app.update(Msg::ServiceLog(Ok(vec![
+            "service ready".into(),
+            "key known-sensitive-value".into(),
+            "TOKEN=unknown-value".into(),
+        ])));
+        let shown = plain(&app.viewer.as_ref().unwrap().lines).join("\n");
+        assert!(shown.contains("service ready") && shown.contains("[redacted]"));
+        assert!(!shown.contains("known-sensitive-value") && !shown.contains("unknown-value"));
+        app.update(key(KeyCode::Esc));
+        app.update(Msg::ServiceLog(Ok(vec!["late".into()])));
+        assert!(app.viewer.is_none());
     }
 
     #[test]
