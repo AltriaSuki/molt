@@ -3,6 +3,8 @@
 //! returns the [`Action`]s the runtime carries out, so the whole flow can be
 //! tested with plain values.
 
+mod queue;
+
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
@@ -412,6 +414,8 @@ pub struct Task {
     pub trace: TraceId,
     pub req: RunRequest,
     pub phase: Phase,
+    pub mode: Mode,
+    settings: Settings,
     pub lanes: Vec<Lane>,
     pub designer_preview: Preview,
     /// The whole task's budget, as the user set it; `req.budget_usd` is
@@ -436,12 +440,14 @@ pub struct Task {
 }
 
 impl Task {
-    fn new(trace: TraceId, req: RunRequest, phase: Phase) -> Self {
+    fn new(trace: TraceId, req: RunRequest, phase: Phase, mode: Mode, settings: Settings) -> Self {
         Self {
             trace,
             budget_usd: req.budget_usd,
             req,
             phase,
+            mode,
+            settings,
             lanes: Vec::new(),
             design_spend: Spend::default(),
             counted: HashSet::new(),
@@ -479,6 +485,8 @@ pub enum Prompt {
         /// The user stopped the run, rather than every attempt failing.
         stopped: bool,
         attempts: Vec<AttemptReport>,
+        mode: Mode,
+        settings: Box<Settings>,
     },
 }
 
@@ -857,6 +865,10 @@ pub struct App {
     /// Runs memory is learning from.
     pub learning: HashSet<String>,
     /// Results still available in their forks, including restored results.
+    pub queue: Vec<queue::Queued>,
+    pub queue_paused: bool,
+    pub queue_view: Option<queue::View>,
+    fork_operations: usize,
     pub kept: Vec<String>,
     kept_entries: Vec<super::kept::Entry>,
     kept_changes: Vec<super::kept::Change>,
@@ -953,6 +965,10 @@ impl App {
             spent_usd: 0.0,
             uncounted_calls: 0,
             learning: HashSet::new(),
+            queue: Vec::new(),
+            queue_paused: false,
+            queue_view: None,
+            fork_operations: 0,
             kept: Vec::new(),
             kept_entries: Vec::new(),
             kept_changes: Vec::new(),
@@ -995,6 +1011,7 @@ impl App {
 
     pub fn command_completions(&self) -> Vec<super::commands::Completion> {
         if !matches!(self.screen, Screen::Main)
+            || self.queue_view.is_some()
             || self.kept_view.is_some()
             || self.prompt.is_some()
             || self.viewer.is_some()
@@ -1142,6 +1159,9 @@ impl App {
             matches!(&msg, Msg::Key(_)).then(|| super::settings::Saved::new(self.mode, self.settings.clone()));
         let input_before = matches!(&msg, Msg::Key(_) | Msg::Paste(_) | Msg::Edited(_))
             .then(|| (self.input.text.clone(), self.input.cursor));
+        if matches!(&msg, Msg::Applied(_) | Msg::Discarded(_)) {
+            self.fork_operations = self.fork_operations.saturating_sub(1);
+        }
         let mut actions = self.handle(msg);
         if actions.iter().any(|a| matches!(a, Action::Quit { .. })) {
             if let Some(entry) = self.pending_result.clone() {
@@ -1149,6 +1169,9 @@ impl App {
             }
         }
         self.committing |= actions.iter().any(|a| matches!(a, Action::Commit { .. }));
+        self.fork_operations +=
+            actions.iter().filter(|a| matches!(a, Action::Apply { .. } | Action::Discard { .. })).count();
+        actions.extend(self.advance_queue());
         if self.reset_preferences {
             self.preference_changes.clear();
             self.preference_changes.push(super::settings::Change::Reset);
@@ -1312,6 +1335,10 @@ impl App {
                     search.selected = 0;
                     return Vec::new();
                 }
+                if let Some(view) = &mut self.queue_view {
+                    view.draft.get_or_insert_with(Input::default).paste(&text);
+                    return Vec::new();
+                }
                 match &mut self.screen {
                     Screen::Memory(view) => match &mut view.edit {
                         Some(MemoryEdit::Filter(input) | MemoryEdit::Reason(input) | MemoryEdit::Promote(input)) => {
@@ -1407,6 +1434,7 @@ impl App {
                 Vec::new()
             }
             Msg::Stopped { kept } => {
+                self.fork_operations = 0;
                 if !kept.is_empty() {
                     self.push(Line::from(span(format!("  kept {} · interrupted", kept.len()), Tone::Dim)));
                     for fork in &kept {
@@ -1625,12 +1653,16 @@ impl App {
         if self.history_search.is_some() {
             return self.history_key(&key);
         }
+        if ctrl(&key, 'c') && self.queue_view.as_ref().is_some_and(|view| view.draft.is_some()) {
+            return self.queue_key(&key);
+        }
         if ctrl(&key, 'd') || (ctrl(&key, 'c') && self.task.is_none() && self.input.text.is_empty()) {
             if self.quit_armed.is_some_and(|at| self.tick.wrapping_sub(at) <= QUIT_TICKS) {
                 self.quit = true;
                 return vec![Action::Quit { keep: self.keep() }];
             }
             self.quit_armed = Some(self.tick);
+            self.show_unexecuted();
             self.flash = Some(self.quit_warning(if ctrl(&key, 'd') { "ctrl+d" } else { "ctrl+c" }));
             return Vec::new();
         }
@@ -1650,6 +1682,9 @@ impl App {
         if self.viewer.is_some() {
             self.viewer_key(&key);
             return Vec::new();
+        }
+        if self.queue_view.is_some() {
+            return self.queue_key(&key);
         }
         if self.kept_view.is_some() {
             return self.kept_key(&key);
@@ -1828,6 +1863,9 @@ impl App {
             1 => parts.push("1 result stays in its fork".into()),
             n => parts.push(format!("{n} results stay in their forks")),
         }
+        if !self.queue.is_empty() {
+            parts.push(format!("{} queued tasks will not run; their text is printed after exit", self.queue.len()));
+        }
         parts.join("; ")
     }
 
@@ -1835,6 +1873,7 @@ impl App {
         if self.task.is_none() && self.learning.is_empty() {
             return Vec::new();
         }
+        self.queue_paused |= !self.queue.is_empty();
         let keep = self.keep();
         if let Some(entry) = self.pending_result.take() {
             self.push(Line::from(span(format!("  kept in {}", clean_line(&entry.fork)), Tone::Dim)));
@@ -1851,9 +1890,15 @@ impl App {
                 self.last_lanes = std::mem::take(&mut task.lanes);
                 // Starting again needs the check in full; a designed one is only known once accepted.
                 if task.req.check.is_some() {
-                    let designed = self.settings.check.as_deref() != task.req.check.as_deref();
-                    self.prompt =
-                        Some(Prompt::Retry { req: Box::new(task.req), designed, stopped: true, attempts: Vec::new() });
+                    let designed = task.settings.check.as_deref() != task.req.check.as_deref();
+                    self.prompt = Some(Prompt::Retry {
+                        req: Box::new(task.req),
+                        designed,
+                        stopped: true,
+                        attempts: Vec::new(),
+                        mode: task.mode,
+                        settings: Box::new(task.settings),
+                    });
                 }
             }
         }
@@ -1903,8 +1948,8 @@ impl App {
     }
 
     fn submit_task(&mut self, line: String) -> Vec<Action> {
-        if self.kept_pending.is_some() {
-            self.flash = Some("wait for the kept result to be applied or discarded".into());
+        if self.fork_operations > 0 || self.committing {
+            self.flash = Some("wait for the current apply, discard or commit".into());
             self.input = Input::with(&line);
             return Vec::new();
         }
@@ -1923,6 +1968,10 @@ impl App {
             self.input = Input::with(&line);
             return Vec::new();
         }
+        self.start_task(line, self.mode, self.settings.clone())
+    }
+
+    fn start_task(&mut self, line: String, mode: Mode, settings: Settings) -> Vec<Action> {
         let files = match self.referenced(&line) {
             Ok(files) => files,
             Err(e) => {
@@ -1934,24 +1983,24 @@ impl App {
         let trace = TraceId::random();
         let mut req = RunRequest::new(line.clone(), self.workspace_path.clone());
         req.files = files;
-        if let Some(n) = self.settings.attempts {
+        if let Some(n) = settings.attempts {
             req.attempts = n;
         }
-        req.model = self.settings.model.clone();
-        req.effort = self.settings.effort;
-        req.budget_usd = self.settings.budget_usd;
-        req.apply = self.mode == Mode::Auto;
+        req.model = settings.model.clone();
+        req.effort = settings.effort;
+        req.budget_usd = settings.budget_usd;
+        req.apply = mode == Mode::Auto;
         req.earlier = self.earlier.clone();
-        req.stream = self.settings.stream;
+        req.stream = settings.stream;
 
         self.gap();
         self.echo(&line);
-        let mut task = Task::new(trace.clone(), req, Phase::Running);
+        let mut task = Task::new(trace.clone(), req, Phase::Running, mode, settings.clone());
         self.last_run = Some(trace.to_string());
-        let action = if let Some(check) = &self.settings.check {
+        let action = if let Some(check) = &settings.check {
             task.req.check = Some(check.clone());
             Action::Run { req: task.req.clone(), trace }
-        } else if self.mode == Mode::Confirm {
+        } else if mode == Mode::Confirm {
             task.phase = Phase::Designing;
             Action::Design { req: task.req.clone(), trace }
         } else {
@@ -1966,7 +2015,7 @@ impl App {
     /// The actions that start a task with `action`: looking at the work tree
     /// first, when results are committed.
     fn starting(&self, trace: TraceId, action: Action) -> Vec<Action> {
-        if self.settings.commit {
+        if self.task.as_ref().is_some_and(|task| task.settings.commit) {
             vec![Action::PrepareCommit { trace }, action]
         } else {
             vec![action]
@@ -1979,9 +2028,16 @@ impl App {
         use super::commands::{builtin, Builtin};
         match builtin(name).map(|c| c.kind) {
             Some(Builtin::Restart) => {
-                if self.task.is_some() || !self.learning.is_empty() || self.committing || self.kept_pending.is_some() {
-                    self.flash =
-                        Some("finish or stop the task and wait for learning and commits before /restart".into());
+                if self.task.is_some()
+                    || !self.learning.is_empty()
+                    || self.committing
+                    || self.kept_pending.is_some()
+                    || self.fork_operations > 0
+                {
+                    self.flash = Some(
+                        "finish or stop the task and wait for learning, applies, discards and commits before /restart"
+                            .into(),
+                    );
                     return Vec::new();
                 }
                 if matches!(self.session, SessionState::Starting) {
@@ -1994,6 +2050,7 @@ impl App {
                 self.push(Line::from(span("restarting the services", Tone::Dim)));
                 return vec![Action::RestartSession { keep: self.kept.clone() }];
             }
+            Some(Builtin::Queue) => return self.queue_command(arg),
             Some(Builtin::Kept) => {
                 self.kept_view = Some(0);
             }
@@ -2205,6 +2262,12 @@ impl App {
                 self.scroll = 0;
             }
             Some(Builtin::Quit) => {
+                if !self.queue.is_empty() {
+                    self.quit_armed = Some(self.tick);
+                    self.show_unexecuted();
+                    self.flash = Some(self.quit_warning("ctrl+d"));
+                    return Vec::new();
+                }
                 self.quit = true;
                 return vec![Action::Quit { keep: self.keep() }];
             }
@@ -2657,7 +2720,8 @@ impl App {
         self.remember(&task.req.task, &resp);
         self.uncounted_calls = self.uncounted_calls.saturating_add(resp.uncounted_calls);
         let mut actions = Vec::new();
-        let memory_model = agent::memory_model(self.settings.memory_model.as_deref(), task.req.model.as_deref());
+        let memory_model = agent::memory_model(task.settings.memory_model.as_deref(), task.req.model.as_deref());
+        let spent_all = task_budget(&task.settings).is_some_and(|b| resp.cost_usd >= b);
 
         for a in &resp.attempts {
             let (mark, tone) = match a.status {
@@ -2760,7 +2824,7 @@ impl App {
         let mut deciding = false;
         let mut applying = false;
         self.to_commit =
-            (self.settings.commit && resp.outcome != Outcome::Failed && !resp.changes.is_empty()).then(|| {
+            (task.settings.commit && resp.outcome != Outcome::Failed && !resp.changes.is_empty()).then(|| {
                 Action::Commit { trace: trace.clone(), task: task.req.task.clone(), resp: Box::new(resp.clone()) }
             });
         self.pending_result = resp.fork.as_ref().filter(|_| !resp.applied).map(|fork| {
@@ -2774,7 +2838,7 @@ impl App {
         } else if let Some(fork) = resp.fork.clone() {
             if resp.changes.is_empty() {
                 actions.push(Action::Discard { fork });
-            } else if self.mode == Mode::Confirm && !task.req.apply && !matches!(resp.outcome, Outcome::Failed) {
+            } else if task.mode == Mode::Confirm && !task.req.apply && !matches!(resp.outcome, Outcome::Failed) {
                 let stops = apply_stops(&resp, &self.rules);
                 if stops.is_empty() && !self.rules.always_ask {
                     applying = true;
@@ -2813,12 +2877,13 @@ impl App {
                     designed,
                     stopped: false,
                     attempts: resp.attempts.clone(),
+                    mode: task.mode,
+                    settings: Box::new(task.settings.clone()),
                 });
             }
         }
 
         // Memory learns from failures too; the run's budget covers it.
-        let spent_all = task_budget(&self.settings).is_some_and(|b| resp.cost_usd >= b);
         if self.memory_up() && !spent_all {
             self.learning.insert(trace.to_string());
             actions.push(Action::Learn { trace, model: memory_model });
@@ -2875,8 +2940,8 @@ impl App {
                     self.flash = Some("the services are not up".into());
                     return Some(Vec::new());
                 }
-                let Some(Prompt::Retry { req, designed, .. }) = self.prompt.take() else { return None };
-                Some(self.retry(*req, designed))
+                let Some(Prompt::Retry { req, designed, mode, settings, .. }) = self.prompt.take() else { return None };
+                Some(self.retry(*req, designed, mode, *settings))
             }
             KeyCode::Char('v') if empty && key.modifiers.is_empty() => {
                 let mut lines = Vec::new();
@@ -2902,7 +2967,7 @@ impl App {
     }
 
     /// Run a failed task again with the check it ran with.
-    fn retry(&mut self, req: RunRequest, designed: bool) -> Vec<Action> {
+    fn retry(&mut self, req: RunRequest, designed: bool, mode: Mode, settings: Settings) -> Vec<Action> {
         let trace = TraceId::random();
         self.gap();
         self.echo(&req.task.clone());
@@ -2918,7 +2983,8 @@ impl App {
         self.scroll = 0;
         self.zoom = None;
         self.last_run = Some(trace.to_string());
-        self.task = Some(Task { check_shown: true, ..Task::new(trace.clone(), req.clone(), Phase::Running) });
+        self.task =
+            Some(Task { check_shown: true, ..Task::new(trace.clone(), req.clone(), Phase::Running, mode, settings) });
         self.starting(trace.clone(), Action::Run { req, trace })
     }
 
@@ -2997,7 +3063,7 @@ impl App {
                 }
             }
             Err(error) => {
-                self.error(&format!("kept result was not {verb}"), &error);
+                self.error(&format!("kept result was not {verb}"), &scrub(&error, &self.secrets));
                 self.viewer = Some(Viewer {
                     title: "kept result remains available".into(),
                     lines: block(&scrub(&error, &self.secrets), "", Tone::Bad),
@@ -3031,6 +3097,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char('n') if !self.kept_entries.is_empty() => {
                 if self.task.is_some()
                     || self.pending_result.is_some()
+                    || self.fork_operations > 0
                     || !self.learning.is_empty()
                     || self.committing
                     || self.kept_pending.is_some()
@@ -3081,7 +3148,12 @@ impl App {
     }
 
     fn can_show_shortcuts(&self) -> bool {
-        if self.viewer.is_some() || self.transcript.is_some() || self.kept_view.is_some() {
+        if let Some(view) = &self.queue_view {
+            if view.draft.as_ref().is_some_and(|input| !input.text.is_empty()) {
+                return false;
+            }
+        }
+        if self.viewer.is_some() || self.transcript.is_some() || self.kept_view.is_some() || self.queue_view.is_some() {
             return true;
         }
         match &self.screen {
@@ -3100,6 +3172,17 @@ impl App {
         if self.viewer.is_some() {
             context = "viewer";
             pairs.extend([("j/k, ↑/↓", "scroll"), ("g/G", "start / end"), ("esc / q", "close viewer")]);
+        } else if self.queue_view.is_some() {
+            context = "task queue";
+            pairs.extend([
+                ("a", "add a task with current settings"),
+                ("j/k, ↑/↓", "select a task"),
+                ("J/K", "move later / earlier"),
+                ("n / delete", "remove selected task"),
+                ("p / r", "pause / resume queue"),
+                ("enter / v", "inspect full task"),
+                ("esc / q", "back to tasks"),
+            ]);
         } else if self.kept_view.is_some() {
             context = "kept results";
             pairs.extend([
@@ -3869,6 +3952,234 @@ mod tests {
         }
     }
 
+    fn queue_app() -> App {
+        let mut app = App::new("/work/project", None);
+        app.update(Msg::SessionUp { versions: vec![], memory_problem: Some("not configured".into()) });
+        app.mode = Mode::Plan;
+        app.settings.check = Some("true".into());
+        app
+    }
+
+    #[test]
+    fn queued_tasks_snapshot_execution_settings_and_plain_input_still_steers_the_current_task() {
+        let mut app = queue_app();
+        type_in(&mut app, "first");
+        type_in(&mut app, "/model haiku");
+        type_in(&mut app, "/attempts 2");
+        type_in(&mut app, "/budget 1.5");
+        type_in(&mut app, "/effort high");
+        type_in(&mut app, "/stream off");
+        assert!(type_in(&mut app, "/queue add second").is_empty());
+        type_in(&mut app, "/model sonnet");
+        type_in(&mut app, "/queue add third");
+        let actions = type_in(&mut app, "also support Unicode");
+        assert!(
+            matches!(actions.as_slice(), [Action::Control { action: Control::Constrain(c), .. }] if c.text == "also support Unicode")
+        );
+        assert_eq!(app.queue.len(), 2);
+        app.mode = Mode::Auto;
+        app.settings.check = Some("false".into());
+        app.settings.model = Some("opus".into());
+        app.take_preference_changes();
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let actions = app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/first"))) });
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(
+            (req.task.as_str(), req.model.as_deref(), req.check.as_deref()),
+            ("second", Some("haiku"), Some("true"))
+        );
+        assert_eq!(
+            (req.attempts, req.budget_usd, req.effort, req.apply, req.stream),
+            (2, Some(1.5), Some(Effort::High), false, false)
+        );
+        assert_eq!(req.earlier.last().unwrap().task, "first");
+        assert_eq!(app.mode, Mode::Auto);
+        assert_eq!(app.settings.model.as_deref(), Some("opus"));
+        assert!(app.take_preference_changes().is_empty());
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let actions = app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/second"))) });
+        assert!(
+            matches!(actions.as_slice(), [Action::Run { req, .. }] if req.task == "third" && req.model.as_deref() == Some("sonnet") && !req.apply)
+        );
+        assert_eq!(app.kept, ["/fork/first", "/fork/second"]);
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn a_queue_waits_for_apply_commit_and_discard_to_settle_before_starting_the_next_task() {
+        let mut app = queue_app();
+        app.mode = Mode::Confirm;
+        app.rules.always_ask = true;
+        app.settings.commit = true;
+        type_in(&mut app, "first");
+        type_in(&mut app, "/queue add second");
+        type_in(&mut app, "/queue add third");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        assert!(app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/first"))) }).is_empty());
+        assert_eq!(app.queue.len(), 2);
+        assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
+        assert_eq!(app.update(key(KeyCode::Enter)), [Action::Apply { fork: "/fork/first".into() }]);
+        assert_eq!(app.queue.len(), 2);
+        let actions = app.update(Msg::Applied(Ok(())));
+        assert!(matches!(actions.as_slice(), [Action::Commit { .. }]));
+        assert_eq!(app.queue.len(), 2);
+        let actions = app.update(Msg::Committed(Ok(None)));
+        assert!(matches!(actions.as_slice(), [Action::PrepareCommit { .. }, Action::Run { req, .. }]
+            if req.task == "second" && req.earlier.last().unwrap().applied));
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/second"))) });
+        assert_eq!(app.update(key(KeyCode::Char('n'))), [Action::Discard { fork: "/fork/second".into() }]);
+        assert_eq!(app.queue.len(), 1);
+        let actions = app.update(Msg::Discarded(Ok(())));
+        assert!(
+            matches!(actions.as_slice(), [Action::PrepareCommit { .. }, Action::Run { req, .. }] if req.task == "third")
+        );
+    }
+
+    #[test]
+    fn queued_confirm_tasks_design_their_own_check_and_wait_for_each_decision() {
+        let mut app = queue_app();
+        type_in(&mut app, "first");
+        app.mode = Mode::Confirm;
+        app.settings.check = None;
+        app.rules.always_ask = true;
+        type_in(&mut app, "/queue add second");
+        type_in(&mut app, "/queue add third");
+        app.mode = Mode::Auto;
+        app.settings.check = Some("false".into());
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let actions = app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/first"))) });
+        let [Action::Design { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.task, "second");
+        assert!(!req.apply && req.check.is_none());
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
+        assert!(matches!(app.prompt, Some(Prompt::Check(_))));
+        assert_eq!(app.queue.len(), 1);
+        let actions = app.update(key(KeyCode::Esc));
+        assert!(matches!(actions.as_slice(), [Action::Design { req, .. }] if req.task == "third"));
+    }
+
+    #[test]
+    fn stopping_the_current_task_preserves_and_pauses_its_queue_until_explicit_resume() {
+        let mut app = queue_app();
+        type_in(&mut app, "first");
+        type_in(&mut app, "/queue add second\nwith a second line");
+        assert!(matches!(app.update(key(KeyCode::Esc)).as_slice(), [Action::Interrupt { .. }]));
+        assert!(app.queue_paused && app.queue.len() == 1);
+        assert!(frame_text(&mut app).contains("1 queued"));
+        assert_eq!(app.update(Msg::Stopped { kept: vec![] }), [Action::StartSession]);
+        assert!(app
+            .update(Msg::SessionUp { versions: vec![], memory_problem: Some("not configured".into()) })
+            .is_empty());
+        let actions = type_in(&mut app, "/queue resume");
+        assert!(matches!(actions.as_slice(), [Action::Run { req, .. }] if req.task == "second\nwith a second line"));
+    }
+
+    #[test]
+    fn queue_exit_warning_and_terminal_report_retain_complete_unexecuted_task_text() {
+        for command in [false, true] {
+            let mut app = queue_app();
+            type_in(&mut app, "/queue pause");
+            let task = "first line\nsecond line with spaces  and Unicode 中文";
+            type_in(&mut app, &format!("/queue add {task}"));
+            if command {
+                assert!(type_in(&mut app, "/quit").is_empty());
+            } else {
+                assert!(app.update(ctrl_key('d')).is_empty());
+            }
+            let shown = plain(&app.viewer.as_ref().unwrap().lines).join("\n");
+            assert!(shown.contains("first line\n  second line with spaces  and Unicode 中文"), "{shown}");
+            assert_eq!(app.unexecuted(), [task]);
+            assert!(matches!(app.update(ctrl_key('d')).as_slice(), [Action::Quit { .. }]));
+            assert!(app.quit && app.queue.len() == 1);
+            assert_eq!(app.unexecuted(), [task]);
+        }
+    }
+
+    #[test]
+    fn the_queue_browser_adds_multiline_tasks_and_can_reorder_inspect_and_remove_them() {
+        let mut app = queue_app();
+        type_in(&mut app, "/queue pause");
+        for task in ["first", "second", "third"] {
+            type_in(&mut app, &format!("/queue add {task}"));
+        }
+        type_in(&mut app, "/queue move 3 1");
+        type_in(&mut app, "/queue remove 2");
+        assert_eq!(app.unexecuted(), ["third", "second"]);
+        type_in(&mut app, "/queue");
+        assert!(frame_text(&mut app).contains("task queue · paused"));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Char('K')));
+        assert_eq!(app.unexecuted(), ["second", "third"]);
+        app.update(key(KeyCode::Char('n')));
+        app.update(key(KeyCode::Char('a')));
+        app.update(Msg::Paste("cancel this draft".into()));
+        app.update(ctrl_key('c'));
+        assert!(app.queue_view.as_ref().unwrap().draft.is_none() && app.quit_armed.is_none());
+        app.update(key(KeyCode::Char('a')));
+        app.update(Msg::Paste("new\nmultiline task".into()));
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.unexecuted(), ["third", "new\nmultiline task"]);
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Enter));
+        assert!(plain(&app.viewer.as_ref().unwrap().lines).join("\n").contains("new\nmultiline task"));
+        app.update(key(KeyCode::Esc));
+        app.update(key(KeyCode::Esc));
+        type_in(&mut app, "/queue move 0 1");
+        assert_eq!(app.queue.len(), 2);
+        type_in(&mut app, "/queue clear");
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn queue_limits_keep_rejected_drafts_and_bad_file_references_pause_without_losing_the_task() {
+        let mut app = queue_app();
+        type_in(&mut app, "/queue pause");
+        let oversized = format!("/queue add {}", "a".repeat(64 * 1024 + 1));
+        type_in(&mut app, &oversized);
+        assert!(app.queue.is_empty());
+        assert_eq!(app.input.full(), oversized);
+        app.input.take();
+        for _ in 0..100 {
+            type_in(&mut app, "/queue add task");
+        }
+        type_in(&mut app, "/queue add overflow");
+        assert_eq!(app.queue.len(), 100);
+        assert_eq!(app.input.full(), "/queue add overflow");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = queue_app();
+        app.workspace_path = tmp.path().to_str().unwrap().into();
+        type_in(&mut app, "first");
+        type_in(&mut app, "/queue add update @../outside");
+        app.input = Input::with("my unsent draft");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        assert!(app.update(Msg::Ran { trace, result: Err("failed".into()) }).is_empty());
+        assert!(app.queue_paused && app.queue.len() == 1 && app.task.is_none());
+        assert_eq!(app.input.full(), "my unsent draft");
+        std::fs::write(tmp.path().join("later.txt"), "added by the preceding task").unwrap();
+        app.input.take();
+        type_in(&mut app, "/queue remove 1");
+        type_in(&mut app, "/queue add update @later.txt");
+        app.files = Some(vec![]);
+        app.files_complete = true;
+        let actions = type_in(&mut app, "/queue resume");
+        assert!(matches!(actions.as_slice(), [Action::Run { req, .. }] if req.files == ["later.txt"]));
+    }
+
+    #[test]
+    fn a_failed_task_yields_its_optional_retry_offer_to_queued_work() {
+        let mut app = queue_app();
+        type_in(&mut app, "first");
+        type_in(&mut app, "/queue add second");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let mut response = passed(false, None);
+        response.outcome = Outcome::Failed;
+        let actions = app.update(Msg::Ran { trace, result: Ok(response) });
+        assert!(matches!(actions.as_slice(), [Action::Run { req, .. }] if req.task == "second"));
+        assert!(app.prompt.is_none());
+    }
+
     #[test]
     fn plan_results_are_browsable_and_remain_available_until_apply_or_discard_succeeds() {
         let mut app = App::new("/work/project", None);
@@ -3930,7 +4241,7 @@ mod tests {
         assert!(type_in(&mut app, "/restart").is_empty());
         assert!(app.flash.as_ref().unwrap().contains("finish or stop"));
         assert!(type_in(&mut app, "another task").is_empty());
-        assert!(app.flash.as_ref().unwrap().contains("kept result"));
+        assert!(app.flash.as_ref().unwrap().contains("current apply"));
     }
 
     #[test]
@@ -4101,6 +4412,7 @@ mod tests {
         let actions = app.update(Msg::Applied(Ok(())));
         assert!(matches!(actions.as_slice(), [Action::Commit { trace: t, .. }] if *t == trace), "{actions:?}");
 
+        app.update(Msg::Committed(Ok(None)));
         // A result the user keeps in its fork, or that fails to apply, is not committed.
         let actions = type_in(&mut app, "once more");
         let [Action::PrepareCommit { trace }, ..] = actions.as_slice() else { panic!("{actions:?}") };

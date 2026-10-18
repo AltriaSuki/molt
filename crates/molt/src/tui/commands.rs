@@ -14,6 +14,7 @@ pub enum Builtin {
     Restart,
     Log,
     Kept,
+    Queue,
     Remember,
     Theme,
     Memory,
@@ -69,6 +70,7 @@ definitions! {
     Reset, "reset", "", "restore configured interface defaults and forget saved settings", &[];
     Restart, "restart", "", "restart idle services, keeping settings, logs and results", &[];
     Log, "log", "", "inspect a bounded tail of the service log", &[];
+    Queue, "queue", "[add TASK|remove N|move FROM TO|pause|resume|clear]", "queue separate tasks with their current settings", &["add", "pause", "resume", "clear"];
     Kept, "kept", "", "inspect, apply or discard results kept in forks", &[];
     Remember, "remember", "TEXT", "a preference of yours, for every project", &[];
     Theme, "theme", "NAME", "dark, light or terminal ANSI colors; saved for next time", &["dark", "light", "ansi"];

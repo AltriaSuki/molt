@@ -24,6 +24,30 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Screen::Memory(view) => draw_memory(frame, main, view, app.tick),
     }
     draw_status(frame, status, app);
+    if let Some(view) = &app.queue_view {
+        let mut viewer = super::app::Viewer {
+            title: if app.queue_paused { "task queue · paused" } else { "task queue" }.into(),
+            lines: fit_rows(app.queue_lines(), area.width * 92 / 100),
+            scroll: view.selected.saturating_sub(2) * 3,
+        };
+        draw_viewer(
+            frame,
+            area,
+            &mut viewer,
+            " a add · J/K move · n remove · p/r pause/resume · enter inspect · esc back ",
+        );
+        if let Some(input) = &view.draft {
+            let area = centered(area, 84, 60);
+            frame.render_widget(Clear, area);
+            let block = Block::new()
+                .borders(Borders::ALL)
+                .title(" queue a task · snapshots current settings ")
+                .title_bottom(" Enter queue · Ctrl+J newline · Esc cancel ");
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            draw_field(frame, inner, input, true);
+        }
+    }
     if let Some(at) = app.kept_view {
         let mut viewer = super::app::Viewer {
             title: "kept results".into(),
@@ -595,9 +619,19 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let mode_tone = if app.mode == Mode::Auto { Tone::Warn } else { Tone::Shell };
     left.push(span(app.mode.label(), mode_tone));
     left.push(span(" (shift+tab)", Tone::Dim));
+    if let Some(task) = app.task.as_ref().filter(|task| task.mode != app.mode) {
+        left.push(span(
+            format!(" · running {}", task.mode.label()),
+            if task.mode == Mode::Auto { Tone::Warn } else { Tone::Shell },
+        ));
+    }
     let s = &app.settings;
     let model = s.model.as_deref().unwrap_or("default model");
     let mut parts = vec![model.to_owned()];
+    if !app.queue.is_empty() {
+        let paused = if app.queue_paused { " · paused" } else { "" };
+        parts.insert(0, format!("{} queued{paused}", app.queue.len()));
+    }
     if !app.kept.is_empty() {
         parts.insert(0, format!("{} kept", app.kept.len()));
     }
