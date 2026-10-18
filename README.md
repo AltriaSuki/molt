@@ -681,7 +681,8 @@ with the project too. Nothing in a project's directory decides which project
 it is.
 
 ```sh
-molt project list                         # ids, names, directories, data dirs
+molt project list                         # ids, names, directories, output and data dirs
+molt project path "Japan trip"            # absolute working directory, also accepts an id
 molt project new "Japan trip"             # a project with no folder
 molt project new site --path ~/src/site   # a directory under a name of your own
 molt project add site ~/src/site-2        # another clone, with the same notes
@@ -690,7 +691,10 @@ molt do "plan five days in Kyoto" --project "Japan trip" --no-check
 ```
 
 `--project ID|NAME` stands in for `--workspace` in `molt do`, `molt resume`,
-`molt ui` and `molt memory`. A project with no folder works in a private one
+`molt ui` and `molt memory`. `molt project path ID|NAME` prints its absolute
+working directory for finding files or `cd "$(molt project path NAME)"`. Text
+results from `do` and `resume` name the applied directory, and JSON results
+include `workspace`. A project with no folder works in a private one
 of its own, `<registry dir>/projects/<id>/files`, which is where its
 research and writing end up. With `--config`, the registry is left out and
 notes are kept by the workspace's path, as before.
