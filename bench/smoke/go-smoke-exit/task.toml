@@ -1,0 +1,18 @@
+title = "Exit with status 2 on bad arguments, in a Go command"
+language = "go"
+kind = "feature"
+difficulty = "easy"
+split = "dev"
+tests = "GOTOOLCHAIN=local go test -count=1 ."
+check = "GOTOOLCHAIN=local go test -count=1 ."
+prompt = """
+`greet` should refuse to run without a name. When it is started with no
+arguments, or with more than one, it prints `usage: greet NAME` and a newline
+to standard error, prints nothing to standard output, and exits with status 2.
+With exactly one argument it keeps printing `hello, NAME` as it does now and
+exits with status 0.
+"""
+
+[smoke]
+# The natural fix adds `os.Exit(2)`, which must not stop the result from being applied.
+verifier = "check"

@@ -1,0 +1,19 @@
+title = "Write the usage guide of a command, a task no test command decides"
+language = "python"
+kind = "docs"
+difficulty = "easy"
+split = "dev"
+tests = "python3 -m unittest -q tests.test_csvsum"
+check = "python3 -m unittest -q tests.test_csvsum tests.test_bench_hidden"
+prompt = """
+Write `docs/USAGE.md`, a usage guide for `csvsum.py` for someone who has never
+seen it. It must have a level-one heading, then explain every option
+(`--column`, `--delimiter`, `--skip-header`) with what it does and its
+default, show at least one example command in a fenced code block that runs
+`python3 csvsum.py`, and list the exit statuses 0, 1 and 2 with what each
+means. Read `csvsum.py` for how it behaves; do not change the code.
+"""
+
+[smoke]
+# Documentation has no command that decides it: Molt should judge it against a rubric.
+verifier = "rubric"

@@ -1,0 +1,136 @@
+name: Smoke
+
+# Real model runs on the fixed projects in bench/smoke, graded by their hidden
+# tests and the smoke assertions (bench/README.md). This spends API money, so
+# it runs only when started by hand, or nightly once the repository variable
+# MOLT_SMOKE_NIGHTLY is set to true. It needs the ANTHROPIC_API_KEY secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_usd:
+        description: Spending limit of the whole run, in US dollars
+        default: "3"
+      task_usd:
+        description: Spending limit of each project, in US dollars
+        default: "0.4"
+      model:
+        description: Model for every run (opus, sonnet, haiku or an id); empty for molt's default
+        default: ""
+      base_url:
+        description: ANTHROPIC_BASE_URL of a compatible endpoint; empty for Anthropic's
+        default: ""
+      model_prices:
+        description: MOLT_MODEL_PRICES for a model molt has no price for, such as grok-4.5=3,15
+        default: ""
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  GOTOOLCHAIN: local
+
+jobs:
+  smoke:
+    if: github.event_name == 'workflow_dispatch' || vars.MOLT_SMOKE_NIGHTLY == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check that there is an API key
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if test -z "$ANTHROPIC_API_KEY"; then
+            echo "::error::the smoke suite needs the ANTHROPIC_API_KEY repository secret"
+            exit 1
+          fi
+      - name: Read pinned toolchain versions
+        id: versions
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          with open("rust-toolchain.toml", "rb") as f:
+              rust = tomllib.load(f)["toolchain"]
+          with open(".github/ci-versions.toml", "rb") as f:
+              versions = tomllib.load(f)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"rust={rust['channel']}", file=output)
+              print(f"go={versions['go']}", file=output)
+          PY
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: ${{ steps.versions.outputs.rust }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          check-latest: false
+          cache: false
+      - name: Install Linux isolation backend
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          # Test runner namespace policy; production never changes host sysctls.
+          if test -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Build molt and its services
+        run: cargo build --release --bins
+      - name: Validate the smoke projects, those that fetch dependencies included
+        env:
+          MOLT_BENCH_NETWORK: "1"
+        run: target/release/molt bench validate --tasks bench/smoke
+      - name: Run the smoke projects
+        id: run
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MOLT_MODEL_PRICES: ${{ inputs.model_prices }}
+          MAX_USD: ${{ inputs.max_usd || '3' }}
+          TASK_USD: ${{ inputs.task_usd || '0.4' }}
+          MODEL: ${{ inputs.model }}
+          BASE_URL: ${{ inputs.base_url }}
+        run: |
+          mkdir -p smoke "$RUNNER_TEMP/s"
+          args=(bench run --tasks bench/smoke --arm molt --results smoke/results.jsonl
+                --max-usd "$MAX_USD" --task-usd "$TASK_USD" --timeout-s 1800 --scratch "$RUNNER_TEMP/s")
+          if test -n "$MODEL"; then args+=(--model "$MODEL"); fi
+          if test -n "$BASE_URL"; then args+=(--env "ANTHROPIC_BASE_URL=$BASE_URL"); fi
+          set +e
+          target/release/molt "${args[@]}" > smoke/report.md
+          status=$?
+          set -e
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          # 3: stopped at --max-usd; the runs it made are still reported.
+          if test "$status" -ne 0 && test "$status" -ne 3; then
+            echo "::error::molt bench run ended with status $status"
+          fi
+      - name: Summarize
+        if: always() && steps.run.outcome != 'skipped'
+        run: |
+          if test -f smoke/results.jsonl; then
+            target/release/molt bench report smoke/results.jsonl >> "$GITHUB_STEP_SUMMARY"
+            target/release/molt bench report smoke/results.jsonl --json > smoke/report.json
+          else
+            echo "No smoke run was recorded." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if test "${{ steps.run.outputs.status }}" = "3"; then
+            echo "Stopped at the spending limit before every project ran." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always() && steps.run.outcome != 'skipped'
+        with:
+          name: smoke-results
+          path: smoke/
+          if-no-files-found: ignore
+      - name: Fail unless every project passed its hidden tests and assertions
+        run: |
+          test "${{ steps.run.outputs.status }}" = "0"
+          target/release/molt bench report smoke/results.jsonl --require-pass > /dev/null

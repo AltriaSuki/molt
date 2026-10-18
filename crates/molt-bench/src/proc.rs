@@ -40,6 +40,20 @@ const PASSED_ENV: &[&str] = &[
     "SSL_CERT_DIR",
 ];
 
+/// Passed as well to a command that needs the network, such as a check that
+/// fetches a crate: the proxies, and where Cargo finds the certificates.
+const NETWORK_ENV: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "all_proxy",
+    "CARGO_HTTP_CAINFO",
+];
+
 /// Set for every command, over whatever the environment says. Python does
 /// not read the user's site-packages or write bytecode next to the code.
 const FIXED_ENV: &[(&str, &str)] = &[
@@ -132,6 +146,16 @@ pub fn clean_env(home: &Path) -> BTreeMap<String, String> {
 /// home directory, and no stdin. The command and everything it starts are
 /// killed at `timeout`, and when the command itself exits.
 pub async fn shell(dir: &Path, command: &str, timeout: Duration) -> io::Result<Ran> {
+    shell_in(dir, command, timeout, false).await
+}
+
+/// [`shell`], with the network variables ([`NETWORK_ENV`]) passed too when
+/// `network` is set.
+pub async fn shell_in(dir: &Path, command: &str, timeout: Duration, network: bool) -> io::Result<Ran> {
+    let network_env = NETWORK_ENV
+        .iter()
+        .filter(|_| network)
+        .filter_map(|name| std::env::var(name).ok().map(|value| (name.to_string(), value)));
     let home = tempfile::Builder::new().prefix("molt-bench-home-").tempdir()?;
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
@@ -143,6 +167,7 @@ pub async fn shell(dir: &Path, command: &str, timeout: Duration) -> io::Result<R
         .process_group(0)
         .env_clear()
         .envs(clean_env(home.path()))
+        .envs(network_env)
         .kill_on_drop(true);
     let started = Instant::now();
     let mut child = cmd.spawn()?;

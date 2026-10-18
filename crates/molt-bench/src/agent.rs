@@ -196,9 +196,12 @@ impl Molt {
             "--json".into(),
             "--budget-usd".into(),
             job.budget_usd.to_string(),
-            // Every run starts from a fresh data dir, so what it would learn is never used.
-            "--no-learn".into(),
         ];
+        // Every run starts from a fresh data dir, so what it would learn is never used, unless what
+        // it learns is what a smoke task checks.
+        if !job.task.spec.smoke.as_ref().is_some_and(|s| s.learn) {
+            args.push("--no-learn".into());
+        }
         args.extend(self.options.iter().cloned());
         args.extend(job.arm.args.iter().cloned());
         args.push("--".into());
@@ -245,24 +248,25 @@ impl Agent for Molt {
             Ok(f) => f,
             Err(e) => return failed(format!("could not create {}: {e}", stderr_path.display())),
         };
-        let mut cmd = Command::new(&self.exe);
+        let remember = job.task.spec.smoke.as_ref().map(|s| s.remember.as_slice()).unwrap_or_default();
+        if !remember.is_empty() {
+            // Memory keeps its notes in the data dir, which `molt do` would otherwise make.
+            if let Err(e) = fs::create_dir_all(job.data_dir) {
+                return failed(format!("could not create {}: {e}", job.data_dir.display()));
+            }
+        }
+        for note in remember {
+            if let Err(e) = self.memory(&job, &["remember", "--kind", "convention", "--", note]).await {
+                return failed(format!("writing a note into memory before the run: {e:#}"));
+            }
+        }
+        let mut cmd = self.command(&job);
         cmd.args(self.args(&job))
-            .current_dir(job.home)
-            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(stderr)
             // Ctrl-C at the terminal reaches the benchmark, which stops its runs itself.
             .process_group(0)
             .kill_on_drop(true);
-        for (name, _) in std::env::vars_os() {
-            if name.to_string_lossy().starts_with("MOLT_") {
-                cmd.env_remove(name);
-            }
-        }
-        // Each run has its own home directory, so the user's price snapshot is named outright.
-        cmd.envs(molt_gateway::prices::forward_env());
-        cmd.envs(self.env.iter().map(|(k, v)| (k, v)));
-        cmd.envs(proc::home_env(job.home));
         #[cfg(target_os = "linux")]
         {
             let bench = std::process::id() as libc::pid_t;
@@ -319,6 +323,13 @@ impl Agent for Molt {
         if !out.is_empty() {
             let _ = fs::write(job.logs.join("molt.json"), &out);
         }
+        // Which notes the run was given, for the smoke assertion that a remembered one was recalled.
+        let id = serde_json::from_slice::<Value>(&out).ok().and_then(|v| v["run"].as_str().map(str::to_owned));
+        if let (false, Some(id)) = (remember.is_empty(), id) {
+            if let Ok(used) = self.memory(&job, &["used", "--json", &id]).await {
+                let _ = fs::write(job.logs.join(crate::smoke::RECALLED_LOG), used);
+            }
+        }
         match serde_json::from_slice::<RunResponse>(&out) {
             Ok(resp) => {
                 run.outcome = Some(resp.outcome);
@@ -362,6 +373,42 @@ impl Agent for Molt {
             let _ = fs::copy(&audit, job.logs.join("audit.jsonl"));
         }
         run
+    }
+}
+
+impl Molt {
+    /// `molt` with the environment of a run: its home directory, none of the
+    /// benchmark's own `MOLT_*` variables, and the variables every run gets.
+    fn command(&self, job: &Job<'_>) -> Command {
+        let mut cmd = Command::new(&self.exe);
+        cmd.current_dir(job.home).stdin(Stdio::null());
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("MOLT_") {
+                cmd.env_remove(name);
+            }
+        }
+        // Each run has its own home directory, so the user's price snapshot is named outright.
+        cmd.envs(molt_gateway::prices::forward_env());
+        cmd.envs(self.env.iter().map(|(k, v)| (k, v)));
+        cmd.envs(proc::home_env(job.home));
+        cmd
+    }
+
+    /// Run `molt memory ARGS` on the run's workspace and data dir, and return what it printed.
+    async fn memory(&self, job: &Job<'_>, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+        let (sub, rest) = args.split_first().context("no memory command")?;
+        let mut cmd = self.command(job);
+        cmd.arg("memory").arg(sub).arg("--workspace").arg(job.workspace).arg("--data-dir").arg(job.data_dir);
+        cmd.args(rest).kill_on_drop(true);
+        let out = tokio::time::timeout(Duration::from_secs(60), cmd.output())
+            .await
+            .context("molt memory took more than a minute")??;
+        ensure!(
+            out.status.success(),
+            "molt memory {sub} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim().chars().take(300).collect::<String>()
+        );
+        Ok(out.stdout)
     }
 }
 

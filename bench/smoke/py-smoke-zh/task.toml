@@ -1,0 +1,23 @@
+title = "A task and a note in Chinese: thousands separators in amounts"
+language = "python"
+kind = "feature"
+difficulty = "easy"
+split = "dev"
+tests = "python3 -m unittest -q tests.test_amount"
+check = "python3 -m unittest -q tests.test_amount tests.test_bench_hidden"
+prompt = """
+给 `ledger/amount.py` 里的 `parse_amount` 加上对千分位逗号的支持，解析金额时：
+
+- `"1,234.50"` 解析为 `Decimal("1234.50")`，`"12,345,678"` 解析为 `Decimal("12345678")`；
+- 没有逗号的写法照旧可用，比如 `"12.5"`、`"-3"`；
+- 逗号必须每三位一个，且只出现在整数部分：`"12,34"`、`"1,2345"`、`",123"`、`"1.234,5"` 都不合法；
+- 不合法时抛出 `ValueError`，消息为 `bad amount '原文'`，比如 `bad amount '12,34'`（带引号，原文照抄）。
+
+在 README 里补一句说明。
+"""
+
+[smoke]
+# Chinese notes must be recalled for a Chinese task, and learning must work.
+remember = ["这个项目的金额一律用 Decimal 计算，不能用 float。"]
+learn = true
+verifier = "check"

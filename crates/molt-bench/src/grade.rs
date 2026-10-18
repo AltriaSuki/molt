@@ -48,7 +48,9 @@ impl From<Ran> for Grade {
 pub async fn grade(task: &Task, workspace: &Path) -> anyhow::Result<Grade> {
     task::overlay(&task.hidden(), workspace).context("laying the hidden files over the workspace")?;
     remove_bytecode(workspace).context("removing compiled Python from the workspace")?;
-    let ran = proc::shell(workspace, &task.spec.check, task.timeout()).await.context("running the check")?;
+    let ran = proc::shell_in(workspace, &task.spec.check, task.timeout(), task.network())
+        .await
+        .context("running the check")?;
     Ok(ran.into())
 }
 
@@ -171,7 +173,7 @@ async fn prepared_run(task: &Task, solved: bool, hidden: bool) -> anyhow::Result
         task::overlay(&task.hidden(), &ws)?;
     }
     let command = if hidden { &task.spec.check } else { &task.spec.tests };
-    Ok(proc::shell(&ws, command, task.timeout()).await?)
+    Ok(proc::shell_in(&ws, command, task.timeout(), task.network()).await?)
 }
 
 #[cfg(test)]

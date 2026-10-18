@@ -1,0 +1,22 @@
+title = "Find the longest word, in a crate with a built target/"
+language = "rust"
+kind = "feature"
+difficulty = "easy"
+split = "dev"
+tests = "cargo test --offline --quiet --test words"
+check = "cargo test --offline --quiet --test words --test bench_hidden"
+prompt = """
+Add `pub fn longest_word(text: &str) -> Option<&str>` to the textstat crate.
+
+Words are what `str::split_whitespace` gives, with ASCII punctuation trimmed
+from both ends of each (`"hello,"` is the word `hello`); a piece that is all
+punctuation is not a word. Length is counted in characters, not bytes. When
+several words are equally long, return the first. Return `None` when the text
+has no word. Mention the function in the README.
+"""
+
+[smoke]
+# A developer's checkout has a built target/, ignored by .gitignore.
+setup = "cargo build --offline --quiet && cargo test --offline --quiet --no-run"
+learn = true
+verifier = "check"
