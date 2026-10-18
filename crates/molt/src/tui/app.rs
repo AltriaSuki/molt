@@ -805,6 +805,7 @@ pub struct App {
     pub task: Option<Task>,
     pub prompt: Option<Prompt>,
     pub viewer: Option<Viewer>,
+    pub shortcuts: Option<Viewer>,
     pub transcript: Option<TranscriptView>,
     pub screen: Screen,
     pub last_run: Option<String>,
@@ -854,6 +855,8 @@ pub struct App {
     pub pick: usize,
     /// An `@` query whose suggestions Esc put away.
     hidden: Option<String>,
+    pub command_pick: usize,
+    command_hidden: Option<String>,
 }
 
 fn key_is(key: &KeyEvent, code: KeyCode) -> bool {
@@ -886,6 +889,7 @@ impl App {
             task: None,
             prompt: None,
             viewer: None,
+            shortcuts: None,
             transcript: None,
             screen: Screen::Main,
             last_run: None,
@@ -913,6 +917,8 @@ impl App {
             listing: false,
             pick: 0,
             hidden: None,
+            command_pick: 0,
+            command_hidden: None,
         }
     }
 
@@ -924,17 +930,19 @@ impl App {
         }
     }
 
-    pub fn command_candidates(&self, prefix: &str) -> Vec<String> {
-        let mut names: Vec<_> = super::commands::BUILTINS
-            .iter()
-            .copied()
-            .chain(self.commands.keys().map(String::as_str))
-            .filter(|name| name.starts_with(prefix))
-            .map(str::to_owned)
-            .collect();
-        names.sort();
-        names.dedup();
-        names
+    pub fn command_completions(&self) -> Vec<super::commands::Completion> {
+        if !matches!(self.screen, Screen::Main)
+            || self.prompt.is_some()
+            || self.viewer.is_some()
+            || self.transcript.is_some()
+            || self.shortcuts.is_some()
+            || self.input.cursor != self.input.text.chars().count()
+            || self.input.text.contains(['\n', '\r'])
+            || self.command_hidden.as_ref() == Some(&self.input.text)
+        {
+            return Vec::new();
+        }
+        super::commands::completions(&self.input.text, &self.commands)
     }
 
     pub fn memory_up(&self) -> bool {
@@ -986,7 +994,13 @@ impl App {
         if let (Msg::Ran { trace, .. }, Some(view)) = (&msg, &mut self.transcript) {
             view.stale |= view.trace == *trace;
         }
+        let input_before = matches!(&msg, Msg::Key(_) | Msg::Paste(_) | Msg::Edited(_))
+            .then(|| (self.input.text.clone(), self.input.cursor));
         let mut actions = self.handle(msg);
+        if input_before.is_some_and(|(text, cursor)| text != self.input.text || cursor != self.input.cursor) {
+            self.command_pick = 0;
+            self.command_hidden = None;
+        }
         if !self.listing && self.files_stale && self.at_query().is_some() {
             self.listing = true;
             self.files_stale = false;
@@ -1346,6 +1360,18 @@ impl App {
             return Vec::new();
         }
         self.quit_armed = None;
+        if self.shortcuts.is_some() {
+            if key_is(&key, KeyCode::Char('?')) {
+                self.shortcuts = None;
+            } else {
+                viewer_key(&mut self.shortcuts, &key);
+            }
+            return Vec::new();
+        }
+        if key_is(&key, KeyCode::Char('?')) && self.can_show_shortcuts() {
+            self.shortcuts = Some(Viewer { title: "shortcuts".into(), lines: self.shortcut_lines(), scroll: 0 });
+            return Vec::new();
+        }
         if self.viewer.is_some() {
             self.viewer_key(&key);
             return Vec::new();
@@ -1359,6 +1385,21 @@ impl App {
         let zoomed = self.zoom.is_some() && self.prompt.is_none() && self.input.text.is_empty();
         if ctrl(&key, 'o') || (zoomed && key.code == KeyCode::Char('o') && key.modifiers.is_empty()) {
             return self.open_transcript();
+        }
+        let commands = self.command_completions();
+        if !commands.is_empty() && key.modifiers.is_empty() {
+            let n = commands.len();
+            let at = self.command_pick.min(n - 1);
+            match key.code {
+                KeyCode::Up => self.command_pick = (at + n - 1) % n,
+                KeyCode::Down => self.command_pick = (at + 1) % n,
+                KeyCode::Tab => self.input = Input::with(&commands[at].text),
+                KeyCode::Esc => self.command_hidden = Some(self.input.text.clone()),
+                _ => {}
+            }
+            if matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Esc) {
+                return Vec::new();
+            }
         }
         if ctrl(&key, 'c') && !self.input.text.is_empty() {
             self.input.take();
@@ -1402,16 +1443,6 @@ impl App {
                 return Vec::new();
             }
             KeyCode::Tab => {
-                if !editing_check && self.input.text.starts_with('/') && !self.input.text.contains(char::is_whitespace)
-                {
-                    let names = self.command_candidates(&self.input.text[1..]);
-                    if names.len() == 1 {
-                        self.input = Input::with(&format!("/{} ", names[0]));
-                    } else if !names.is_empty() {
-                        self.flash = Some(names.iter().map(|n| format!("/{n}")).collect::<Vec<_>>().join(" · "));
-                    }
-                    return Vec::new();
-                }
                 if let Some(task) = &self.task {
                     let indices: Vec<u32> = task.lanes.iter().map(|l| l.index).collect();
                     self.zoom = match self.zoom.and_then(|z| indices.iter().position(|&i| i == z)) {
@@ -1649,12 +1680,13 @@ impl App {
     fn command(&mut self, command: &str) -> Vec<Action> {
         let (name, arg) = command.split_once(' ').map_or((command, ""), |(n, a)| (n, a.trim()));
         let set = |what: &str, value: &str| format!("{what}: {value}");
-        match name {
-            "memory-used" => {
+        use super::commands::{builtin, Builtin};
+        match builtin(name).map(|c| c.kind) {
+            Some(Builtin::MemoryUsed) => {
                 let run = if arg.is_empty() { self.last_run.clone() } else { Some(arg.to_owned()) };
                 return self.open_used(run);
             }
-            "theme" => {
+            Some(Builtin::Theme) => {
                 if arg.is_empty() {
                     self.flash = Some(format!("theme: {}; /theme dark|light|ansi", self.theme.name()));
                 } else if let Some(theme) = text::Theme::parse(arg) {
@@ -1665,10 +1697,10 @@ impl App {
                     self.flash = Some("theme: dark, light or ansi".into());
                 }
             }
-            "help" => {
+            Some(Builtin::Help) => {
                 self.viewer = Some(Viewer { title: "help".into(), lines: self.help(), scroll: 0 });
             }
-            "memory" => {
+            Some(Builtin::Memory) => {
                 if !self.memory_up() {
                     self.flash = Some("memory is not running".into());
                     return Vec::new();
@@ -1684,7 +1716,7 @@ impl App {
                 });
                 return vec![Action::LoadNotes { query }];
             }
-            "remember" => {
+            Some(Builtin::Remember) => {
                 if !self.memory_up() {
                     self.flash = Some("memory is not running".into());
                     return Vec::new();
@@ -1695,7 +1727,7 @@ impl App {
                 }
                 return vec![Action::Remember { text: arg.to_owned() }];
             }
-            "check" if self.running() => {
+            Some(Builtin::Check) if self.running() => {
                 if arg.is_empty() {
                     self.flash = Some("the running task keeps a check; give the command to use instead".into());
                     return Vec::new();
@@ -1704,7 +1736,7 @@ impl App {
                 return self
                     .steer(Control::Constrain(Constraint { check: Some(arg.to_owned()), ..Default::default() }));
             }
-            "protect" => {
+            Some(Builtin::Protect) => {
                 let paths: Vec<String> = arg.split_whitespace().map(str::to_owned).collect();
                 if paths.is_empty() {
                     self.flash = Some("protect: the files or directories to leave as they are".into());
@@ -1717,17 +1749,17 @@ impl App {
                 self.echo_constraint(&format!("leave {} unchanged", paths.join(", ")));
                 return self.steer(Control::Constrain(Constraint { protect: paths, ..Default::default() }));
             }
-            "pause" => return self.steer(Control::Pause),
-            "resume" => return self.steer(Control::Resume),
-            "new" => {
+            Some(Builtin::Pause) => return self.steer(Control::Pause),
+            Some(Builtin::Resume) => return self.steer(Control::Resume),
+            Some(Builtin::New) => {
                 self.earlier.clear();
                 self.flash = Some("a new conversation: the next task starts without the earlier ones".into());
             }
-            "check" => {
+            Some(Builtin::Check) => {
                 self.settings.check = (!arg.is_empty()).then(|| arg.to_owned());
                 self.flash = Some(set("check", self.settings.check.as_deref().unwrap_or("designed for each task")));
             }
-            "attempts" => match arg.parse::<u32>() {
+            Some(Builtin::Attempts) => match arg.parse::<u32>() {
                 Ok(n @ 1..=8) => {
                     self.settings.attempts = Some(n);
                     self.flash = Some(set("attempts", arg));
@@ -1738,7 +1770,7 @@ impl App {
                 }
                 _ => self.flash = Some("attempts: 1 to 8".into()),
             },
-            "commit" => {
+            Some(Builtin::Commit) => {
                 match arg {
                     "on" => self.settings.commit = true,
                     "off" | "default" | "" => self.settings.commit = false,
@@ -1749,7 +1781,7 @@ impl App {
                 }
                 self.flash = Some(format!("commit: {} (next task)", if self.settings.commit { "on" } else { "off" }));
             }
-            "stream" => {
+            Some(Builtin::Stream) => {
                 match arg {
                     "on" | "default" | "" => self.settings.stream = true,
                     "off" => self.settings.stream = false,
@@ -1760,7 +1792,7 @@ impl App {
                 }
                 self.flash = Some(format!("stream: {} (next task)", if self.settings.stream { "on" } else { "off" }));
             }
-            "notify" => {
+            Some(Builtin::Notify) => {
                 self.settings.notify = match arg {
                     "on" | "default" | "" => Notify::Waiting,
                     "all" => Notify::All,
@@ -1779,11 +1811,11 @@ impl App {
                     .into(),
                 );
             }
-            "model" => {
+            Some(Builtin::Model) => {
                 self.settings.model = (!arg.is_empty() && arg != "default").then(|| arg.to_owned());
                 self.flash = Some(set("model", self.settings.model.as_deref().unwrap_or("default")));
             }
-            "memory-model" => {
+            Some(Builtin::MemoryModel) => {
                 self.settings.memory_model = (!arg.is_empty() && arg != "default").then(|| arg.to_owned());
                 let shown = match self.settings.memory_model.as_deref() {
                     None => "default",
@@ -1792,7 +1824,7 @@ impl App {
                 };
                 self.flash = Some(set("memory model", shown));
             }
-            "effort" => {
+            Some(Builtin::Effort) => {
                 if arg.is_empty() || arg == "default" {
                     self.settings.effort = None;
                     self.flash = Some(set("effort", "default"));
@@ -1806,7 +1838,7 @@ impl App {
                     }
                 }
             }
-            "budget" => match arg.trim_start_matches('$').parse::<f64>() {
+            Some(Builtin::Budget) => match arg.trim_start_matches('$').parse::<f64>() {
                 Ok(usd) if usd.is_finite() && usd > 0.0 => {
                     self.settings.budget_usd = Some(usd);
                     self.flash = Some(format!("budget: ${usd:.2} per task"));
@@ -1817,7 +1849,7 @@ impl App {
                 }
                 _ => self.flash = Some("budget: a positive amount of US dollars".into()),
             },
-            "lanes" => {
+            Some(Builtin::Lanes) => {
                 if self.last_lanes.is_empty() {
                     self.flash = Some("no task has finished yet".into());
                 } else {
@@ -1825,20 +1857,20 @@ impl App {
                         Some(Viewer { title: "attempts".into(), lines: lane_lines(&self.last_lanes), scroll: 0 });
                 }
             }
-            "last" => match &self.last {
+            Some(Builtin::Last) => match &self.last {
                 Some(last) => self.viewer = Some(diff_viewer(&last.patch, last.truncated)),
                 None => self.flash = Some("no task has finished with changes yet".into()),
             },
-            "clear" => {
+            Some(Builtin::Clear) => {
                 self.log.clear();
                 self.scroll = 0;
             }
-            "quit" | "exit" => {
+            Some(Builtin::Quit) => {
                 self.quit = true;
                 return vec![Action::Quit { keep: self.keep() }];
             }
-            other => {
-                if let Some(template) = self.commands.get(other).cloned() {
+            None => {
+                if let Some(template) = self.commands.get(name).cloned() {
                     if self.task.is_some() {
                         self.flash = Some("a task is waiting; project commands start a new task".into());
                         return Vec::new();
@@ -1884,7 +1916,7 @@ impl App {
                     }
                     return actions;
                 }
-                self.flash = Some(format!("no command /{}; /help lists them", clean_line(other)));
+                self.flash = Some(format!("no command /{}; /help lists them", clean_line(name)));
             }
         }
         Vec::new()
@@ -2580,18 +2612,113 @@ impl App {
     }
 
     fn viewer_key(&mut self, key: &KeyEvent) {
-        let Some(viewer) = &mut self.viewer else { return };
-        let last = viewer.lines.len().saturating_sub(1);
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.viewer = None,
-            KeyCode::Down | KeyCode::Char('j') => viewer.scroll = (viewer.scroll + 1).min(last),
-            KeyCode::Up | KeyCode::Char('k') => viewer.scroll = viewer.scroll.saturating_sub(1),
-            KeyCode::PageDown | KeyCode::Char(' ') => viewer.scroll = (viewer.scroll + 20).min(last),
-            KeyCode::PageUp => viewer.scroll = viewer.scroll.saturating_sub(20),
-            KeyCode::Char('g') | KeyCode::Home => viewer.scroll = 0,
-            KeyCode::Char('G') | KeyCode::End => viewer.scroll = last,
-            _ => {}
+        viewer_key(&mut self.viewer, key);
+    }
+
+    fn can_show_shortcuts(&self) -> bool {
+        if self.viewer.is_some() || self.transcript.is_some() {
+            return true;
         }
+        match &self.screen {
+            Screen::Main => self.input.text.is_empty(),
+            Screen::Memory(view) => match &view.edit {
+                Some(MemoryEdit::Filter(i) | MemoryEdit::Reason(i) | MemoryEdit::Promote(i)) => i.text.is_empty(),
+                Some(MemoryEdit::Change(c)) => c.input().is_none_or(|i| i.text.is_empty()),
+                None => true,
+            },
+        }
+    }
+
+    fn shortcut_lines(&self) -> Vec<Line<'static>> {
+        let mut pairs = vec![("? / esc", "close shortcuts")];
+        let context;
+        if self.viewer.is_some() {
+            context = "viewer";
+            pairs.extend([("j/k, ↑/↓", "scroll"), ("g/G", "start / end"), ("esc / q", "close viewer")]);
+        } else if self.transcript.is_some() {
+            context = "transcript";
+            pairs.extend([
+                ("j/k, ↑/↓", "scroll"),
+                ("{/}", "previous / next turn"),
+                ("e", "fold / unfold"),
+                ("v", "open in editor"),
+                ("esc / ctrl+o", "close transcript"),
+            ]);
+        } else if let Screen::Memory(view) = &self.screen {
+            context = "memory";
+            if view.edit.is_some() {
+                pairs.extend([("enter", "accept the field / save"), ("esc", "cancel editing")]);
+                if let Some(MemoryEdit::Change(c)) = &view.edit {
+                    pairs.push(("shift+tab", "previous field"));
+                    if c.step == ChangeStep::Confirm {
+                        pairs.push(("t", "toggle temporary"));
+                    }
+                }
+            } else {
+                pairs.extend([
+                    ("j/k, ↑/↓", "select a note"),
+                    ("/", "filter notes"),
+                    ("enter / v", "inspect note"),
+                    ("a / c", "accept / correct note"),
+                    ("f", "forget with a reason"),
+                    ("p", "promote to every project"),
+                    ("u", "latest task's recalled notes"),
+                    ("r", "reload notes"),
+                    ("esc / q", "back to tasks"),
+                ]);
+            }
+        } else {
+            context = match &self.prompt {
+                Some(Prompt::Check(d)) => {
+                    pairs.extend([("enter", "run attempts"), ("esc", "cancel task")]);
+                    if d.command.is_some() {
+                        pairs.extend([("e", "edit check"), ("n", "run without check")]);
+                    }
+                    if !d.files.is_empty() {
+                        pairs.push(("v", "view check files"));
+                    }
+                    "check confirmation"
+                }
+                Some(Prompt::Apply { .. }) => {
+                    pairs.extend([
+                        ("enter", "apply result"),
+                        ("d", "view diff"),
+                        ("k / esc", "keep result in its fork"),
+                        ("n", "discard result"),
+                    ]);
+                    "apply confirmation"
+                }
+                Some(Prompt::Retry { .. }) => {
+                    pairs.extend([("r", "retry with the same check"), ("v", "view attempts"), ("esc", "dismiss")]);
+                    "retry"
+                }
+                Some(Prompt::EditCheck(_)) => {
+                    pairs.extend([("enter", "save check command"), ("esc", "back to check confirmation")]);
+                    "edit check"
+                }
+                None => {
+                    pairs.extend([
+                        ("enter", if self.running() { "add input to the running task" } else { "submit task" }),
+                        ("shift+enter / ctrl+j", "new line (also \\ then enter)"),
+                        ("shift+tab", "switch mode"),
+                        ("tab", "complete suggestion / enlarge attempt"),
+                        ("↑/↓", "pick suggestion / move line / input history"),
+                        ("ctrl+g", "edit task in editor"),
+                    ]);
+                    if self.busy() {
+                        pairs.push(("esc", "stop task"));
+                    }
+                    "tasks"
+                }
+            };
+            pairs.extend([("ctrl+o", "open transcript"), ("pgup / pgdn", "scroll log")]);
+        }
+        pairs.extend([("ctrl+l", "redraw screen"), ("ctrl+z", "suspend interface"), ("ctrl+d twice", "quit")]);
+        let mut lines = vec![Line::from(span(context, Tone::Dim))];
+        lines.extend(pairs.into_iter().map(|(key, description)| {
+            Line::from(vec![span(format!("  {key:<24}"), Tone::Shell), span(description, Tone::Plain)])
+        }));
+        lines
     }
 
     /// The transcript of the running task, or else of the last one; of the
@@ -3122,16 +3249,34 @@ fn task_budget(settings: &Settings) -> Option<f64> {
     settings.budget_usd
 }
 
+fn viewer_key(view: &mut Option<Viewer>, key: &KeyEvent) {
+    let Some(viewer) = view else { return };
+    let last = viewer.lines.len().saturating_sub(1);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => *view = None,
+        KeyCode::Down | KeyCode::Char('j') => viewer.scroll = (viewer.scroll + 1).min(last),
+        KeyCode::Up | KeyCode::Char('k') => viewer.scroll = viewer.scroll.saturating_sub(1),
+        KeyCode::PageDown | KeyCode::Char(' ') => viewer.scroll = (viewer.scroll + 20).min(last),
+        KeyCode::PageUp => viewer.scroll = viewer.scroll.saturating_sub(20),
+        KeyCode::Char('g') | KeyCode::Home => viewer.scroll = 0,
+        KeyCode::Char('G') | KeyCode::End => viewer.scroll = last,
+        _ => {}
+    }
+}
+
 fn help() -> Vec<Line<'static>> {
     let row = |keys: &str, what: &str| {
-        Line::from(vec![span(format!("  {keys:<18}"), Tone::Shell), span(what.to_owned(), Tone::Plain)])
+        Line::from(vec![span(format!("  {keys:<24} "), Tone::Shell), span(what.to_owned(), Tone::Plain)])
     };
     let head = |t: &str| Line::from(span(t.to_owned(), Tone::Dim));
-    vec![
+    let mut lines = vec![
         head("tasks"),
         row("enter", "run the task in the input"),
         row("shift+tab", "mode: plan only, confirm, auto"),
-        row("tab", "show one attempt large; again for the next"),
+        row("tab", "complete a picked suggestion; otherwise show one attempt large"),
+        row("/", "commands and argument hints; arrows pick, Tab completes"),
+        row("@path", "point the task at a file; arrows pick, Tab completes"),
+        row("? (empty input)", "shortcuts for the current screen"),
         row("ctrl+o", "the transcript: model text, tool arguments and results (o: of the attempt shown large)"),
         row("esc", "stop the task"),
         row("enter (running)", "add what you typed to the running task"),
@@ -3145,34 +3290,16 @@ fn help() -> Vec<Line<'static>> {
         row("ctrl+d twice", "quit"),
         Line::default(),
         head("commands"),
-        row("/memory [words]", "notes about this project"),
-        row("/memory-used [run]", "recorded context for this run (default: latest)"),
-        row("/remember TEXT", "a preference of yours, for every project"),
-        row("/check [command]", "use this check for every task; empty: design one"),
-        row("", "while a task runs: check its result with this instead"),
-        row("/protect PATH...", "the running task must leave these as they are"),
-        row("/pause, /resume", "start nothing new in the running task, then go on"),
-        row("/new", "a new conversation: later tasks forget the earlier ones"),
-        row("/attempts N", "attempts at once, 1 to 8"),
-        row("/stream on|off", "model text previews for the next task"),
-        row("@path", "point the task at a file; tab puts in the picked suggestion"),
-        row("/notify on|all|off", "bell and desktop notice when waiting (all: also when a task ends)"),
-        row("/commit on|off", "commit each applied result to git; `molt undo` takes it back"),
-        row("/model NAME", "opus, sonnet, haiku or a model id"),
-        row("/memory-model NAME", "model memory learns with; same: the attempts'"),
-        row("/effort LEVEL", "low, medium, high, xhigh or max"),
-        row("/budget USD", "spending limit per task"),
-        row("/last", "the diff of the last finished task"),
-        row("/lanes", "the tool calls of the last finished task"),
-        row("/theme NAME", "dark, light or terminal ANSI colors; saved for next time"),
-        row("/clear", "clear the log"),
-        row("/quit", "quit"),
+    ];
+    lines.extend(super::commands::BUILTINS.iter().map(|c| row(&c.label(), c.description)));
+    lines.extend([
         Line::default(),
         head("modes"),
         row("plan only", "results stay in their forks; the workspace is not changed"),
         row("confirm", "stop for the check or the result when one needs a look"),
         row("auto", "design the check and apply what passes"),
-    ]
+    ]);
+    lines
 }
 
 /// Lines as plain text, for tests.
@@ -3517,6 +3644,179 @@ mod tests {
     }
 
     #[test]
+    fn slash_commands_and_values_are_suggested_before_submission() {
+        let mut app = App::new("/w", None);
+        app.update(Msg::Paste("/ef".into()));
+        assert!(frame_text(&mut app).contains("/effort LEVEL"));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "/effort ");
+        let frame = frame_text(&mut app);
+        for value in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(frame.contains(value), "{value}: {frame}");
+        }
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "/effort medium ");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.settings.effort, Some(Effort::Medium));
+    }
+
+    #[test]
+    fn question_mark_opens_and_closes_shortcuts_but_is_text_in_a_task() {
+        let mut app = App::new("/w", None);
+        app.update(key(KeyCode::Char('?')));
+        assert!(app.input.text.is_empty());
+        assert!(frame_text(&mut app).contains("shortcuts"));
+        app.update(key(KeyCode::Char('?')));
+        assert!(!frame_text(&mut app).contains("shortcuts"));
+        app.update(Msg::Paste("why".into()));
+        app.update(key(KeyCode::Char('?')));
+        assert_eq!(app.input.text, "why?");
+        app.input.take();
+        app.update(key(KeyCode::Char('?')));
+        app.update(key(KeyCode::Esc));
+        assert!(!frame_text(&mut app).contains("shortcuts"));
+    }
+
+    #[test]
+    fn the_picker_scrolls_wraps_hides_and_preserves_the_input_until_tab() {
+        let mut app = App::new("/w", None);
+        app.update(Msg::Paste("/attempts ".into()));
+        let frame = frame_rows(&mut app, 140);
+        assert_eq!(frame.iter().filter(|l| l.contains("attempts at once")).count(), 6);
+        app.update(key(KeyCode::Up));
+        let frame = frame_text(&mut app);
+        assert!(frame.contains("› default") && frame.contains("9/9"), "{frame}");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|frame| super::super::view::draw(frame, &mut app)).unwrap();
+        let small: String = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(small.contains("› default"), "the picked value stays visible in a short terminal: {small}");
+        assert_eq!(app.input.text, "/attempts ");
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Up));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "/attempts 1 ");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.settings.attempts, Some(1));
+        app.update(Msg::Paste("/model ".into()));
+        app.update(key(KeyCode::Esc));
+        assert!(app.command_completions().is_empty());
+        assert_eq!(app.input.text, "/model ");
+        app.update(key(KeyCode::Char('s')));
+        assert!(frame_text(&mut app).contains("› sonnet"));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "/model sonnet ");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.settings.model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn completion_does_not_replace_free_text_or_text_after_the_cursor() {
+        let mut app = App::new("/w", None);
+        for text in ["/model custom-model", "/check echo hello", "/effort high\nmore text", "/unknown"] {
+            app.input = Input::with(text);
+            assert!(app.command_completions().is_empty(), "{text}");
+            app.update(key(KeyCode::Tab));
+            assert_eq!(app.input.text, text);
+        }
+        app.input = Input::with("/model sonnet");
+        app.update(key(KeyCode::Left));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "/model sonnet");
+    }
+
+    #[test]
+    fn completion_takes_tab_and_escape_before_the_running_task_does() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        type_in(&mut app, "implement it");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        attempt_with_tool_call(&mut app, &trace, "cargo test");
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.zoom, Some(0));
+        app.update(Msg::Paste("/ef".into()));
+        assert!(frame_text(&mut app).contains("/effort LEVEL"));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "/effort ");
+        assert_eq!(app.zoom, Some(0));
+        assert!(app.update(key(KeyCode::Esc)).is_empty());
+        assert!(app.running());
+        assert!(app.command_completions().is_empty());
+        app.input.take();
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.zoom, None);
+    }
+
+    #[test]
+    fn shortcut_help_keeps_confirmation_and_memory_editing_intact() {
+        let mut app = App::new("/w", None);
+        app.prompt = Some(Prompt::Check(design()));
+        app.update(key(KeyCode::Char('?')));
+        let text = frame_text(&mut app);
+        assert!(text.contains("check confirmation") && text.contains("edit check"));
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.prompt, Some(Prompt::Check(_))));
+        app.prompt = Some(Prompt::Apply { resp: Box::new(passed(false, Some("/fork"))), fork: "/fork".into() });
+        app.update(key(KeyCode::Char('?')));
+        let text = frame_text(&mut app);
+        assert!(text.contains("apply confirmation") && text.contains("keep result in its fork"));
+        app.update(key(KeyCode::Char('?')));
+        assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
+        app.prompt = None;
+        app.screen = Screen::Memory(MemoryView {
+            query: String::new(),
+            notes: vec![],
+            selected: 0,
+            loading: false,
+            error: None,
+            edit: None,
+        });
+        app.update(key(KeyCode::Char('?')));
+        assert!(frame_text(&mut app).contains("filter notes"));
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.screen, Screen::Memory(_)));
+        app.update(key(KeyCode::Char('/')));
+        app.update(Msg::Paste("why".into()));
+        app.update(key(KeyCode::Char('?')));
+        let Screen::Memory(view) = &app.screen else { panic!("memory closed") };
+        assert!(matches!(&view.edit, Some(MemoryEdit::Filter(i)) if i.text == "why?"));
+        assert!(app.shortcuts.is_none());
+        app.screen = Screen::Main;
+        type_in(&mut app, "/help");
+        app.update(key(KeyCode::Char('?')));
+        assert!(plain(&app.shortcuts.as_ref().unwrap().lines).join("\n").contains("close viewer"));
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.viewer.as_ref().unwrap().title, "help");
+    }
+
+    #[test]
+    fn every_builtin_is_parsed_documented_and_reserves_its_name() {
+        let mut names = HashSet::new();
+        let help = plain(&help()).join("\n");
+        for definition in super::super::commands::BUILTINS {
+            assert!(names.insert(definition.name), "duplicate {}", definition.name);
+            assert!(help.contains(&definition.label()), "{} missing from help", definition.name);
+            assert!(help.contains(definition.description));
+            let mut app = App::new("/w", None);
+            up(&mut app);
+            let arg = definition.values.first().copied().unwrap_or("");
+            app.command(&format!("{} {arg}", definition.name));
+            assert!(!app.flash.as_deref().is_some_and(|s| s.starts_with("no command")), "{}", definition.name);
+        }
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".molt/commands");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in &names {
+            std::fs::write(dir.join(format!("{name}.md")), "conflict").unwrap();
+        }
+        let (projects, warnings) = super::super::commands::load(root.path());
+        assert!(projects.is_empty());
+        assert_eq!(warnings.len(), names.len());
+    }
+
+    #[test]
     fn an_at_path_completes_from_the_workspace_and_goes_with_the_task() {
         let mut app = App::new("/work/project", None);
         up(&mut app);
@@ -3711,7 +4011,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("fix-issue.md"),
-            "---\ncheck: cargo test\nattempts: 3\nbudget: 2.5\n---\nFix issue $ARGUMENTS",
+            "---\ndescription: Fix an issue\nargument-hint: ISSUE\ncheck: cargo test\nattempts: 3\nbudget: 2.5\n---\nFix issue $ARGUMENTS",
         )
         .unwrap();
         std::fs::write(dir.join("help.md"), "wrong").unwrap();
@@ -3719,8 +4019,12 @@ mod tests {
         app.load_commands(root.path());
         up(&mut app);
         app.settings.budget_usd = Some(1.0);
-        assert_eq!(app.command_candidates("fix-"), ["fix-issue"]);
-        assert!(type_in(&mut app, "/fix-issue 12").is_empty());
+        app.update(Msg::Paste("/fix-".into()));
+        let frame = frame_text(&mut app);
+        assert!(frame.contains("/fix-issue ISSUE") && frame.contains("Fix an issue"));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "/fix-issue ");
+        assert!(type_in(&mut app, "12").is_empty());
         let task = app.task.as_ref().unwrap();
         assert_eq!(task.req.task, "Fix issue 12");
         assert_eq!(task.req.attempts, 3);
