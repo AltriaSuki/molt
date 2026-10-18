@@ -2313,7 +2313,7 @@ impl App {
             Some(Builtin::MemoryModel) => {
                 self.settings.memory_model = (!arg.is_empty() && arg != "default").then(|| arg.to_owned());
                 let shown = match self.settings.memory_model.as_deref() {
-                    None => "default",
+                    None => "default (MOLT_MEMORY_MODEL, else the attempts' model)",
                     Some(agent::SAME_MODEL) => "the attempts' model",
                     Some(m) => m,
                 };
@@ -3130,6 +3130,7 @@ impl App {
             Err(e) => self.push(head(format!("learned nothing: {}", clean_line(&e)))),
             Ok(r) => {
                 self.spent_usd += r.cost_usd;
+                self.uncounted_calls = self.uncounted_calls.saturating_add(r.uncounted_calls);
                 let count = |n: usize| {
                     if n == 1 {
                         "1 note".to_owned()
@@ -6002,8 +6003,10 @@ mod tests {
             proposed: vec![],
             usage: Usage::default(),
             cost_usd: 0.01,
+            uncounted_calls: 1,
         };
         app.learned(Ok(skipped));
+        assert_eq!(app.uncounted_calls, 1, "a learning call without a price leaves the session's spending a subtotal");
         assert!(log(&app).ends_with("◇ memory  nothing new: the episode held nothing worth keeping"), "{}", log(&app));
     }
 

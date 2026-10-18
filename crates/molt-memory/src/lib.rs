@@ -49,7 +49,11 @@ const DATA_DIR: &str = ".molt";
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Model that reads finished episodes, unless a request names one.
-    pub model: String,
+    /// `None`: the model the episode's attempts used.
+    pub model: Option<String>,
+    /// The attempts' model for a run that names none, as the planner and
+    /// the gateway pick it. `None` leaves the choice to the gateway.
+    pub attempts_model: Option<String>,
     pub effort: Effort,
     /// `max_tokens` of that model call.
     pub max_tokens: u32,
@@ -98,7 +102,8 @@ pub fn adopt(db: &Db, project: &Project) -> anyhow::Result<usize> {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model: "sonnet".into(),
+            model: None,
+            attempts_model: None,
             effort: Effort::Low,
             max_tokens: 8_000,
             model_timeout: Duration::from_secs(300),
@@ -115,10 +120,13 @@ impl Config {
     ///
     /// | Variable | Default |
     /// |---|---|
-    /// | `MOLT_MEMORY_MODEL` | `sonnet` |
+    /// | `MOLT_MEMORY_MODEL` | the attempts' model |
     /// | `MOLT_MEMORY_EFFORT` | `low` |
     /// | `MOLT_MEMORY_MAX_TOKENS` | `8000` |
     /// | `MOLT_MEMORY_MODEL_TIMEOUT_S` | `300` |
+    ///
+    /// The attempts' model comes from `MOLT_PLANNER_MODEL`, else
+    /// `MOLT_MODEL`, as the planner and the gateway read them.
     ///
     /// An empty variable counts as unset; a value that does not parse, or a
     /// zero, is an error.
@@ -140,7 +148,8 @@ impl Config {
             None => d.effort,
         };
         Ok(Self {
-            model: get("MOLT_MEMORY_MODEL").unwrap_or(d.model),
+            model: get("MOLT_MEMORY_MODEL"),
+            attempts_model: get("MOLT_PLANNER_MODEL").or_else(|| get("MOLT_MODEL")),
             effort,
             max_tokens: u32::try_from(number("MOLT_MEMORY_MAX_TOKENS", d.max_tokens.into())?)
                 .context("MOLT_MEMORY_MAX_TOKENS is too large")?,
@@ -657,7 +666,7 @@ mod tests {
     #[test]
     fn settings_come_from_the_environment() {
         let d = from(&[]).unwrap();
-        assert_eq!((d.model.as_str(), d.effort, d.max_tokens), ("sonnet", Effort::Low, 8_000));
+        assert_eq!((d.model, d.attempts_model, d.effort, d.max_tokens), (None, None, Effort::Low, 8_000));
         let c = from(&[
             ("MOLT_MEMORY_MODEL", "haiku"),
             ("MOLT_MEMORY_EFFORT", "medium"),
@@ -665,11 +674,19 @@ mod tests {
             ("MOLT_MEMORY_MODEL_TIMEOUT_S", "9"),
         ])
         .unwrap();
-        assert_eq!((c.model.as_str(), c.effort, c.max_tokens), ("haiku", Effort::Medium, 2_000));
+        assert_eq!((c.model.as_deref(), c.effort, c.max_tokens), (Some("haiku"), Effort::Medium, 2_000));
         assert_eq!(c.model_timeout, Duration::from_secs(9));
-        assert_eq!(from(&[("MOLT_MEMORY_MODEL", " ")]).unwrap().model, "sonnet");
+        assert_eq!(from(&[("MOLT_MEMORY_MODEL", " ")]).unwrap().model, None);
         assert!(from(&[("MOLT_MEMORY_EFFORT", "huge")]).is_err());
         assert!(from(&[("MOLT_MEMORY_MAX_TOKENS", "0")]).is_err());
         assert!(from(&[("MOLT_MEMORY_MODEL_TIMEOUT_S", "soon")]).is_err());
+    }
+
+    #[test]
+    fn without_a_memory_model_learning_follows_the_attempts_default() {
+        assert_eq!(from(&[("MOLT_MODEL", "grok-4.5")]).unwrap().attempts_model.as_deref(), Some("grok-4.5"));
+        let both = from(&[("MOLT_MODEL", "grok-4.5"), ("MOLT_PLANNER_MODEL", "glm-4.6")]).unwrap();
+        assert_eq!(both.attempts_model.as_deref(), Some("glm-4.6"), "the planner's default wins, as in the planner");
+        assert_eq!(from(&[("MOLT_PLANNER_MODEL", " ")]).unwrap().attempts_model, None);
     }
 }

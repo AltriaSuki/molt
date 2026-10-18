@@ -283,8 +283,16 @@ const PLANNER_ENV: &[&str] = &[
 ];
 
 /// What the memory service reads from its environment (see `molt_memory::Config::from_env`).
-const MEMORY_ENV: &[&str] =
-    &["MOLT_MEMORY_MODEL", "MOLT_MEMORY_EFFORT", "MOLT_MEMORY_MAX_TOKENS", "MOLT_MEMORY_MODEL_TIMEOUT_S"];
+/// It reads the planner's and the gateway's model too: unless told
+/// otherwise, it learns with the model the attempts use.
+const MEMORY_ENV: &[&str] = &[
+    "MOLT_MEMORY_MODEL",
+    "MOLT_MEMORY_EFFORT",
+    "MOLT_MEMORY_MAX_TOKENS",
+    "MOLT_MEMORY_MODEL_TIMEOUT_S",
+    "MOLT_PLANNER_MODEL",
+    "MOLT_MODEL",
+];
 
 /// The web service's name.
 pub const WEB: &str = "web";
@@ -714,7 +722,9 @@ mod tests {
         );
         assert_eq!(memory.tier, Tier::Mutable);
         assert_eq!(targets("memory"), ["model.complete", "kernel.audit.read", "topic:subscribe:fs.changed", "fs.view"]);
-        assert!(memory.pass_env.iter().all(|v| v.starts_with("MOLT_MEMORY_")));
+        assert!(memory.pass_env.iter().all(|v| v.starts_with("MOLT_MEMORY_") || v.ends_with("_MODEL")), "no secrets");
+        // Memory learns with the attempts' model unless told otherwise, so it reads which that is.
+        assert!(["MOLT_PLANNER_MODEL", "MOLT_MODEL"].iter().all(|v| memory.pass_env.iter().any(|p| p == v)));
 
         let planner = cfg.service("planner").unwrap();
         assert_eq!(planner.exec.as_ref().unwrap().command, "/opt/molt/bin/molt-planner");
