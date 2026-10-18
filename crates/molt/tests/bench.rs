@@ -257,3 +257,82 @@ async fn the_agents_commands_reach_the_toolchain_in_and_out_of_the_sandbox() {
         assert_eq!((r.outcome, r.passed, r.setup.sandboxed), (Some(Outcome::Passed), true, sandboxed), "{r:#?}");
     }
 }
+
+/// A smoke task's run is checked beyond its hidden tests: its result is
+/// clean and applied, it was verified by a check, a note written into memory
+/// before it was recalled, and the cost it reported is its audit log's. The
+/// report names each assertion a run failed, and `--require-pass` fails.
+#[tokio::test]
+async fn smoke_runs_are_checked_for_hygiene_memory_and_cost() {
+    let server = MockServer::start().await;
+    let api = FakeApi { check: "test -f hello.txt\n".into() };
+    Mock::given(method("POST")).and(path("/v1/messages")).respond_with(api).mount(&server).await;
+    let root = tempfile::tempdir().unwrap();
+    let tasks = root.path().join("tasks");
+    task(&tasks, "py-smoke-hi", "hi");
+    task(&tasks, "py-smoke-kept", "hi");
+    let smoke = |id: &str, table: &str| {
+        let toml = tasks.join(id).join("task.toml");
+        let text = std::fs::read_to_string(&toml).unwrap();
+        std::fs::write(&toml, format!("{text}\n[smoke]\n{table}")).unwrap();
+    };
+    smoke(
+        "py-smoke-hi",
+        "verifier = \"check\"\nremember = [\"Write hello.txt in lowercase.\"]\nsetup = \"mkdir -p target && echo x > target/stamp\"\n",
+    );
+    // Expects what this run will not do.
+    smoke("py-smoke-kept", "applied = false\nverifier = \"rubric\"\n");
+    let scratch = tempfile::tempdir().unwrap();
+    let results = root.path().join("smoke.jsonl");
+    let results_arg = results.to_str().unwrap();
+    let run = [
+        "run",
+        "--tasks",
+        tasks.to_str().unwrap(),
+        "--results",
+        results_arg,
+        // The reviewer's call is left out of the cost `molt do` reports (#174), which the cost assertion
+        // catches; this test is about the assertions working, so the run has no reviewer.
+        "--arm",
+        "molt=--no-review",
+        "--max-usd",
+        "5",
+        "--task-usd",
+        "1",
+        "--timeout-s",
+        "120",
+        "--scratch",
+        scratch.path().to_str().unwrap(),
+    ];
+    let out = molt_bench(&server, &run);
+    assert!(out.status.success(), "{}\n{}", text(&out.stdout), text(&out.stderr));
+    let records = record::load(&results).unwrap();
+    let find = |task: &str| -> &Record { records.iter().find(|r| r.task == task).unwrap() };
+
+    let hi = find("py-smoke-hi");
+    assert!(hi.passed && hi.error.is_none(), "{hi:#?}");
+    assert!(hi.model_calls > 0 && hi.cost_usd > 0.0, "{hi:#?}");
+    let names: Vec<&str> = hi.assertions.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["clean", "applied", "verifier", "recalled", "cost", "unsettled"], "{hi:#?}");
+    assert!(hi.assertions.iter().all(|a| a.ok), "{:#?}", hi.assertions);
+    let clean = &hi.assertions[0];
+    // What setup built is not the run's; hello.txt and the check it was verified by are.
+    assert_eq!(clean.detail, "2 files added or changed, none of them build output", "{clean:?}");
+    let logs = root.path().join("smoke.logs/py-smoke-hi/molt-0");
+    assert!(std::fs::read_to_string(logs.join("recalled.json")).unwrap().contains("Write hello.txt in lowercase."));
+
+    let kept = find("py-smoke-kept");
+    let failed: Vec<&str> = kept.failed_assertions().map(|a| a.name.as_str()).collect();
+    assert_eq!(failed, ["applied", "verifier"], "{:#?}", kept.assertions);
+
+    let out = molt_bench(&server, &["report", results_arg, "--require-pass"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("1 of 2 smoke runs passed their hidden tests and every assertion."), "{stdout}");
+    assert!(
+        stdout.contains(
+            "| py-smoke-kept | molt | 1 | verifier | the result was verified by check; the task expects rubric |"
+        ),
+        "{stdout}"
+    );
+}

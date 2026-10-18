@@ -1,0 +1,19 @@
+title = "Count a byte with memchr, in a crate with a crates.io dependency"
+language = "rust"
+kind = "feature"
+difficulty = "easy"
+split = "dev"
+tests = "cargo test --quiet --test lines"
+check = "cargo test --quiet --test lines --test bench_hidden"
+prompt = """
+Add `pub fn count_byte(haystack: &[u8], needle: u8) -> usize` to the
+linecount crate: how many times `needle` occurs in `haystack`. Use the memchr
+crate the project already depends on, as `lines` does, rather than a loop
+over the bytes. Add a test of your own for it next to the test of `lines`.
+"""
+
+[smoke]
+# Real Rust projects have dependencies; the sandbox has no network and no registry.
+setup = "cargo build --quiet && cargo test --quiet --no-run"
+network = true
+learn = true

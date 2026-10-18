@@ -11,6 +11,7 @@ pub mod record;
 pub mod report;
 pub mod run;
 pub mod sandbox;
+pub mod smoke;
 pub mod stats;
 pub mod task;
 
