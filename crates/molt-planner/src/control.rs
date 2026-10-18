@@ -9,12 +9,16 @@
 //! freezes the requirements, so nothing added after it can be left out of
 //! the result.
 //!
+//! The answer to an attempt's question to the person (`ask_user`) is a
+//! version like any other: one that names the question it answers.
+//!
 //! A paused run starts no new model call, command or check. Calls already
 //! running cannot be stopped: they finish, and the run's state says which
 //! they are until they have.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Duration;
 
 use molt_api::planner::{Constraint, ControlResponse, Requirement, RunState};
 use molt_api::progress::Progress;
@@ -49,14 +53,18 @@ struct State {
     /// The check's own files, which no constraint can protect.
     check_files: Vec<String>,
     paused: bool,
+    /// Questions asked so far; question `n` is the `n`th.
+    questions: u32,
     busy: BTreeMap<u64, String>,
     next_busy: u64,
 }
 
 impl Control {
     pub fn new(versions: Vec<Requirement>) -> Arc<Self> {
+        // A resumed run numbers its new questions after those answered before.
+        let questions = versions.iter().filter_map(|r| r.constraint.answers).max().unwrap_or(0);
         Arc::new(Self {
-            state: Mutex::new(State { versions, ..State::default() }),
+            state: Mutex::new(State { versions, questions, ..State::default() }),
             changed: watch::Sender::new(0),
             store: Mutex::new(None),
         })
@@ -130,6 +138,9 @@ impl Control {
             protect.push(plain_path(path)?);
         }
         constraint.protect = protect;
+        if constraint.answers.is_some() && constraint.text.is_empty() {
+            return Err("the answer is empty: give its text".into());
+        }
         if constraint.text.is_empty() && constraint.protect.is_empty() && constraint.check.is_none() {
             return Err("the constraint says nothing: give its text, paths to protect or a check".into());
         }
@@ -155,6 +166,14 @@ impl Control {
             }
             if let Some(path) = constraint.protect.iter().find(|p| state.check_files.contains(p)) {
                 return Err(format!("{path} is a file of the run's done-check, which the run restores itself"));
+            }
+            if let Some(question) = constraint.answers {
+                if question == 0 || question > state.questions {
+                    return Err(format!("no question {question} was asked in this run"));
+                }
+                if state.versions.iter().any(|r| r.constraint.answers == Some(question)) {
+                    return Err(format!("question {question} is answered already"));
+                }
             }
             let requirement = Requirement {
                 version: state.versions.len() as u32 + 1,
@@ -197,6 +216,40 @@ impl Control {
         let mut state = self.state();
         if state.frozen.is_none() {
             state.frozen = Some((why.to_owned(), None));
+        }
+    }
+
+    /// Number a new question, at most `max` in the run. An error says why
+    /// none can be asked: the person can no longer change the run, or the
+    /// run has asked as many as it may.
+    pub fn ask(&self, max: u32) -> Result<u32, String> {
+        let mut state = self.state();
+        if let Some((why, _)) = &state.frozen {
+            return Err(format!("the run takes no answer any more: {why}"));
+        }
+        if state.questions >= max {
+            return Err(format!("the run has asked as many questions as it may ({max})"));
+        }
+        state.questions += 1;
+        Ok(state.questions)
+    }
+
+    /// The version that answers `question`, once there is one; `None` when
+    /// `timeout` passed or `cancel` fired first.
+    pub async fn answer(&self, question: u32, timeout: Duration, cancel: &CancellationToken) -> Option<Requirement> {
+        let mut changed = self.changed.subscribe();
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        loop {
+            let found = self.state().versions.iter().find(|r| r.constraint.answers == Some(question)).cloned();
+            if found.is_some() {
+                return found;
+            }
+            tokio::select! {
+                _ = changed.changed() => {}
+                () = &mut deadline => return None,
+                _ = cancel.cancelled() => return None,
+            }
         }
     }
 
@@ -393,6 +446,35 @@ mod tests {
         control.set_paused(true);
         cancel.cancel();
         assert!(!control.wait_go(&cancel, &never).await);
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_a_version_that_names_its_question() {
+        let control = Control::new(Vec::new());
+        let answer = |question, t: &str| Constraint { answers: Some(question), ..text(t) };
+        assert!(control.add(answer(1, "yes")).unwrap_err().contains("no question 1"));
+        assert_eq!(control.ask(2), Ok(1));
+        assert!(control.add(answer(1, " ")).unwrap_err().contains("empty"));
+
+        let waiting = {
+            let control = control.clone();
+            tokio::spawn(async move { control.answer(1, Duration::from_secs(60), &CancellationToken::new()).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        // Steering of its own does not answer the question.
+        control.add(text("answer in French")).unwrap();
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        assert_eq!(control.add(answer(1, "use tabs")).unwrap().version, 2);
+        assert_eq!(waiting.await.unwrap().map(|r| r.constraint.text).as_deref(), Some("use tabs"));
+        assert!(control.add(answer(1, "spaces")).unwrap_err().contains("answered already"));
+
+        assert_eq!(control.ask(2), Ok(2));
+        assert!(control.ask(2).unwrap_err().contains("as many questions as it may (2)"));
+        assert_eq!(control.answer(2, Duration::from_millis(10), &CancellationToken::new()).await, None);
+        // A resumed run numbers its questions on from the answered ones.
+        assert_eq!(Control::new(control.all()).ask(5), Ok(2));
     }
 
     #[test]

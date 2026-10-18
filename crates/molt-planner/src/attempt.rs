@@ -316,6 +316,8 @@ impl Attempt {
             Some(_) => prompts::checked_attempt_tools(self.memory_tools, self.web_tools),
             None => prompts::attempt_tools(self.memory_tools, self.web_tools),
         });
+        // A read-only `ask` attempt may only read, so it is not offered the question either.
+        let tools = if ctx.interactive && !self.read_only { Arc::new(prompts::with_ask_user(&tools)) } else { tools };
         // A final reply the model gave before the run stopped, still to be checked.
         let mut given = None;
         let (fork, mut conv) = match resume {

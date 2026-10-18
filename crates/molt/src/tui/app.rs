@@ -461,6 +461,9 @@ pub struct Task {
     pub state: RunState,
     /// What a pausing run waits for before it is paused.
     pub waiting: Vec<String>,
+    /// The attempts' questions not answered yet, oldest first: the number
+    /// of each and its options. What the user types next answers the first.
+    pub asked: Vec<(u32, Vec<String>)>,
 }
 
 impl Task {
@@ -486,6 +489,7 @@ impl Task {
             version: 0,
             state: RunState::Running,
             waiting: Vec::new(),
+            asked: Vec::new(),
         }
     }
 
@@ -2124,6 +2128,15 @@ impl App {
             self.input = Input::with(&line);
             return Vec::new();
         }
+        if let Some((question, options)) =
+            self.task.as_mut().filter(|t| t.phase == Phase::Running && !t.asked.is_empty()).map(|t| t.asked.remove(0))
+        {
+            // Typed while an attempt waits on its question: the answer, an option by its number or in words.
+            let picked = line.parse::<usize>().ok().and_then(|n| options.get(n.checked_sub(1)?)).cloned();
+            let text = picked.unwrap_or(line);
+            self.echo_constraint(&text);
+            return self.steer(Control::Constrain(Constraint { text, answers: Some(question), ..Default::default() }));
+        }
         if self.task.as_ref().is_some_and(|t| t.phase == Phase::Running) {
             // Typed while the attempts run: more of what the task asks.
             self.echo_constraint(&line);
@@ -2165,6 +2178,8 @@ impl App {
         let trace = TraceId::random();
         let mut req = RunRequest::new(line.clone(), self.workspace_path.clone());
         req.files = files;
+        // Someone is here to answer the attempts' questions.
+        req.interactive = true;
         if let Some(n) = settings.attempts {
             req.attempts = n;
         }
@@ -2829,7 +2844,10 @@ impl App {
                     lane.ended.get_or_insert_with(Instant::now);
                 }
             }
-            Progress::Required { requirement, .. } => task.version = task.version.max(requirement.version),
+            Progress::Required { requirement, .. } => {
+                task.version = task.version.max(requirement.version);
+                task.asked.retain(|(q, _)| Some(*q) != requirement.constraint.answers);
+            }
             Progress::Adopted { attempt, version, .. } => {
                 if let Some(lane) = lane(task, attempt) {
                     lane.push(Line::from(span(format!("   now follows v{version}"), Tone::Warn)));
@@ -2838,6 +2856,23 @@ impl App {
             Progress::State { state, waiting, .. } => {
                 task.state = state;
                 task.waiting = waiting;
+            }
+            Progress::Asked { attempt, question, text, options, .. } => {
+                if task.asked.iter().any(|(q, _)| *q == question) {
+                    return;
+                }
+                let words = scrub(&text, &self.secrets);
+                for (i, l) in text::clean(&words).into_iter().enumerate() {
+                    let head = if i == 0 { format!("? attempt {attempt} asks  ") } else { "  ".to_owned() };
+                    self.log.push(Line::from(vec![span(head, Tone::Warn), span(l, Tone::Plain)]));
+                }
+                for (i, option) in options.iter().enumerate() {
+                    let option = scrub(option, &self.secrets);
+                    self.log.push(Line::from(span(format!("  {}. {}", i + 1, clean_line(&option)), Tone::Plain)));
+                }
+                let how = if options.is_empty() { "type the answer" } else { "type an option's number or an answer" };
+                self.log.push(Line::from(span(format!("  {how}; every attempt follows it"), Tone::Dim)));
+                task.asked.push((question, options));
             }
         }
     }
@@ -6089,6 +6124,56 @@ mod tests {
         app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-2"))) });
         assert!(app.prompt.is_none());
         assert_eq!(app.kept, ["/d/work/fork-2"]);
+    }
+
+    #[test]
+    fn an_attempts_question_is_shown_and_what_is_typed_next_answers_it() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.settings.check = Some("make test".into());
+        let actions = type_in(&mut app, "indent the file");
+        let [Action::Run { req, trace: run }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert!(req.interactive, "someone is here to answer");
+        let run = run.clone();
+        app.update(Msg::Progress(Progress::AttemptStarted { run: run.to_string(), attempt: 0, fork: None }));
+        app.update(Msg::Progress(Progress::Asked {
+            run: run.to_string(),
+            attempt: 0,
+            question: 1,
+            text: "Tabs or spaces?".into(),
+            options: vec!["tabs".into(), "four spaces".into()],
+        }));
+        let shown = log(&app);
+        assert!(shown.contains("? attempt 0 asks  Tabs or spaces?"), "{shown}");
+        assert!(shown.contains("  2. four spaces") && shown.contains("type an option's number"), "{shown}");
+
+        // An option by its number.
+        let (trace, action) = control(&type_in(&mut app, "2"));
+        assert_eq!(trace, run);
+        let answer = Constraint { text: "four spaces".into(), answers: Some(1), ..Default::default() };
+        assert_eq!(action, Control::Constrain(answer));
+        assert!(log(&app).contains("+ four spaces"), "{}", log(&app));
+
+        // Answered, what is typed next steers the run as before.
+        let (_, action) = control(&type_in(&mut app, "keep the header"));
+        assert_eq!(action, Control::Constrain(Constraint { text: "keep the header".into(), ..Default::default() }));
+
+        // A question answered elsewhere is no longer waiting.
+        let asked = |question| Progress::Asked {
+            run: run.to_string(),
+            attempt: 1,
+            question,
+            text: "Which file?".into(),
+            options: vec![],
+        };
+        app.update(Msg::Progress(asked(2)));
+        let requirement = Requirement {
+            version: 3,
+            constraint: Constraint { text: "main.rs".into(), answers: Some(2), ..Default::default() },
+            at_ms: 0,
+        };
+        app.update(Msg::Progress(Progress::Required { run: run.to_string(), requirement }));
+        assert!(app.task.as_ref().unwrap().asked.is_empty());
     }
 
     fn control(actions: &[Action]) -> (TraceId, Control) {

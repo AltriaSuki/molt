@@ -701,6 +701,28 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
     })
 }
 
+/// `tools` with ask_user last, for the attempts of an interactive run.
+pub(crate) fn with_ask_user(tools: &[Value]) -> Vec<Value> {
+    let mut tools = tools.to_vec();
+    tools.push(tool(
+        t::ASK_USER,
+        "Ask the user a question, when the task leaves open something only they can decide and a wrong guess \
+         would waste the work: what they want, not what you can find out yourself. You wait for the answer; it \
+         becomes part of the task for every attempt. Questions are few per run, and an unanswered one comes back \
+         telling you to decide yourself. Ask one clear question; give options when the choices are known.",
+        json!({
+            "question": { "type": "string", "description": "The question, on its own: the user sees only this." },
+            "options": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Short answers to pick from, when the choices are known; the user may answer otherwise.",
+            },
+        }),
+        &["question"],
+    ));
+    tools
+}
+
 /// The tools of an attempt, in a fixed order; with `memory`, the two that
 /// ask memory about the project come next, and with `web`, `fetch_url` last.
 pub(crate) fn attempt_tools(memory: bool, web: bool) -> Vec<Value> {

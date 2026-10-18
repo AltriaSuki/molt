@@ -99,6 +99,8 @@ pub(crate) struct Ctx {
     /// stops, so that it spends at most its share (see [`Ctx::capped`]).
     pub spend_cap: Option<f64>,
     pub stream: bool,
+    /// A person can answer: attempts are offered `ask_user`.
+    pub interactive: bool,
     /// What memory knows about the workspace; empty when memory is not up.
     pub memory: Memory,
     /// The planner may read the web (it holds a capability for `web.fetch`):
@@ -213,6 +215,7 @@ impl Ctx {
             design_budget_usd: req.design_budget_usd.unwrap_or(share * budget_usd).min(budget_usd),
             spend_cap: None,
             stream: req.stream,
+            interactive: req.interactive,
             memory: Memory::default(),
             web,
             web_health: Arc::default(),

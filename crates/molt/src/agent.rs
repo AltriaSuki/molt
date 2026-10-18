@@ -982,6 +982,15 @@ pub fn describe(event: &Progress) -> String {
         Progress::State { state: RunState::Pausing, waiting, .. } => {
             format!("pausing; waiting for {}", waiting.join(", "))
         }
+        Progress::Asked { attempt, question, text, options, .. } => {
+            let mut line = format!("attempt {attempt} asks (question {question}): {text}");
+            if !options.is_empty() {
+                let numbered: Vec<String> =
+                    options.iter().enumerate().map(|(i, o)| format!("{}. {o}", i + 1)).collect();
+                line.push_str(&format!(" [{}]", numbered.join(" ")));
+            }
+            line
+        }
         Progress::Recalled { run, notes, map_tokens } => {
             let mut parts = Vec::new();
             if let Some(tokens) = map_tokens {
@@ -1014,7 +1023,12 @@ pub fn requirement_line(requirement: &Requirement) -> String {
     if let Some(check) = &c.check {
         parts.push(format!("check: {check}"));
     }
-    format!("requirements v{}: {}", requirement.version, parts.join("; "))
+    match c.answers {
+        Some(question) => {
+            format!("requirements v{}: answer to question {question}: {}", requirement.version, parts.join("; "))
+        }
+        None => format!("requirements v{}: {}", requirement.version, parts.join("; ")),
+    }
 }
 
 fn model_label(context: &molt_api::progress::ModelCall) -> String {
@@ -1248,7 +1262,7 @@ fn change_name(kind: ChangeKind) -> &'static str {
 mod tests {
     use molt_api::fs::Change;
     use molt_api::model::Usage;
-    use molt_api::planner::{CheckSpec, Review};
+    use molt_api::planner::{CheckSpec, Constraint, Review};
     use serde_json::json;
 
     use super::*;
@@ -1431,6 +1445,21 @@ mod tests {
         let fs = shared.service_mut("fs").unwrap().exec.as_mut().unwrap();
         fs.args[4] = data.join("../elsewhere").to_str().unwrap().to_owned();
         assert!(RunForks::before(&shared).is_none());
+    }
+
+    #[test]
+    fn a_question_and_its_answer_are_one_line_each() {
+        let asked = Progress::Asked {
+            run: "r".into(),
+            attempt: 1,
+            question: 2,
+            text: "Tabs or spaces?".into(),
+            options: vec!["tabs".into(), "spaces".into()],
+        };
+        assert_eq!(describe(&asked), "attempt 1 asks (question 2): Tabs or spaces? [1. tabs 2. spaces]");
+        let constraint = Constraint { text: "tabs".into(), answers: Some(2), ..Default::default() };
+        let answer = Requirement { version: 3, constraint, at_ms: 0 };
+        assert_eq!(requirement_line(&answer), "requirements v3: answer to question 2: tabs");
     }
 
     #[test]

@@ -111,6 +111,17 @@ pub enum Progress {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         waiting: Vec<String>,
     },
+    /// Attempt `attempt` asked the person `text` and waits for the answer: a
+    /// constraint on `planner.control` that answers `question`, numbered
+    /// from 1 within the run.
+    Asked {
+        run: String,
+        attempt: u32,
+        question: u32,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<String>,
+    },
     /// What memory gave the run to start with: the notes recalled, best
     /// first, and the size of the project map.
     Recalled {
@@ -149,6 +160,7 @@ impl Progress {
             | Self::CheckRan { run, .. }
             | Self::AttemptFinished { run, .. }
             | Self::Note { run, .. }
+            | Self::Asked { run, .. }
             | Self::Required { run, .. }
             | Self::Adopted { run, .. }
             | Self::State { run, .. }
