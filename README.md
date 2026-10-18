@@ -221,6 +221,30 @@ once per stop. `/notify all` also calls when a task ends
 title follows what it is doing (`molt · running 2/4`, `molt · waiting:
 apply`, `molt · idle`), and the terminal's own title is put back on exit.
 
+Interface settings are saved automatically for each workspace: mode, model,
+attempts, effort, budget, check, memory model, previews, notifications and commit.
+The next launch restores them, and `/reset` removes saved settings and restores
+the defaults from the explicitly selected config, or built-in defaults. The auto
+mode label stays yellow. A malformed or unsupported saved file is ignored with a
+single-line notice. Files use mode 0600 in the same private workspace state directory
+as history; values containing known credentials or common key patterns are not saved.
+
+The config passed with `--config` can set defaults, for example:
+
+```toml
+[tui]
+mode = "confirm"
+check = "cargo test"
+attempts = 2
+budget = 3.0
+model = "sonnet"
+```
+
+Commands entered this session override saved values, which override these config
+values, which override built-in defaults. Project command templates still affect
+only their own task and do not overwrite saved preferences. Changing defaults does not rewrite a run request already submitted for a task. Configuration
+files are still loaded only when explicitly selected.
+
 Input history is private to the workspace and survives restarts, even when two
 workspaces use the same data directory. ↑/↓ browses it; returning past the newest
 entry restores the unfinished draft. Ctrl+R searches newest first without duplicate
@@ -1184,7 +1208,7 @@ uses only the terminal's 16 colors and follows its background. Without a saved
 choice, `COLORTERM=truecolor` or `24bit` selects dark and other terminals select
 ANSI. Light's eight text colors meet WCAG AA (4.5:1) against its white background.
 `NO_COLOR` keeps colors disabled. The choice is saved privately in
-`<data dir>/tui-theme.json`; other interface settings are not saved yet.
+`<data dir>/tui-theme.json`; workspace settings are saved separately as described below.
 
 Ctrl+L clears and redraws the interface. On Unix, Ctrl+Z restores the terminal
 and suspends just the interface process; use the shell's `fg` to return. Its

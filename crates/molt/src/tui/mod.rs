@@ -10,6 +10,7 @@ mod backend;
 mod commands;
 mod notice;
 mod preview;
+mod settings;
 mod state;
 mod text;
 mod transcript;
@@ -141,10 +142,11 @@ async fn event_loop(
             Some(store)
         }
         Err(e) => {
-            app.flash = Some(format!("input history could not be opened: {e}"));
+            app.flash = Some(format!("workspace interface state could not be opened: {e}"));
             None
         }
     };
+    settings::restore(&mut app, &cfg.tui, store.as_ref());
     let theme_file = cfg.kernel.data_dir.join("tui-theme.json");
     match std::fs::read(&theme_file) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -171,6 +173,13 @@ async fn event_loop(
         let mut actions = app.update(msg);
         while let Ok(msg) = rx.try_recv() {
             actions.extend(app.update(msg));
+        }
+        for change in app.take_preference_changes() {
+            if let Some(store) = &store {
+                if let Err(e) = settings::persist(store, &change, &app.secrets) {
+                    app.flash = Some(format!("settings changed but could not be saved: {e}"));
+                }
+            }
         }
         for change in app.take_history_changes() {
             if let Some(store) = &store {
