@@ -424,9 +424,12 @@ through its progress callback, with previews enabled by default.
 | 0 | Passed (or finished unverified, when no automated check fits the task) and applied, or kept as `--no-apply` asks. |
 | 1 | No attempt passed, or molt failed. |
 | 2 | The command line was wrong (an unknown flag, `--attempts 9`, ...); nothing started. |
-| 3 | Passed (or finished unverified), but the changes were not applied: the review did not approve them, or merging failed (for example, the workspace changed). They are kept in the fork the report names. |
+| 3 | Passed (or finished unverified), but the changes could not be merged, e.g. because the workspace changed under them; they are kept in the fork the report names. |
 | 4 | Passed and applied, but `--commit` could not commit the changes; the reason is printed. |
 | 128+N | Stopped by signal N: 130 for Ctrl-C, 129 for SIGHUP, 143 for SIGTERM. The services are stopped and the run's forks removed. |
+
+Status 3 also covers a passing result withheld by the review. The report explains
+the review findings and names the kept fork for inspection.
 
 ### Config and secrets
 
