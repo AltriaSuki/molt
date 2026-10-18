@@ -378,6 +378,8 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             }
             wrap_all(&lines, width)
         }
+        Some(Prompt::Apply { part, .. }) if part.checking => busy("checking again before it is applied"),
+        Some(Prompt::Apply { part, .. }) if part.picking.is_some() => pick_lines(part),
         Some(Prompt::Apply { resp, .. }) => {
             let (added, removed) = text::diff_counts(&resp.patch);
             let files =
@@ -393,6 +395,8 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             lines.push(keys(&[
                 ("enter", "apply"),
                 ("d", "diff"),
+                ("s", "choose files"),
+                ("e", "edit"),
                 ("v", "review"),
                 ("k", "keep in its fork"),
                 ("n", "discard"),
@@ -459,6 +463,34 @@ fn suggestion_lines(app: &App) -> Vec<Line<'static>> {
 fn stops_line(app: &App) -> Option<Line<'static>> {
     let stops = &app.task.as_ref()?.stops;
     (!stops.is_empty()).then(|| Line::from(vec![span("  stopped: ", Tone::Dim), span(stops.join(" · "), Tone::Warn)]))
+}
+
+/// The apply confirmation's file list: at most eight files, around the cursor.
+fn pick_lines(part: &super::app::Part) -> Vec<Line<'static>> {
+    const SHOWN: usize = 8;
+    let Some((marks, cursor)) = &part.picking else { return Vec::new() };
+    let chosen = marks.iter().filter(|m| **m).count();
+    let mut lines = vec![Line::from(vec![
+        span("◆ apply which files?", Tone::Shell),
+        span(format!("  {chosen} of {} chosen", marks.len()), Tone::Dim),
+    ])];
+    let start = cursor.saturating_sub(SHOWN - 1);
+    for (i, (change, mark)) in part.all.iter().zip(marks).enumerate().skip(start).take(SHOWN) {
+        let tone = if i == *cursor { Tone::Shell } else { Tone::Plain };
+        let kind = match change.kind {
+            molt_api::fs::ChangeKind::Added => "added",
+            molt_api::fs::ChangeKind::Modified => "modified",
+            molt_api::fs::ChangeKind::Deleted => "deleted",
+        };
+        lines.push(Line::from(vec![
+            span(if i == *cursor { "› " } else { "  " }, tone),
+            span(if *mark { "[x] " } else { "[ ] " }, tone),
+            span(clean_line(&change.path), tone),
+            span(format!("  {kind}"), Tone::Dim),
+        ]));
+    }
+    lines.push(keys(&[("space", "choose"), ("a", "all"), ("enter", "check them again"), ("esc", "back")]));
+    lines
 }
 
 fn keys(pairs: &[(&str, &str)]) -> Line<'static> {

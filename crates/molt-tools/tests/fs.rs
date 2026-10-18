@@ -563,6 +563,48 @@ async fn diff_and_merge_carry_changes_back() {
 }
 
 #[tokio::test]
+async fn part_of_a_fork_can_be_diffed_narrowed_into_a_fork_of_its_own_and_merged_alone() {
+    let env = Env::new();
+    project(&env);
+    let fork = env.fork().await;
+    env.ok("edit", json!({ "workspace": fork, "path": "src/main.rs", "old": "\"hi\"", "new": "\"hello\"" })).await;
+    env.ok("write", json!({ "workspace": fork, "path": "notes/new.txt", "content": "new file\n" })).await;
+    fs::remove_file(fork.join("run.sh")).unwrap();
+    let paths = |d: &DiffResponse| d.changes.iter().map(|c| c.path.clone()).collect::<Vec<_>>();
+
+    let part: DiffResponse =
+        serde_json::from_value(env.ok("diff", json!({ "fork": fork, "paths": ["notes/new.txt", "run.sh"] })).await)
+            .unwrap();
+    assert_eq!(paths(&part), ["notes/new.txt", "run.sh"]);
+    assert!(!part.patch.contains("src/main.rs"), "{}", part.patch);
+    let unknown = env.invalid("diff", json!({ "fork": fork, "paths": ["README.md"] })).await;
+    assert!(unknown.contains("not among the fork's changes: README.md"), "{unknown}");
+
+    // The narrowed fork has the chosen changes and the original's state of everything else.
+    let narrowed: ForkResponse =
+        serde_json::from_value(env.ok("narrow", json!({ "fork": fork, "paths": ["notes/new.txt", "run.sh"] })).await)
+            .unwrap();
+    let narrowed = PathBuf::from(narrowed.fork);
+    assert_ne!(narrowed, fork);
+    assert_eq!(fs::read_to_string(narrowed.join("notes/new.txt")).unwrap(), "new file\n");
+    assert!(!narrowed.join("run.sh").exists());
+    assert!(fs::read_to_string(narrowed.join("src/main.rs")).unwrap().contains("\"hi\""));
+    assert_eq!(paths(&diff_of(&env, &narrowed).await), ["notes/new.txt", "run.sh"]);
+    assert!(env.invalid("narrow", json!({ "fork": fork, "paths": ["README.md"] })).await.contains("README.md"));
+    env.ok("drop", json!({ "fork": narrowed })).await;
+
+    // Nothing is written when one path is not a change; the chosen ones merge alone.
+    assert!(env.invalid("merge", json!({ "fork": fork, "paths": ["src/main.rs", "nope"] })).await.contains("nope"));
+    assert!(fs::read_to_string(env.ws.join("src/main.rs")).unwrap().contains("\"hi\""));
+    let reply: MergeResponse =
+        serde_json::from_value(env.ok("merge", json!({ "fork": fork, "paths": ["src/main.rs"] })).await).unwrap();
+    assert_eq!(reply.changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), ["src/main.rs"]);
+    assert!(fs::read_to_string(env.ws.join("src/main.rs")).unwrap().contains("\"hello\""));
+    assert!(!env.ws.join("notes/new.txt").exists());
+    assert!(env.ws.join("run.sh").exists());
+}
+
+#[tokio::test]
 async fn build_artifacts_that_commands_leave_in_a_fork_are_reported_and_never_merged() {
     let env = Env::new();
     Env::put(&env.ws, &[("src/lib.rs", "pub fn f() {}\n"), ("vendor/prebuilt.so", "old\n")]);

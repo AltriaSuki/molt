@@ -1,4 +1,4 @@
-//! `fs.fork`, `fs.diff`, `fs.merge` and `fs.drop`.
+//! `fs.fork`, `fs.diff`, `fs.merge`, `fs.narrow` and `fs.drop`.
 //!
 //! A fork is `scratch/fork-<id>`, with its metadata in
 //! `scratch/fork-<id>.json`: the workspace it was copied from and the state
@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use molt_api::fs::{
     Change, ChangeKind, DiffRequest, DiffResponse, DropRequest, DropResponse, ForkRequest, ForkResponse, LeftOut,
-    MergeRequest, MergeResponse, ViewRequest, ViewResponse,
+    MergeRequest, MergeResponse, NarrowRequest, ViewRequest, ViewResponse,
 };
 use molt_proto::RemoteError;
 use serde::{Deserialize, Serialize};
@@ -366,6 +366,7 @@ pub(crate) fn diff(roots: &Roots, req: DiffRequest) -> Result<DiffResponse, Remo
     let fork = open(roots, &req.fork)?;
     let now = current(&fork, &roots.scratch)?;
     let (changes, left_out) = artifacts(&fork, changes(&fork.meta.files, &now), &now);
+    let changes = only(changes, &req.paths)?;
     let mut patch = String::new();
     let mut truncated = false;
     for change in &changes {
@@ -530,6 +531,7 @@ pub(crate) fn merge(
     let fork = open(roots, &req.fork)?;
     let now = current(&fork, &roots.scratch)?;
     let (changes, left_out) = artifacts(&fork, changes(&fork.meta.files, &now), &now);
+    let changes = only(changes, &req.paths)?;
     let base = &fork.meta.base;
 
     // Every check comes before the first write, so a conflict leaves the original untouched.
@@ -580,6 +582,92 @@ pub(crate) fn merge(
         })?;
     }
     Ok(MergeResponse { changes, operation, left_out })
+}
+
+/// `changes` cut down to `paths`, or all of them when `paths` is empty.
+fn only(changes: Vec<Change>, paths: &[String]) -> Result<Vec<Change>, RemoteError> {
+    if paths.is_empty() {
+        return Ok(changes);
+    }
+    let unknown: Vec<&str> =
+        paths.iter().filter(|p| !changes.iter().any(|c| &c.path == *p)).map(String::as_str).collect();
+    if !unknown.is_empty() {
+        return Err(invalid(format!("not among the fork's changes: {}", unknown.join(", "))));
+    }
+    Ok(changes.into_iter().filter(|c| paths.contains(&c.path)).collect())
+}
+
+/// A new fork of `req.fork`'s original as it is now, with `req.paths` of
+/// its changes carried over.
+pub(crate) fn narrow(roots: &Roots, lock: &Mutex<()>, req: NarrowRequest) -> Result<ForkResponse, RemoteError> {
+    if req.paths.is_empty() {
+        return Err(invalid("narrow needs the paths to carry over"));
+    }
+    // A merge or drop must not change the fork while it is copied from.
+    let _merging = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let fork = open(roots, &req.fork)?;
+    let now = current(&fork, &roots.scratch)?;
+    let (changes, _) = artifacts(&fork, changes(&fork.meta.files, &now), &now);
+    let changes = only(changes, &req.paths)?;
+    let made = self::fork(roots, ForkRequest { workspace: fork.meta.base.to_string_lossy().into_owned() })?;
+    let dir = PathBuf::from(&made.fork);
+    match carry(&fork.dir, &dir, &changes) {
+        Ok(()) => Ok(made),
+        Err(e) => {
+            let _ = remove(&dir);
+            Err(e)
+        }
+    }
+}
+
+/// Put `changes` as `from` has them into the fresh fork `to`.
+fn carry(from: &Path, to: &Path, changes: &[Change]) -> Result<(), RemoteError> {
+    let mut written = String::new();
+    for change in changes {
+        let err = |e: io::Error| failed(format!("narrow: {}: {e}", change.path));
+        // A link the new fork made to an ignored entry leads to the original: never write through one.
+        let rel = Path::new(&change.path);
+        for parent in rel.ancestors().skip(1).filter(|p| !p.as_os_str().is_empty()) {
+            if fs::symlink_metadata(to.join(parent)).is_ok_and(|m| !m.is_dir()) {
+                return Err(failed(format!(
+                    "narrow: {}: {} is not a directory in the workspace now",
+                    change.path,
+                    parent.display()
+                )));
+            }
+        }
+        let dest = to.join(rel);
+        match fs::symlink_metadata(&dest) {
+            Ok(m) if m.is_dir() => fs::remove_dir_all(&dest).map_err(err)?,
+            Ok(_) => fs::remove_file(&dest).map_err(err)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(err(e)),
+        }
+        if change.kind == ChangeKind::Deleted {
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            DirBuilder::new().recursive(true).mode(0o700).create(parent).map_err(err)?;
+        }
+        let source = from.join(rel);
+        if fs::symlink_metadata(&source).map_err(err)?.file_type().is_symlink() {
+            symlink(fs::read_link(&source).map_err(err)?, &dest).map_err(err)?;
+        } else {
+            copy_file(&source, &dest).map_err(err)?;
+        }
+        // As the new fork's own writes, so that its diff leaves out the same build artifacts.
+        written.push_str(&serde_json::to_string(&change.path).map_err(|e| failed(e.to_string()))?);
+        written.push('\n');
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(written_path(to))
+        .and_then(|mut f| f.write_all(written.as_bytes()))
+        .map_err(|e| failed(format!("narrow: recording the carried files: {e}")))
 }
 
 /// `mode` made executable or not by its owner. Making it executable also

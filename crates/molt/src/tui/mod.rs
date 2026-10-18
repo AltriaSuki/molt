@@ -290,6 +290,11 @@ async fn event_loop(
                     let edited = edit_outside(terminal, &pause, &data_dir, "task", &text);
                     app.update(Msg::Edited(edited));
                 }
+                Action::EditFork { fork } => {
+                    // Through the loop, so the check it starts goes to the backend like any other action.
+                    let result = step_aside(terminal, &pause, Path::new(&fork));
+                    let _ = lister.send(Msg::ForkEdited { fork, result });
+                }
                 action => backend.send(&action).await?,
             }
         }
@@ -475,6 +480,13 @@ impl Runtime {
             Action::Apply { fork } => self.call(move |s| async move {
                 Msg::Applied(s.apply(&fork).await.map(|_| ()).map_err(|e| format!("{e:#}")))
             }),
+            Action::ApplyOnly { fork, paths } => self.call(move |s| async move {
+                Msg::Applied(s.apply_only(&fork, &paths).await.map(|_| ()).map_err(|e| format!("{e:#}")))
+            }),
+            Action::Recheck { fork, only, check } => self.call(move |s| async move {
+                let result = s.recheck(&fork, only.as_deref(), check.as_ref()).await.map_err(|e| format!("{e:#}"));
+                Msg::Rechecked { fork, only, result }
+            }),
             Action::Undo { run } => {
                 let (session, tx) = (self.session.clone(), self.tx.clone());
                 // The interface waits for both Git and memory before quitting.
@@ -600,7 +612,8 @@ impl Runtime {
             | Action::Alert { .. }
             | Action::ListFiles
             | Action::ReadAudit { .. }
-            | Action::Export { .. } => {}
+            | Action::Export { .. }
+            | Action::EditFork { .. } => {}
         }
     }
 
@@ -632,10 +645,6 @@ fn edit_outside(
 ) -> Result<String, String> {
     use std::io::Write;
 
-    let editor = ["VISUAL", "EDITOR"]
-        .iter()
-        .find_map(|v| std::env::var(v).ok().filter(|e| !e.trim().is_empty()))
-        .unwrap_or_else(|| "vi".into());
     // In the private data dir: the draft may hold anything the user typed.
     let path = dir.join(format!("{name}-{}.md", std::process::id()));
     std::fs::OpenOptions::new()
@@ -646,14 +655,26 @@ fn edit_outside(
         .open(&path)
         .and_then(|mut f| f.write_all(text.as_bytes()))
         .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    let edited = step_aside(terminal, pause, &path)
+        .and_then(|()| std::fs::read_to_string(&path).map_err(|e| format!("could not read {}: {e}", path.display())));
+    let _ = std::fs::remove_file(&path);
+    edited
+}
 
+/// Open `path`, a file or a directory, in `$VISUAL` or `$EDITOR` (`vi`
+/// without either) on the terminal while the interface steps aside.
+fn step_aside(terminal: &mut DefaultTerminal, pause: &Pause, path: &Path) -> Result<(), String> {
+    let editor = ["VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|v| std::env::var(v).ok().filter(|e| !e.trim().is_empty()))
+        .unwrap_or_else(|| "vi".into());
     pause.paused.store(true, Ordering::SeqCst);
     let reading = pause.reading.lock().unwrap_or_else(PoisonError::into_inner);
     let _ = execute!(std::io::stdout(), DisableFocusChange, DisableBracketedPaste);
     ratatui::restore();
     // `sh` splits the variable as a shell would, so `EDITOR="code --wait"` works.
     let status = tokio::task::block_in_place(|| {
-        std::process::Command::new("sh").arg("-c").arg(format!("{editor} \"$1\"")).arg("sh").arg(&path).status()
+        std::process::Command::new("sh").arg("-c").arg(format!("{editor} \"$1\"")).arg("sh").arg(path).status()
     });
     // Not `terminal.clear()`: it asks the terminal where the cursor is. An empty frame over the
     // cleared screen makes the next draw a full one.
@@ -671,11 +692,9 @@ fn edit_outside(
     drop(reading);
     pause.paused.store(false, Ordering::SeqCst);
 
-    let edited = std::fs::read_to_string(&path).map_err(|e| format!("could not read {}: {e}", path.display()));
-    let _ = std::fs::remove_file(&path);
     back.map_err(|e| format!("could not take the terminal back: {e}"))?;
     match status {
-        Ok(s) if s.success() => edited,
+        Ok(s) if s.success() => Ok(()),
         Ok(s) => Err(format!("{editor} {s}")),
         Err(e) => Err(format!("could not start {editor}: {e}")),
     }
