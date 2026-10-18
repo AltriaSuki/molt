@@ -16,8 +16,11 @@ use std::time::{Duration, Instant};
 use molt::agent::{run_task, Done, Interrupted, Learn};
 use molt::{Config, Secrets, TransportKind};
 use molt_api::fs::{ChangeKind, DROP, FORK, MERGE, WRITE};
+use molt_api::memory::SUBMIT_NOTES;
 use molt_api::model::COMPLETE;
-use molt_api::planner::tools::{DISPUTE_CHECK, RUN, SUBMIT_CHECK, SUBMIT_REVIEW, SUBMIT_VETTING, WRITE_FILE};
+use molt_api::planner::tools::{
+    DISPUTE_CHECK, LIST_FILES, RUN, SUBMIT_CHECK, SUBMIT_JUDGEMENT, SUBMIT_REVIEW, SUBMIT_VETTING, WRITE_FILE,
+};
 use molt_api::planner::{AttemptStatus, CheckSpec, Outcome, RunRequest, RunResponse, RUN as PLANNER_RUN};
 use molt_api::progress::Progress;
 use molt_api::shell::RUN as RUN_CHECK;
@@ -56,6 +59,8 @@ enum Fake {
     Refuses,
     /// Attempts dispute the check rather than greet.
     Disputes,
+    /// The designer lists files turn after turn and never submits a check.
+    NeverSubmits,
     /// Attempts run a command that starts a long `sleep`, writes its pid to
     /// this file and waits for it.
     Hangs(PathBuf),
@@ -80,16 +85,17 @@ impl Respond for FakeApi {
         let n = messages.len();
         let model = body["model"].as_str().unwrap_or("unknown");
         let stream = body["stream"] == true;
-        // Memory learning from a finished run asks for JSON in a fixed shape.
-        if body["output_config"]["format"]["type"] == "json_schema" {
+        // Memory learning from a finished run submits its notes with a tool,
+        // having first said something no schema allows, as some endpoints do.
+        if learns(&body) {
             let note =
                 json!({ "kind": "lesson", "text": LEARNED_TEXT, "confidence": 0.9, "steps": [1], "contradicts": "" });
-            let text = json!({ "notes": [note], "supports": [] }).to_string();
             let content = vec![
                 json!({ "type": "thinking", "thinking": "", "signature": signature(n) }),
-                json!({ "type": "text", "text": text }),
+                json!({ "type": "text", "text": "<notes>the check greps greeting.txt</notes>" }),
+                tool_use(n, SUBMIT_NOTES, json!({ "notes": [note], "supports": [] })),
             ];
-            return message(n, model, content, "end_turn", stream);
+            return message(n, model, content, "tool_use", stream);
         }
         // The reviewer of a passing result approves it.
         if body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_REVIEW)) {
@@ -108,6 +114,15 @@ impl Respond for FakeApi {
             ];
             return message(n, model, content, "tool_use", stream);
         }
+        // The judge of a rubric finds its one criterion met.
+        if body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_JUDGEMENT)) {
+            let input = json!({ "findings": [{ "criterion": 1, "met": true, "reason": "greeting.txt greets." }] });
+            let content = vec![
+                json!({ "type": "thinking", "thinking": "", "signature": signature(n) }),
+                tool_use(n, SUBMIT_JUDGEMENT, input),
+            ];
+            return message(n, model, content, "tool_use", stream);
+        }
         let designer = body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_CHECK));
         let last = messages.last().cloned().unwrap_or(Value::Null);
         let after_tools = last["content"].as_array().is_some_and(|c| c.iter().any(|b| b["type"] == "tool_result"));
@@ -119,6 +134,7 @@ impl Respond for FakeApi {
         let write = |path: &str, content: &str| tool_use(n, WRITE_FILE, json!({ "path": path, "content": content }));
         let (mut content, stop) = match (&self.0, designer, turn) {
             (Fake::Refuses, ..) => return message(n, model, vec![], "refusal", stream),
+            (Fake::NeverSubmits, true, _) => (vec![tool_use(n, LIST_FILES, json!({}))], "tool_use"),
             (_, true, Turn::First) => (vec![write("check.sh", &format!("{CHECK}\n"))], "tool_use"),
             (_, true, _) => {
                 let input = json!({ "command": "sh check.sh", "files": ["check.sh"], "rationale": "Greets." });
@@ -398,6 +414,11 @@ async fn bodies(server: &MockServer) -> Vec<Value> {
     server.received_requests().await.unwrap().iter().map(|r| r.body_json().unwrap()).collect()
 }
 
+/// Whether a request is memory learning from a run.
+fn learns(body: &Value) -> bool {
+    body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_NOTES))
+}
+
 fn offers_submit_check(body: &Value) -> bool {
     body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_CHECK))
 }
@@ -477,6 +498,7 @@ fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) ->
         "MOLT_MAX_TURNS",
         "MOLT_MAX_CHECK_ROUNDS",
         "MOLT_BUDGET_USD",
+        "MOLT_DESIGN_BUDGET_SHARE",
         "MOLT_CHECK_TIMEOUT_S",
         "MOLT_MAP_TOKENS",
         "MOLT_CONTEXT_TOKENS",
@@ -490,6 +512,25 @@ fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) ->
         cmd.env_remove(var);
     }
     cmd
+}
+
+#[tokio::test]
+async fn memory_learns_with_the_model_the_run_asked_for() {
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    setup.learn = true;
+    let mut req = setup.request(Some(CHECK), 1);
+    req.model = Some("haiku".into());
+    let (done, _) = setup.run_done(req).await;
+    assert_eq!(done.run.outcome, Outcome::Passed, "{:#?}", done.run);
+    let learned = done.learned.unwrap().unwrap();
+    assert_eq!(learned.added.len(), 1, "{learned:#?}");
+    let bodies = bodies(&server).await;
+    let models: std::collections::BTreeSet<&str> = bodies.iter().filter_map(|b| b["model"].as_str()).collect();
+    assert_eq!(models.into_iter().collect::<Vec<_>>(), ["claude-haiku-4-5"], "attempts and learning alike");
+    let learning = bodies.iter().find(|b| learns(b)).expect("memory learned");
+    assert!(learning.get("output_config").is_none(), "no effort for a model that takes none, and no output schema");
+    assert_requests_valid(&server).await;
 }
 
 #[tokio::test]
@@ -616,7 +657,13 @@ async fn a_second_run_starts_with_what_the_first_learned_and_a_map_of_the_code()
     assert!(!note.provenance.events.is_empty());
     assert!(note.provenance.events.iter().all(|id| logged.contains(id)), "{:?}", note.provenance);
     assert!(audit.iter().any(|e| matches!(e.event, AuditEvent::AuditRead { .. })), "memory read the run back");
-    let asked = bodies(&server).await.len();
+    let asked = bodies(&server).await;
+    // With no memory model set, memory learned with the attempts' model: the gateway's default.
+    let learning: Vec<&Value> = asked.iter().filter(|b| learns(b)).collect();
+    assert_eq!(learning.len(), 1, "one learning call: the tool's input was valid");
+    assert_eq!(learning[0]["model"], MODEL);
+    assert!(asked.iter().all(|b| b["model"] == MODEL), "every stage used one model");
+    let asked = asked.len();
 
     let (second, _) = setup.run_done(setup.request(Some(CHECK), 1)).await;
     assert_eq!(second.run.outcome, Outcome::Passed, "{:#?}", second.run);
@@ -741,6 +788,72 @@ async fn molt_do_prints_a_disputed_check_and_exits_nonzero() {
     let dispute = resp.dispute.expect("the reply carries the dispute");
     assert_eq!((dispute.attempt, dispute.reproduce.as_str()), (0, CHECK));
     assert_eq!(resp.attempts[0].status, AttemptStatus::Cancelled);
+    assert_requests_valid(&server).await;
+    assert_forks_dropped(data.path());
+}
+
+#[tokio::test]
+async fn molt_do_given_criteria_designs_nothing_and_a_judge_decides_them() {
+    let server = fake_api(Fake::Greets).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let args = ["--criterion", "greeting.txt greets the reader", "--attempts", "1", "--no-learn", "--no-review"];
+    let cmd = molt_do(&server, workspace.path(), data.path(), &args).output();
+    let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("greeting.txt greets the reader"), "{stdout}");
+    assert_eq!(std::fs::read_to_string(workspace.path().join("greeting.txt")).unwrap(), "hello\n");
+    let bodies = bodies(&server).await;
+    assert!(!bodies.iter().any(offers_submit_check), "no model call designs a check");
+    let judged = bodies
+        .iter()
+        .filter(|b| b["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_JUDGEMENT)));
+    assert_eq!(judged.count(), 1);
+    // The attempt's two turns and the judge's one: nothing else.
+    assert_eq!(bodies.len(), 3);
+    assert_requests_valid(&server).await;
+
+    // A criterion with a check or without one makes no sense together.
+    for conflicting in [["--check", CHECK], ["--no-check", "--no-learn"]] {
+        let mut args = vec!["--criterion", "greets"];
+        args.extend(conflicting);
+        let out = molt_do(&server, workspace.path(), data.path(), &args).output().await.unwrap();
+        assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn molt_do_stops_a_designer_that_never_submits_at_its_budget_and_says_what_to_do() {
+    let server = fake_api(Fake::NeverSubmits).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The first call spends more than designing may: the second is never made.
+    let args = ["--budget-usd", "1", "--design-budget-usd", "0.000001", "--no-learn"];
+    let cmd = molt_do(&server, workspace.path(), data.path(), &args).output();
+    let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("the design budget ran out before the designer submitted a check"), "{stdout}");
+    assert!(stdout.contains("of the run's $1.00 budget is left"), "{stdout}");
+    for next in ["--check CMD", "--criterion TEXT", "--no-check", "--design-budget-usd USD"] {
+        assert!(stdout.contains(next), "{next}: {stdout}");
+    }
+    let bodies = bodies(&server).await;
+    assert_eq!(bodies.len(), 1, "one designer call, and no attempt");
+    assert!(offers_submit_check(&bodies[0]));
+    assert!(!workspace.path().join("greeting.txt").exists());
+
+    // More for designing than the run has is refused before anything starts.
+    let args = ["--budget-usd", "1", "--design-budget-usd", "2", "--no-learn"];
+    let out = molt_do(&server, workspace.path(), data.path(), &args).output().await.unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("design_budget_usd ($2.00) is more than the run's budget ($1.00)"), "{stderr}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
     assert_requests_valid(&server).await;
     assert_forks_dropped(data.path());
 }
@@ -1685,7 +1798,7 @@ async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
     let learned = session.learn(&trace, Some("haiku".into())).await.unwrap();
     assert_eq!(learned.added.len(), 1, "{learned:#?}");
     // Memory learned with the model it was given, not its default.
-    let learning = bodies(&server).await.into_iter().filter(|b| b["output_config"]["format"]["type"] == "json_schema");
+    let learning = bodies(&server).await.into_iter().filter(learns);
     assert_eq!(learning.map(|b| b["model"].clone()).collect::<Vec<_>>(), [json!("claude-haiku-4-5")]);
     let mut notes = session.notes("").await.unwrap();
     assert_eq!(notes.iter().map(|r| r.note.text.as_str()).collect::<Vec<_>>(), [LEARNED_TEXT]);

@@ -485,7 +485,7 @@ pub fn require_services(cfg: &Config) -> anyhow::Result<()> {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Learn {
     /// The model memory learns with; `None` for memory's own default
-    /// (`MOLT_MEMORY_MODEL`, else sonnet).
+    /// (`MOLT_MEMORY_MODEL`, else the model the run's attempts used).
     pub model: Option<String>,
 }
 
@@ -1161,7 +1161,11 @@ pub fn learned(learned: &Result<ConsolidateResponse, String>) -> String {
             } else {
                 parts.join(", ")
             };
-            let mut line = format!("memory: {what}; cost ${:.4} ({} tokens)", r.cost_usd, r.usage.total());
+            let cost = match r.uncounted_calls {
+                0 => format!("cost ${:.4}", r.cost_usd),
+                n => format!("cost ${:.4} known, {n} calls without a known price", r.cost_usd),
+            };
+            let mut line = format!("memory: {what}; {cost} ({} tokens)", r.usage.total());
             for note in &r.added {
                 line.push_str(&format!("\n  + [{}] {}", note.kind.as_str(), note.text));
             }
@@ -1296,6 +1300,23 @@ mod tests {
         assert_eq!(memory_model(Some("haiku"), Some("opus")).as_deref(), Some("haiku"));
         assert_eq!(memory_model(Some("same"), Some("opus")).as_deref(), Some("opus"));
         assert_eq!(memory_model(Some("same"), None), None);
+    }
+
+    #[test]
+    fn learning_whose_price_is_unknown_says_its_cost_is_a_subtotal() {
+        let response = |uncounted_calls| ConsolidateResponse {
+            skill_drafts: Vec::new(),
+            added: Vec::new(),
+            reinforced: Vec::new(),
+            contradicted: Vec::new(),
+            skipped: Some("the episode held nothing worth keeping".into()),
+            proposed: Vec::new(),
+            usage: Usage::default(),
+            cost_usd: 0.01,
+            uncounted_calls,
+        };
+        assert!(learned(&Ok(response(0))).contains("; cost $0.0100 ("));
+        assert!(learned(&Ok(response(2))).contains("cost $0.0100 known, 2 calls without a known price"));
     }
 
     #[test]

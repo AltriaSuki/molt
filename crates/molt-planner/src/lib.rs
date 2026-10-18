@@ -44,6 +44,9 @@ pub struct Config {
     pub max_turns: u32,
     pub max_check_rounds: u32,
     pub budget_usd: f64,
+    /// The share of a run's budget designing its check may spend, for runs
+    /// that set no `design_budget_usd`: more than 0, at most 1.
+    pub design_share: f64,
     /// `max_tokens` for each model call.
     pub max_tokens: u32,
     /// Deadline for one model call.
@@ -82,6 +85,7 @@ impl Default for Config {
             max_turns: 50,
             max_check_rounds: 3,
             budget_usd: 10.0,
+            design_share: 0.25,
             max_tokens: 32_000,
             model_timeout: Duration::from_secs(1200),
             check_timeout: Duration::from_secs(900),
@@ -100,7 +104,7 @@ impl Default for Config {
 impl Config {
     /// [`Config::default`] overridden by `MOLT_PLANNER_MODEL`,
     /// `MOLT_MAX_TURNS`, `MOLT_MAX_CHECK_ROUNDS`, `MOLT_BUDGET_USD`,
-    /// `MOLT_MAX_TOKENS`, `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
+    /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_MAX_TOKENS`, `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
     /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES` and
     /// `MOLT_SYNTAX_CHECK`.
     ///
@@ -110,6 +114,7 @@ impl Config {
     /// | `MOLT_MAX_TURNS` | `50` |
     /// | `MOLT_MAX_CHECK_ROUNDS` | `3` |
     /// | `MOLT_BUDGET_USD` | `10` |
+    /// | `MOLT_DESIGN_BUDGET_SHARE` | `0.25`: designing the check may spend a quarter of the run's budget |
     /// | `MOLT_MAX_TOKENS` | `32000` |
     /// | `MOLT_MODEL_TIMEOUT_S` | `1200` |
     /// | `MOLT_CHECK_TIMEOUT_S` | `900` |
@@ -144,6 +149,18 @@ impl Config {
             }
             None => d.budget_usd,
         };
+        let design_share = match get("MOLT_DESIGN_BUDGET_SHARE") {
+            Some(v) => {
+                let share: f64 =
+                    v.parse().with_context(|| format!("MOLT_DESIGN_BUDGET_SHARE={v:?} is not a number"))?;
+                ensure!(
+                    share > 0.0 && share <= 1.0,
+                    "MOLT_DESIGN_BUDGET_SHARE={v:?} must be more than 0 and at most 1, such as 0.25 for a quarter"
+                );
+                share
+            }
+            None => d.design_share,
+        };
         let hooks = get("MOLT_HOOKS_JSON")
             .map(|s| serde_json::from_str::<Vec<hooks::Hook>>(&s))
             .transpose()?
@@ -155,6 +172,7 @@ impl Config {
             max_turns: small("MOLT_MAX_TURNS", d.max_turns)?,
             max_check_rounds: small("MOLT_MAX_CHECK_ROUNDS", d.max_check_rounds)?,
             budget_usd,
+            design_share,
             max_tokens: small("MOLT_MAX_TOKENS", d.max_tokens)?,
             model_timeout: Duration::from_secs(number("MOLT_MODEL_TIMEOUT_S", d.model_timeout.as_secs())?),
             check_timeout: Duration::from_secs(number("MOLT_CHECK_TIMEOUT_S", d.check_timeout.as_secs())?),
@@ -415,6 +433,7 @@ mod tests {
         assert_eq!(cfg.max_turns, d.max_turns);
         assert_eq!(cfg.max_check_rounds, d.max_check_rounds);
         assert_eq!(cfg.budget_usd, d.budget_usd);
+        assert_eq!(cfg.design_share, 0.25);
         assert_eq!(cfg.max_tokens, d.max_tokens);
         assert_eq!(cfg.model_timeout, d.model_timeout);
         assert_eq!(cfg.check_timeout, d.check_timeout);
@@ -431,6 +450,7 @@ mod tests {
             ("MOLT_MAX_TURNS", "7"),
             ("MOLT_MAX_CHECK_ROUNDS", "4"),
             ("MOLT_BUDGET_USD", "2.5"),
+            ("MOLT_DESIGN_BUDGET_SHARE", "0.5"),
             ("MOLT_MAX_TOKENS", "1000"),
             ("MOLT_MODEL_TIMEOUT_S", "5"),
             ("MOLT_CHECK_TIMEOUT_S", "6"),
@@ -442,6 +462,7 @@ mod tests {
         assert_eq!(cfg.max_turns, 7);
         assert_eq!(cfg.max_check_rounds, 4);
         assert_eq!(cfg.budget_usd, 2.5);
+        assert_eq!(cfg.design_share, 0.5);
         assert_eq!(cfg.max_tokens, 1000);
         assert_eq!(cfg.model_timeout, Duration::from_secs(5));
         assert_eq!(cfg.check_timeout, Duration::from_secs(6));
@@ -472,6 +493,11 @@ mod tests {
         assert!(from(&[("MOLT_BUDGET_USD", "cheap")]).is_err());
         assert!(from(&[("MOLT_BUDGET_USD", "-1")]).is_err());
         assert!(from(&[("MOLT_BUDGET_USD", "NaN")]).is_err());
+        for share in ["0", "1.5", "-0.1", "NaN", "a quarter"] {
+            let err = from(&[("MOLT_DESIGN_BUDGET_SHARE", share)]).unwrap_err().to_string();
+            assert!(err.contains("MOLT_DESIGN_BUDGET_SHARE"), "{err}");
+        }
+        assert_eq!(from(&[("MOLT_DESIGN_BUDGET_SHARE", "1")]).unwrap().design_share, 1.0);
         assert!(from(&[("MOLT_CHECK_TIMEOUT_S", "1.5")]).is_err());
         assert!(from(&[("MOLT_INSTRUCTION_FILES", "docs/AGENTS.md")]).is_err());
         assert!(from(&[("MOLT_INSTRUCTION_FILES", "..")]).is_err());

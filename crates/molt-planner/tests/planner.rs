@@ -1036,7 +1036,9 @@ async fn a_designer_that_never_submits_is_nudged_once_then_the_run_fails() {
 #[tokio::test]
 async fn a_designer_out_of_turns_fails_the_run_whatever_the_attempts_turn_limit() {
     let fake = Fake::new(|req| use_tools(req, &[("list_files", json!({}))]), |_, _| exit(0, ""));
-    let resp = run(&fake, RunRequest { max_turns: Some(3), ..request(None, 2) }).await;
+    // The whole budget for designing, so that the turns run out first.
+    let req = RunRequest { max_turns: Some(3), design_budget_usd: Some(10.0), ..request(None, 2) };
+    let resp = run(&fake, req).await;
 
     // max_turns limits each attempt; the designer has its own limit.
     assert_eq!(fake.requests().len(), 25);
@@ -2923,6 +2925,154 @@ async fn a_vetter_that_does_not_finish_lets_the_check_through_and_says_it_was_no
     assert_eq!(design.uncounted_calls, 1);
     assert!(fake.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
         if message.starts_with("check vetter: did not finish (the model call failed: overloaded)"))));
+}
+
+// --- The design's share of the budget (#137) ---------------------------------
+
+/// A designer that never submits: it lists files, turn after turn.
+fn never_submits(req: &CompleteRequest) -> Reply {
+    assert!(is_designer(req), "no attempt may start");
+    use_tools(req, &[("list_files", json!({}))])
+}
+
+#[tokio::test]
+async fn a_designer_that_never_submits_stops_within_its_share_and_says_what_to_do() {
+    let fake = Fake::new(never_submits, |_, _| panic!("no command should run"));
+    // A quarter of $1 by default; each call costs $0.125.
+    let resp = run(&fake, RunRequest { budget_usd: Some(1.0), ..request(None, 2) }).await;
+
+    let requests = fake.requests();
+    assert!(requests.iter().all(is_designer));
+    // Checked before each call, as the run's budget is: two calls reach $0.25 and the third is not made.
+    assert_eq!(requests.len(), 2);
+    assert!(resp.cost_usd <= 0.25, "{}", resp.cost_usd);
+    assert_eq!((resp.outcome, resp.attempts.len(), resp.applied), (Outcome::Failed, 0, false));
+    assert!(!fake.events().iter().any(|e| matches!(e, Progress::AttemptStarted { .. })));
+    let summary = &resp.summary;
+    assert!(
+        summary.starts_with(
+            "Could not design a done-check: the design budget ran out before the designer submitted a check: \
+             designing spent $0.25 of the $0.25 it may use, and $0.75 of the run's $1.00 budget is left."
+        ),
+        "{summary}"
+    );
+    for next in ["--check CMD", "--criterion TEXT", "--no-check", "--design-budget-usd USD"] {
+        assert!(summary.contains(next), "{next}: {summary}");
+    }
+    assert!(fake.forks_alive().is_empty());
+
+    // planner.design, which the TUI's confirm mode uses, stops the same way and says how much is left.
+    let fake = Fake::new(never_submits, |_, _| panic!("no command should run"));
+    let bus: Arc<dyn Bus> = fake.clone();
+    let req = RunRequest { budget_usd: Some(1.0), ..request(None, 1) };
+    let design = molt_planner::design(bus, Arc::new(config()), req, TraceId::from_raw("trace_design")).await.unwrap();
+    let error = design.error.expect("the design failed");
+    assert!(error.starts_with("could not design a done-check: the design budget ran out"), "{error}");
+    assert_eq!((design.cost_usd, design.remaining_budget_usd), (0.25, Some(0.75)));
+}
+
+#[tokio::test]
+async fn a_design_budget_given_or_set_as_a_share_caps_designing_and_one_call_can_pass_it() {
+    // $0.30 given: after two calls ($0.25) a third is still allowed, and it takes designing past the cap.
+    let fake = Fake::new(never_submits, |_, _| panic!("no command should run"));
+    let req = RunRequest { budget_usd: Some(1.0), design_budget_usd: Some(0.3), ..request(None, 1) };
+    let resp = run(&fake, req).await;
+    assert_eq!(fake.requests().len(), 3);
+    assert!(close(resp.cost_usd, 0.375), "{}", resp.cost_usd);
+    assert!(resp.summary.contains("designing spent $0.38 of the $0.30 it may use"), "{}", resp.summary);
+
+    // The planner's share, from MOLT_DESIGN_BUDGET_SHARE: half of $1 is four calls.
+    let fake = Fake::new(never_submits, |_, _| panic!("no command should run"));
+    let cfg = Config { design_share: 0.5, ..config() };
+    let resp = run_with(&fake, cfg, RunRequest { budget_usd: Some(1.0), ..request(None, 1) }).await;
+    assert_eq!(fake.requests().len(), 4);
+    assert!(resp.summary.contains("and $0.50 of the run's $1.00 budget is left"), "{}", resp.summary);
+
+    // A design budget cannot grow the run's.
+    let bus: Arc<dyn Bus> = fake.clone();
+    let req = RunRequest { budget_usd: Some(1.0), design_budget_usd: Some(2.0), ..request(None, 1) };
+    let err = molt_planner::run(bus, Arc::new(config()), req, TraceId::random()).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid);
+    assert!(
+        err.message.starts_with("design_budget_usd ($2.00) is more than the run's budget ($1.00)"),
+        "{}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn the_design_share_does_not_limit_the_attempts() {
+    // The designer submits at once; the attempts may then spend past the design's share.
+    let fake = Fake::new(
+        |req| {
+            if is_designer(req) {
+                let submit = json!({ "command": "check", "files": [], "rationale": "greps it" });
+                return use_tools(req, &[("submit_check", submit)]);
+            }
+            match turn(req) {
+                1..=3 => use_tools(req, &[("list_files", json!({}))]),
+                4 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            }
+        },
+        hello_check,
+    );
+    let resp = run(&fake, RunRequest { budget_usd: Some(1.0), ..request(None, 1) }).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert!(resp.cost_usd > 0.25, "{}", resp.cost_usd);
+}
+
+#[tokio::test]
+async fn a_designer_that_does_the_task_in_its_fork_is_reported_as_overreach() {
+    let fake = Fake::new(
+        |req| {
+            if is_vetter(req) {
+                return submit_vetting(req, &[]);
+            }
+            if is_designer(req) {
+                return match turn(req) {
+                    // The deliverable, to try the check on, and the check itself.
+                    1 => use_tools(
+                        req,
+                        &[
+                            ("write_file", json!({ "path": "hello.txt", "content": "hi\n" })),
+                            ("write_file", json!({ "path": "tests/check.sh", "content": RIGHT_CHECK })),
+                        ],
+                    ),
+                    _ => {
+                        let submit = json!({ "command": "sh tests/check.sh", "files": ["tests/check.sh"], "rationale": "greps it" });
+                        use_tools(req, &[("submit_check", submit)])
+                    }
+                };
+            }
+            match turn(req) {
+                1 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            }
+        },
+        greeting_check,
+    );
+    let resp = run(&fake, request(None, 1)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    let notes: Vec<String> = fake
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Progress::Note { message, .. } if message.contains("overreach") || message.contains("designer changed") => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].starts_with("the check's designer changed 1 file that is not a check file (hello.txt)"),
+        "{}",
+        notes[0]
+    );
+    // The designer's prompt says so before it starts.
+    let designer = fake.requests().into_iter().find(is_designer).unwrap();
+    assert!(designer.system.as_deref().unwrap().contains("writing the task's deliverables"));
 }
 
 fn dispute(req: &CompleteRequest) -> Reply {

@@ -33,6 +33,7 @@ pub enum Builtin {
     MemoryModel,
     Effort,
     Budget,
+    DesignBudget,
     Last,
     Lanes,
     Clear,
@@ -91,6 +92,7 @@ definitions! {
     MemoryModel, "memory-model", "NAME", "model memory learns with; same: the attempts'", &["opus", "sonnet", "haiku", "same", "default"];
     Effort, "effort", "LEVEL", "low, medium, high, xhigh or max", &["low", "medium", "high", "xhigh", "max", "default"];
     Budget, "budget", "USD", "spending limit per task", &["default"];
+    DesignBudget, "design-budget", "USD", "most of a task's budget designing its check may spend", &["default"];
     Last, "last", "", "the diff of the last finished task", &[];
     Lanes, "lanes", "", "the tool calls of the last finished task", &[];
     Clear, "clear", "", "clear the log", &[];

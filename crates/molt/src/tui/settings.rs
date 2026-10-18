@@ -41,6 +41,7 @@ impl Saved {
                 model: config.model.clone(),
                 effort: config.effort,
                 budget_usd: config.budget,
+                design_budget_usd: None,
                 check: config.check.clone(),
                 memory_model: config.memory_model.clone(),
                 stream: config.stream.unwrap_or(true),
@@ -60,6 +61,10 @@ impl Saved {
         ensure!(
             self.settings.budget_usd.is_none_or(|b| b.is_finite() && b > 0.0),
             "saved budget must be finite and positive"
+        );
+        ensure!(
+            self.settings.design_budget_usd.is_none_or(|b| b.is_finite() && b > 0.0),
+            "saved design budget must be finite and positive"
         );
         for value in [&self.settings.model, &self.settings.memory_model, &self.settings.check].into_iter().flatten() {
             ensure!(!value.trim().is_empty() && value.len() <= 16 * 1024, "saved model or check is empty or too long");
