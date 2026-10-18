@@ -215,7 +215,7 @@ for every project. `/attempts`, `/model`, `/effort`, `/budget`,
 `/design-budget` and `/check` set the next tasks' options (`/check` while a task runs changes only
 that task); `/memory-model NAME` sets the model
 memory learns with (`same` for the attempts' model, `default` for
-`MOLT_MEMORY_MODEL` or `sonnet`), and when learning finds nothing the log
+`MOLT_MEMORY_MODEL`, else the attempts' model), and when learning finds nothing the log
 says why. Typing `/` shows matching commands and argument hints above the input
 (up to six at once). ↑/↓ selects a candidate and Tab puts it in; commands with
 fixed values, such as `/effort` and `/model`, suggest those values next. Esc
@@ -393,7 +393,7 @@ molt undo [RUN] [--workspace DIR] [--data-dir DIR]
 | `--pass-env NAME` | Pass a variable from your environment to the commands the agent runs, the check included. Repeatable. |
 | `--no-memory` | Run without memory: no map or notes for the model, nothing learned. |
 | `--no-learn` | Use memory, but do not learn from this run (learning is one more model call after it). |
-| `--memory-model MODEL` | The model memory learns from this run with; `same` uses the attempts' model. Default: `MOLT_MEMORY_MODEL`, else `sonnet`. Useful when that model is not on your endpoint. |
+| `--memory-model MODEL` | The model memory learns from this run with; `same` uses the attempts' model. Default: `MOLT_MEMORY_MODEL`, else the attempts' model. |
 | `--judge-model MODEL` | The model that judges a task no command can check against its criteria (below). Default: the attempts' model. |
 | `--checkpoint` | Save a checkpoint as the run goes, so a run that stops before it finishes can go on with `molt resume` (below). |
 | `--config FILE` | Run your own service setup (see `molt.example.toml`) instead of the default one. |
@@ -680,7 +680,7 @@ Defaults come from the environment:
 | `MOLT_CONTEXT_TOKENS` | planner | the model's context window: `200000` for Claude models, `128000` for others |
 | `MOLT_INSTRUCTION_FILES` | planner | `AGENTS.md,CLAUDE.md` (the project's instruction files; `none` reads none) |
 | `MOLT_SYNTAX_CHECK` | planner | `report` (see [Syntax errors after an edit](#syntax-errors-after-an-edit)); `reject` or `off` |
-| `MOLT_MEMORY_MODEL`, `MOLT_MEMORY_EFFORT`, `MOLT_MEMORY_MAX_TOKENS`, `MOLT_MEMORY_MODEL_TIMEOUT_S` | memory | `sonnet`, `low`, `8000`, `300` |
+| `MOLT_MEMORY_MODEL`, `MOLT_MEMORY_EFFORT`, `MOLT_MEMORY_MAX_TOKENS`, `MOLT_MEMORY_MODEL_TIMEOUT_S` | memory | the attempts' model (the run's `--model`, else `MOLT_PLANNER_MODEL`, else the gateway's `MOLT_MODEL`), `low`, `8000`, `300` |
 
 The planner reads `MOLT_MAX_TOKENS` and `MOLT_MODEL_TIMEOUT_S` too: a model
 call ends at that deadline, the gateway's retries included. `MOLT_FALLBACKS`
@@ -886,12 +886,20 @@ the symbol model, and responses expose skipped/truncated results.
 **Notes** are one-sentence facts, conventions, decisions, preferences and
 lessons. After a run, memory reads it back from the audit log, boils it down
 to numbered steps, and has the model write what would help a later task, each
-note citing the steps, and so the logged messages, it rests on. A note the run
+note citing the steps, and so the logged messages, it rests on. The model
+answers by calling a `submit_notes` tool whose input schema is the answer's
+shape, so learning does not depend on the endpoint enforcing a JSON schema;
+an answer in plain JSON text is accepted too. An answer that does not fit is
+sent back once with the error, and if the second does not fit either the run
+is not learned from and the reason is shown; both calls are counted in the
+learning cost. A note the run
 bore out gains confidence; one it proved wrong is kept beside its correction,
 both less certain, until more evidence settles it. Notes carry the version
 of the service that wrote them, so rolling a version back retracts what it
 learned. Recall ranks notes by keyword match (SQLite FTS5 with stemming),
-confidence and recency.
+confidence and recency. Chinese, Japanese and Korean, written without spaces
+between words, are matched on overlapping pairs of characters, so `测试` finds
+a note that says `测试命令是 cargo test`.
 
 Every context or `recall` tool lookup the planner uses records an immutable
 snapshot: note IDs and revisions, original text, source runs and audit message
@@ -1201,7 +1209,7 @@ needed. Deleting an unfinished record loses its recovery material.
 - A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet. Its task queue lives in memory: normal exit prints unexecuted tasks, while a crash loses them.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.
-- Default recall matches keywords with stemming, so differently worded notes can be missed. Optional offline word-vector recall needs a reviewed hash-pinned local model; its mean-pooling backend does not understand word order or supply a pretrained vocabulary.
+- Default recall matches keywords with stemming, so differently worded notes can be missed. Chinese, Japanese and Korean match on pairs of characters, so a query can also find a note where its pair spans two words, and a one-character query word finds only notes where that character stands alone. Optional offline word-vector recall needs a reviewed hash-pinned local model; its mean-pooling backend does not understand word order or supply a pretrained vocabulary.
 - Notes learned from a run stay with that project, preferences included: a run's record holds text the project's files and commands chose. Only notes you write or promote yourself are shared between projects. Clones of one project share its data dir, so molt runs in one of them at a time.
 - The project model indexes the first 20,000 source files of a project, in walk order; `memory.index` reports when a project has more. A file that takes more than 2 seconds to parse keeps the symbols found by then.
 - Legacy `topic:<name>` capabilities still permit both publication and subscription; use the explicit rights to reduce them. Events already accepted for delivery may arrive after revocation.

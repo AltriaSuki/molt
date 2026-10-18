@@ -380,10 +380,14 @@ pub struct ConsolidateRequest {
     /// Trace id of the episode, e.g. the trace of a `planner.run` request.
     pub episode: String,
     pub workspace: String,
-    /// Model for the extraction. Default set by the service.
+    /// Model for the extraction. Default set by the service: the
+    /// episode's attempts' model unless it was told otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
+
+/// The tool a consolidation's model answers with: its input is the answer.
+pub const SUBMIT_NOTES: &str = "submit_notes";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConsolidateResponse {
@@ -403,7 +407,16 @@ pub struct ConsolidateResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proposed: Vec<String>,
     pub usage: Usage,
+    /// Known cost of the learning calls; a subtotal when `uncounted_calls`
+    /// is above zero.
     pub cost_usd: f64,
+    /// Learning calls whose cost is unknown (no price for the model).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub uncounted_calls: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Bring the project model of `workspace` up to date.

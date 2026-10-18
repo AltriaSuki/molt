@@ -11,7 +11,7 @@ use anyhow::Context;
 use rusqlite::Connection;
 
 /// Bumped when the schema changes in a way old databases must be migrated for.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// The database. Every write goes through its one connection, so writes
 /// never race; keep the work done under [`Db::with`] short. Long reads (the
@@ -84,6 +84,11 @@ impl Db {
         conn.execute_batch(crate::project::SCHEMA)?;
         conn.execute_batch(crate::review::SCHEMA)?;
         conn.execute_batch(crate::skills::SCHEMA)?;
+        if version < 3 {
+            // Schema 3 indexes the character pairs of Chinese, Japanese and
+            // Korean text, which the notes stored before it never were.
+            crate::notes::reindex_cjk(&conn)?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn: Mutex::new(conn), reader: None, semantic: None })
     }
@@ -201,5 +206,53 @@ mod tests {
         assert_eq!(notes[0].note.id, "old_note");
         assert_eq!(notes[0].details, Default::default());
         assert!(crate::recall_snapshots(&upgraded, "/w", "source_run").unwrap().is_empty());
+    }
+
+    /// The notes tables as schema 2 made them, before character pairs were indexed.
+    const SCHEMA_2_NOTES: &str = "
+        CREATE TABLE notes (
+            id TEXT PRIMARY KEY, kind TEXT NOT NULL, text TEXT NOT NULL, norm TEXT NOT NULL, workspace TEXT,
+            confidence REAL NOT NULL, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL,
+            reinforced INTEGER NOT NULL DEFAULT 0, conflicts TEXT NOT NULL DEFAULT '[]', trace TEXT NOT NULL,
+            events TEXT NOT NULL DEFAULT '[]', service TEXT NOT NULL, version TEXT NOT NULL,
+            rev INTEGER NOT NULL DEFAULT 1, forgotten_ms INTEGER, forget_reason TEXT
+        );
+        CREATE VIRTUAL TABLE notes_fts
+            USING fts5(text, content='notes', content_rowid='rowid', tokenize='porter unicode61');
+        CREATE TRIGGER notes_ai AFTER INSERT ON notes BEGIN
+            INSERT INTO notes_fts(rowid, text) VALUES (new.rowid, new.text);
+        END;
+        CREATE TRIGGER notes_ad AFTER DELETE ON notes BEGIN
+            INSERT INTO notes_fts(notes_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+        END;
+        CREATE TRIGGER notes_au AFTER UPDATE OF text ON notes BEGIN
+            INSERT INTO notes_fts(notes_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+            INSERT INTO notes_fts(rowid, text) VALUES (new.rowid, new.text);
+        END;
+        INSERT INTO notes (id, kind, text, norm, confidence, created_ms, updated_ms, trace, service, version)
+            VALUES ('old_note', 'fact', '测试命令是 cargo test，target/ 在沙箱里只读。',
+                    '测试命令是 cargo test，target/ 在沙箱里只读。', 0.8, 1, 1, 'source_run', 'memory', 'v1');
+        PRAGMA user_version = 2;
+    ";
+
+    #[test]
+    fn notes_stored_before_schema_three_are_recalled_by_chinese_words_after_the_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.sqlite");
+        Connection::open(&path).unwrap().execute_batch(SCHEMA_2_NOTES).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let upgraded = Db::open(&path).unwrap();
+        let version: i64 = upgraded.with(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0))).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        for query in ["沙箱", "只读", "测试", "cargo"] {
+            let req = molt_api::memory::RecallRequest { query: query.into(), ..Default::default() };
+            let found = crate::recall(&upgraded, &req, None, None).unwrap();
+            assert_eq!(found.iter().map(|r| r.note.id.as_str()).collect::<Vec<_>>(), ["old_note"], "{query}");
+        }
+        // Opening it again indexes nothing twice.
+        drop(upgraded);
+        let again = Db::open(&path).unwrap();
+        let rows: i64 = again.with(|c| c.query_row("SELECT COUNT(*) FROM notes_cjk", [], |r| r.get(0))).unwrap();
+        assert_eq!(rows, 1);
     }
 }

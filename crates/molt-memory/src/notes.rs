@@ -4,7 +4,9 @@
 //! notes with the same text (ignoring case, spacing and a final period) about
 //! the same workspace are one note: storing it again reinforces it. Recall
 //! matches word stems with SQLite's full-text index and ranks the matches by
-//! relevance, confidence and recency. Forgetting leaves a tombstone.
+//! relevance, confidence and recency. Chinese, Japanese and Korean, written
+//! without spaces between words, are matched on overlapping pairs of
+//! characters instead. Forgetting leaves a tombstone.
 //!
 //! Every change to a note is a row in the `evidence` table, naming the
 //! episode and the writer (service and version) behind it, and a note's
@@ -24,8 +26,11 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use crate::db::Db;
 use crate::error::{self, invalid};
 
-/// Notes, their full-text index, the evidence behind each, and the
-/// episodes already learned from.
+/// Notes, their full-text indexes, the evidence behind each, and the
+/// episodes already learned from. `notes_fts` holds the words of every note;
+/// `notes_cjk` holds the character pairs of the notes with Chinese, Japanese
+/// or Korean in them (see [`cjk_grams`]), kept apart so that they leave the
+/// ranking of other words as it was.
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS notes (
     id TEXT PRIMARY KEY,
@@ -59,6 +64,17 @@ END;
 CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE OF text ON notes BEGIN
     INSERT INTO notes_fts(notes_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
     INSERT INTO notes_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_cjk USING fts5(grams, tokenize='unicode61');
+CREATE TRIGGER IF NOT EXISTS notes_cjk_ai AFTER INSERT ON notes WHEN cjk_grams(new.text) <> '' BEGIN
+    INSERT INTO notes_cjk(rowid, grams) VALUES (new.rowid, cjk_grams(new.text));
+END;
+CREATE TRIGGER IF NOT EXISTS notes_cjk_ad AFTER DELETE ON notes BEGIN
+    DELETE FROM notes_cjk WHERE rowid = old.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS notes_cjk_au AFTER UPDATE OF text ON notes BEGIN
+    DELETE FROM notes_cjk WHERE rowid = old.rowid;
+    INSERT INTO notes_cjk(rowid, grams) SELECT new.rowid, cjk_grams(new.text) WHERE cjk_grams(new.text) <> '';
 END;
 CREATE TABLE IF NOT EXISTS evidence (
     note TEXT NOT NULL REFERENCES notes(id),
@@ -700,22 +716,105 @@ const STOPWORDS: &[&str] = &[
     "its", "make", "of", "on", "or", "so", "that", "the", "this", "to", "was", "we", "with", "you",
 ];
 
-/// `query` as an FTS5 query that matches any of its words, or `None` when it
-/// has no word worth matching. Each word is quoted, so nothing in the query
-/// is read as FTS5 syntax.
-fn fts_query(query: &str) -> Option<String> {
-    let mut words: Vec<String> = Vec::new();
-    for word in query.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
-        let word = word.to_lowercase();
-        if word.chars().count() < 2 || STOPWORDS.contains(&word.as_str()) || words.contains(&word) {
+/// Whether `c` belongs to a script written without spaces between words:
+/// Han (with its iteration and zero marks), kana and Hangul.
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3005 | 0x3007 // 々 〇
+        | 0x3040..=0x30FF // hiragana, katakana
+        | 0x31F0..=0x31FF // katakana extensions
+        | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF // Han
+        | 0x20000..=0x2EBEF | 0x30000..=0x323AF // Han, supplementary planes
+        | 0xFF66..=0xFF9F // halfwidth katakana
+        | 0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xAC00..=0xD7AF | 0xD7B0..=0xD7FF // Hangul
+    )
+}
+
+/// Each run of CJK characters in `text` as its overlapping pairs of
+/// characters, and a lone character as itself.
+fn grams(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut run: Vec<char> = Vec::new();
+    for c in text.chars().chain(std::iter::once(' ')) {
+        if is_cjk(c) {
+            run.push(c);
             continue;
         }
-        words.push(word);
-        if words.len() == 32 {
-            break;
+        match run.len() {
+            0 => {}
+            1 => out.push(run[0].to_string()),
+            _ => out.extend(run.windows(2).map(|w| w.iter().collect::<String>())),
         }
+        run.clear();
     }
-    (!words.is_empty()).then(|| words.iter().map(|w| format!("\"{w}\"")).collect::<Vec<_>>().join(" OR "))
+    out
+}
+
+/// What `notes_cjk` indexes for a note: [`grams`] of its text, separated by
+/// spaces, or nothing when it has no CJK characters. The full-text index
+/// cuts words at spaces and punctuation only, so it would take a whole
+/// sentence of Chinese for one word; its pairs match any word of two
+/// characters or more in it.
+fn cjk_grams(text: &str) -> String {
+    grams(text).join(" ")
+}
+
+/// The words of a recall query worth matching on.
+#[derive(Debug, Default)]
+struct Keywords {
+    /// Words for `notes_fts`: none of the most common English words.
+    words: Vec<String>,
+    /// Character pairs for `notes_cjk`.
+    grams: Vec<String>,
+}
+
+impl Keywords {
+    fn of(query: &str) -> Self {
+        let mut k = Self::default();
+        for word in query.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+            // A word can mix scripts, as in `用cargo测试`: split it where it changes.
+            let mut rest = word;
+            while let Some(c) = rest.chars().next() {
+                let cjk = is_cjk(c);
+                let end = rest.find(|c: char| is_cjk(c) != cjk).unwrap_or(rest.len());
+                let (part, tail) = rest.split_at(end);
+                rest = tail;
+                if cjk {
+                    for gram in grams(part) {
+                        if k.grams.len() < 64 && !k.grams.contains(&gram) {
+                            k.grams.push(gram);
+                        }
+                    }
+                    continue;
+                }
+                let part = part.to_lowercase();
+                if part.chars().count() < 2
+                    || STOPWORDS.contains(&part.as_str())
+                    || k.words.contains(&part)
+                    || k.words.len() == 32
+                {
+                    continue;
+                }
+                k.words.push(part);
+            }
+        }
+        k
+    }
+
+    fn is_empty(&self) -> bool {
+        self.words.is_empty() && self.grams.is_empty()
+    }
+
+    /// `terms` as an FTS5 query that matches any of them. Each is quoted, so
+    /// nothing in the query is read as FTS5 syntax.
+    fn any(terms: &[String]) -> Option<String> {
+        (!terms.is_empty()).then(|| terms.iter().map(|w| format!("\"{w}\"")).collect::<Vec<_>>().join(" OR "))
+    }
+
+    /// Every term matched on, for the reason a note was recalled.
+    fn shown(&self) -> Option<String> {
+        Self::any(&[self.words.as_slice(), self.grams.as_slice()].concat())
+    }
 }
 
 /// Weight for ranking of a note last changed at `updated_ms`, at `now`: 1
@@ -725,11 +824,24 @@ fn recency(updated_ms: i64, now: u64) -> f64 {
     0.5f64.powf(age_days / HALF_LIFE_DAYS)
 }
 
-/// Make `recency(updated_ms, now)` callable from SQL on `conn`.
+/// Make `recency(updated_ms, now)` and `cjk_grams(text)`, which the
+/// triggers that keep `notes_cjk` call, callable from SQL on `conn`.
 pub(crate) fn register(conn: &Connection) -> rusqlite::Result<()> {
-    conn.create_scalar_function("recency", 2, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC, |c| {
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    conn.create_scalar_function("recency", 2, flags, |c| {
         Ok(recency(c.get::<i64>(0)?, c.get::<i64>(1)?.max(0) as u64))
-    })
+    })?;
+    conn.create_scalar_function("cjk_grams", 1, flags, |c| Ok(cjk_grams(&c.get::<String>(0)?)))
+}
+
+/// Index the character pairs of every note again. A database from before
+/// `notes_cjk` existed has notes it never saw.
+pub(crate) fn reindex_cjk(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "BEGIN; DELETE FROM notes_cjk; \
+         INSERT INTO notes_cjk(rowid, grams) SELECT rowid, cjk_grams(text) FROM notes WHERE cjk_grams(text) <> ''; \
+         COMMIT;",
+    )
 }
 
 /// Which notes a recall looks at besides those about its workspace.
@@ -778,10 +890,11 @@ pub(crate) fn select(
 ) -> rusqlite::Result<Vec<Recalled>> {
     let model = model.filter(|m| m.weight > 0.0);
     let k = req.k.unwrap_or(DEFAULT_K).clamp(1, MAX_K) as usize;
-    let fts = fts_query(&req.query);
-    if fts.is_none() && !req.query.trim().is_empty() {
+    let keywords = Keywords::of(&req.query);
+    if keywords.is_empty() && !req.query.trim().is_empty() {
         return Ok(Vec::new());
     }
+    let (words, grams) = (Keywords::any(&keywords.words), Keywords::any(&keywords.grams));
     // Every filter is applied before the candidates are cut, so none of them
     // can empty a recall that has matches.
     let mut filter = match scope {
@@ -801,25 +914,40 @@ pub(crate) fn select(
     let min = req.min_confidence.unwrap_or(0.0);
     let mut candidates: Vec<(Note, f64, molt_api::memory::NoteDetails)> = {
         let details = "COALESCE((SELECT details FROM note_details WHERE note = n.id), '{}')";
-        let sql = match &fts {
-                Some(_) => format!(
-                    "SELECT {columns}, -bm25(notes_fts), {details} FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid \
-                     WHERE notes_fts MATCH ?2 AND {filter} ORDER BY bm25(notes_fts) LIMIT {CANDIDATES}"
-                ),
-                // Without words to match, the ranking is known in full: let SQL do it.
-                None => format!(
-                    "SELECT {columns}, 0.0, {details} FROM notes n WHERE {filter} AND ?2 IS NULL \
-                     ORDER BY 0.7 * n.confidence + 0.3 * recency(n.updated_ms, ?4) DESC, n.id LIMIT {k}"
-                ),
-            };
+        // Words and character pairs are ranked in their own indexes, and a
+        // note's relevance is the sum of the two, so a CJK match weighs as much
+        // as a word match and leaves the ranking of words alone. The word
+        // query, or else the pairs, is ?2, and the pairs with words are ?4.
+        let matches = match (&words, &grams) {
+            (Some(_), None) => "SELECT rowid AS id, -bm25(notes_fts) AS rel FROM notes_fts WHERE notes_fts MATCH ?2",
+            (None, Some(_)) => "SELECT rowid AS id, -bm25(notes_cjk) AS rel FROM notes_cjk WHERE notes_cjk MATCH ?2",
+            _ => {
+                "SELECT id, SUM(rel) AS rel FROM ( \
+                 SELECT rowid AS id, -bm25(notes_fts) AS rel FROM notes_fts WHERE notes_fts MATCH ?2 UNION ALL \
+                 SELECT rowid AS id, -bm25(notes_cjk) AS rel FROM notes_cjk WHERE notes_cjk MATCH ?4) GROUP BY id"
+            }
+        };
+        let sql = if keywords.is_empty() {
+            // Without words to match, the ranking is known in full: let SQL do it.
+            format!(
+                "SELECT {columns}, 0.0, {details} FROM notes n WHERE {filter} AND ?2 IS NULL \
+                 ORDER BY 0.7 * n.confidence + 0.3 * recency(n.updated_ms, ?4) DESC, n.id LIMIT {k}"
+            )
+        } else {
+            format!(
+                "SELECT {columns}, m.rel, {details} FROM ({matches}) m JOIN notes n ON n.rowid = m.id \
+                 WHERE {filter} ORDER BY m.rel DESC LIMIT {CANDIDATES}"
+            )
+        };
         let mut stmt = conn.prepare_cached(&sql)?;
         let row = |r: &Row| {
             let details: String = r.get(15)?;
             Ok((note_from(r)?, r.get::<_, f64>(14)?, crate::review::decode(&details)?))
         };
-        let rows = match &fts {
-            Some(fts) => stmt.query_map(params![req.workspace, fts, min], row)?,
-            None => stmt.query_map(params![req.workspace, None::<String>, min, now as i64], row)?,
+        let rows = match (&words, &grams) {
+            (Some(words), Some(grams)) => stmt.query_map(params![req.workspace, words, min, grams], row)?,
+            (Some(only), None) | (None, Some(only)) => stmt.query_map(params![req.workspace, only, min], row)?,
+            (None, None) => stmt.query_map(params![req.workspace, None::<String>, min, now as i64], row)?,
         };
         rows.collect::<rusqlite::Result<_>>()?
     };
@@ -851,7 +979,7 @@ pub(crate) fn select(
     }
 
     let best = candidates.iter().map(|(_, rel, _)| *rel).fold(0.0, f64::max);
-    let matched = fts.is_some();
+    let matched = !keywords.is_empty();
     let mut ranked: Vec<Recalled> = candidates
         .into_iter()
         .map(|(note, rel, details)| {
@@ -873,7 +1001,7 @@ pub(crate) fn select(
                     + 0.15 * recency;
             }
             let reason = RecallReason {
-                keywords: fts.clone(),
+                keywords: keywords.shown(),
                 relevance: matched.then_some(if best > 0.0 { rel / best } else { 0.0 }),
                 confidence: note.confidence,
                 recency,
@@ -1243,5 +1371,98 @@ mod tests {
         let req = RecallRequest { kinds: vec![NoteKind::Preference], ..ask("build", Some("/w")) };
         assert_eq!(recall(&db, &req, 1).unwrap().len(), 1);
         assert!(recall_in(&db, &req, Scope::Own, 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn chinese_notes_are_recalled_by_the_words_in_them() {
+        let db = Db::in_memory().unwrap();
+        let text = "测试命令是 CARGO_TARGET_DIR=/tmp/ct cargo test，target/ 在沙箱里只读。";
+        let stored = remember(&db, note(NoteKind::Fact, text, Some("/w")), 1).unwrap().0;
+        remember(&db, note(NoteKind::Fact, "文档在 docs 目录里。", Some("/w")), 1).unwrap();
+        for query in ["测试", "沙箱", "只读", "cargo", "测试命令是", "在沙箱里只读"] {
+            let found = recall(&db, &ask(query, Some("/w")), 1).unwrap();
+            assert_eq!(found.iter().map(|r| r.note.id.as_str()).collect::<Vec<_>>(), [stored.id.as_str()], "{query}");
+        }
+        let found = recall(&db, &ask("沙箱", Some("/w")), 1).unwrap();
+        assert_eq!(found[0].reason.keywords.as_deref(), Some("\"沙箱\""));
+        assert_eq!(found[0].reason.relevance, Some(1.0));
+        // A word the note does not have finds nothing.
+        assert!(recall(&db, &ask("网络", Some("/w")), 1).unwrap().is_empty());
+        // Words and pairs mix in one query; the note matching both ranks first.
+        let both = recall(&db, &ask("用cargo跑测试", Some("/w")), 1).unwrap();
+        assert_eq!(both[0].note.id, stored.id);
+        assert_eq!(both[0].reason.keywords.as_deref(), Some("\"cargo\" OR \"用\" OR \"跑测\" OR \"测试\""));
+    }
+
+    #[test]
+    fn japanese_and_korean_notes_are_recalled_by_the_words_in_them() {
+        let db = Db::in_memory().unwrap();
+        let ja = remember(&db, note(NoteKind::Fact, "テストは日本語のドキュメントを読む。", Some("/w")), 1).unwrap().0;
+        let ko = remember(&db, note(NoteKind::Fact, "테스트는 cargo로 실행한다.", Some("/w")), 1).unwrap().0;
+        for (query, id) in [("テスト", &ja.id), ("日本語", &ja.id), ("ドキュメント", &ja.id), ("실행", &ko.id)]
+        {
+            let found = recall(&db, &ask(query, Some("/w")), 1).unwrap();
+            assert_eq!(found.iter().map(|r| &r.note.id).collect::<Vec<_>>(), [id], "{query}");
+        }
+    }
+
+    #[test]
+    fn a_cjk_run_becomes_overlapping_pairs_and_a_lone_character_stays_itself() {
+        assert_eq!(cjk_grams("只读"), "只读");
+        assert_eq!(cjk_grams("在沙箱里"), "在沙 沙箱 箱里");
+        assert_eq!(cjk_grams("target/ 在 tmp，テスト"), "在 テス スト");
+        assert_eq!(cjk_grams("plain English."), "");
+        let k = Keywords::of("Run the 测试 with cargo");
+        assert_eq!((k.words, k.grams), (vec!["run".to_owned(), "cargo".to_owned()], vec!["测试".to_owned()]));
+    }
+
+    #[test]
+    fn an_english_query_is_ranked_by_the_word_index_alone() {
+        let db = Db::in_memory().unwrap();
+        for text in [
+            "Integration tests live in crates/*/tests and run with cargo test.",
+            "Testing the gateway needs a fake Messages API (wiremock).",
+            "Run the tests with cargo nextest when it is installed.",
+            "测试用 cargo 运行。",
+            "沙箱里 target/ 只读。",
+        ] {
+            remember(&db, note(NoteKind::Fact, text, Some("/w")), 1).unwrap();
+        }
+        let query = "How do I run the tests with cargo?";
+        let found = recall(&db, &ask(query, Some("/w")), 1).unwrap();
+        // What recall ranked on before character pairs were indexed.
+        let words = Keywords::any(&Keywords::of(query).words).unwrap();
+        let before: Vec<(String, f64)> = db.with(|c| {
+            let mut s = c
+                .prepare(
+                    "SELECT n.id, -bm25(notes_fts) FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid \
+                     WHERE notes_fts MATCH ?1",
+                )
+                .unwrap();
+            s.query_map([&words], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap()
+        });
+        let best = before.iter().map(|(_, rel)| *rel).fold(0.0, f64::max);
+        assert_eq!(found.len(), before.len());
+        for r in &found {
+            let rel = before.iter().find(|(id, _)| *id == r.note.id).unwrap().1;
+            assert_eq!(r.reason.relevance, Some(rel / best), "{}", r.note.text);
+        }
+        assert_eq!(found[0].reason.keywords.as_deref(), Some("\"how\" OR \"run\" OR \"tests\" OR \"cargo\""));
+    }
+
+    #[test]
+    fn the_pair_index_follows_a_note_whose_text_changes_or_is_deleted() {
+        let db = Db::in_memory().unwrap();
+        let n = remember(&db, note(NoteKind::Fact, "测试在沙箱里跑。", Some("/w")), 1).unwrap().0;
+        db.with(|c| c.execute("UPDATE notes SET text = '构建在容器里跑。' WHERE id = ?1", [&n.id])).unwrap();
+        assert!(recall(&db, &ask("沙箱", Some("/w")), 1).unwrap().is_empty());
+        assert_eq!(recall(&db, &ask("容器", Some("/w")), 1).unwrap().len(), 1);
+        db.with(|c| {
+            c.execute("DELETE FROM evidence WHERE note = ?1", [&n.id])?;
+            c.execute("DELETE FROM notes WHERE id = ?1", [&n.id])
+        })
+        .unwrap();
+        let left: i64 = db.with(|c| c.query_row("SELECT COUNT(*) FROM notes_cjk", [], |r| r.get(0))).unwrap();
+        assert_eq!(left, 0);
     }
 }

@@ -71,7 +71,7 @@ name = "memory"
 tier = "mutable"
 exec = { command = "molt-memory", args = ["--root", ".", "--db", ".molt/memory.db", "--forks", "/home/you/.cache/molt/work"] }
 provides = ["memory.*"]
-pass_env = ["MOLT_MEMORY_MODEL", "MOLT_MEMORY_EFFORT", "MOLT_MEMORY_MAX_TOKENS", "MOLT_MEMORY_MODEL_TIMEOUT_S"]
+pass_env = ["MOLT_MEMORY_MODEL", "MOLT_MEMORY_EFFORT", "MOLT_MEMORY_MAX_TOKENS", "MOLT_MEMORY_MODEL_TIMEOUT_S", "MOLT_PLANNER_MODEL", "MOLT_MODEL"]
 requests = [
   { target = "model.complete", budget = { tokens = 1000000000, calls = 1000000 } },
   { target = "kernel.audit.read", budget = { calls = 10000000 } },
