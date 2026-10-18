@@ -457,6 +457,14 @@ impl Ctx {
         }
     }
 
+    /// Every fork still alive is the caller's now: the run drops none of them.
+    pub fn hand_over_forks(&self) {
+        let forks = std::mem::take(&mut *self.forks.lock().unwrap_or_else(PoisonError::into_inner));
+        if !forks.is_empty() {
+            tracing::info!(run = %self.trace, forks = ?forks, "the run was stopped; its forks are left to the caller");
+        }
+    }
+
     /// The fork is gone or handed to the caller; the run no longer owns it.
     pub fn forget_fork(&self, fork: &str) {
         self.forks.lock().unwrap_or_else(PoisonError::into_inner).retain(|f| f != fork);

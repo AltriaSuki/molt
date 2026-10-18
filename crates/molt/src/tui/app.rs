@@ -33,7 +33,8 @@ use crate::config::ConfirmSection;
 const SUMMARY_BYTES: usize = 1 << 20;
 /// Lines kept per attempt while it runs.
 const LANE_LINES: usize = 200;
-/// Ticks within which a second Ctrl+C or Ctrl+D quits: about a second.
+/// Ticks within which a second Ctrl+C or Ctrl+D quits, or a second Esc
+/// stops a task: about a second.
 const QUIT_TICKS: u64 = 7;
 /// Lines of a failed attempt's note shown under it in the log.
 const NOTE_LINES: usize = 6;
@@ -295,9 +296,11 @@ pub enum Msg {
     },
     ServiceLog(Result<Vec<String>, String>),
     /// The services of an interrupted session have stopped; `kept` are the
-    /// forks of interrupted attempts kept for their changes.
+    /// forks of interrupted attempts kept for their changes, and `notes` say
+    /// what could not be told about the others.
     Stopped {
         kept: Vec<String>,
+        notes: Vec<String>,
     },
     Progress(Progress),
     Designed {
@@ -433,6 +436,14 @@ pub struct Task {
     pub design_spend: Spend,
     /// Model calls already counted, so a repeated event is not counted twice.
     counted: HashSet<String>,
+    /// What finished calls cost that no reply has settled yet: an interrupt
+    /// counts it, since the reply that would have will not come.
+    unsettled: Spend,
+    /// Of those, the calls whose cost is unknown.
+    unsettled_unknown: u32,
+    /// Calls that have started and not finished, whose cost is unknown if
+    /// the task is stopped.
+    open_calls: HashSet<String>,
     /// The check is in the log already.
     check_shown: bool,
     recalled_shown: bool,
@@ -458,6 +469,9 @@ impl Task {
             lanes: Vec::new(),
             design_spend: Spend::default(),
             counted: HashSet::new(),
+            unsettled: Spend::default(),
+            unsettled_unknown: 0,
+            open_calls: HashSet::new(),
             check_shown: false,
             recalled_shown: false,
             notes_seen: HashSet::new(),
@@ -467,6 +481,13 @@ impl Task {
             state: RunState::Running,
             waiting: Vec::new(),
         }
+    }
+
+    /// A reply settled every call so far; later progress is for calls after it.
+    fn settle(&mut self) {
+        self.unsettled = Spend::default();
+        self.unsettled_unknown = 0;
+        self.open_calls.clear();
     }
 
     /// What this task has cost so far, by finished model calls; the run's
@@ -872,6 +893,9 @@ pub struct App {
     pub spent_usd: f64,
     /// Calls whose usage or price is still unknown; spending is a subtotal.
     pub uncounted_calls: u32,
+    /// Stopped work none of whose calls could be counted: a run without
+    /// previews, or memory learning, whose reply never came.
+    pub uncounted_stops: u32,
     /// Runs memory is learning from.
     pub learning: HashSet<String>,
     /// Results still available in their forks, including restored results.
@@ -907,6 +931,8 @@ pub struct App {
     pub tick: u64,
     /// The tick of a first Ctrl+C or Ctrl+D; a second soon after quits.
     quit_armed: Option<u64>,
+    /// The tick of a first Esc while a task runs; a second soon after stops it.
+    stop_armed: Option<u64>,
     pub quit: bool,
     /// The tick of the last key or paste.
     last_key: Option<u64>,
@@ -975,6 +1001,7 @@ impl App {
             last_run: None,
             spent_usd: 0.0,
             uncounted_calls: 0,
+            uncounted_stops: 0,
             learning: HashSet::new(),
             queue: Vec::new(),
             queue_paused: false,
@@ -997,6 +1024,7 @@ impl App {
             flash: None,
             tick: 0,
             quit_armed: None,
+            stop_armed: None,
             quit: false,
             last_key: None,
             focused: None,
@@ -1453,8 +1481,11 @@ impl App {
                 }
                 Vec::new()
             }
-            Msg::Stopped { kept } => {
+            Msg::Stopped { kept, notes } => {
                 self.fork_operations = 0;
+                for note in &notes {
+                    self.push(Line::from(span(format!("  {}", clean_line(note)), Tone::Warn)));
+                }
                 if !kept.is_empty() {
                     self.push(Line::from(span(format!("  kept {} · interrupted", kept.len()), Tone::Dim)));
                     for fork in &kept {
@@ -1734,6 +1765,7 @@ impl App {
             return Vec::new();
         }
         self.quit_armed = None;
+        let stop_armed = self.stop_armed.take();
         if self.shortcuts.is_some() {
             if key_is(&key, KeyCode::Char('?')) {
                 self.shortcuts = None;
@@ -1790,8 +1822,17 @@ impl App {
             self.input.take();
             return Vec::new();
         }
-        if ctrl(&key, 'c') || (key_is(&key, KeyCode::Esc) && self.busy()) {
+        if ctrl(&key, 'c') {
             return self.interrupt();
+        }
+        // Esc also closes every overlay and prompt: one press too many must not throw a task's work away.
+        if key_is(&key, KeyCode::Esc) && self.busy() {
+            if stop_armed.is_some_and(|at| self.tick.wrapping_sub(at) <= QUIT_TICKS) {
+                return self.interrupt();
+            }
+            self.stop_armed = Some(self.tick);
+            self.flash = Some("esc again to stop".into());
+            return Vec::new();
         }
         // Confirmation must leave the evidence in the log reachable.
         if self.prompt.is_some() {
@@ -1962,9 +2003,15 @@ impl App {
             self.keep_entry(entry);
         }
         self.prompt = None;
+        let stopped = self.task.take();
+        let spent = stopped.as_ref().and_then(|task| self.settle_stopped(task));
+        if !self.learning.is_empty() {
+            // Learning's reply would have said what it cost; the services stop before it comes.
+            self.uncounted_stops = self.uncounted_stops.saturating_add(self.learning.len() as u32);
+        }
         let mut attempts = Vec::new();
         let mut check_files = Vec::new();
-        if let Some(mut task) = self.task.take() {
+        if let Some(mut task) = stopped {
             self.interrupted_task = Some(task.req.task.clone());
             if matches!(task.phase, Phase::Running) {
                 attempts = task.lanes.iter().filter_map(|l| l.fork.clone()).collect();
@@ -1987,8 +2034,32 @@ impl App {
         self.zoom = None;
         self.learning.clear();
         self.push(Line::from(span("■ stopped; restarting the services", Tone::Warn)));
+        if let Some(spent) = spent {
+            self.push(Line::from(span(format!("  {spent}"), Tone::Dim)));
+        }
         self.session = SessionState::Starting;
         vec![Action::Interrupt { keep, attempts, check_files }]
+    }
+
+    /// Count what a task stopped before its reply has spent so far, and say
+    /// what that was; `None` when a reply has settled it already.
+    fn settle_stopped(&mut self, task: &Task) -> Option<String> {
+        if !matches!(task.phase, Phase::Designing | Phase::Running) {
+            return None;
+        }
+        if !task.req.stream {
+            // Without previews no call's cost arrives before the reply.
+            self.uncounted_stops = self.uncounted_stops.saturating_add(1);
+            return Some("what it spent is unknown: previews were off, and its reply will not come".into());
+        }
+        let uncounted = task.unsettled_unknown.saturating_add(task.open_calls.len() as u32);
+        self.spent_usd += task.unsettled.usd;
+        self.uncounted_calls = self.uncounted_calls.saturating_add(uncounted);
+        Some(match uncounted {
+            0 => format!("${:.2} spent before it stopped", task.unsettled.usd),
+            1 => format!("${:.2} known spent before it stopped · 1 call uncounted", task.unsettled.usd),
+            n => format!("${:.2} known spent before it stopped · {n} calls uncounted", task.unsettled.usd),
+        })
     }
 
     fn history_step(&mut self, back: bool) {
@@ -2075,6 +2146,8 @@ impl App {
         req.apply = mode == Mode::Auto;
         req.earlier = self.earlier.clone();
         req.stream = settings.stream;
+        // An interrupt looks at what the attempts changed itself: the planner must not drop their forks first.
+        req.keep_cancelled_forks = true;
 
         self.gap();
         self.echo(&line);
@@ -2575,10 +2648,18 @@ impl App {
                         task.lanes.sort_by_key(|l| l.index);
                     }
                 }
+                if matches!(event, Progress::ModelStarted { .. }) && !task.counted.contains(&context.call) {
+                    task.open_calls.insert(context.call.clone());
+                }
                 // Counted even when previews are off or the lane has ended:
                 // a cancelled attempt's last call settles after it stops.
                 if let Progress::ModelFinished { cost_usd, .. } = &event {
+                    task.open_calls.remove(&context.call);
                     if task.counted.insert(context.call.clone()) {
+                        task.unsettled.add(*cost_usd);
+                        if !cost_usd.is_some_and(|c| c.is_finite() && c >= 0.0) {
+                            task.unsettled_unknown += 1;
+                        }
                         match (context.attempt, attempt) {
                             (None, _) => task.design_spend.add(*cost_usd),
                             (_, Some(attempt)) => {
@@ -2674,6 +2755,7 @@ impl App {
         self.log.extend(task.designer_preview.finish("ended; final preview event unavailable", true));
         match result {
             Ok(d) => {
+                task.settle();
                 task.design_spend = Spend { usd: d.cost_usd, unknown: d.uncounted_calls > 0 };
                 self.spent_usd += d.cost_usd;
                 self.uncounted_calls = self.uncounted_calls.saturating_add(d.uncounted_calls);
@@ -2801,6 +2883,7 @@ impl App {
             return Vec::new();
         }
         let mut task = self.task.take().expect("checked above");
+        task.settle();
         self.zoom = None;
         let now = Instant::now();
         for lane in &mut task.lanes {
@@ -3402,7 +3485,7 @@ impl App {
                         ("ctrl+r", "search this workspace's input history"),
                     ]);
                     if self.busy() {
-                        pairs.push(("esc", "stop task"));
+                        pairs.push(("esc twice", "stop task"));
                     }
                     "tasks"
                 }
@@ -4105,7 +4188,7 @@ fn help() -> Vec<Line<'static>> {
         row("@path", "point the task at a file; arrows pick, Tab completes"),
         row("? (empty input)", "shortcuts for the current screen"),
         row("ctrl+o", "the transcript: model text, tool arguments and results (o: of the attempt shown large)"),
-        row("esc", "stop the task"),
+        row("esc twice", "stop the task"),
         row("enter (running)", "add what you typed to the running task"),
         row("pgup / pgdn", "scroll the log"),
         row("ctrl+home / end", "the start or end of the log"),
@@ -4145,6 +4228,13 @@ mod tests {
     use ratatui::crossterm::event::KeyEventState;
 
     use super::*;
+
+    /// Esc twice, as stopping a running task takes.
+    fn stop(app: &mut App) -> Vec<Action> {
+        assert!(app.update(key(KeyCode::Esc)).is_empty(), "one Esc only warns");
+        assert_eq!(app.flash.as_deref(), Some("esc again to stop"));
+        app.update(key(KeyCode::Esc))
+    }
 
     fn key(code: KeyCode) -> Msg {
         Msg::Key(KeyEvent {
@@ -4311,10 +4401,10 @@ mod tests {
         let mut app = queue_app();
         type_in(&mut app, "first");
         type_in(&mut app, "/queue add second\nwith a second line");
-        assert!(matches!(app.update(key(KeyCode::Esc)).as_slice(), [Action::Interrupt { .. }]));
+        assert!(matches!(stop(&mut app).as_slice(), [Action::Interrupt { .. }]));
         assert!(app.queue_paused && app.queue.len() == 1);
         assert!(frame_text(&mut app).contains("1 queued"));
-        assert_eq!(app.update(Msg::Stopped { kept: vec![] }), [Action::StartSession]);
+        assert_eq!(app.update(Msg::Stopped { kept: vec![], notes: vec![] }), [Action::StartSession]);
         assert!(app
             .update(Msg::SessionUp { versions: vec![], memory_problem: Some("not configured".into()) })
             .is_empty());
@@ -4734,6 +4824,113 @@ mod tests {
 
         app.update(Msg::Ran { trace, result: Ok(passed(false, Some("fork"))) });
         assert!((app.spent_usd - 0.3).abs() < 1e-9, "the reply settles the run once: {}", app.spent_usd);
+    }
+
+    #[test]
+    fn a_single_esc_does_not_stop_a_running_task() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        type_in(&mut app, "implement it");
+        assert!(app.update(key(KeyCode::Esc)).is_empty());
+        assert!(app.task.is_some());
+        assert_eq!(app.flash.as_deref(), Some("esc again to stop"));
+        // Another key in between, or a second press too late, starts over.
+        app.update(key(KeyCode::Char('x')));
+        assert!(app.update(key(KeyCode::Esc)).is_empty());
+        for _ in 0..=QUIT_TICKS {
+            app.update(Msg::Tick);
+        }
+        assert!(app.update(key(KeyCode::Esc)).is_empty());
+        assert!(app.task.is_some());
+        assert!(matches!(app.update(key(KeyCode::Esc)).as_slice(), [Action::Interrupt { .. }]));
+        assert!(app.task.is_none());
+    }
+
+    #[test]
+    fn an_interrupt_counts_what_the_stopped_run_spent_and_keeps_unknown_calls_uncounted() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert!(req.keep_cancelled_forks, "the interface decides which stopped forks hold work");
+        app.update(finished(&app, Some(0), "a", Some(0.1)));
+        app.update(finished(&app, Some(1), "b", Some(0.2)));
+        app.update(finished(&app, Some(1), "c", None));
+        let open = molt_api::progress::ModelCall { call: "d".into(), ..model_context(&app, Some(0), 0) };
+        app.update(Msg::Progress(Progress::ModelStarted { context: open }));
+        let late = finished(&app, Some(0), "d", Some(0.5));
+        assert_eq!(app.spent_usd, 0.0);
+
+        assert!(matches!(stop(&mut app).as_slice(), [Action::Interrupt { .. }]));
+        assert!((app.spent_usd - 0.3).abs() < 1e-9, "{}", app.spent_usd);
+        assert_eq!(app.uncounted_calls, 2, "a call without a price and one cut off are not free");
+        assert!(log(&app).contains("$0.30 known spent before it stopped · 2 calls uncounted"), "{}", log(&app));
+        assert!(frame_text(&mut app).contains("$0.30 known · 2 calls uncounted"));
+        app.update(late);
+        assert!((app.spent_usd - 0.3).abs() < 1e-9, "the stopped run is not counted twice");
+    }
+
+    #[test]
+    fn a_settled_design_is_not_counted_again_when_its_run_is_stopped() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.rules.always_ask = true;
+        let actions = type_in(&mut app, "task");
+        let [Action::Design { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let trace = trace.clone();
+        app.update(finished(&app, None, "design", Some(0.25)));
+        app.update(Msg::Designed { trace, result: Ok(design()), existing: vec![] });
+        app.update(key(KeyCode::Enter));
+        app.update(finished(&app, Some(0), "a", Some(0.1)));
+        stop(&mut app);
+        assert!((app.spent_usd - 0.35).abs() < 1e-9, "{}", app.spent_usd);
+        assert_eq!(app.uncounted_calls, 0);
+        assert!(log(&app).contains("$0.10 spent before it stopped"), "{}", log(&app));
+    }
+
+    #[test]
+    fn a_design_stopped_before_its_reply_counts_its_finished_calls() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "task");
+        assert_eq!(app.task.as_ref().unwrap().phase, Phase::Designing);
+        app.update(finished(&app, None, "design", Some(0.05)));
+        assert!(matches!(stop(&mut app).as_slice(), [Action::Interrupt { .. }]));
+        assert!((app.spent_usd - 0.05).abs() < 1e-9, "{}", app.spent_usd);
+    }
+
+    #[test]
+    fn a_stopped_run_without_previews_leaves_the_session_total_marked_incomplete() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/stream off");
+        type_in(&mut app, "/check true");
+        type_in(&mut app, "implement it");
+        stop(&mut app);
+        assert_eq!((app.spent_usd, app.uncounted_calls, app.uncounted_stops), (0.0, 0, 1));
+        assert!(log(&app).contains("what it spent is unknown"), "{}", log(&app));
+        assert!(frame_text(&mut app).contains("$0.00 known · 1 stopped task uncounted"));
+    }
+
+    #[test]
+    fn a_fork_kept_because_its_changes_could_not_be_listed_says_why() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        type_in(&mut app, "implement it");
+        let run = app.task.as_ref().unwrap().trace.to_string();
+        app.update(Msg::Progress(Progress::AttemptStarted { run, attempt: 0, fork: Some("/d/work/fork-a".into()) }));
+        let actions = stop(&mut app);
+        let [Action::Interrupt { attempts, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(attempts, &["/d/work/fork-a"]);
+        let note =
+            "the changes in /d/work/fork-a could not be listed, so it is kept in case it holds work: fs.diff failed";
+        app.update(Msg::Stopped { kept: vec!["/d/work/fork-a".into()], notes: vec![note.into()] });
+        assert_eq!(app.kept, ["/d/work/fork-a"]);
+        let log = log(&app);
+        assert!(log.contains(note) && log.ends_with("  kept 1 · interrupted\n  kept in /d/work/fork-a"), "{log}");
     }
 
     #[test]
@@ -5505,14 +5702,14 @@ mod tests {
         app.update(Msg::Progress(Progress::ModelText { context, text: "hidden preview".into() }));
         assert!(app.task.as_ref().unwrap().lanes.is_empty());
         assert!(!frame_text(&mut app).contains("hidden preview"));
-        app.update(key(KeyCode::Esc));
+        stop(&mut app);
         up(&mut app);
         type_in(&mut app, "/stream on");
         type_in(&mut app, "implement it again");
         let context = model_context(&app, Some(0), 1);
         app.update(Msg::Progress(Progress::ModelText { context: context.clone(), text: "provisional".into() }));
         assert!(frame_text(&mut app).contains("provisional"));
-        assert!(matches!(app.update(key(KeyCode::Esc))[0], Action::Interrupt { .. }));
+        assert!(matches!(stop(&mut app)[0], Action::Interrupt { .. }));
         // Only the offer to start again with the same check is left.
         assert!(app.task.is_none() && matches!(app.prompt, Some(Prompt::Retry { stopped: true, .. })));
         app.update(Msg::Progress(Progress::ModelText { context, text: "late result".into() }));
@@ -5914,12 +6111,12 @@ mod tests {
         let [Action::Run { req, .. }] = actions.as_slice() else { panic!() };
         assert!(!req.verify && req.check.is_none() && req.check_files.is_empty());
 
-        // Esc while it runs stops everything.
-        let actions = app.update(key(KeyCode::Esc));
+        // Esc twice while it runs stops everything.
+        let actions = stop(&mut app);
         assert_eq!(actions, [Action::Interrupt { keep: vec![], attempts: vec![], check_files: vec![] }]);
         assert!(app.task.is_none());
         assert_eq!(app.session, SessionState::Starting);
-        assert_eq!(app.update(Msg::Stopped { kept: vec![] }), [Action::StartSession]);
+        assert_eq!(app.update(Msg::Stopped { kept: vec![], notes: vec![] }), [Action::StartSession]);
 
         // A design that fails ends the task.
         up(&mut app);
@@ -6707,7 +6904,7 @@ mod tests {
                 fork: fork.map(str::to_owned),
             }));
         }
-        let actions = app.update(key(KeyCode::Esc));
+        let actions = stop(&mut app);
         assert_eq!(
             actions,
             [Action::Interrupt {
@@ -6717,7 +6914,10 @@ mod tests {
             }]
         );
         // The runtime found changes in one of them.
-        assert_eq!(app.update(Msg::Stopped { kept: vec!["/d/work/fork-b".into()] }), [Action::StartSession]);
+        assert_eq!(
+            app.update(Msg::Stopped { kept: vec!["/d/work/fork-b".into()], notes: vec![] }),
+            [Action::StartSession]
+        );
         assert_eq!(app.kept, ["/d/work/fork-b"]);
         assert!(log(&app).ends_with("  kept 1 · interrupted\n  kept in /d/work/fork-b"), "{}", log(&app));
 
