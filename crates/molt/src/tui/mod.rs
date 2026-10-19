@@ -39,6 +39,7 @@ use tokio::task::JoinHandle;
 
 use self::app::{Action, App, Msg};
 use self::notice::Notice;
+use crate::config::secret_name;
 use crate::session::Session;
 use crate::{agent, Config};
 
@@ -57,6 +58,8 @@ pub struct Options {
     /// Hosts the agent may read web pages from.
     pub allow_web: Vec<String>,
     pub web_resolver: Option<String>,
+    /// The `[profile.NAME]` of the config to take defaults from.
+    pub profile: Option<String>,
 }
 
 /// Run the interface until the user quits. Returns the forks the user kept.
@@ -68,8 +71,13 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
     let stop = crate::stop_signal()?;
     let (workspace, project) = agent::locate(opts.project.as_deref(), &opts.workspace, opts.config.is_some())?;
     let path = workspace.to_str().context("the workspace path is not UTF-8")?.to_owned();
-    let mut cfg =
-        agent::resolve_config(opts.config.as_deref(), &workspace, opts.data_dir.as_deref(), project.as_ref())?;
+    let mut cfg = agent::resolve_config(
+        opts.config.as_deref(),
+        &workspace,
+        opts.data_dir.as_deref(),
+        project.as_ref(),
+        opts.profile.as_deref(),
+    )?;
     if let Some(shell) = cfg.service_mut("shell") {
         shell.pass_env.extend(opts.pass_env);
     }
@@ -361,10 +369,6 @@ fn read_terminal(tx: UnboundedSender<Msg>, pause: Arc<Pause>) {
 /// hides them in what commands print.
 fn secrets_in_env() -> Vec<String> {
     std::env::vars().filter(|(name, value)| value.len() >= 8 && secret_name(name)).map(|(_, value)| value).collect()
-}
-
-fn secret_name(name: &str) -> bool {
-    ["API_KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|marker| name.to_ascii_uppercase().contains(marker))
 }
 
 /// How long an interrupt waits before it lists a fork's changes again,

@@ -162,9 +162,14 @@ pub struct Config {
     pub tui: TuiSection,
     #[serde(default)]
     pub hooks: Vec<molt_planner::hooks::Hook>,
+    /// Sets of `[tui]` defaults, one picked with `--profile NAME`.
+    #[serde(default, rename = "profile", skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, TuiSection>,
 }
 
-/// Defaults for the terminal interface, from an explicitly selected config.
+/// Defaults for the terminal interface; `model`, `effort`, `attempts`,
+/// `budget` and `check` are `molt do`'s too (`molt ask` takes the first
+/// three but `attempts`), each where its flag is not given.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TuiSection {
@@ -294,6 +299,11 @@ const MEMORY_ENV: &[&str] = &[
     "MOLT_MODEL",
 ];
 
+/// Whether a variable of this name likely holds a credential.
+pub(crate) fn secret_name(name: &str) -> bool {
+    ["API_KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|marker| name.to_ascii_uppercase().contains(marker))
+}
+
 /// The web service's name.
 pub const WEB: &str = "web";
 
@@ -311,6 +321,9 @@ impl Config {
     pub fn parse(text: &str) -> anyhow::Result<Self> {
         let config: Self = toml::from_str(text)?;
         config.tui.validate()?;
+        for (name, profile) in &config.profiles {
+            profile.validate().with_context(|| format!("in profile {name}"))?;
+        }
         Ok(config)
     }
 
@@ -399,6 +412,7 @@ impl Config {
             confirm: ConfirmSection::default(),
             tui: TuiSection::default(),
             hooks: Vec::new(),
+            profiles: BTreeMap::new(),
         })
     }
 
