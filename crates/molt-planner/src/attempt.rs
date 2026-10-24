@@ -5,7 +5,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use molt_api::model::{attempt_name, tool_result, user_blocks, user_text, Role, ToolUse, STOP_MAX_TOKENS};
-use molt_api::planner::tools::{DisputeCheck, DISPUTE_CHECK};
+use molt_api::planner::tools::{DisputeCheck, DISPUTE_CHECK, EXPLORE};
 use molt_api::planner::{AttemptReport, AttemptStatus, CheckDispute, Criterion, Finding};
 use molt_api::progress::Progress;
 use molt_api::shell;
@@ -18,7 +18,7 @@ use crate::checkpoint::{SavedAttempt, SavedEnd};
 use crate::control;
 use crate::ctx::{Conversation, Ctx, Spend};
 use crate::tools::{self, Actor};
-use crate::{judge, prompts};
+use crate::{explore, judge, prompts};
 
 /// Bytes of check output kept in a failed attempt's note.
 const NOTE_TAIL: usize = 2000;
@@ -327,6 +327,8 @@ impl Attempt {
         // A read-only `ask` attempt may only read, so it is not offered the question either.
         let tools = if ctx.interactive && !self.read_only { prompts::with_ask_user(&tools) } else { tools };
         let max_turns = seat.max_turns.unwrap_or(ctx.max_turns);
+        // Last, after ask_user: without it the list is what it was.
+        let tools = if self.explores() { explore::with_explore(tools) } else { tools };
         // A final reply the model gave before the run stopped, still to be checked.
         let mut given = None;
         let (fork, mut conv) = match resume {
@@ -424,7 +426,9 @@ impl Attempt {
                             return Err(End::disputed(dispute));
                         }
                         let actor = Actor::Attempt { index: self.index, turn: self.meter.turns };
-                        let results = self.or_cancel(self.execute(&fork, &calls, cut_off, actor)).await?;
+                        let (results, explored) = self.or_cancel(self.execute(&fork, &calls, cut_off, actor)).await?;
+                        // What its explorer spent is the attempt's too; the run already counts it.
+                        self.meter.spend.absorb(&explored);
                         conv.push(user_blocks(results));
                         self.save(&conv);
                         continue;
@@ -574,20 +578,50 @@ impl Attempt {
         self.conversation = kept.messages;
     }
 
-    /// Results for a turn's calls, in order. A dispute_check that reaches
-    /// here was not well formed, and gets an error saying why. An attempt
-    /// that only reads runs nothing else: the calls are refused unrun.
-    async fn execute(&self, fork: &str, calls: &[ToolUse], cut_off: Option<&str>, actor: Actor) -> Vec<Value> {
+    /// It is offered `explore`: its workflow explores, it changes files,
+    /// and its role may have the tool.
+    fn explores(&self) -> bool {
+        !self.read_only && self.ctx.workflow.explores() && self.ctx.seats().attempt.allows(EXPLORE)
+    }
+
+    /// Results for a turn's calls, in order, and what its `explore` calls
+    /// spent. A dispute_check that reaches here was not well formed, and
+    /// gets an error saying why. An attempt that only reads runs nothing
+    /// else: the calls are refused unrun. `explore` calls run after the
+    /// turn's other calls, one at a time, each with its slice of what is
+    /// left.
+    async fn execute(&self, fork: &str, calls: &[ToolUse], cut_off: Option<&str>, actor: Actor) -> (Vec<Value>, Spend) {
+        let explores = self.explores();
         let is_dispute = |c: &ToolUse| self.check.is_some() && c.name == DISPUTE_CHECK;
+        let is_explore = |c: &ToolUse| explores && c.name == EXPLORE;
         let refused = |c: &ToolUse| self.read_only && !self.ctx.tools.offers(ToolRole::Attempt, true, &c.name);
-        let others: Vec<ToolUse> = calls.iter().filter(|c| !is_dispute(c) && !refused(c)).cloned().collect();
+        let others: Vec<ToolUse> =
+            calls.iter().filter(|c| !is_dispute(c) && !is_explore(c) && !refused(c)).cloned().collect();
         let mut results = tools::execute(&self.ctx, fork, &others, cut_off, actor).await.into_iter();
-        calls
+        let mut spent = Spend::default();
+        let mut explored = Vec::new();
+        for call in calls.iter().filter(|c| is_explore(c)) {
+            if cut_off == Some(call.id.as_str()) {
+                explored.push(tool_result(&call.id, prompts::CUT_OFF, true));
+                continue;
+            }
+            let (ctx, index, turn) = (&self.ctx, self.index, self.meter.turns);
+            let e = explore::explore(ctx, fork, index, turn, call, self.memory_tools, &self.cancel).await;
+            spent.absorb(&e.spend);
+            explored.push(tool_result(&call.id, e.text, e.is_error));
+        }
+        let mut explored = explored.into_iter();
+        let results = calls
             .iter()
             .map(|call| {
                 if refused(call) {
                     let why = format!("{} is not available: this task only reads, and changes nothing.", call.name);
                     return tool_result(&call.id, why, true);
+                }
+                if is_explore(call) {
+                    return explored
+                        .next()
+                        .unwrap_or_else(|| tool_result(&call.id, "The tool failed unexpectedly.", true));
                 }
                 if !is_dispute(call) {
                     return results
@@ -601,7 +635,8 @@ impl Attempt {
                 };
                 tool_result(&call.id, why, true)
             })
-            .collect()
+            .collect();
+        (results, spent)
     }
 
     /// Have the judge decide the result against the rubric, and say how it

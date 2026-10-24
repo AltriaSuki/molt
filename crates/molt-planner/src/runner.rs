@@ -319,7 +319,7 @@ async fn announce_prompts(ctx: &Ctx) {
 /// The workflow `name` names: a built-in, or one of the planner's own
 /// configuration. `None` is [`workflow::VERIFY`].
 pub(crate) fn workflow(cfg: &Config, name: Option<&str>) -> Result<Workflow, String> {
-    let found = match workflow::builtin(name) {
+    let mut found = match workflow::builtin(name) {
         Some(builtin) => builtin,
         None => {
             let name = name.unwrap_or_default();
@@ -338,6 +338,12 @@ pub(crate) fn workflow(cfg: &Config, name: Option<&str>) -> Result<Workflow, Str
                 .ok_or_else(|| format!("no workflow is named {name:?}: this planner has {}", known()))?
         }
     };
+    // The planner's starter can have every workflow whose attempts change files explore (#42).
+    if cfg.explore {
+        if let Some(attempts) = found.stages.attempts.as_mut().filter(|a| !a.read_only) {
+            attempts.explore = true;
+        }
+    }
     if let Some(problem) = found.problem() {
         return Err(problem);
     }

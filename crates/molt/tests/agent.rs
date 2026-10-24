@@ -539,6 +539,8 @@ fn molt(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) -> to
         "MOLT_MAX_CHECK_ROUNDS",
         "MOLT_BUDGET_USD",
         "MOLT_DESIGN_BUDGET_SHARE",
+        "MOLT_EXPLORE",
+        "MOLT_EXPLORE_MODEL",
         "MOLT_CHECK_TIMEOUT_S",
         "MOLT_MAP_TOKENS",
         "MOLT_CONTEXT_TOKENS",

@@ -20,6 +20,10 @@ until phase 3 of the roadmap.
 An `ask` run gets only the ones that read. The vetter, the reviewer and the
 judge get `read_file`, `list_files` and `search`.
 
+With `MOLT_EXPLORE=on`, or a workflow that sets `attempts.explore`, the
+attempts also get `explore`, last: a question to a sub-agent that reads
+their fork and returns only its conclusion (see [explore.md](explore.md)).
+
 ## Adding a tool of your own
 
 A tool is served by a service you run: a program that connects to the bus

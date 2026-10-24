@@ -182,8 +182,8 @@ impl Pack {
             }
             if let Some(share) = role.budget_share {
                 ensure!(
-                    role.base == Base::Designer,
-                    "role {name}: budget_share is read for designer roles only; leave it out"
+                    matches!(role.base, Base::Designer | Base::Explorer),
+                    "role {name}: budget_share is read for designer and explorer roles only; leave it out"
                 );
                 ensure!(share > 0.0 && share <= 1.0, "role {name}: budget_share must be more than 0 and at most 1");
             }
@@ -399,6 +399,9 @@ impl Seats {
             seats.extend([&self.designer, &self.vetter]);
         }
         seats.push(if workflow.read_only() { &self.explorer } else { &self.attempt });
+        if workflow.explores() {
+            seats.push(&self.explorer);
+        }
         if s.review.is_some_and(|r| !r.rules_only) {
             seats.push(&self.reviewer);
         }
@@ -535,7 +538,7 @@ deliver = {}
         let cases: &[(&str, &str)] = &[
             ("[[role]]\nname = \"x\"\nbase = \"attempt\"\nprompt = \"missing\"\n", "no prompt \"missing\""),
             ("[[role]]\nname = \"reviewer\"\nbase = \"reviewer\"\n", "built-in role"),
-            ("[[role]]\nname = \"x\"\nbase = \"attempt\"\nbudget_share = 0.5\n", "designer roles only"),
+            ("[[role]]\nname = \"x\"\nbase = \"attempt\"\nbudget_share = 0.5\n", "designer and explorer roles only"),
             ("[[role]]\nname = \"x\"\nbase = \"attempt\"\nmax_turns = 0\n", "max_turns"),
             ("[[role]]\nname = \"x\"\nbase = \"attempt\"\nturns = 3\n", "unknown field"),
             (

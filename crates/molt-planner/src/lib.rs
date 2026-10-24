@@ -11,6 +11,7 @@ pub mod checkpoint;
 mod control;
 mod ctx;
 mod designer;
+mod explore;
 mod fit;
 pub mod hooks;
 mod instructions;
@@ -53,6 +54,12 @@ pub struct Config {
     /// The share of a run's budget designing its check may spend, for runs
     /// that set no `design_budget_usd`: more than 0, at most 1.
     pub design_share: f64,
+    /// Offer `explore` to the attempts of every workflow whose attempts
+    /// change files, as if it set `attempts.explore` (#42).
+    pub explore: bool,
+    /// Model for `explore`'s sub-agent when the explorer role names none;
+    /// `None` uses the run's model.
+    pub explore_model: Option<String>,
     /// `max_tokens` for each model call.
     pub max_tokens: u32,
     /// Deadline for one model call.
@@ -117,6 +124,8 @@ impl Default for Config {
             max_check_rounds: 3,
             budget_usd: 10.0,
             design_share: 0.25,
+            explore: false,
+            explore_model: None,
             max_tokens: 32_000,
             model_timeout: Duration::from_secs(1200),
             check_timeout: Duration::from_secs(900),
@@ -142,7 +151,8 @@ impl Default for Config {
 impl Config {
     /// [`Config::default`] overridden by `MOLT_PLANNER_MODEL`,
     /// `MOLT_MAX_TURNS`, `MOLT_MAX_CHECK_ROUNDS`, `MOLT_BUDGET_USD`,
-    /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_MAX_TOKENS`, `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
+    /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_EXPLORE`, `MOLT_EXPLORE_MODEL`, `MOLT_MAX_TOKENS`,
+    /// `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
     /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES`,
     /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL`, `MOLT_PROMPTS_DIR` and `MOLT_SKILLS_DIR`.
     ///
@@ -153,6 +163,8 @@ impl Config {
     /// | `MOLT_MAX_CHECK_ROUNDS` | `3` |
     /// | `MOLT_BUDGET_USD` | `10` |
     /// | `MOLT_DESIGN_BUDGET_SHARE` | `0.25`: designing the check may spend a quarter of the run's budget |
+    /// | `MOLT_EXPLORE` | `off`: only workflows that set `attempts.explore` offer `explore`; `on` for every one whose attempts change files |
+    /// | `MOLT_EXPLORE_MODEL` | unset: `explore`'s sub-agent uses the explorer role's model, else the run's |
     /// | `MOLT_MAX_TOKENS` | `32000` |
     /// | `MOLT_MODEL_TIMEOUT_S` | `1200` |
     /// | `MOLT_CHECK_TIMEOUT_S` | `900` |
@@ -224,6 +236,12 @@ impl Config {
             max_check_rounds: small("MOLT_MAX_CHECK_ROUNDS", d.max_check_rounds)?,
             budget_usd,
             design_share,
+            explore: match get("MOLT_EXPLORE").as_deref() {
+                None | Some("off" | "0" | "false") => false,
+                Some("on" | "1" | "true") => true,
+                Some(v) => anyhow::bail!("MOLT_EXPLORE={v:?}: use on or off"),
+            },
+            explore_model: get("MOLT_EXPLORE_MODEL"),
             max_tokens: small("MOLT_MAX_TOKENS", d.max_tokens)?,
             model_timeout: Duration::from_secs(number("MOLT_MODEL_TIMEOUT_S", d.model_timeout.as_secs())?),
             check_timeout: Duration::from_secs(number("MOLT_CHECK_TIMEOUT_S", d.check_timeout.as_secs())?),
@@ -694,5 +712,21 @@ mod tests {
         let ok = json!({ "task": "t", "workspace": "/w" });
         let err = handle(bus, cfg, envelope("planner.run", ok)).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Unavailable);
+    }
+
+    #[test]
+    fn explore_is_off_unless_the_planners_starter_turns_it_on() {
+        let cfg = from(&[]).unwrap();
+        assert!(!cfg.explore && cfg.explore_model.is_none());
+        let cfg = from(&[("MOLT_EXPLORE", "on"), ("MOLT_EXPLORE_MODEL", "haiku")]).unwrap();
+        assert!(cfg.explore && cfg.explore_model.as_deref() == Some("haiku"));
+        assert!(!from(&[("MOLT_EXPLORE", "off")]).unwrap().explore);
+        assert!(format!("{:#}", from(&[("MOLT_EXPLORE", "yes")]).unwrap_err()).contains("use on or off"));
+        // On, it is every workflow whose attempts change files, and never ask's.
+        let cfg = Config { explore: true, ..Config::default() };
+        assert!(runner::workflow(&cfg, None).unwrap().explores());
+        assert!(runner::workflow(&cfg, Some("quick")).unwrap().explores());
+        assert!(!runner::workflow(&cfg, Some("ask")).unwrap().explores());
+        assert!(!runner::workflow(&Config::default(), None).unwrap().explores());
     }
 }

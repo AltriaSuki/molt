@@ -49,6 +49,13 @@ impl Spend {
         // This is the known subtotal; unknown calls are reported separately.
         self.cost_usd += resp.cost_usd.unwrap_or(0.0);
     }
+
+    /// Count what another loop spent, such as an attempt's explorer, as this one's too.
+    pub fn absorb(&mut self, other: &Spend) {
+        self.usage.add(&other.usage);
+        self.cost_usd += other.cost_usd;
+        self.unknown_calls += other.unknown_calls;
+    }
 }
 
 /// The run's spend and its model calls still unanswered, kept together so a
@@ -479,6 +486,7 @@ impl Ctx {
             stream: self.stream.then_some(model::StreamContext { attempt: conv.attempt, turn }),
             role: Some(conv.role),
             prompt: conv.prompt.clone(),
+            attempt: conv.attempt,
         };
         if let Some(prompt) = &conv.prompt {
             let mut spoke = self.spoke.lock().unwrap_or_else(PoisonError::into_inner);
