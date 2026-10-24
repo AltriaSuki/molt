@@ -135,7 +135,7 @@ mod tests {
         type_in(&mut app, "/check true");
         type_in(&mut app, "fix parser");
         let trace = app.task.as_ref().unwrap().trace.clone();
-        app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/result"))) });
+        app.update(Msg::Ran { trace, result: Box::new(Ok(passed(false, Some("/fork/result")))) });
         app.learning.clear();
         type_in(&mut app, "/kept");
         let shown = frame_text(&mut app);
@@ -205,7 +205,7 @@ mod tests {
             type_in(&mut app, "/check true");
             type_in(&mut app, "fix parser");
             let trace = app.task.as_ref().unwrap().trace.clone();
-            app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/waiting"))) });
+            app.update(Msg::Ran { trace, result: Box::new(Ok(passed(false, Some("/fork/waiting")))) });
             if exit == 0 {
                 app.update(key(KeyCode::Enter));
                 app.update(Msg::Applied(Err("conflict".into())));
@@ -235,7 +235,7 @@ mod tests {
         assert!(actions.is_empty());
         let actions = type_in(&mut app, "task");
         let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
-        app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-9"))) });
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(passed(false, Some("/d/work/fork-9")))) });
         assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
         assert!(app.update(ctrl_key('d')).is_empty());
         assert_eq!(app.flash.as_deref(), Some("ctrl+d again to quit; 1 result stays in its fork"));

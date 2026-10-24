@@ -496,7 +496,7 @@ mod tests {
         assert!(plain(&task.lanes[0].lines).iter().any(|l| l.contains("now follows v2")));
 
         // Once the task is done, there is nothing to steer.
-        app.update(Msg::Ran { trace: run, result: Ok(passed(true, None)) });
+        app.update(Msg::Ran { trace: run, result: Box::new(Ok(passed(true, None))) });
         assert!(type_in(&mut app, "/pause").is_empty());
         assert_eq!(app.flash.as_deref(), Some("no task is running"));
     }
@@ -510,7 +510,7 @@ mod tests {
         let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
         assert!(req.earlier.is_empty());
         let trace = trace.clone();
-        app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/d/work/fork-1"))) });
+        app.update(Msg::Ran { trace, result: Box::new(Ok(passed(false, Some("/d/work/fork-1")))) });
         if let Some(Prompt::Apply { .. }) = app.prompt {
             app.update(key(KeyCode::Enter));
         }
@@ -527,7 +527,7 @@ mod tests {
         assert_eq!(earlier.summary, "Trailing commas parse.");
         assert_eq!(earlier.changes, ["src/parser.rs"]);
         let trace = trace.clone();
-        app.update(Msg::Ran { trace, result: Ok(passed(true, None)) });
+        app.update(Msg::Ran { trace, result: Box::new(Ok(passed(true, None))) });
         assert_eq!(app.earlier.len(), 2);
 
         type_in(&mut app, "/new");
@@ -546,7 +546,7 @@ mod tests {
             let actions = type_in(&mut app, &format!("task {i}"));
             let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
             let trace = trace.clone();
-            app.update(Msg::Ran { trace, result: Ok(passed(true, None)) });
+            app.update(Msg::Ran { trace, result: Box::new(Ok(passed(true, None))) });
         }
         assert_eq!(app.earlier.len(), EARLIER_TASKS);
         assert_eq!(app.earlier[0].task, "task 2");
@@ -652,7 +652,7 @@ mod tests {
             conversation: conversation(),
             ..passed(false, None)
         };
-        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(answer) });
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(answer)) });
         assert!(actions.is_empty(), "an answer is not learned from: {actions:?}");
         assert!(log(&app).contains("✓ unverified answer"), "{}", log(&app));
 
@@ -678,7 +678,7 @@ mod tests {
         assert!(log(&app).contains("handled as quick (a comment) · /verify for the full workflow"), "{}", log(&app));
         assert_eq!(app.task.as_ref().unwrap().req.workflow.as_deref(), Some("quick"));
         let done = RunResponse { workflow: Some("quick".into()), ..passed(true, None) };
-        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(done) });
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(done)) });
         assert!(actions.iter().all(|a| !matches!(a, Action::Learn { .. })), "quick does not learn: {actions:?}");
 
         let actions = type_in(&mut app, "/verify");
@@ -721,7 +721,7 @@ mod tests {
         let actions = type_in(&mut app, "first");
         let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
         let kept = RunResponse { conversation: conversation(), ..passed(false, Some("/fork/first")) };
-        app.update(Msg::Ran { trace: trace.clone(), result: Ok(kept) });
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(kept)) });
         assert_eq!(app.kept, ["/fork/first"]);
 
         let actions = type_in(&mut app, "/continue now document it");
@@ -733,7 +733,7 @@ mod tests {
             "the whole conversation, and the result it goes on from"
         );
         let applied = RunResponse { conversation: conversation(), ..passed(true, None) };
-        app.update(Msg::Ran { trace: trace.clone(), result: Ok(applied) });
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(applied)) });
         assert!(app.kept.is_empty(), "the kept result was applied with the task that went on from it");
         assert_eq!(app.continuation.as_ref().map(|c| c.fork.clone()), Some(None));
 

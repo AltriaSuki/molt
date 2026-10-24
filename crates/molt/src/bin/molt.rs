@@ -108,6 +108,32 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// See the system prompts runs use, and promote a protected one of your
+    /// prompt pack (~/.config/molt/prompts/).
+    Prompts {
+        #[command(subcommand)]
+        cmd: PromptsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PromptsCmd {
+    /// List every prompt with its version (the first digits of its SHA-256),
+    /// whether it is built in or yours, and whether a protected one of yours
+    /// is promoted; then the pack's roles and workflows.
+    List,
+    /// Print a prompt's text: your pack's file, else the built-in one.
+    Show {
+        name: String,
+        /// The built-in text, whatever your pack holds.
+        #[arg(long)]
+        builtin: bool,
+    },
+    /// Promote your pack's NAME.md as it is now. The reviewer's, the judge's
+    /// and the vetter's prompts, and any prompt a role of theirs speaks
+    /// with, take effect only once promoted, and again after each change.
+    /// It asks you, at a terminal, to type the name back.
+    Promote { name: String },
 }
 
 #[derive(Subcommand)]
@@ -790,6 +816,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             )?;
             print!("{}", layered.show(origin)?);
         }
+        Cmd::Prompts { cmd } => prompts_cmd(cmd)?,
         Cmd::NatsConfig => {
             let cfg = config()?;
             let mut ids: Vec<ServiceId> = cfg.services.iter().map(|s| s.name.clone()).collect();
@@ -1531,4 +1558,30 @@ fn show_notes(notes: &[molt_api::memory::Recalled]) -> String {
         }
     }
     out
+}
+
+fn prompts_cmd(cmd: PromptsCmd) -> anyhow::Result<()> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let dir = molt::prompts::dir(&|name| std::env::var(name).ok());
+    match cmd {
+        PromptsCmd::List => print!("{}", molt::prompts::list(dir.as_deref())?),
+        PromptsCmd::Show { name, builtin } => print!("{}", molt::prompts::show(dir.as_deref(), &name, builtin)?),
+        PromptsCmd::Promote { name } => {
+            let dir = dir.context("there is no prompt pack: HOME is not set, or MOLT_PROMPTS_DIR is none")?;
+            // A promotion is a person's word: a script or an agent has no terminal to type it at.
+            anyhow::ensure!(
+                std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+                "molt prompts promote asks a person to confirm at a terminal; run it there, not from a script"
+            );
+            let mut confirm = |question: &str| -> anyhow::Result<String> {
+                eprint!("{question}");
+                std::io::stderr().flush()?;
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line)?;
+                Ok(line)
+            };
+            molt::prompts::promote(&dir, &name, &mut std::io::stderr(), &mut confirm)?;
+        }
+    }
+    Ok(())
 }

@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(app.task.as_ref().unwrap().version, 1, "its requirements are the checkpoint's");
         let mut resp = passed(true, None);
         resp.cost_usd = 0.4;
-        app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(resp)) });
         assert!((app.spent_usd - 0.4).abs() < 1e-9, "the reply counts what it spent before: {}", app.spent_usd);
         assert_eq!(app.earlier.len(), 1);
         assert!(app.snapshot().active.is_none());
@@ -362,7 +362,7 @@ mod tests {
         type_in(&mut app, "/check true");
         let actions = type_in(&mut app, "first");
         let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
-        app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(true, None)) });
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(passed(true, None))) });
         let snapshot = app.snapshot();
         assert!(snapshot.active.is_none());
 

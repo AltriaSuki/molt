@@ -102,7 +102,7 @@ mod tests {
             attempt(0, AttemptStatus::Failed, &note),
             attempt(1, AttemptStatus::Error, "model call failed: overloaded"),
         ]);
-        let actions = app.update(Msg::Ran { trace, result: Ok(resp) });
+        let actions = app.update(Msg::Ran { trace, result: Box::new(Ok(resp)) });
         assert_eq!(actions.len(), 1, "only learning: {actions:?}");
         let log = log(&app);
         assert!(
@@ -141,7 +141,10 @@ mod tests {
             tool: "read_file".into(),
             detail: "read Makefile".into(),
         }));
-        app.update(Msg::Ran { trace: trace.clone(), result: Ok(failed(vec![attempt(0, AttemptStatus::Failed, "x")])) });
+        app.update(Msg::Ran {
+            trace: trace.clone(),
+            result: Box::new(Ok(failed(vec![attempt(0, AttemptStatus::Failed, "x")]))),
+        });
         assert!(matches!(app.prompt, Some(Prompt::Retry { .. })));
         // A key that is not the offer's goes to the input and ends the offer.
         app.update(key(KeyCode::Char('f')));

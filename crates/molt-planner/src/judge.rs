@@ -73,14 +73,12 @@ pub(crate) async fn judge(
         let reply = clip(reply.to_owned(), MAX_REPLY);
         let requirements = ctx.control.upto(version);
         let first = prompts::judge_first_message(&ctx.task, &requirements, &asked, &reply, &patch, truncated);
-        let mut conv = Conversation::new(
-            prompts::JUDGE_SYSTEM,
-            Arc::new(prompts::judge_tools(&ctx.tools)),
-            first,
-            Role::Judge,
-            None,
-        );
-        conv.model = ctx.judge_model.clone();
+        let seat = ctx.seats().judge;
+        let mut conv = Conversation::seated(&seat, "", prompts::judge_tools(&ctx.tools), first, Role::Judge, None);
+        // The judge model the request names wins over the role's.
+        if ctx.judge_model.is_some() {
+            conv.model = ctx.judge_model.clone();
+        }
         for judged in model(ctx, fork, &mut conv, &asked, cancel).await? {
             let i = judged.criterion as usize - 1;
             let reason = judged.reason.trim().to_owned();
@@ -105,7 +103,9 @@ async fn model(
     let mut meter = Meter::default();
     let mut nudged = false;
     loop {
-        let resp = agent::turn(ctx, conv, MAX_TURNS, &mut meter, cancel).await.map_err(|stop| match stop {
+        let resp = agent::turn(ctx, conv, ctx.seats().judge.max_turns.unwrap_or(MAX_TURNS), &mut meter, cancel)
+            .await
+            .map_err(|stop| match stop {
             Stop::OutOfTurns => Unjudged::Failed("the judge ran out of turns".into()),
             stop => Unjudged::Stopped(stop),
         })?;

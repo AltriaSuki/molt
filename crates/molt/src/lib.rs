@@ -9,6 +9,7 @@ pub mod git;
 pub mod layers;
 mod lock;
 pub mod project;
+pub mod prompts;
 pub mod session;
 pub mod tui;
 

@@ -16,6 +16,7 @@ pub mod hooks;
 mod instructions;
 mod judge;
 mod memory;
+pub mod pack;
 mod prompts;
 mod referenced;
 mod registry;
@@ -93,6 +94,11 @@ pub struct Config {
     /// from whoever starts the planner, never from a request or a project;
     /// a run offers only those whose method the planner holds a capability for.
     pub tools: Vec<molt_proto::tool::ProvidedTool>,
+    /// The prompt pack: the system prompts, roles and workflows besides
+    /// the built-ins (RFC 0003). Like the tools, it comes from whoever
+    /// starts the planner, never from a request or a project. Its
+    /// workflows are run by name, after those of `workflows`.
+    pub pack: Arc<pack::Pack>,
 }
 
 impl Default for Config {
@@ -120,6 +126,7 @@ impl Default for Config {
             workflows: Vec::new(),
             route_model: None,
             tools: Vec::new(),
+            pack: Arc::default(),
         }
     }
 }
@@ -129,7 +136,7 @@ impl Config {
     /// `MOLT_MAX_TURNS`, `MOLT_MAX_CHECK_ROUNDS`, `MOLT_BUDGET_USD`,
     /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_MAX_TOKENS`, `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
     /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES`,
-    /// `MOLT_SYNTAX_CHECK` and `MOLT_ROUTE_MODEL`.
+    /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL` and `MOLT_PROMPTS_DIR`.
     ///
     /// | Variable | Default |
     /// |---|---|
@@ -146,6 +153,7 @@ impl Config {
     /// | `MOLT_INSTRUCTION_FILES` | `AGENTS.md,CLAUDE.md`; `none` reads none |
     /// | `MOLT_SYNTAX_CHECK` | `report`; or `reject`, or `off` |
     /// | `MOLT_ROUTE_MODEL` | unset: the run's model picks the workflow of a run that names `auto` |
+    /// | `MOLT_PROMPTS_DIR` | unset: the built-in prompts; else the prompt pack to read ([`pack::Pack::load`]) |
     ///
     /// An empty variable counts as unset. A value that does not parse is an
     /// error, and so is a zero: none of these limits has a "no limit" value.
@@ -196,6 +204,10 @@ impl Config {
             .context("MOLT_TOOLS_JSON is not a list of tool declarations")?
             .unwrap_or_default();
         validate_tools(&tools)?;
+        let pack = match get(pack::PROMPTS_ENV) {
+            Some(dir) => pack::Pack::load(std::path::Path::new(&dir))?,
+            None => pack::Pack::default(),
+        };
         Ok(Self {
             hooks,
             default_model: get("MOLT_PLANNER_MODEL"),
@@ -236,6 +248,7 @@ impl Config {
             workflows: d.workflows,
             route_model: get("MOLT_ROUTE_MODEL"),
             tools,
+            pack: Arc::new(pack),
         })
     }
 }
@@ -531,6 +544,19 @@ mod tests {
         assert_eq!(cfg.map_tokens, 3_000);
         assert_eq!(cfg.instruction_files, ["AGENTS.md", "CLAUDE.md"]);
         assert_eq!(cfg.syntax_check, molt_api::fs::SyntaxCheck::Report);
+    }
+
+    #[test]
+    fn the_prompt_pack_comes_from_the_directory_its_starter_names() {
+        assert!(from(&[]).unwrap().pack.prompts.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("attempt.md"), "Be brief.\n").unwrap();
+        let path = dir.path().to_str().unwrap();
+        let cfg = from(&[(pack::PROMPTS_ENV, path)]).unwrap();
+        assert_eq!(cfg.pack.prompts["attempt"], "Be brief.");
+        std::fs::write(dir.path().join("pack.toml"), "[[role]]\nname = \"x\"\nbase = \"nobody\"\n").unwrap();
+        assert!(from(&[(pack::PROMPTS_ENV, path)]).is_err(), "a pack that does not read stops the planner");
+        assert!(from(&[(pack::PROMPTS_ENV, "/no/such/pack")]).is_err());
     }
 
     #[test]

@@ -112,7 +112,8 @@ mod tests {
         app.update(Msg::Progress(Progress::AttemptStarted { run: trace.to_string(), attempt: 0, fork: None }));
         assert_eq!(app.title(), "molt · running 1/2");
         look_away(&mut app);
-        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/fork"))) });
+        let actions =
+            app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(passed(false, Some("/d/fork")))) });
         assert_eq!(alerts(&actions), ["molt: result ready"], "by default an ended task does not ring");
         assert_eq!(app.title(), "molt · waiting: apply");
 
@@ -133,7 +134,7 @@ mod tests {
             let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
             let trace = trace.clone();
             look_away(app);
-            let actions = app.update(Msg::Ran { trace, result: outcome });
+            let actions = app.update(Msg::Ran { trace, result: Box::new(outcome) });
             app.prompt = None;
             app.task = None;
             alerts(&actions).into_iter().map(str::to_owned).collect::<Vec<_>>()
@@ -147,7 +148,7 @@ mod tests {
         // Not while the user is at the terminal: just typed, or it has focus.
         let actions = type_in(&mut app, "task");
         let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
-        assert!(alerts(&app.update(Msg::Ran { trace: trace.clone(), result: Err("x".into()) })).is_empty());
+        assert!(alerts(&app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Err("x".into())) })).is_empty());
         app.update(Msg::Focus(true));
         assert!(run(&mut app, Err("boom".into())).is_empty());
         app.update(Msg::Focus(false));

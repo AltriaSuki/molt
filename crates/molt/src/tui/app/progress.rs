@@ -588,7 +588,7 @@ mod tests {
         app.update(Msg::Progress(Progress::ModelText { context, text: "late forged result".into() }));
         assert!(!frame_text(&mut app).contains("forged result"));
         let trace = app.task.as_ref().unwrap().trace.clone();
-        assert!(app.update(Msg::Ran { trace, result: Err("the model refused".into()) }).is_empty());
+        assert!(app.update(Msg::Ran { trace, result: Box::new(Err("the model refused".into())) }).is_empty());
         assert!(app.task.is_none() && app.prompt.is_none());
         assert!(log(&app).contains("the model refused"));
     }
@@ -624,7 +624,7 @@ mod tests {
         app.update(finished(&app, Some(1), "c", Some(0.05)));
         assert_eq!(app.task.as_ref().unwrap().lanes[1].spend.label(), "≥ $0.05");
 
-        app.update(Msg::Ran { trace, result: Ok(passed(false, Some("fork"))) });
+        app.update(Msg::Ran { trace, result: Box::new(Ok(passed(false, Some("fork")))) });
         assert!((app.spent_usd - 0.3).abs() < 1e-9, "the reply settles the run once: {}", app.spent_usd);
     }
 
@@ -705,7 +705,7 @@ mod tests {
         app.update(Msg::Progress(Progress::AttemptStarted { run: trace.to_string(), attempt: 1, fork: None }));
         let resp = passed(false, Some("fork"));
         let cost = resp.attempts.iter().find(|a| a.index == 1).unwrap().cost_usd;
-        app.update(Msg::Ran { trace, result: Ok(resp) });
+        app.update(Msg::Ran { trace, result: Box::new(Ok(resp)) });
         assert_eq!(app.last_lanes.iter().find(|a| a.index == 1).unwrap().spend.usd, cost);
         assert!(cost > 0.0);
     }
@@ -861,7 +861,7 @@ mod tests {
             designed: true,
             rubric: vec![],
         }));
-        app.update(Msg::Ran { trace, result: Ok(passed(true, None)) });
+        app.update(Msg::Ran { trace, result: Box::new(Ok(passed(true, None))) });
         assert!(app.prompt.is_none() && app.task.is_none());
         assert!(log(&app).contains("  $ make test") && log(&app).ends_with("  applied"), "{}", log(&app));
 
@@ -870,7 +870,7 @@ mod tests {
         let actions = type_in(&mut app, "again");
         let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
         assert!(!req.apply);
-        app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-2"))) });
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(passed(false, Some("/d/work/fork-2")))) });
         assert!(app.prompt.is_none());
         assert_eq!(app.kept, ["/d/work/fork-2"]);
     }
@@ -891,7 +891,7 @@ mod tests {
         let mut resp = passed(false, Some("/d/work/fork-3"));
         resp.summary = (0..200).map(|i| format!("summary line {i}")).collect::<Vec<_>>().join("\n");
         resp.changes = (0..30).map(|i| Change { path: format!("src/f{i}.rs"), kind: ChangeKind::Modified }).collect();
-        app.update(Msg::Ran { trace, result: Ok(resp) });
+        app.update(Msg::Ran { trace, result: Box::new(Ok(resp)) });
         let log = log(&app);
         for i in 0..8 {
             assert!(log.contains(&format!("0.50 fact {i}")), "{log}");
@@ -917,7 +917,7 @@ mod tests {
         resp.winner = None;
         resp.changes = vec![];
         resp.summary = (0..200).map(|i| format!("why {i}")).collect::<Vec<_>>().join("\n");
-        app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(resp)) });
         assert!(log(&app).contains("  why 0\n") && log(&app).contains("  why 199"), "{}", log(&app));
         assert!(!log(&app).contains("cut at"), "{}", log(&app));
 
@@ -925,7 +925,7 @@ mod tests {
         let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
         let mut resp = passed(false, Some("/d/work/fork-4"));
         resp.summary = "é".repeat(SUMMARY_BYTES);
-        app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(resp)) });
         let note = format!("  (cut at 1 MB; the whole text is in the audit log, trace {trace})");
         assert!(log(&app).contains(&note), "the cut is said, with where to find the rest");
     }

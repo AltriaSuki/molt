@@ -92,14 +92,16 @@ async fn run_baseline(ctx: &Arc<Ctx>, fork: &str, command: &str, files: &[(Strin
 }
 
 async fn work(ctx: &Arc<Ctx>, fork: &str) -> Design {
-    let tools = Arc::new(prompts::designer_tools(&ctx.tools, ctx.memory.up, ctx.web));
+    let seat = ctx.seats().designer;
+    let tools = prompts::designer_tools(&ctx.tools, ctx.memory.up, ctx.web);
     let first = prompts::designer_first_message(&ctx.task, &ctx.preamble());
-    let mut conv = Conversation::new(prompts::DESIGNER_SYSTEM, tools, first, Role::Designer, None);
+    let mut conv = Conversation::seated(&seat, "", tools, first, Role::Designer, None);
+    let max_turns = seat.max_turns.unwrap_or(MAX_TURNS);
     let mut meter = Meter::default();
     let mut nudged = false;
     let mut conflicted = 0;
     loop {
-        let resp = match agent::turn(ctx, &mut conv, MAX_TURNS, &mut meter, &ctx.cancel).await {
+        let resp = match agent::turn(ctx, &mut conv, max_turns, &mut meter, &ctx.cancel).await {
             Ok(resp) => resp,
             Err(Stop::OutOfTurns) => {
                 return Design::Failed("the check designer ran out of turns without submitting a check".into())

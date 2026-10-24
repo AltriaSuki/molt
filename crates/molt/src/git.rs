@@ -29,6 +29,9 @@ pub const UNDO_TRAILER: &str = "Molt-Undo";
 pub const CHECK_TRAILER: &str = "Molt-Check";
 /// What the run's result was held to: `command`, `judged`, `rules` or `none`.
 pub const VERIFICATION_TRAILER: &str = "Molt-Verification";
+/// A role of the run that spoke with a prompt of the user's pack, and that
+/// prompt's version: `role=NAME prompt=NAME sha256=HEX`.
+pub const PROMPT_TRAILER: &str = "Molt-Prompt";
 
 /// Longest commit subject, in characters, before it is cut.
 const SUBJECT: usize = 72;
@@ -84,6 +87,9 @@ pub struct RunCommit<'a> {
     pub paths: Vec<String>,
     /// Commit on this new branch, made from `HEAD` and switched to.
     pub branch: Option<&'a str>,
+    /// The roles of the run and their prompts; those of the user's prompt
+    /// pack get a trailer each.
+    pub prompts: &'a [molt_api::role::PromptUse],
 }
 
 /// A commit made for a run.
@@ -169,7 +175,8 @@ impl Before {
         };
         let summary = resp.summary.as_str();
         let verification = resp.verification;
-        self.repo.commit_run(&RunCommit { run, summary, task, check, verification, paths, branch })
+        let prompts = resp.prompts.as_slice();
+        self.repo.commit_run(&RunCommit { run, summary, task, check, verification, paths, branch, prompts })
     }
 }
 
@@ -736,6 +743,11 @@ fn run_message(c: &RunCommit) -> (String, String) {
         Some(check) => message.push_str(&format!("{CHECK_TRAILER}: {}\n", one_line(check))),
         None => message.push_str(&format!("{CHECK_TRAILER}: none (unverified)\n")),
     }
+    // The built-in prompts are the planner's version's; a prompt of the user's is named by its hash.
+    for used in c.prompts.iter().filter(|p| p.prompt.source == molt_api::role::Source::User) {
+        let (role, prompt) = (one_line(&used.role), one_line(&used.prompt.name));
+        message.push_str(&format!("{PROMPT_TRAILER}: role={role} prompt={prompt} sha256={}\n", used.prompt.sha256));
+    }
     (subject, message)
 }
 
@@ -775,6 +787,27 @@ mod tests {
         assert!(message.contains("Molt-Verification: none\nMolt-Check: none (unverified)\n"), "{message}");
     }
 
+    #[test]
+    fn a_run_commit_names_each_prompt_of_the_users_pack_by_its_hash() {
+        use molt_api::role::{PromptUse, PromptVersion, Source};
+        let used = |role: &str, source| PromptUse {
+            role: role.into(),
+            prompt: PromptVersion { name: role.into(), sha256: "ab".repeat(32), source },
+        };
+        let prompts = [used("designer", Source::Builtin), used("terse", Source::User)];
+        let c = RunCommit {
+            run: "trace_1",
+            summary: "Fix it",
+            check: Some("make"),
+            prompts: &prompts,
+            ..Default::default()
+        };
+        let (_, message) = run_message(&c);
+        let trailer = format!("Molt-Check: make\nMolt-Prompt: role=terse prompt=terse sha256={}\n", "ab".repeat(32));
+        assert!(message.ends_with(&trailer), "{message}");
+        assert!(!message.contains("role=designer"), "built-in prompts get no trailer");
+    }
+
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git").args(args).current_dir(dir).env_remove("GIT_INDEX_FILE").output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
@@ -805,6 +838,7 @@ mod tests {
             verification: None,
             paths: paths.iter().map(|p| (*p).to_owned()).collect(),
             branch: None,
+            prompts: &[],
         }
     }
 

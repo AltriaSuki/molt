@@ -603,6 +603,7 @@ mod tests {
             verification: None,
             workflow: None,
             conversation: Vec::new(),
+            prompts: Vec::new(),
         }
     }
 
