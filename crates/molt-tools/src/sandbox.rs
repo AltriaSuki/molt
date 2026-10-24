@@ -202,6 +202,19 @@ impl SandboxPolicy {
         Ok(())
     }
 
+    /// A long-lived program, such as an MCP server, in the sandbox the
+    /// commands get, but with no workspace: it sees the system's read-only
+    /// directories, the policy's `read_only` paths, a private `/tmp` and an
+    /// empty home it starts in, and the network only when the policy says
+    /// so. Its environment is only `PATH`, the locale and the policy's
+    /// `environment` names, read from this process. Keep the [`Guard`]
+    /// alive while the program runs.
+    pub fn server_command(&self, program: &Path) -> anyhow::Result<(Command, Guard)> {
+        self.validate()?;
+        ensure!(program.is_absolute(), "the program to sandbox must be an absolute path");
+        self.command(program, None, None, None)
+    }
+
     pub(crate) fn prepare(
         &self,
         roots: &Roots,
@@ -303,8 +316,9 @@ fn read_policy(file: std::fs::File) -> anyhow::Result<SandboxPolicy> {
     Ok(policy)
 }
 
-pub(crate) struct Guard {
-    pub info: std::sync::Arc<std::fs::File>,
+/// What a sandboxed process needs kept open while it runs.
+pub struct Guard {
+    pub(crate) info: std::sync::Arc<std::fs::File>,
     _seccomp: std::fs::File,
 }
 
@@ -440,8 +454,13 @@ mod linux {
                 command.arg("--tmpfs").arg(base.join(".molt"));
             }
         }
-        if let Some(ws) = workspace {
-            command.arg("--bind").arg(ws).arg(ws).arg("--chdir").arg(ws);
+        match workspace {
+            Some(ws) => {
+                command.arg("--bind").arg(ws).arg(ws).arg("--chdir").arg(ws);
+            }
+            None => {
+                command.args(["--chdir", "/home/molt"]);
+            }
         }
         // Build output goes to private directories outside the fork, which
         // persist for the workspace (see `build_dir`).
