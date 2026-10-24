@@ -23,8 +23,8 @@ Issues follow the format of the existing ones:
 - Say what you checked and what you only inferred. "Not measured yet" is
   fine; an unsupported claim is not.
 
-Issues may be written in Chinese or English. Code, comments, commit messages
-and the README are in English.
+Issues may be written in Chinese or English. Code, comments, commit messages,
+the README and the pages in `docs/` are in English.
 
 ## Set up
 
@@ -101,7 +101,17 @@ needs an issue and the maintainer's agreement first.
   a message type says so in its PR.
 
 When you add a guarantee, add its test and a row to that README table. When
-you add or remove a limitation, update "Known limits".
+you add or remove a limitation, update [Known limits](docs/limits.md).
+
+## Documentation
+
+The README holds only the overview, the quick start, the guarantees table and
+a link to each page under `docs/`; how each part works is on its own page
+there (`docs/tui.md`, `docs/do.md`, `docs/memory.md`, ...). A feature pull
+request updates only its own page, so pull requests on different features do
+not conflict in the docs. It touches the README only to add a row to the
+guarantees table, or a link when it adds a page. A link from one page to
+another names the page, as in `config.md#configuration-layers`.
 
 ## Code style
 

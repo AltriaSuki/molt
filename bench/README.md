@@ -1,8 +1,8 @@
 # Benchmark tasks
 
 `molt bench` runs Molt and a plain agent loop on the same coding tasks and
-compares success rate, time to done and cost per task (the main README's
-Benchmark section shows how to run it). The tasks in
+compares success rate, time to done and cost per task ([docs/bench.md](../docs/bench.md)
+shows how to run it). The tasks in
 `tasks/` are also the seed of the evaluator's replay set: every task has an
 id, a split, and a content hash that results record, so later runs can tell
 whether they measured the same thing.
@@ -44,8 +44,8 @@ workspace root with `bash -c`. The task passed when the check exits 0
 within `timeout_s`. Python bytecode caches are removed from the workspace
 first. The agent is not given `hidden/` or `solution/` and is told nothing
 about the check. Its commands run in Molt's sandbox, which shows them only
-the workspace, the system and the toolchains, not the tasks (the main
-README's Benchmark section lists the known limits).
+the workspace, the system and the toolchains, not the tasks ([docs/bench.md](../docs/bench.md)
+lists the known limits).
 
 The check runs with a clean environment: `PATH`, the user, shell, locale
 and time zone, `TMPDIR`, the toolchain roots (`GOROOT`, `JAVA_HOME`,

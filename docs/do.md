@@ -1,0 +1,328 @@
+# `molt do`
+
+```
+molt do TASK [--check CMD | --no-check | --criterion TEXT...] [--workflow NAME] [--attempts N] [--select MODE] [--model M] [--effort E] [--max-turns N]
+        [--budget-usd X] [--design-budget-usd X] [--no-apply | --commit [--branch NAME]] [--no-review] [--json] [--stream]
+        [--workspace DIR] [--data-dir DIR] [--pass-env NAME]... [--no-memory] [--no-learn]
+        [--memory-model MODEL] [--judge-model MODEL] [--checkpoint] [--config FILE]
+molt resume [RUN] [--retry] [--list] [--budget-usd X] [--design-budget-usd X] [--no-apply] [--commit] [--json] [--workspace DIR] ...
+molt undo [RUN] [--workspace DIR] [--data-dir DIR]
+molt ask QUESTION [--model M] [--effort E] [--max-turns N] [--budget-usd X] [--json] [--workspace DIR] ...
+```
+
+`molt ask` answers a question about the workspace with one attempt whose tools
+only read, in the workspace itself: no fork, no check, nothing changed, and
+the report says `outcome: unverified answer`.
+
+| Flag | Meaning |
+| --- | --- |
+| `--workflow NAME` | `verify` (the default: design or take a check, race the attempts, compare, review, learn), `quick` (one attempt, the given check or none, only the review's fixed rules, no learning), `ask` (answer with read-only tools; nothing changes), `auto` (one model call picks among those three, never `ask` with `--check`; stderr says which), or one the planner's configuration defines. |
+| `--check CMD` | Shell command that exits 0 once the task is done, run in each attempt's fork. Default: the planner designs one. |
+| `--no-check` | Design no check: one attempt does the task and its result is applied unverified. This is the plain agent loop `molt bench` compares Molt with. |
+| `--criterion TEXT` | A criterion the result must meet, for a task no command can check (repeatable, at most 12): the criteria are the run's rubric, an independent judge decides each, and no check is designed (see [Tasks no command can check](#tasks-no-command-can-check)). Not with `--check` or `--no-check`. |
+| `--attempts N` | Parallel attempts, 1 to 8 (default 2). The first to pass wins and the others are cancelled, unless `--select` says otherwise. |
+| `--select MODE` | How to pick among attempts that pass: `first` (default) takes the first; `wait:<seconds>` gives the others that long after the first passes; `all` lets every attempt finish. Then the passing ones are compared (see below). |
+| `--model`, `--effort` | Model for the attempts (`opus`, `sonnet`, `haiku` or an id) and how hard it thinks. |
+| `--max-turns`, `--budget-usd` | Model turns per attempt, and the spending limit for the whole run. |
+| `--design-budget-usd X` | The most designing the check may spend, out of the run's budget and at most all of it (see [Designing has a budget](#designing-has-a-budget)). Default: a quarter of the run's budget, or the share `MOLT_DESIGN_BUDGET_SHARE` sets. |
+| `--no-apply` | Keep the result in its fork and print its path instead of merging it. |
+| `--commit` | Commit the applied result to git (see below). |
+| `--branch NAME` | With `--commit`, commit on a new branch made from the current commit and switched to. |
+| `--no-review` | Skip the review of a passing result (see below). |
+| `--json` | Print the full result (`planner.run`'s reply in `molt-api`) as JSON. |
+| `--stream` | Show model text previews on stderr while the designer and attempts work. The final result still goes to stdout, including with `--json`. |
+| `--workspace DIR` | The project (default: the current directory). |
+| `--data-dir DIR` | Kernel state, the audit log and forks. Default `~/.cache/molt/<project>-<hash>` (under `$XDG_CACHE_HOME` if set). Must be outside the workspace. |
+| `--pass-env NAME` | Pass a variable from your environment to the commands the agent runs, the check included. Repeatable. |
+| `--no-memory` | Run without memory: no map or notes for the model, nothing learned. |
+| `--no-learn` | Use memory, but do not learn from this run (learning is one more model call after it). |
+| `--memory-model MODEL` | The model memory learns from this run with; `same` uses the attempts' model. Default: `MOLT_MEMORY_MODEL`, else the attempts' model. |
+| `--judge-model MODEL` | The model that judges a task no command can check against its criteria (below). Default: the attempts' model. |
+| `--checkpoint` | Save a checkpoint as the run goes, so a run that stops before it finishes can go on with `molt resume` (below). |
+| `--config FILE` | Run your own service setup (see `molt.example.toml`) instead of the default one. |
+
+Progress goes to stderr and the result to stdout. Control characters in text
+from the model or from file names are printed escaped.
+
+Build output stays out of the result. Commands build into a private
+directory outside the fork (see "Linux command isolation"), and a file a
+command still leaves in the fork that looks like build output, in a build or
+cache directory (`target-*/` at the top, `__pycache__/`, `node_modules/`,
+`.pytest_cache/`, a directory holding a `CACHEDIR.TAG`, ...) or compiled
+(`.pyc`, `.o`, `.rlib`, `.so`, a binary executable, ...), is left out unless
+the original has it or the attempt wrote it with its file tools. The report
+says how many were left out and names a few (`left_out` in `--json`), and in
+the interface's confirm mode they are a reason to stop.
+
+A result that passed its check is reviewed before it is applied. Fixed rules
+look for the usual ways of gaming a check: deleted test files, new skip or
+`only` markers, and changed test configuration. A reviewer model then reads
+the task, the check and the diff with read-only tools and answers approve,
+concern or reject. Only an approved result is merged; otherwise it is kept in
+its fork and the findings are printed. Unverified results (`--no-check`) and
+empty changes are not reviewed.
+
+With `--select wait:<seconds>` or `--select all`, attempts go on after the
+first one passes, and when more than one passes they are compared on what can
+be audited, never on a model's opinion of its own work: first whether the
+project's own test suite still passes in each one's fork (the designer names
+the suite when it finds one), then fewer changed lines, then fewer changed
+files, then which passed first. With review on, the candidates are reviewed in
+that order and the first one approved wins, so a result that games the check
+gives way to the next. The report and `--json` (`selection`) list every
+candidate with its scores, and the choice is noted in the audit log. When
+less budget is left than the first passing attempt cost, the run takes it
+without waiting, as `first` would. To compare the modes on the benchmark, add
+an arm: `molt bench --arm molt --arm select-all="--select all"`.
+
+### Tasks no command can check
+
+Some tasks have no command that can tell when they are done: write a design
+note, reword the error messages, explain a module in its docs. For those the
+designer sets a rubric instead of a check: a few concrete criteria the result
+must meet, each with a command where one can check that part (a file exists,
+a word is gone) and without one where only reading can tell. When the attempt
+finishes, the criteria with a command are run in its fork, and a separate
+judge model, which never saw the attempt work, reads the task, the criteria,
+the attempt's final reply and the diff, with read-only tools, and answers each
+remaining criterion met or not with a reason. Unmet criteria go back to the
+attempt, as a failed check would, up to the same number of rounds; a result
+that still misses one fails the run and is not applied. With more than one
+passing attempt, the one that meets more criteria ranks first (see above).
+
+A result accepted this way is reported as passed (judged by a model), not
+passed, and the report and `--json` (`rubric`, `judgement`) list each
+criterion with what the judge said and whether a command decided it. A rubric
+works without any network access beyond the model API. Memory learns less
+from a judged run than from a checked one. `planner.design` returns the
+rubric in place of a check when it designs one, and a run given a rubric
+designs nothing. To give the criteria yourself and skip designing, pass
+`--criterion TEXT` once for each:
+
+```sh
+molt do 'Write docs/errors.md listing every error message with an input that triggers it' \
+  --criterion 'docs/errors.md lists every error message the lexer and parser can report' \
+  --criterion 'each message has an example input and the line and column it reports'
+```
+
+### Designing has a budget
+
+The designer, and the vetter that checks its work, may spend only a share of
+the run's budget: a quarter by default, `MOLT_DESIGN_BUDGET_SHARE` for another
+share (such as `0.4`), or `--design-budget-usd X` for an amount, which can be
+at most the run's budget (with `molt resume`, it replaces the stopped run's).
+It is checked before each of their model calls, as the run's budget is, so the
+last call can take designing past it. The attempts keep what is left of the
+run's budget, as before. When the share runs out before the designer has
+submitted a check, the run stops before any attempt with a failure that says
+so, what designing spent, how much of the run's budget is left, and what to
+do next: give the check with `--check CMD` or the criteria with `--criterion
+TEXT`, run unverified with `--no-check`, or allow more with
+`--design-budget-usd`. `molt do` prints it and exits with status 1; confirm
+mode in the TUI stops with it and names `/check` and `/design-budget` instead.
+
+Designing does not do the task: only the check files the designer lists reach
+the attempts. When it changes other files in its fork anyway, such as writing
+the task's own document to try its check on, the run's progress says which,
+since that work is thrown away and only spent the budget.
+
+### When the check is wrong
+
+A designed check can expect something the task rules out: a column counted
+wrong, a message without the quotes the task asks for. When the designer's
+check comes with test files of its own, a separate vetter model, which only
+reads, compares those files and the command with the task (and the files the
+task points to) and lists each assertion the task contradicts or gives no
+basis for, quoting the task. A conflict goes back to the designer as the
+result of its `submit_check`, to revise; when its second check still
+conflicts, the design fails with the conflicts listed and no attempt starts
+(`planner.design` returns the same error, which confirm mode shows). The
+vetter's calls count toward the run's cost and budget. A vetter that does not
+finish holds nothing back: the check is used, and the design's rationale says
+it was not vetted.
+
+An attempt that finds the check contradicting the task can call
+`dispute_check` with the assertion, the task's words it contradicts and a
+command that shows it, instead of bending the code to the check. That ends the
+attempt, which is reported as cancelled with its `dispute`, not as failed; the
+other attempts go on. When no attempt passes and one disputed, the reply
+carries the `dispute`, its summary leads with it, `molt do` prints it under
+`outcome: failed, the check was disputed` and exits with status 1, and the
+TUI stops at the check card with the dispute, where `e` edits the check and
+Enter runs the task again with it. (The card needs the check in full: a check
+designed in auto mode with files of its own stays in the planner, so there the
+dispute is only shown.) Attempts judged by a rubric or run without
+a check have no `dispute_check`.
+
+### Commits and `molt undo`
+
+With `--commit`, an applied result is committed to git. The commit holds
+exactly the files the run merged, as the workspace has them: it is built in a
+scratch index from the current commit, so what you staged stays staged and
+out of it. Its subject is the first line of the winning attempt's summary, the
+rest of the summary is its body. Subjects stay within 72 characters, using a
+word boundary when possible and no ellipsis; emphasis is removed while literal
+code is kept.
+The message ends with trailers:
+
+```
+Molt-Run: trace_…
+Molt-Check: cargo test
+```
+
+`Molt-Run` is the run id, so `git log` leads back to the run's audit trace and
+to `molt memory used RUN` for the notes it recalled. `Molt-Check` is the check
+the result passed, or `none (unverified)`. Git runs on your side, after the
+run; attempts never run it. A file git ignores is left out and named. Nothing
+is committed when a file the run changed had changes of yours not committed
+before it (the commit would take them in), or when the workspace is not in a
+git work tree; the result is still applied, the reason is printed, and the
+exit status is 4. A `--branch` name git refuses, or one that exists, stops the
+run before it starts.
+
+CLI undo checks the data-directory lock before changing Git; when the interface
+holds it, use `/undo` there. A later memory notification failure exits with status
+4 and prints the run id to retry.
+
+`molt undo [RUN]` takes back the commit of a run, by default the newest on the
+current branch not taken back yet. It makes a new commit that puts the run's
+files back as they were before it, with a `Molt-Undo: RUN` trailer; history is
+not rewritten, and what you have staged elsewhere stays staged. It refuses
+when one of those files changed after the run, or has changes not committed,
+and says so rather than overwriting them. Memory is then told: the evidence
+the run gave is voided, so it no longer lends any note confidence. Notes only
+it showed are forgotten, the notes it bore out or disputed are worked out
+again without it, and it is not learned from again. If memory cannot be
+reached, `molt undo RUN` again tells it without a second revert.
+
+### Applying a kept result: `molt apply`
+
+```
+molt apply FORK [--only PATH...] [--check CMD [--check-file PATH...] | --no-check] [--workspace DIR] [--data-dir DIR]
+```
+
+applies a result kept in its fork, such as one `molt do --no-apply` printed,
+and drops the fork. `--only` applies just those of its files; since that is not
+what was checked, it needs `--check CMD` to run the check again first, in a
+fork of the workspace with only the chosen files (and the `--check-file`s the
+check needs, which are not applied), or `--no-check` to apply them unchecked.
+`--check` without `--only` checks the whole result again, as after you edited
+the fork by hand. When the check fails, nothing is applied, the fork stays,
+and the exit status is 1. What the review's fixed rules find (a deleted test,
+a new skip marker) is printed. The merge request names the chosen files, so
+the audit log has them.
+
+### Checkpoints and `molt resume`
+
+With `--checkpoint`, the planner saves the run in the data dir
+(`runs/<run>.json`, readable by you only) at every boundary: a model call
+starting or answered, an attempt's tool calls about to run or done, a check
+run, an attempt ending. The file holds the task, the check, each attempt's
+fork and conversation, and the spend so far.
+
+A run that finishes removes its checkpoint. One that stops first keeps it,
+along with its forks: interrupted (Ctrl-C, a signal, the process killed) or
+out of budget. `molt resume --list` shows the stopped runs of the workspace.
+`molt resume [RUN]` goes on with one (the latest by default), under the same
+run id:
+
+- Attempts go on from their last checkpoint, in their forks.
+- The cost so far counts against the budget; `--budget-usd` gives the run
+  more.
+- A model call that was unanswered when the run stopped is reported as
+  uncounted, never as free.
+- Tool calls that a stop cut short are not run again. The model is told
+  their effect is unknown and to look before redoing them.
+- A check that was running runs again.
+- `--retry` leaves the stopped attempts as they are and starts new ones with
+  the same check; the earlier record and cost stay.
+
+The result is applied as any run's is, so changes made to the workspace in
+the meantime are never silently overwritten: a conflicting path keeps the
+result in its fork, with exit status 3. A damaged checkpoint, one in another
+format, or one for another workspace is refused with the reason. The ten
+newest checkpoints are kept; older ones are removed with their forks when a
+new checkpointed run starts.
+With `--workflow auto`, a checkpoint is kept unless the planner picks a
+workflow that only reads (`ask`), which answers in one go and keeps none.
+
+With `--stream`, previews identify the attempt (or check designer), turn and
+model call. These are provisional text, not verified results. Thinking and
+partial tool arguments are not displayed; tools execute only after the entire
+message, including its JSON inputs, has been received and validated. A broken
+or malformed stream fails the call without retrying its partial answer. HTTP
+errors before a stream begins still use the gateway's normal retry policy.
+
+Preview events are coalesced, capped at 4 KiB and queued with a fixed bound.
+A slow subscriber can miss previews; sequence gaps are reported, and the
+complete model reply and final task result remain authoritative. The display
+shows cost pending until the call ends, and cost unknown when pricing or a
+complete response is unavailable. Cancelled attempts' late previews are hidden;
+their remote calls can still run and incur charges (see [the limits](limits.md#cancellation-and-model-settlement)).
+This line-oriented mode uses no alternate screen or cursor controls, so it
+also works in a narrow terminal or when stderr is redirected.
+
+For `--config`, give the model service a `topic:publish:progress` request capability,
+as in `molt.example.toml`; `--stream` refuses a setup without it. The new
+gateway events use the request's audit trace and are accepted by the CLI only
+from the kernel-authenticated model service. The TUI consumes the same events
+through its progress callback, with previews enabled by default.
+
+| Exit status | Meaning |
+| --- | --- |
+| 0 | Passed (or finished unverified, when no automated check fits the task) and applied, or kept as `--no-apply` asks. |
+| 1 | No attempt passed, or molt failed. |
+| 2 | The command line was wrong (an unknown flag, `--attempts 9`, ...); nothing started. |
+| 3 | Passed (or finished unverified), but the changes could not be merged, e.g. because the workspace changed under them; they are kept in the fork the report names. |
+| 4 | A commit or undo could not fully complete. A partial undo may leave Git reverted with memory notification pending; retry the named run. The reason is printed. |
+| 128+N | Stopped by signal N: 130 for Ctrl-C, 129 for SIGHUP, 143 for SIGTERM. The services are stopped and the run's forks removed. |
+
+Status 3 also covers a passing result withheld by the review. The report explains
+the review findings and names the kept fork for inspection.
+
+### Long tasks
+
+Before each model call, the planner checks that the conversation fits: the
+model's input (`MOLT_CONTEXT_TOKENS` less `MOLT_MAX_TOKENS` for the reply,
+counted from what the model measured on the last call) and the bus frame
+(8 MiB for the whole request). When it would not, the oldest turns are left
+out, always a whole round trip, so no tool call loses its result and no
+assistant turn is changed. Molt adds a short record of what those turns did
+to the first message, after the task and the check, which are never cut. A
+single result too big to fit even alone is cut down, and says so. Progress
+notes each time this happens, and the full conversation stays in the audit
+log. When even that cannot fit, the attempt ends with an error that names
+the limit, the model's input or the transport frame.
+
+### Project instructions
+
+A run starts by reading the project's instruction files, `AGENTS.md` and
+`CLAUDE.md`, from the workspace root and from every directory on the way to a
+path the task names (`crates/molt/src/x.rs` brings in `crates/AGENTS.md` and
+`crates/molt/AGENTS.md` too). They go into the first message of the check's
+designer and of every attempt, as a `<project_instructions>` block before the
+task, at most 16 KiB of them; a file under the same text by another name is
+shown once. They are data, like memory's notes: they never go into the
+system prompt, nothing in them runs, and they change neither the sandbox
+nor the done-check. The block says the task wins where they disagree, and
+that they win over notes. They are read with `fs.read`, so the audit log
+records what each run saw, and the run's progress lists the files.
+`--no-memory` does not turn them off; `MOLT_INSTRUCTION_FILES` names other
+files, or `none`.
+
+### Syntax errors after an edit
+
+When an attempt writes or edits a file in a language the project model
+parses ([Memory](memory.md#memory)), the `fs` service parses the file before and after the change
+with the same tree-sitter grammars and returns the syntax errors the change
+added, with the lines around each, in the tool's result. An error the file
+already had is not reported again, wherever the edit moved it, so a project
+that was broken before, or a construct a grammar does not know, does not get
+in the way. Nothing outside the service runs and nothing is fetched; a
+version that takes over 2 seconds to parse is not checked. By default the
+change is still made (`report`); `--syntax-check reject` (or
+`MOLT_SYNTAX_CHECK=reject`) leaves the file as it was and returns the errors
+as a failed call, as SWE-agent's edit guard does, and `off` does not look.
+The check files a run writes into forks are never checked. To compare the
+modes, run them as benchmark arms, such as
+`--arm reject="--syntax-check reject" --arm unchecked="--syntax-check off"`.

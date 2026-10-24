@@ -310,3 +310,138 @@ impl App {
         Vec::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::*;
+    use super::*;
+
+    #[test]
+    fn a_task_cut_off_by_a_crash_goes_on_from_its_checkpoint_only_when_asked_and_its_cost_is_counted_once() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert!(req.checkpoint, "a task that changes things keeps a checkpoint");
+        app.update(finished(&app, Some(0), "a", Some(0.1)));
+        let snapshot = app.snapshot();
+        let active = snapshot.active.clone().unwrap();
+        assert_eq!(
+            (active.run.as_str(), active.phase, active.checkpointed),
+            (trace.as_str(), saved::Phase::Running, true)
+        );
+
+        // The process is killed; a new interface picks the session up and starts nothing.
+        let mut app = App::new("/w", None);
+        app.restore_session(snapshot);
+        assert!(log(&app).contains("molt stopped while running: implement it"), "{}", log(&app));
+        up(&mut app);
+        assert!(app.update(Msg::Runs(vec![stopped_run(trace.as_str(), req, 0.25, 1)])).is_empty());
+        assert!(app.task.is_none());
+        assert_eq!(app.snapshot().active, Some(active), "named until it is resumed or dropped");
+
+        let actions = type_in(&mut app, "/runs resume");
+        let [Action::Run { req: resumed, trace: again }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(again, trace, "it goes on under its own id");
+        assert_eq!(resumed.resume, Some(Resume { run: trace.to_string(), retry: false }));
+        assert!(resumed.checkpoint && resumed.check.as_deref() == Some("true"));
+        assert_eq!(app.task.as_ref().unwrap().version, 1, "its requirements are the checkpoint's");
+        let mut resp = passed(true, None);
+        resp.cost_usd = 0.4;
+        app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+        assert!((app.spent_usd - 0.4).abs() < 1e-9, "the reply counts what it spent before: {}", app.spent_usd);
+        assert_eq!(app.earlier.len(), 1);
+        assert!(app.snapshot().active.is_none());
+    }
+
+    #[test]
+    fn finished_summaries_and_the_session_total_come_back_and_a_new_task_is_a_new_run() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "first");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
+        app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(true, None)) });
+        let snapshot = app.snapshot();
+        assert!(snapshot.active.is_none());
+
+        let mut app = App::new("/w", None);
+        app.restore_session(snapshot);
+        up(&mut app);
+        assert!((app.spent_usd - 0.3).abs() < 1e-9);
+        assert!(log(&app).contains("1 earlier tasks are told to the next one"), "{}", log(&app));
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "second");
+        let [Action::Run { req, trace: next }] = actions.as_slice() else { panic!() };
+        assert_ne!(next, trace);
+        assert_eq!((req.resume.as_ref(), req.earlier.len(), req.earlier[0].task.as_str()), (None, 1, "first"));
+    }
+
+    #[test]
+    fn stopping_a_checkpointed_task_drops_its_checkpoint_and_dropping_a_stopped_run_counts_what_it_spent() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { trace, req }] = actions.as_slice() else { panic!() };
+        let actions = stop(&mut app);
+        let [Action::Interrupt { drop_run, .. }] = actions.as_slice() else { panic!() };
+        assert_eq!(drop_run.as_deref(), Some(trace.as_str()));
+        assert!(app.snapshot().active.is_none(), "stopped by the user, it is not picked up again");
+        app.update(Msg::Stopped { kept: vec![], notes: vec![] });
+        up(&mut app);
+
+        let listed = || vec![stopped_run("trace_cli", req, 0.5, 2)];
+        app.update(Msg::Runs(listed()));
+        assert!(log(&app).contains("1 stopped runs in this workspace can go on"), "{}", log(&app));
+        assert_eq!(type_in(&mut app, "/runs"), [Action::ListRuns]);
+        app.update(Msg::Runs(listed()));
+        assert!(log(&app).contains("  trace_cli  "), "{}", log(&app));
+        assert_eq!(type_in(&mut app, "/runs discard trace_cli"), [Action::DropRun { run: "trace_cli".into() }]);
+        assert!(type_in(&mut app, "/runs resume trace_cli").is_empty(), "not while it is being dropped");
+        app.update(Msg::RunDropped { run: "trace_cli".into(), result: Ok(()) });
+        assert!((app.spent_usd - 0.5).abs() < 1e-9, "{}", app.spent_usd);
+        assert_eq!(app.uncounted_calls, 2, "calls unanswered when it stopped are not free");
+        assert!(type_in(&mut app, "/runs resume trace_cli").is_empty());
+        assert!(app.flash.as_deref().is_some_and(|f| f.contains("no stopped run trace_cli")), "{:?}", app.flash);
+    }
+
+    #[test]
+    fn a_damaged_checkpoint_or_a_lost_fork_is_refused_with_why_and_starts_nothing() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let req = RunRequest::new("t", "/w");
+        let mut lost = stopped_run("trace_lost", &req, 0.1, 0);
+        lost.gone = vec!["/d/work/fork-x".into()];
+        let damaged = Stopped { run: "trace_bad".into(), saved: Err("it is damaged (EOF)".into()), gone: vec![] };
+        app.update(Msg::Runs(vec![lost, damaged]));
+        assert!(type_in(&mut app, "/runs resume trace_bad").is_empty());
+        assert!(log(&app).contains("cannot be resumed: it is damaged"), "{}", log(&app));
+        assert!(type_in(&mut app, "/runs resume trace_lost").is_empty());
+        assert!(log(&app).contains("/d/work/fork-x, which is gone"), "{}", log(&app));
+        assert!(app.task.is_none());
+    }
+
+    #[test]
+    fn what_cannot_go_on_exactly_is_offered_again_and_its_unknown_cost_is_not_free() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        let actions = type_in(&mut app, "/ask what is this");
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert!(!req.checkpoint, "an answer in one go keeps no checkpoint");
+        let mut snapshot = app.snapshot();
+        snapshot.active.as_mut().unwrap().phase = saved::Phase::Designing;
+        let tmp = tempfile::tempdir().unwrap();
+        let fork = tmp.path().join("fork-1");
+        std::fs::create_dir(&fork).unwrap();
+        snapshot.pending = Some(crate::tui::kept::Entry::new(fork.to_str().unwrap().into(), "earlier", "passed"));
+
+        let mut app = App::new("/w", None);
+        app.restore_session(snapshot);
+        assert_eq!(app.input.full(), "what is this", "Enter starts it again");
+        assert_eq!(app.uncounted_stops, 1);
+        assert_eq!(app.kept, [fork.to_str().unwrap()], "the result that waited is kept");
+        assert!(app.snapshot().active.is_none());
+    }
+}

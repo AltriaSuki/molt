@@ -217,3 +217,229 @@ impl App {
             Some(Viewer { title: "unexecuted queued tasks · Ctrl+D again to quit".into(), lines, scroll: 0 });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::*;
+    use super::*;
+
+    #[test]
+    fn queued_tasks_snapshot_execution_settings_and_plain_input_still_steers_the_current_task() {
+        let mut app = queue_app();
+        type_in(&mut app, "first");
+        type_in(&mut app, "/model haiku");
+        type_in(&mut app, "/attempts 2");
+        type_in(&mut app, "/budget 1.5");
+        type_in(&mut app, "/effort high");
+        type_in(&mut app, "/stream off");
+        assert!(type_in(&mut app, "/queue add second").is_empty());
+        type_in(&mut app, "/model sonnet");
+        type_in(&mut app, "/queue add third");
+        let actions = type_in(&mut app, "also support Unicode");
+        assert!(
+            matches!(actions.as_slice(), [Action::Control { action: Control::Constrain(c), .. }] if c.text == "also support Unicode")
+        );
+        assert_eq!(app.queue.len(), 2);
+        app.mode = Mode::Auto;
+        app.settings.check = Some("false".into());
+        app.settings.model = Some("opus".into());
+        app.take_preference_changes();
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let actions = app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/first"))) });
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(
+            (req.task.as_str(), req.model.as_deref(), req.check.as_deref()),
+            ("second", Some("haiku"), Some("true"))
+        );
+        assert_eq!(
+            (req.attempts, req.budget_usd, req.effort, req.apply, req.stream),
+            (2, Some(1.5), Some(Effort::High), false, false)
+        );
+        assert_eq!(req.earlier.last().unwrap().task, "first");
+        assert_eq!(app.mode, Mode::Auto);
+        assert_eq!(app.settings.model.as_deref(), Some("opus"));
+        assert!(app.take_preference_changes().is_empty());
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let actions = app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/second"))) });
+        assert!(
+            matches!(actions.as_slice(), [Action::Run { req, .. }] if req.task == "third" && req.model.as_deref() == Some("sonnet") && !req.apply)
+        );
+        assert_eq!(app.kept, ["/fork/first", "/fork/second"]);
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn a_queue_waits_for_apply_commit_and_discard_to_settle_before_starting_the_next_task() {
+        let mut app = queue_app();
+        app.mode = Mode::Confirm;
+        app.rules.always_ask = true;
+        app.settings.commit = true;
+        type_in(&mut app, "first");
+        type_in(&mut app, "/queue add second");
+        type_in(&mut app, "/queue add third");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        assert!(app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/first"))) }).is_empty());
+        assert_eq!(app.queue.len(), 2);
+        assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
+        assert_eq!(app.update(key(KeyCode::Enter)), [Action::Apply { fork: "/fork/first".into() }]);
+        assert_eq!(app.queue.len(), 2);
+        let actions = app.update(Msg::Applied(Ok(())));
+        assert!(matches!(actions.as_slice(), [Action::Commit { .. }]));
+        assert_eq!(app.queue.len(), 2);
+        let actions = app.update(Msg::Committed(Ok(None)));
+        assert!(matches!(actions.as_slice(), [Action::PrepareCommit { .. }, Action::Run { req, .. }]
+            if req.task == "second" && req.earlier.last().unwrap().applied));
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/second"))) });
+        assert_eq!(app.update(key(KeyCode::Char('n'))), [Action::Discard { fork: "/fork/second".into() }]);
+        assert_eq!(app.queue.len(), 1);
+        let actions = app.update(Msg::Discarded(Ok(())));
+        assert!(
+            matches!(actions.as_slice(), [Action::PrepareCommit { .. }, Action::Run { req, .. }] if req.task == "third")
+        );
+    }
+
+    #[test]
+    fn queued_confirm_tasks_design_their_own_check_and_wait_for_each_decision() {
+        let mut app = queue_app();
+        type_in(&mut app, "first");
+        app.mode = Mode::Confirm;
+        app.settings.check = None;
+        app.rules.always_ask = true;
+        type_in(&mut app, "/queue add second");
+        type_in(&mut app, "/queue add third");
+        app.mode = Mode::Auto;
+        app.settings.check = Some("false".into());
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let actions = app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/first"))) });
+        let [Action::Design { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.task, "second");
+        assert!(!req.apply && req.check.is_none());
+        app.update(Msg::Designed { trace: trace.clone(), result: Ok(design()), existing: vec![] });
+        assert!(matches!(app.prompt, Some(Prompt::Check(_))));
+        assert_eq!(app.queue.len(), 1);
+        let actions = app.update(key(KeyCode::Esc));
+        assert!(matches!(actions.as_slice(), [Action::Design { req, .. }] if req.task == "third"));
+    }
+
+    #[test]
+    fn stopping_the_current_task_preserves_and_pauses_its_queue_until_explicit_resume() {
+        let mut app = queue_app();
+        type_in(&mut app, "first");
+        type_in(&mut app, "/queue add second\nwith a second line");
+        assert!(matches!(stop(&mut app).as_slice(), [Action::Interrupt { .. }]));
+        assert!(app.queue_paused && app.queue.len() == 1);
+        assert!(frame_text(&mut app).contains("1 queued"));
+        assert_eq!(app.update(Msg::Stopped { kept: vec![], notes: vec![] }), [Action::StartSession]);
+        assert!(app
+            .update(Msg::SessionUp { versions: vec![], memory_problem: Some("not configured".into()) })
+            .is_empty());
+        let actions = type_in(&mut app, "/queue resume");
+        assert!(matches!(actions.as_slice(), [Action::Run { req, .. }] if req.task == "second\nwith a second line"));
+    }
+
+    #[test]
+    fn queue_exit_warning_and_terminal_report_retain_complete_unexecuted_task_text() {
+        for command in [false, true] {
+            let mut app = queue_app();
+            type_in(&mut app, "/queue pause");
+            let task = "first line\nsecond line with spaces  and Unicode 中文";
+            type_in(&mut app, &format!("/queue add {task}"));
+            if command {
+                assert!(type_in(&mut app, "/quit").is_empty());
+            } else {
+                assert!(app.update(ctrl_key('d')).is_empty());
+            }
+            let shown = plain(&app.viewer.as_ref().unwrap().lines).join("\n");
+            assert!(shown.contains("first line\n  second line with spaces  and Unicode 中文"), "{shown}");
+            assert_eq!(app.unexecuted(), [task]);
+            assert!(matches!(app.update(ctrl_key('d')).as_slice(), [Action::Quit { .. }]));
+            assert!(app.quit && app.queue.len() == 1);
+            assert_eq!(app.unexecuted(), [task]);
+        }
+    }
+
+    #[test]
+    fn the_queue_browser_adds_multiline_tasks_and_can_reorder_inspect_and_remove_them() {
+        let mut app = queue_app();
+        type_in(&mut app, "/queue pause");
+        for task in ["first", "second", "third"] {
+            type_in(&mut app, &format!("/queue add {task}"));
+        }
+        type_in(&mut app, "/queue move 3 1");
+        type_in(&mut app, "/queue remove 2");
+        assert_eq!(app.unexecuted(), ["third", "second"]);
+        type_in(&mut app, "/queue");
+        assert!(frame_text(&mut app).contains("task queue · paused"));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Char('K')));
+        assert_eq!(app.unexecuted(), ["second", "third"]);
+        app.update(key(KeyCode::Char('n')));
+        app.update(key(KeyCode::Char('a')));
+        app.update(Msg::Paste("cancel this draft".into()));
+        app.update(ctrl_key('c'));
+        assert!(app.queue_view.as_ref().unwrap().draft.is_none() && app.quit_armed.is_none());
+        app.update(key(KeyCode::Char('a')));
+        app.update(Msg::Paste("new\nmultiline task".into()));
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.unexecuted(), ["third", "new\nmultiline task"]);
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Enter));
+        assert!(plain(&app.viewer.as_ref().unwrap().lines).join("\n").contains("new\nmultiline task"));
+        app.update(key(KeyCode::Esc));
+        app.update(key(KeyCode::Esc));
+        type_in(&mut app, "/queue move 0 1");
+        assert_eq!(app.queue.len(), 2);
+        type_in(&mut app, "/queue clear");
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn queue_limits_keep_rejected_drafts_and_bad_file_references_pause_without_losing_the_task() {
+        let mut app = queue_app();
+        type_in(&mut app, "/queue pause");
+        let oversized = format!("/queue add {}", "a".repeat(64 * 1024 + 1));
+        type_in(&mut app, &oversized);
+        assert!(app.queue.is_empty());
+        assert_eq!(app.input.full(), oversized);
+        app.input.take();
+        for _ in 0..100 {
+            type_in(&mut app, "/queue add task");
+        }
+        type_in(&mut app, "/queue add overflow");
+        assert_eq!(app.queue.len(), 100);
+        assert_eq!(app.input.full(), "/queue add overflow");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = queue_app();
+        app.workspace_path = tmp.path().to_str().unwrap().into();
+        type_in(&mut app, "first");
+        type_in(&mut app, "/queue add update @../outside");
+        app.input = Input::with("my unsent draft");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        assert!(app.update(Msg::Ran { trace, result: Err("failed".into()) }).is_empty());
+        assert!(app.queue_paused && app.queue.len() == 1 && app.task.is_none());
+        assert_eq!(app.input.full(), "my unsent draft");
+        std::fs::write(tmp.path().join("later.txt"), "added by the preceding task").unwrap();
+        app.input.take();
+        type_in(&mut app, "/queue remove 1");
+        type_in(&mut app, "/queue add update @later.txt");
+        app.files = Some(vec![]);
+        app.files_complete = true;
+        let actions = type_in(&mut app, "/queue resume");
+        assert!(matches!(actions.as_slice(), [Action::Run { req, .. }] if req.files == ["later.txt"]));
+    }
+
+    #[test]
+    fn a_failed_task_yields_its_optional_retry_offer_to_queued_work() {
+        let mut app = queue_app();
+        type_in(&mut app, "first");
+        type_in(&mut app, "/queue add second");
+        let trace = app.task.as_ref().unwrap().trace.clone();
+        let mut response = passed(false, None);
+        response.outcome = Outcome::Failed;
+        let actions = app.update(Msg::Ran { trace, result: Ok(response) });
+        assert!(matches!(actions.as_slice(), [Action::Run { req, .. }] if req.task == "second"));
+        assert!(app.prompt.is_none());
+    }
+}
