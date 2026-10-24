@@ -240,12 +240,14 @@ The MCP bridge is a service, started from the user's configuration like any
 other. For each MCP server it is configured with, it lists the server's
 tools when it is installed and writes them into its manifest: `name`
 (prefixed with the server's name, to keep names unique), `description`,
-`input_schema` as the server gives it, `target` `mcp.call`, `trust`
+`input_schema` as the server gives it, `target` `mcp-NAME.call` (one
+service per server; a service id cannot contain a dot), `trust`
 `external`, and `read_only` only where the user's configuration says so
 (an MCP annotation is the server's own claim, so it is not taken on its
 word). `mcp.call` turns a `ToolCall` into `tools/call` and the result's text
-content into `ToolOutput`, with `isError` as `is_error`. The user grants the
-planner `mcp.call`, as for any provider.
+content into `ToolOutput`, with `isError` as `is_error`. Configuring a
+server in the trusted config grants the planner `mcp-NAME.call`; see
+[docs/mcp.md](../mcp.md) for what #43 built.
 
 ## Acceptance
 
