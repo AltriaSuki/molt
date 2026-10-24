@@ -233,12 +233,22 @@ impl Shell {
         payload: Value,
         cancel: CancellationToken,
     ) -> Result<Value, RemoteError> {
+        self.handle_streaming(method, payload, cancel, None).await
+    }
+
+    async fn handle_streaming(
+        &self,
+        method: &str,
+        payload: Value,
+        cancel: CancellationToken,
+        sink: Option<shell::Sink>,
+    ) -> Result<Value, RemoteError> {
         let method = method.strip_prefix("shell.").unwrap_or(method);
         match method {
             "run" => {
                 let req = parse("shell", method, payload)?;
                 let policy = self.policy.as_deref().map(|policy| (policy, self.cargo.clone()));
-                let reply = shell::run(&self.roots, &self.program, &self.running, policy, req, cancel).await?;
+                let reply = shell::run(&self.roots, &self.program, &self.running, policy, req, cancel, sink).await?;
                 serde_json::to_value(reply).map_err(|e| failed(e.to_string()))
             }
             _ => Err(invalid(format!("unknown method shell.{method}"))),
@@ -314,11 +324,27 @@ pub async fn serve_fs(svc: Arc<Service>, fs: Arc<Fs>) {
     .await
 }
 
-/// Serve `shell.*` on `svc` until its link closes.
+/// Serve `shell.*` on `svc` until its link closes. When `svc` holds a
+/// capability for `topic:progress`, a request that asks for it has its
+/// command's output published there as it comes, before the reply.
 pub async fn serve_shell(svc: Arc<Service>, shell: Arc<Shell>) {
+    let topic: Target = format!("topic:publish:{}", molt_api::progress::TOPIC).parse().expect("a valid topic");
+    let report = svc.cap_for(&topic).is_some();
+    let publisher = svc.clone();
     svc.serve_cancellable(8, move |req, cancel| {
-        let shell = shell.clone();
-        async move { shell.handle_cancellable(&method_of(&req)?, req.payload, cancel).await }
+        let (shell, publisher) = (shell.clone(), publisher.clone());
+        async move {
+            let method = method_of(&req)?;
+            let wanted = req.payload.get("stream").and_then(Value::as_bool) == Some(true);
+            if !(report && wanted) {
+                return shell.handle_cancellable(&method, req.payload, cancel).await;
+            }
+            let (sink, published) = shell::stream(publisher, req.trace_id.clone());
+            let reply = shell.handle_streaming(&method, req.payload, cancel, Some(sink)).await;
+            // The output goes out before the reply that ends it; a stalled bus does not hold the reply.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), published).await;
+            reply
+        }
     })
     .await
 }

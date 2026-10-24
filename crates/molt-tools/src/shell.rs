@@ -13,13 +13,17 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use molt_api::progress::{self, Progress};
 use molt_api::shell::{RunRequest, RunResponse};
-use molt_proto::{ErrorCode, RemoteError};
+use molt_proto::{ErrorCode, RemoteError, TraceId};
+use molt_sdk::Service;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::cargo_cache::CargoCache;
@@ -34,6 +38,10 @@ const TAIL_BYTES: usize = 24 * 1024;
 const GRACE: Duration = Duration::from_millis(500);
 /// Removed from the command's environment: the service's bus secret and API keys.
 const HIDDEN_PREFIXES: [&[u8]; 3] = [b"MOLT_", b"ANTHROPIC_", b"OPENAI_"];
+/// Output a streamed command publishes at most; the reply has the rest of its start and end.
+const STREAM_BYTES: usize = 1 << 20;
+/// A line longer than this is published in pieces.
+const STREAM_LINE: usize = 8 * 1024;
 /// Keep tools from paging, prompting or printing colour codes.
 pub(crate) const FIXED_ENV: [(&str, &str); 6] = [
     ("TERM", "dumb"),
@@ -89,6 +97,7 @@ pub(crate) async fn run(
     sandbox: Option<(&SandboxPolicy, Option<Arc<CargoCache>>)>,
     req: RunRequest,
     cancel: CancellationToken,
+    sink: Option<Sink>,
 ) -> Result<RunResponse, RemoteError> {
     let (policy, cargo) = match sandbox {
         Some((policy, cargo)) => (Some(policy), cargo),
@@ -142,8 +151,8 @@ pub(crate) async fn run(
     let stderr = Arc::new(Mutex::new(Capture::default()));
     // JoinSet aborts its readers when this request future is dropped, too.
     let mut readers = tokio::task::JoinSet::new();
-    readers.spawn(drain(child.stdout.take(), stdout.clone()));
-    readers.spawn(drain(child.stderr.take(), stderr.clone()));
+    readers.spawn(drain(child.stdout.take(), stdout.clone(), sink.clone().map(|s| (s, false))));
+    readers.spawn(drain(child.stderr.take(), stderr.clone(), sink.map(|s| (s, true))));
 
     // Prefer an already-finished command in a cancellation/completion tie.
     let (status, timed_out, cancelled) = tokio::select! {
@@ -300,14 +309,113 @@ fn killpg(pgid: libc::pid_t) {
     }
 }
 
-async fn drain(pipe: Option<impl AsyncRead + Unpin>, into: Arc<Mutex<Capture>>) {
+async fn drain(pipe: Option<impl AsyncRead + Unpin>, into: Arc<Mutex<Capture>>, sink: Option<(Sink, bool)>) {
     let Some(mut pipe) = pipe else { return };
     let mut buf = vec![0u8; 16 * 1024];
     loop {
         match pipe.read(&mut buf).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => lock(&into).push(&buf[..n]),
+            Ok(n) => {
+                lock(&into).push(&buf[..n]);
+                if let Some((sink, stderr)) = &sink {
+                    sink.send(*stderr, &buf[..n]);
+                }
+            }
         }
+    }
+}
+
+/// Where a streamed command's output goes as it is read, to be published.
+#[derive(Clone)]
+pub(crate) struct Sink {
+    tx: mpsc::UnboundedSender<(bool, Vec<u8>)>,
+    /// Bytes handed on so far, by both streams: past [`STREAM_BYTES`] no more are.
+    sent: Arc<AtomicUsize>,
+}
+
+impl Sink {
+    fn send(&self, stderr: bool, bytes: &[u8]) {
+        // The chunk that crosses the limit still goes, so the publisher sees the output was cut.
+        if self.sent.fetch_add(bytes.len(), Ordering::Relaxed) < STREAM_BYTES {
+            let _ = self.tx.send((stderr, bytes.to_vec()));
+        }
+    }
+}
+
+/// A sink for one command's output, and the task that publishes what it
+/// gets on `topic:progress` as [`Progress::Output`] events traced `trace`.
+/// The task ends once every clone of the sink is dropped and what is left
+/// is published.
+pub(crate) fn stream(svc: Arc<Service>, trace: TraceId) -> (Sink, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let sink = Sink { tx, sent: Arc::default() };
+    (sink, tokio::spawn(publish(svc, trace, rx)))
+}
+
+async fn publish(svc: Arc<Service>, trace: TraceId, mut chunks: mpsc::UnboundedReceiver<(bool, Vec<u8>)>) {
+    let mut out = Publisher { svc, run: trace.to_string(), trace, seq: 0, sent: 0, cut: false };
+    // Partial lines of stdout and stderr.
+    let mut partial = [Vec::new(), Vec::new()];
+    while let Some(first) = chunks.recv().await {
+        if out.cut {
+            continue;
+        }
+        // Whatever else has arrived goes in the same events.
+        let mut texts: Vec<(bool, Vec<u8>)> = Vec::new();
+        let mut next = Some(first);
+        while let Some((stderr, bytes)) = next.take().or_else(|| chunks.try_recv().ok()) {
+            let buf = &mut partial[usize::from(stderr)];
+            buf.extend_from_slice(&bytes);
+            let end = match buf.iter().rposition(|&b| b == b'\n') {
+                Some(at) => at + 1,
+                None if buf.len() >= STREAM_LINE => buf.len(),
+                None => continue,
+            };
+            let text: Vec<u8> = buf.drain(..end).collect();
+            match texts.last_mut() {
+                Some((last, joined)) if *last == stderr => joined.extend(text),
+                _ => texts.push((stderr, text)),
+            }
+        }
+        for (stderr, text) in texts {
+            if !out.send(stderr, &text).await {
+                break;
+            }
+        }
+    }
+    for (stderr, rest) in [(false, &partial[0]), (true, &partial[1])] {
+        if !out.cut && !rest.is_empty() && !out.send(stderr, rest).await {
+            break;
+        }
+    }
+}
+
+struct Publisher {
+    svc: Arc<Service>,
+    trace: TraceId,
+    run: String,
+    seq: u64,
+    sent: usize,
+    cut: bool,
+}
+
+impl Publisher {
+    /// Publish `text`, or the cut when it would go past [`STREAM_BYTES`]; false once cut.
+    async fn send(&mut self, stderr: bool, text: &[u8]) -> bool {
+        self.sent += text.len();
+        self.cut = self.sent > STREAM_BYTES;
+        let text = if self.cut { String::new() } else { String::from_utf8_lossy(text).into_owned() };
+        let event = Progress::Output { run: self.run.clone(), seq: self.seq, text, stderr, cut: self.cut };
+        self.seq += 1;
+        match serde_json::to_value(event) {
+            Ok(event) => {
+                if let Err(e) = self.svc.publish_traced(progress::TOPIC, event, self.trace.clone()).await {
+                    tracing::debug!(error = %e, "could not publish command output");
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "could not encode command output"),
+        }
+        !self.cut
     }
 }
 

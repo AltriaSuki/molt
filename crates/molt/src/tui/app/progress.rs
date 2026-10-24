@@ -8,6 +8,8 @@ impl App {
             return;
         }
         match event {
+            // A command's output; [`App::command_output`] takes it.
+            Progress::Output { .. } => {}
             Progress::Routed { workflow, reason, .. } => {
                 task.req.workflow = Some(workflow.clone());
                 let line = agent::routed_line(&workflow, &reason, "/verify");

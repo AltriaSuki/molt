@@ -42,7 +42,12 @@ impl App {
                 return false;
             }
         }
-        if self.viewer.is_some() || self.transcript.is_some() || self.kept_view.is_some() || self.queue_view.is_some() {
+        if self.viewer.is_some()
+            || self.transcript.is_some()
+            || self.kept_view.is_some()
+            || self.changes.is_some()
+            || self.queue_view.is_some()
+        {
             return true;
         }
         match &self.screen {
@@ -79,6 +84,14 @@ impl App {
                 ("d", "inspect its current diff"),
                 ("enter", "apply when idle"),
                 ("n", "discard when idle"),
+                ("esc / q", "back to tasks"),
+            ]);
+        } else if self.changes.is_some() {
+            context = "changes against HEAD";
+            pairs.extend([
+                ("j/k, ↑/↓", "select a file"),
+                ("enter", "its diff"),
+                ("r", "list again"),
                 ("esc / q", "back to tasks"),
             ]);
         } else if self.transcript.is_some() {

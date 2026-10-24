@@ -9,6 +9,9 @@
 //! (`molt memory used`). Undoing a run is a new commit that puts those files
 //! back as they were before it, marked with an [`UNDO_TRAILER`]; history is
 //! never rewritten.
+//!
+//! It also says what the workspace changed against `HEAD`, for the
+//! interface's `/diff`: [`Repo::changes`] and [`Repo::file_diff`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -29,6 +32,32 @@ pub const VERIFICATION_TRAILER: &str = "Molt-Verification";
 
 /// Longest commit subject, in characters, before it is cut.
 const SUBJECT: usize = 72;
+/// Bytes of one file's diff that `/diff` shows; past this it is cut.
+const FILE_DIFF_BYTES: usize = 4 << 20;
+/// Bytes of an untracked file read to count its lines.
+const COUNTED_BYTES: u64 = 16 << 20;
+/// Options that keep `git diff` to plain text: no external diff, text
+/// conversion or colour the repository's config chose.
+const PLAIN_DIFF: [&str; 4] = ["--no-ext-diff", "--no-textconv", "--no-color", "--no-renames"];
+
+/// A file the workspace changed against `HEAD`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Changed {
+    /// Relative to the workspace.
+    pub path: String,
+    /// Lines added and removed; `None` for a binary file.
+    pub lines: Option<(u64, u64)>,
+    /// Not tracked: a new file git does not ignore, all of it added.
+    pub untracked: bool,
+}
+
+/// One file's diff against `HEAD`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileDiff {
+    pub patch: String,
+    /// Cut at [`FILE_DIFF_BYTES`].
+    pub truncated: bool,
+}
 
 /// The git work tree a workspace is in.
 #[derive(Debug)]
@@ -236,6 +265,64 @@ impl Repo {
             .filter_map(|path| path.strip_prefix(&self.prefix))
             .map(str::to_owned)
             .collect())
+    }
+
+    /// What the workspace changed against `HEAD`, by path: tracked files
+    /// that differ from it, staged or not, and untracked files git does not
+    /// ignore. Refused when `HEAD` has no commit yet.
+    pub fn changes(&self) -> anyhow::Result<Vec<Changed>> {
+        ensure!(self.commit_of("HEAD")?.is_some(), "the repository has no commit yet to compare with");
+        let mut args = vec!["diff", "HEAD", "--no-relative", "--numstat", "-z"];
+        args.extend(PLAIN_DIFF);
+        args.extend(self.within());
+        let mut changes = Vec::new();
+        for entry in self.git(&args, None, None)?.split('\0').filter(|e| !e.is_empty()) {
+            let mut fields = entry.splitn(3, '\t');
+            let (Some(added), Some(removed), Some(path)) = (fields.next(), fields.next(), fields.next()) else {
+                bail!("git diff --numstat printed {entry:?}, which is not a count and a path");
+            };
+            let Some(path) = path.strip_prefix(&self.prefix) else { continue };
+            let lines = added.parse().ok().zip(removed.parse().ok());
+            changes.push(Changed { path: path.to_owned(), lines, untracked: false });
+        }
+        let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z"];
+        args.extend(self.within());
+        for path in self.git(&args, None, None)?.split('\0').filter(|e| !e.is_empty()) {
+            let Some(path) = path.strip_prefix(&self.prefix) else { continue };
+            let lines = new_lines(&self.top.join(self.top_relative(path))).map(|n| (n, 0));
+            changes.push(Changed { path: path.to_owned(), lines, untracked: true });
+        }
+        changes.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(changes)
+    }
+
+    /// The diff of one file of [`Repo::changes`] against `HEAD`.
+    pub fn file_diff(&self, change: &Changed) -> anyhow::Result<FileDiff> {
+        let path = self.top_relative(&change.path);
+        let mut cmd = self.command();
+        if change.untracked {
+            cmd.args(["diff", "--no-index"]).args(PLAIN_DIFF).args(["--", "/dev/null", &path]);
+        } else {
+            cmd.args(["diff", "HEAD", "--no-relative"]).args(PLAIN_DIFF).args(["--", &path]);
+        }
+        let out = cmd.stdin(Stdio::null()).output().context("git could not be run; is it installed?")?;
+        // `--no-index` exits 1 when the files differ, as a new file does.
+        let differ = change.untracked && out.status.code() == Some(1);
+        if !out.status.success() && !differ {
+            bail!("git diff failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        let truncated = out.stdout.len() > FILE_DIFF_BYTES;
+        let shown = &out.stdout[..out.stdout.len().min(FILE_DIFF_BYTES)];
+        Ok(FileDiff { patch: String::from_utf8_lossy(shown).into_owned(), truncated })
+    }
+
+    /// The pathspec that keeps git to the workspace, when it is below the top of the work tree.
+    fn within(&self) -> Vec<&str> {
+        if self.prefix.is_empty() {
+            Vec::new()
+        } else {
+            vec!["--", &self.prefix]
+        }
     }
 
     /// Refuse a `--branch` name git would not take, or one that exists already.
@@ -508,6 +595,25 @@ impl Drop for Scratch {
 }
 
 /// Remove paired emphasis without changing literal code or identifier underscores.
+/// The lines of a new file, as a diff would add them; `None` for one that
+/// looks binary, or is too large to read for a count.
+fn new_lines(path: &Path) -> Option<u64> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() {
+        // Git keeps a link as its target: one line.
+        return Some(1);
+    }
+    if !meta.is_file() || meta.len() > COUNTED_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    let newlines = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
+    Some(newlines + u64::from(bytes.last().is_some_and(|&b| b != b'\n')))
+}
+
 fn plain_summary(text: &str) -> String {
     fn unmark(text: &str, marker: &str) -> String {
         let mut out = String::new();
@@ -811,6 +917,54 @@ mod tests {
         assert_eq!(git(d, &["status", "--porcelain"]), "");
         // Committing what HEAD has already is nothing to commit.
         assert_eq!(repo.commit_run(&commit("trace_3", &["x.txt"])).unwrap(), None);
+    }
+
+    #[test]
+    fn changes_against_head_list_tracked_staged_and_new_files_with_their_lines() {
+        let dir = repo();
+        let d = dir.path();
+        std::fs::write(d.join("a.txt"), "a\nmore\n").unwrap();
+        std::fs::write(d.join("b.txt"), "staged\n").unwrap();
+        git(d, &["add", "b.txt"]);
+        std::fs::write(d.join("new file.txt"), "one\ntwo").unwrap();
+        std::fs::write(d.join("blob.bin"), b"\0\x01").unwrap();
+        std::fs::write(d.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(d.join("ignored.txt"), "left out\n").unwrap();
+        let repo = Repo::open(d).unwrap();
+        let changes = repo.changes().unwrap();
+        let listed: Vec<_> = changes.iter().map(|c| (c.path.as_str(), c.lines, c.untracked)).collect();
+        assert_eq!(
+            listed,
+            [
+                (".gitignore", Some((1, 0)), true),
+                ("a.txt", Some((1, 0)), false),
+                ("b.txt", Some((1, 1)), false),
+                ("blob.bin", None, true),
+                ("new file.txt", Some((2, 0)), true),
+            ]
+        );
+        let diff = repo.file_diff(&changes[1]).unwrap();
+        assert!(diff.patch.contains("+more") && !diff.truncated, "{}", diff.patch);
+        let diff = repo.file_diff(&changes[4]).unwrap();
+        assert!(diff.patch.contains("+one") && diff.patch.contains("new file mode"), "{}", diff.patch);
+    }
+
+    #[test]
+    fn changes_stay_inside_a_workspace_below_the_top_and_need_a_commit() {
+        let dir = repo();
+        let d = dir.path();
+        std::fs::create_dir(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub/inner.txt"), "x\n").unwrap();
+        std::fs::write(d.join("a.txt"), "outside\n").unwrap();
+        let repo = Repo::open(&d.join("sub")).unwrap();
+        let changes = repo.changes().unwrap();
+        assert_eq!(changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), ["inner.txt"]);
+        assert!(repo.file_diff(&changes[0]).unwrap().patch.contains("+x"));
+
+        let empty = tempfile::tempdir().unwrap();
+        git(empty.path(), &["init", "-q"]);
+        let err = Repo::open(empty.path()).unwrap().changes().unwrap_err().to_string();
+        assert!(err.contains("no commit yet"), "{err}");
     }
 
     #[test]

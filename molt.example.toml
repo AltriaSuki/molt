@@ -61,6 +61,7 @@ name = "shell"
 tier = "protected"
 exec = { command = "molt-tools", args = ["shell", "--root", ".", "--scratch", "/home/you/.cache/molt/work"] }
 provides = ["shell.*"]
+requests = [{ target = "topic:publish:progress", budget = { calls = 10000000 } }]
 # Where the environment profiles find rustup and your Cargo cache.
 pass_env = ["CARGO_HOME", "RUSTUP_HOME"]
 

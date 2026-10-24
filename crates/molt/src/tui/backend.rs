@@ -147,6 +147,7 @@ pub(super) async fn serve() -> anyhow::Result<()> {
         session: None,
         starting: false,
         work: Vec::new(),
+        commands: Default::default(),
         before: None,
     };
     let mut keep = Vec::new();

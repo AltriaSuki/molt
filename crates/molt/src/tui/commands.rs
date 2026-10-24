@@ -40,6 +40,7 @@ pub enum Builtin {
     Budget,
     DesignBudget,
     Last,
+    Diff,
     Lanes,
     Clear,
     Quit,
@@ -104,6 +105,7 @@ definitions! {
     Budget, "budget", "USD", "spending limit per task", &["default"];
     DesignBudget, "design-budget", "USD", "most of a task's budget designing its check may spend", &["default"];
     Last, "last", "", "the diff of the last finished task", &[];
+    Diff, "diff", "", "the workspace's changes against git HEAD, file by file", &[];
     Lanes, "lanes", "", "the tool calls of the last finished task", &[];
     Clear, "clear", "", "clear the log", &[];
     Quit, "quit", "", "quit", &[];

@@ -298,6 +298,9 @@ impl App {
         if self.kept_view.is_some() {
             return self.kept_key(&key);
         }
+        if self.changes.is_some() {
+            return self.changes_key(&key);
+        }
         if self.transcript.is_some() {
             return self.transcript_key(&key);
         }
@@ -334,6 +337,14 @@ impl App {
         }
         if ctrl(&key, 'c') {
             return self.interrupt();
+        }
+        // One Esc stops the user's own command: it holds no work to lose.
+        if key_is(&key, KeyCode::Esc)
+            && self.input.text.is_empty()
+            && !matches!(self.prompt, Some(Prompt::EditCheck(_)))
+            && self.shell.as_ref().is_some_and(|s| s.running())
+        {
+            return self.stop_command();
         }
         // Esc also closes every overlay and prompt: one press too many must not throw a task's work away.
         if key_is(&key, KeyCode::Esc) && self.busy() {
@@ -513,6 +524,9 @@ impl App {
         self.scroll = 0;
         if let Some(command) = line.strip_prefix('/') {
             return self.command(command);
+        }
+        if let Some(command) = line.strip_prefix('!') {
+            return self.run_command(command);
         }
         self.submit_task(line)
     }

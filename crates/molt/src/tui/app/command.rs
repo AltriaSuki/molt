@@ -9,13 +9,14 @@ impl App {
         match builtin(name).map(|c| c.kind) {
             Some(Builtin::Restart) => {
                 if self.task.is_some()
+                    || self.shell.is_some()
                     || !self.learning.is_empty()
                     || self.git_busy
                     || self.kept_pending.is_some()
                     || self.fork_operations > 0
                 {
                     self.flash = Some(
-                        "finish or stop the task and wait for learning, applies, discards and commits before /restart"
+                        "finish or stop the task or command and wait for learning, applies, discards and commits before /restart"
                             .into(),
                     );
                     return Vec::new();
@@ -275,6 +276,7 @@ impl App {
                 Some(last) => self.viewer = Some(diff_viewer(&last.patch, last.truncated)),
                 None => self.flash = Some("no task has finished with changes yet".into()),
             },
+            Some(Builtin::Diff) => return self.open_changes(),
             Some(Builtin::Clear) => {
                 self.log.clear();
                 self.scroll = 0;

@@ -88,6 +88,12 @@ impl PendingReply {
         send_cancel(&self.link, &self.id).await
     }
 
+    /// A handle that requests cancellation of this request while its reply
+    /// is being awaited, as [`PendingReply::cancel`] does.
+    pub fn canceller(&self) -> Canceller {
+        Canceller { link: self.link.clone(), id: self.id.clone() }
+    }
+
     pub async fn wait(self) -> Result<Value, SdkError> {
         let reply = self.wait_envelope().await?;
         match reply.error() {
@@ -112,6 +118,20 @@ impl PendingReply {
             },
         };
         reply.map_err(|_| SdkError::Closed)
+    }
+}
+
+/// Requests cancellation of a request whose reply another task awaits.
+#[derive(Clone)]
+pub struct Canceller {
+    link: Arc<dyn Link>,
+    id: MsgId,
+}
+
+impl Canceller {
+    /// Request cancellation; the callee's reply still settles the request.
+    pub async fn cancel(&self) -> Result<(), SdkError> {
+        send_cancel(&self.link, &self.id).await
     }
 }
 

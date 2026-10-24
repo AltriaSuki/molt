@@ -373,6 +373,9 @@ impl Config {
         let mut shell = service("shell", Tier::Protected, tools("shell")?)?;
         // Where the environment profiles find rustup and the Cargo cache.
         shell.pass_env = names(&["CARGO_HOME", "RUSTUP_HOME"]);
+        // The output of a command the interface runs (`!cmd`), as it comes.
+        shell.requests =
+            vec![request(&format!("topic:publish:{}", molt_api::progress::TOPIC), Budget::new(0, 0, 10_000_000))?];
         let mut memory_exec = bin("molt-memory")?;
         // The project model leaves out the data dir, with the forks in it, should it be inside the workspace.
         memory_exec.args = vec![
@@ -729,7 +732,7 @@ mod tests {
             cfg.service(name).unwrap().requests.iter().map(|r| r.target.to_string()).collect()
         };
         assert_eq!(targets("fs"), ["topic:publish:fs.changed"], "fs reports the files it changes");
-        assert!(targets("shell").is_empty());
+        assert_eq!(targets("shell"), ["topic:publish:progress"], "the shell streams the output it is asked to");
 
         let memory = cfg.service("memory").unwrap();
         let exec = memory.exec.as_ref().unwrap();
