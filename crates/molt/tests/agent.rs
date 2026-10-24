@@ -548,6 +548,26 @@ fn molt(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) -> to
     cmd
 }
 
+/// Start a session on `cfg`'s data dir, waiting out the lock of one just
+/// shut down. Another test's child, forked before it execs, can hold a
+/// copy of the lock's file descriptor for a moment after the kernel that
+/// took it is gone.
+async fn start_session(
+    cfg: &Config,
+    workspace: &str,
+    events: tokio::sync::mpsc::UnboundedSender<Progress>,
+) -> anyhow::Result<molt::session::Session> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match molt::session::Session::start(cfg, workspace, events.clone()).await {
+            Err(e) if format!("{e:#}").contains("is already running on") && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            result => return result,
+        }
+    }
+}
+
 #[tokio::test]
 async fn memory_learns_with_the_model_the_run_asked_for() {
     let server = fake_api(Fake::Greets).await;
@@ -1764,12 +1784,11 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
 
 #[tokio::test]
 async fn a_kept_session_result_survives_restart_and_refuses_workspace_conflicts() {
-    use molt::session::Session;
     let server = fake_api(Fake::Greets).await;
     let setup = Setup::new(&server);
     let workspace = setup.workspace.path().canonicalize().unwrap();
     let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
-    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    let session = start_session(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
     let mut req = setup.request(Some(CHECK), 1);
     req.apply = false;
     let response = session.run(&req, &molt_proto::TraceId::random()).await.unwrap();
@@ -1778,7 +1797,7 @@ async fn a_kept_session_result_survives_restart_and_refuses_workspace_conflicts(
     // A saved path from a different workspace cannot redirect a human's operation.
     let other = tempfile::tempdir().unwrap();
     let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
-    let wrong = Session::start(&setup.cfg, other.path().to_str().unwrap(), events).await.unwrap();
+    let wrong = start_session(&setup.cfg, other.path().to_str().unwrap(), events).await.unwrap();
     for error in [
         wrong.diff(&fork).await.unwrap_err(),
         wrong.apply(&fork).await.unwrap_err(),
@@ -1790,7 +1809,7 @@ async fn a_kept_session_result_survives_restart_and_refuses_workspace_conflicts(
     assert_eq!(setup.files(), ["README.txt"]);
     wrong.shutdown(std::slice::from_ref(&fork)).await;
     let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
-    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    let session = start_session(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
     assert!(session.diff(&fork).await.unwrap().patch.contains("+hello"));
     std::fs::write(workspace.join("greeting.txt"), "user's work\n").unwrap();
     let error = format!("{:#}", session.apply(&fork).await.unwrap_err());
@@ -1806,7 +1825,6 @@ async fn a_kept_session_result_survives_restart_and_refuses_workspace_conflicts(
 
 #[tokio::test]
 async fn session_undo_notifies_memory_and_cli_undo_refuses_its_lock_before_changing_git() {
-    use molt::session::Session;
     let server = fake_api(Fake::Greets).await;
     let setup = Setup::new(&server);
     let w = setup.workspace.path();
@@ -1819,7 +1837,7 @@ async fn session_undo_notifies_memory_and_cli_undo_refuses_its_lock_before_chang
     let config = setup.data.path().join("config.toml");
     std::fs::write(&config, toml::to_string(&setup.cfg).unwrap()).unwrap();
     let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
-    let session = Session::start(&setup.cfg, w.to_str().unwrap(), events).await.unwrap();
+    let session = start_session(&setup.cfg, w.to_str().unwrap(), events).await.unwrap();
     for locked_cli in [false, true] {
         let trace = molt_proto::TraceId::random();
         let before = molt::git::Before::look(w).unwrap();
@@ -1883,13 +1901,11 @@ async fn session_undo_notifies_memory_and_cli_undo_refuses_its_lock_before_chang
 /// what was learned.
 #[tokio::test]
 async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
-    use molt::session::Session;
-
     let server = fake_api(Fake::DesignsThenGreets).await;
     let setup = Setup::new(&server);
     let workspace = setup.workspace.path().canonicalize().unwrap();
     let (events, mut progress) = tokio::sync::mpsc::unbounded_channel();
-    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    let session = start_session(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
     assert_eq!(session.memory_problem(), None);
     assert!(session.versions().iter().any(|(name, v)| name == "planner" && v.len() == 8), "{:?}", session.versions());
     let trace = molt_proto::TraceId::random();
@@ -2022,14 +2038,13 @@ async fn stop_early(setup: &Setup, session: &molt::session::Session) -> (RunResp
 
 #[tokio::test]
 async fn the_interfaces_session_keeps_a_stopped_runs_forks_to_resume_it_and_drops_them_when_told() {
-    use molt::session::Session;
     let server = fake_api(Fake::Greets).await;
     let setup = Setup::new(&server);
     let workspace = setup.workspace.path().canonicalize().unwrap();
     let runs = setup.data.path().join(molt::config::RUNS);
     let start = || async {
         let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
-        Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap()
+        start_session(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap()
     };
 
     // Quit: the session stops, and the stopped run's fork stays for the next one.
@@ -2220,7 +2235,6 @@ async fn an_apply_before_hook_keeps_a_passing_result_out_of_the_workspace() {
 
 #[tokio::test]
 async fn a_kept_result_the_user_applies_passes_the_apply_hooks_too() {
-    use molt::session::Session;
     use molt_planner::hooks::{Event, Hook};
     let server = fake_api(Fake::Greets).await;
     let mut setup = Setup::new(&server);
@@ -2228,7 +2242,7 @@ async fn a_kept_result_the_user_applies_passes_the_apply_hooks_too() {
     let refuse = "grep -q greeting.txt && { echo 'greetings need a sign-off' >&2; exit 2; }";
     setup.cfg.hooks = vec![Hook { paths: vec!["*.txt".into()], ..Hook::new(Event::ApplyBefore, refuse) }];
     let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
-    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    let session = start_session(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
     let req = RunRequest { apply: false, ..setup.request(Some(CHECK), 1) };
     let fork = session.run(&req, &molt_proto::TraceId::random()).await.unwrap().fork.unwrap();
     let error = format!("{:#}", session.apply(&fork).await.unwrap_err());
@@ -2239,7 +2253,7 @@ async fn a_kept_result_the_user_applies_passes_the_apply_hooks_too() {
 
     setup.cfg.hooks = vec![Hook::new(Event::AfterApply, "cat > /dev/null")];
     let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
-    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    let session = start_session(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
     session.apply(&fork).await.unwrap();
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
     session.shutdown(&[]).await;
@@ -2346,13 +2360,12 @@ async fn the_ui_backend_finishes_without_terminal_reads_and_exits_when_the_pipe_
 /// output, stops it when asked, calls no model, and the audit log has it.
 #[tokio::test]
 async fn a_session_command_streams_its_output_from_the_sandbox_and_is_audited() {
-    use molt::session::Session;
     use tokio_util::sync::CancellationToken;
     let server = fake_api(Fake::Greets).await;
     let setup = Setup::new(&server);
     let workspace = setup.workspace.path().canonicalize().unwrap();
     let (events, mut progress) = tokio::sync::mpsc::unbounded_channel();
-    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    let session = start_session(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
     let trace = molt_proto::TraceId::random();
     // As the shell's own sandbox tests check it: the sandbox's home, and no host secret in reach.
     let secret = setup.data.path().join("host-secret");
