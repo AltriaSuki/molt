@@ -15,6 +15,17 @@ impl App {
                 let line = agent::routed_line(&workflow, &reason, "/verify");
                 self.log.push(Line::from(vec![span("◆ ", Tone::Shell), span(clean_line(&line), Tone::Dim)]));
             }
+            Progress::Planned { steps, edited, .. } => {
+                let line = agent::planned_line(&steps, edited);
+                self.log.push(Line::from(vec![span("◆ ", Tone::Shell), span(clean_line(&line), Tone::Dim)]));
+            }
+            Progress::Step { step, steps, goal, fork, .. } => {
+                // A step is a run of its own: its check, lanes and spend start over.
+                task.step_starts();
+                task.plan_fork = fork.or(task.plan_fork.take());
+                let line = agent::step_line(step, steps, &goal);
+                self.log.push(Line::from(vec![span("◆ ", Tone::Shell), span(clean_line(&line), Tone::Plain)]));
+            }
             Progress::CheckReady { command, files, designed, rubric, .. } => {
                 task.designer_retry = None;
                 if task.check_shown {

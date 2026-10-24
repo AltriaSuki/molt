@@ -12,6 +12,7 @@ use molt_api::memory::{
     UndoRequest,
 };
 use molt_api::model::Effort;
+use molt_api::plan::PlanRequest;
 use molt_api::planner::{Criterion, Outcome, Resume, RunRequest, Select};
 use molt_planner::checkpoint;
 use molt_proto::{ServiceId, TraceId};
@@ -207,6 +208,17 @@ struct DoArgs {
     /// configuration defines. Default: verify.
     #[arg(long, value_name = "NAME")]
     workflow: Option<String>,
+    /// Carry the task out as ordered steps, each a run with its own
+    /// designed check, the next going on from the last one's result; then
+    /// the overall check (--check, or one designed for the whole task) runs
+    /// on the result. The planner plans the steps, and they run as planned.
+    /// One budget covers every step. See docs/plan.md.
+    #[arg(long, conflicts_with_all = ["checkpoint", "criterion"])]
+    plan: bool,
+    /// A step of the plan, in order (repeatable), to run instead of the
+    /// planned ones: one goal sentence each. Implies --plan.
+    #[arg(long, value_name = "TEXT", conflicts_with_all = ["checkpoint", "criterion"])]
+    step: Vec<String>,
     #[command(flatten)]
     common: RunArgs,
 }
@@ -1040,7 +1052,8 @@ async fn do_task(config: Option<&Path>, profile: Option<&str>, args: DoArgs) -> 
     req.checkpoint = args.checkpoint;
     req.review = !args.common.no_review;
     req.workflow = args.workflow.filter(|w| !w.trim().is_empty());
-    execute(&cfg, req, TraceId::random(), &args.common, stop).await
+    let plan = (args.plan || !args.step.is_empty()).then_some(args.step);
+    execute_as(&cfg, req, plan, TraceId::random(), &args.common, stop).await
 }
 
 async fn ask(config: Option<&Path>, profile: Option<&str>, args: AskArgs) -> anyhow::Result<ExitCode> {
@@ -1110,6 +1123,19 @@ async fn execute(
     args: &RunArgs,
     stop: impl std::future::Future<Output = i32>,
 ) -> anyhow::Result<ExitCode> {
+    execute_as(cfg, req, None, trace, args, stop).await
+}
+
+/// [`execute`], or with `plan`, `req` as a plan of those steps, or of the
+/// planned ones when there are none.
+async fn execute_as(
+    cfg: &Config,
+    req: RunRequest,
+    plan: Option<Vec<String>>,
+    trace: TraceId,
+    args: &RunArgs,
+    stop: impl std::future::Future<Output = i32>,
+) -> anyhow::Result<ExitCode> {
     let workspace = req.workspace.clone();
     let apply = req.apply;
     for warning in agent::web_warnings(cfg).await? {
@@ -1135,7 +1161,13 @@ async fn execute(
     let progress = |event: &_| eprintln!("{}", agent::describe(event));
     let learn = (!args.no_learn)
         .then(|| agent::Learn { model: agent::memory_model(args.memory_model.as_deref(), req.model.as_deref()) });
-    let result = agent::run_task_as(cfg, req, trace, learn, progress, stopped).await;
+    let result = match plan {
+        Some(steps) => {
+            let req = PlanRequest { steps, ..PlanRequest::new(req) };
+            agent::plan_task_as(cfg, req, trace, learn, progress, stopped).await
+        }
+        None => agent::run_task_as(cfg, req, trace, learn, progress, stopped).await,
+    };
     let done = match result {
         Ok(done) => done,
         Err(e) if e.is::<Interrupted>() => {
@@ -1172,8 +1204,15 @@ async fn execute(
         }
         // What learning did and cost, next to the run's own spend.
         out["learning"] = done.learned.as_ref().map_or(serde_json::Value::Null, agent::learning_json);
+        // A plan: its steps, and each step's run; the rest is the plan's result.
+        if let Some(plan) = &done.plan {
+            out["plan"] = serde_json::to_value(plan)?;
+        }
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
+        if let Some(plan) = &done.plan {
+            print!("{}", agent::plan_report(plan));
+        }
         print!("{}", agent::report_at(&resp, Some(&workspace)));
     }
     if let Some(learned) = &done.learned {

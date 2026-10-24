@@ -937,10 +937,8 @@ pub(crate) fn steps_tools() -> Vec<Value> {
 /// The task of step `at` of `steps`, for its own run: the whole task, the
 /// plan with where this step is in it, and what this step is to do.
 pub(crate) fn step_task(task: &str, steps: &[String], at: usize) -> String {
-    let mut s = format!(
-        "{}\n\n<plan>\nThis task is carried out in steps, one run each, in this order:\n",
-        task.trim_end()
-    );
+    let mut s =
+        format!("{}\n\n<plan>\nThis task is carried out in steps, one run each, in this order:\n", task.trim_end());
     for (i, goal) in steps.iter().enumerate() {
         let state = match i.cmp(&at) {
             std::cmp::Ordering::Less => "done: its result is in the workspace",

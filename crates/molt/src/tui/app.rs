@@ -11,6 +11,7 @@ mod completion;
 mod input;
 mod kept;
 mod memory;
+mod plan;
 mod progress;
 mod queue;
 mod retry;
@@ -34,6 +35,7 @@ pub use viewer::{TranscriptView, Viewer};
 use apply::apply_stops;
 use check::{check_head, disputed_check, rubric_lines, tui_next_steps};
 use memory::snapshot_lines;
+pub(crate) use plan::{plan_card, PlanSteps};
 use progress::{bounded, lane_lines};
 use settings::task_budget;
 use viewer::{diff_viewer, review_viewer, viewer_key};
@@ -44,6 +46,7 @@ use std::time::{Duration, Instant};
 use molt_api::fs::ChangeKind;
 use molt_api::memory::{ConsolidateResponse, Layer, RecallSnapshot, Recalled, ReviewRequest, ReviewResponse};
 use molt_api::model::{attempt_name, Effort, Role};
+use molt_api::plan::{PlanRequest, PlanResponse};
 use molt_api::planner::{
     AttemptReport, AttemptStatus, Constraint, Continuation, Control, ControlResponse, DesignResponse, Earlier, Outcome,
     RunRequest, RunResponse, RunState, Verdict,
@@ -159,6 +162,12 @@ pub enum Action {
     },
     Run {
         req: RunRequest,
+        trace: TraceId,
+    },
+    /// Plan a task as steps (`req.propose`), or carry its steps out; the
+    /// answer comes back as [`Msg::Planned`].
+    Plan {
+        req: Box<PlanRequest>,
         trace: TraceId,
     },
     Learn {
@@ -356,6 +365,10 @@ pub enum Msg {
         trace: TraceId,
         // Boxed: a run's reply is much larger than any other message.
         result: Box<Result<RunResponse, String>>,
+    },
+    Planned {
+        trace: TraceId,
+        result: Box<Result<PlanResponse, String>>,
     },
     Learned {
         trace: TraceId,
@@ -561,6 +574,8 @@ pub struct Task {
     /// Of a resumed run, what it spent before this resume that the session
     /// total does not count yet: its cost, and its calls of unknown cost.
     carried: (f64, u32),
+    /// Of a plan, the fork its steps' results go into, once a step has started.
+    pub plan_fork: Option<String>,
 }
 
 impl Task {
@@ -591,6 +606,7 @@ impl Task {
             waiting: Vec::new(),
             asked: Vec::new(),
             carried: (0.0, 0),
+            plan_fork: None,
         }
     }
 
@@ -611,6 +627,17 @@ impl Task {
         self.open_calls.clear();
     }
 
+    /// A plan's next step starts: a run of its own, with its own check and
+    /// attempts. What the steps before it spent stays in the task's total.
+    fn step_starts(&mut self) {
+        self.design_spend = self.spend();
+        self.lanes.clear();
+        self.check_shown = false;
+        self.designer_preview = Preview::default();
+        self.role_previews.clear();
+        self.designer_retry = None;
+    }
+
     /// What this task has cost so far, by finished model calls; the run's
     /// reply settles it.
     pub fn spend(&self) -> Spend {
@@ -629,6 +656,11 @@ pub enum Prompt {
     Check(DesignResponse),
     /// The check's command is in the input box.
     EditCheck(DesignResponse),
+    /// A plan's steps, as proposed or as the user edited them; the plan
+    /// runs them once the user confirms.
+    Plan(PlanSteps),
+    /// The steps are in the input box, one per line.
+    EditPlan(PlanSteps),
     Apply {
         resp: Box<RunResponse>,
         fork: String,
@@ -941,7 +973,7 @@ impl App {
         };
 
         let before = self.attention();
-        if matches!(msg, Msg::Ran { .. } | Msg::Applied(_) | Msg::Stopped { .. }) {
+        if matches!(msg, Msg::Ran { .. } | Msg::Planned { .. } | Msg::Applied(_) | Msg::Stopped { .. }) {
             self.files_stale = true;
         }
         // The last turns of a run that ended are read once more.
@@ -1186,6 +1218,7 @@ impl App {
             }
             Msg::Designed { trace, result, existing } => self.designed(trace, result, &existing),
             Msg::Ran { trace, result } => self.ran(trace, *result),
+            Msg::Planned { trace, result } => self.planned(trace, *result),
             Msg::Runs(runs) => {
                 self.listed_runs(runs);
                 Vec::new()

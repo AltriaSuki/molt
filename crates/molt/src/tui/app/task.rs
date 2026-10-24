@@ -31,6 +31,8 @@ impl App {
                     drop_run = Some(task.trace.to_string());
                 }
                 attempts = task.lanes.iter().filter_map(|l| l.fork.clone()).collect();
+                // A plan's steps that passed are in its own fork.
+                attempts.extend(task.plan_fork.clone());
                 check_files = task.req.check_files.iter().map(|f| f.path.clone()).collect();
                 self.last_lanes = std::mem::take(&mut task.lanes);
                 // Starting again needs the check in full; a designed one is only known once accepted.

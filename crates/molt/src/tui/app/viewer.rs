@@ -154,6 +154,18 @@ impl App {
                     pairs.extend([("r", "retry with the same check"), ("v", "view attempts"), ("esc", "dismiss")]);
                     "retry"
                 }
+                Some(Prompt::Plan(_)) => {
+                    pairs.extend([("enter", "run the steps"), ("e", "edit the steps"), ("esc", "cancel")]);
+                    "plan confirmation"
+                }
+                Some(Prompt::EditPlan(_)) => {
+                    pairs.extend([
+                        ("enter", "save the steps"),
+                        ("shift+enter / ctrl+j", "new line: one step per line"),
+                        ("esc", "back to plan confirmation"),
+                    ]);
+                    "edit plan"
+                }
                 Some(Prompt::EditCheck(_)) => {
                     pairs.extend([("enter", "save check command"), ("esc", "back to check confirmation")]);
                     "edit check"

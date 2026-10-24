@@ -66,6 +66,8 @@ enum Fake {
     /// Attempts run a command that starts a long `sleep`, writes its pid to
     /// this file and waits for it.
     Hangs(PathBuf),
+    /// The designer submits the check alone, with no file of its own; attempts greet.
+    DesignsWithoutFiles,
     /// Attempts greet and, when they are offered this tool, call it too.
     GreetsWithTool(&'static str),
     /// Attempts greet and, when they are offered the first of these tools,
@@ -142,6 +144,10 @@ impl Respond for FakeApi {
         let (mut content, stop) = match (&self.0, designer, turn) {
             (Fake::Refuses, ..) => return message(n, model, vec![], "refusal", stream),
             (Fake::NeverSubmits, true, _) => (vec![tool_use(n, LIST_FILES, json!({}))], "tool_use"),
+            (Fake::DesignsWithoutFiles, true, _) => {
+                let input = json!({ "command": CHECK, "files": [], "rationale": "Greets." });
+                (vec![tool_use(n, SUBMIT_CHECK, input)], "tool_use")
+            }
             (_, true, Turn::First) => (vec![write("check.sh", &format!("{CHECK}\n"))], "tool_use"),
             (_, true, _) => {
                 let input = json!({ "command": "sh check.sh", "files": ["check.sh"], "rationale": "Greets." });
@@ -2731,4 +2737,70 @@ async fn a_users_skill_is_offered_by_name_and_read_through_load_skill_and_a_proj
     assert_eq!(offered, [("greet-style", user_md.to_str().unwrap()), ("deploy", ".molt/skills/deploy/SKILL.md")]);
     assert_requests_valid(&server).await;
     setup.assert_forks_dropped();
+}
+
+#[tokio::test]
+async fn molt_do_plan_runs_each_given_step_with_its_own_designed_check_then_the_overall_one() {
+    let server = fake_api(Fake::DesignsWithoutFiles).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let args = [
+        "--step",
+        "Write the greeting.",
+        "--step",
+        "Check that the greeting is still there.",
+        "--check",
+        CHECK,
+        "--attempts",
+        "1",
+        "--json",
+        "--no-learn",
+    ];
+    let out = tokio::time::timeout(RUN_LIMIT, molt_do(&server, workspace.path(), data.path(), &args).output())
+        .await
+        .expect("molt do hung")
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "status {:?}\nstdout:\n{}\nstderr:\n{stderr}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(stderr.contains("plan: 2 steps: 1. Write the greeting."), "{stderr}");
+    assert!(stderr.contains("step 1/2: Write the greeting."), "{stderr}");
+    assert!(stderr.contains("step 2/2: Check that the greeting is still there."), "{stderr}");
+    let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["outcome"], "passed", "{json:#}");
+    assert_eq!(json["check"]["command"], CHECK, "the given check is the overall one");
+    assert_eq!(json["applied"], true, "{json:#}");
+    let ran = json["plan"]["ran"].as_array().unwrap();
+    assert_eq!(ran.len(), 2, "{json:#}");
+    for step in ran {
+        assert_eq!(step["run"]["outcome"], "passed", "{step:#}");
+        // Each step designed a check of its own.
+        assert_eq!(step["run"]["check"]["designed"], true, "{step:#}");
+    }
+    assert_eq!(std::fs::read_to_string(workspace.path().join("greeting.txt")).unwrap(), "hello\n");
+    // Every step, and the plan itself, is in the audit log under the plan's trace.
+    let audit = molt_kernel::audit::read_all(&data.path().join("audit.jsonl")).await.unwrap();
+    let plans: Vec<_> = audit
+        .iter()
+        .filter_map(|e| match &e.event {
+            AuditEvent::Message { envelope }
+                if envelope.kind == Kind::Request && envelope.to.to_string() == molt_api::plan::PLAN =>
+            {
+                Some(envelope)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].payload["steps"][1], "Check that the greeting is still there.");
+    // And so is its answer: each step's check and result.
+    assert!(audit.iter().any(|e| matches!(&e.event, AuditEvent::Message { envelope }
+        if envelope.kind == Kind::Reply && envelope.payload["ran"].as_array().is_some_and(|r| r.len() == 2))));
+    assert_requests_valid(&server).await;
+    assert_forks_dropped(data.path());
 }

@@ -129,7 +129,9 @@ pub(crate) async fn plan(
     let mut plan = Plan { steps, proposed, edited, rationale, ran: Vec::new(), spent: Spent::default() };
     let overall = match overall_check(&ctx, &req.run, overall_designed).await {
         Ok(overall) => overall,
-        Err(why) => return Ok(plan.stopped_before(&ctx, &req.run, format!("Could not design the overall check: {why}.")).await),
+        Err(why) => {
+            return Ok(plan.stopped_before(&ctx, &req.run, format!("Could not design the overall check: {why}.")).await)
+        }
     };
     // The result of the steps: the kept result to go on in, or a new fork of the workspace.
     let continued = req.run.continues.as_ref().and_then(|c| c.fork.clone());
@@ -165,13 +167,14 @@ async fn propose(ctx: &Arc<Ctx>) -> Result<(Vec<String>, String), String> {
     let max_turns = seat.max_turns.unwrap_or(MAX_TURNS);
     let mut meter = Meter::default();
     loop {
-        let resp = agent::turn(ctx, &mut conv, max_turns, &mut meter, &ctx.run_cancel).await.map_err(|stop| match stop {
-            Stop::OutOfTurns => "the step designer stopped without submitting the steps".to_owned(),
-            Stop::Budget => "the budget ran out before the steps were submitted".to_owned(),
-            Stop::Model(e) => format!("model call failed: {e}"),
-            Stop::Refused => "the model declined".to_owned(),
-            Stop::Cancelled => "cancelled".to_owned(),
-        })?;
+        let resp =
+            agent::turn(ctx, &mut conv, max_turns, &mut meter, &ctx.run_cancel).await.map_err(|stop| match stop {
+                Stop::OutOfTurns => "the step designer stopped without submitting the steps".to_owned(),
+                Stop::Budget => "the budget ran out before the steps were submitted".to_owned(),
+                Stop::Model(e) => format!("model call failed: {e}"),
+                Stop::Refused => "the model declined".to_owned(),
+                Stop::Cancelled => "cancelled".to_owned(),
+            })?;
         let cut_off = agent::cut_off(&resp);
         let mut results = Vec::new();
         for call in resp.tool_uses() {
@@ -342,7 +345,8 @@ impl Plan {
             let req = step_request(run, &self.steps, at, left);
             // A child: stopping the plan stops the step, but a step that runs out of its share stops only itself.
             let cancel = ctx.run_cancel.child_token();
-            let ran = runner::run_on(bus.clone(), cfg.clone(), req, ctx.trace.clone(), cancel, Some(staging.into())).await;
+            let ran =
+                runner::run_on(bus.clone(), cfg.clone(), req, ctx.trace.clone(), cancel, Some(staging.into())).await;
             let mut resp = match ran {
                 Ok(resp) => resp,
                 Err(e) => return Some(Stopped { at, why: format!("its run could not start: {}", e.message) }),
@@ -400,7 +404,9 @@ impl Plan {
         result.outcome = match (&stop, &checked) {
             (Some(_), _) | (None, Some((false, _))) => Outcome::Failed,
             (None, Some((true, _))) => Outcome::Passed,
-            (None, None) => self.ran.iter().map(|s| s.run.outcome).min_by_key(|o| outcome_rank(*o)).unwrap_or(Outcome::Passed),
+            (None, None) => {
+                self.ran.iter().map(|s| s.run.outcome).min_by_key(|o| outcome_rank(*o)).unwrap_or(Outcome::Passed)
+            }
         };
         result.verification = Some(match &overall {
             Some(_) => Verification::Command,
@@ -488,7 +494,9 @@ impl Plan {
             s.push_str(&format!("\n{}. {goal}: {how}", at + 1));
         }
         match (overall, checked) {
-            (Some((check, _)), Some((true, _))) => s.push_str(&format!("\nThe overall check `{}` passed.", check.command)),
+            (Some((check, _)), Some((true, _))) => {
+                s.push_str(&format!("\nThe overall check `{}` passed.", check.command))
+            }
             (Some((check, _)), Some((false, tail))) => {
                 s.push_str(&format!("\nThe overall check `{}` failed:\n{}", check.command, tail.trim_end()))
             }
@@ -691,7 +699,8 @@ mod tests {
 
     #[test]
     fn a_plan_is_as_strong_as_its_weakest_step() {
-        let weakest = [Outcome::Passed, Outcome::Unverified, Outcome::Judged].into_iter().min_by_key(|o| outcome_rank(*o));
+        let weakest =
+            [Outcome::Passed, Outcome::Unverified, Outcome::Judged].into_iter().min_by_key(|o| outcome_rank(*o));
         assert_eq!(weakest, Some(Outcome::Unverified));
         let levels = [Verification::Command, Verification::Rules].into_iter().min_by_key(|v| level_rank(*v));
         assert_eq!(levels, Some(Verification::Rules));

@@ -58,7 +58,9 @@ fn changes(base: &Files, now: &Files) -> Vec<Change> {
             kind: if base.contains_key(path) { ChangeKind::Modified } else { ChangeKind::Added },
         })
         .collect();
-    out.extend(base.keys().filter(|p| !now.contains_key(*p)).map(|p| Change { path: p.clone(), kind: ChangeKind::Deleted }));
+    out.extend(
+        base.keys().filter(|p| !now.contains_key(*p)).map(|p| Change { path: p.clone(), kind: ChangeKind::Deleted }),
+    );
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
@@ -77,13 +79,12 @@ impl State {
 fn check(command: &str, files: &Files) -> shell::RunResponse {
     let upto = match command {
         "check-all" => 3,
-        other => match other.strip_prefix("check-").and_then(|n| n.parse::<usize>().ok()) {
-            Some(n) => n,
-            None => 0,
-        },
+        other => other.strip_prefix("check-").and_then(|n| n.parse::<usize>().ok()).unwrap_or_default(),
     };
-    let missing: Vec<String> =
-        (1..=upto).map(|n| format!("step{n}.txt")).filter(|p| files.get(p).map(String::as_str) != Some("done\n")).collect();
+    let missing: Vec<String> = (1..=upto)
+        .map(|n| format!("step{n}.txt"))
+        .filter(|p| files.get(p).map(String::as_str) != Some("done\n"))
+        .collect();
     shell::RunResponse {
         exit_code: Some(if missing.is_empty() { 0 } else { 1 }),
         signal: None,
@@ -99,10 +100,8 @@ fn check(command: &str, files: &Files) -> shell::RunResponse {
 
 impl Fake {
     fn new(model: impl Fn(&CompleteRequest) -> CompleteResponse + Send + Sync + 'static) -> Arc<Self> {
-        let state = State {
-            workspace: Files::from([("README.md".to_owned(), "# project\n".to_owned())]),
-            ..State::default()
-        };
+        let state =
+            State { workspace: Files::from([("README.md".to_owned(), "# project\n".to_owned())]), ..State::default() };
         Arc::new(Self { state: Mutex::new(state), model: Box::new(model) })
     }
 
@@ -263,7 +262,10 @@ fn model(fails: Option<usize>) -> impl Fn(&CompleteRequest) -> CompleteResponse 
 }
 
 /// [`model`] for a plan whose first step is step `first` of [`STEPS`].
-fn model_from(first: usize, fails: Option<usize>) -> impl Fn(&CompleteRequest) -> CompleteResponse + Send + Sync + 'static {
+fn model_from(
+    first: usize,
+    fails: Option<usize>,
+) -> impl Fn(&CompleteRequest) -> CompleteResponse + Send + Sync + 'static {
     move |req| {
         if offers(req, "submit_plan") {
             return call(req, "submit_plan", json!({ "steps": STEPS, "rationale": "One file per step." }));
@@ -407,7 +409,7 @@ async fn when_step_two_fails_step_three_never_starts_and_step_one_is_kept_to_app
     assert!(!result.applied);
     assert!(!fake.workspace().contains_key("step1.txt"));
     let kept = result.fork.clone().unwrap();
-    assert_eq!(fake.forks_alive(), [kept.clone()], "only the plan's result is left");
+    assert_eq!(fake.forks_alive(), std::slice::from_ref(&kept), "only the plan's result is left");
     let files = fake.fork_files(&kept);
     assert_eq!((files.get("step1.txt").map(String::as_str), files.get("step2.txt")), (Some("done\n"), None));
     assert_eq!(result.changes, [Change { path: "step1.txt".into(), kind: ChangeKind::Added }]);
@@ -461,10 +463,14 @@ async fn an_edited_plan_is_the_one_that_runs_and_the_edit_is_on_record() {
     let edited = vec!["Add step1.txt.".to_owned(), "Add step3.txt, and step2.txt with it.".to_owned()];
     let fake = Fake::new(model(None));
     let req = PlanRequest { steps: edited.clone(), proposed: proposal.steps.clone(), ..request() };
-    let resp = plan(&fake, PlanRequest { run: RunRequest { check: Some("check-1".into()), ..req.run.clone() }, ..req }).await;
+    let resp =
+        plan(&fake, PlanRequest { run: RunRequest { check: Some("check-1".into()), ..req.run.clone() }, ..req }).await;
     assert!(resp.edited);
     assert_eq!((resp.steps.clone(), resp.proposed.clone()), (edited.clone(), STEPS.map(String::from).to_vec()));
-    assert!(fake.events().iter().any(|e| matches!(e, Progress::Planned { steps, edited: true, .. } if steps == &edited)));
+    assert!(fake
+        .events()
+        .iter()
+        .any(|e| matches!(e, Progress::Planned { steps, edited: true, .. } if steps == &edited)));
     assert!(fake.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
         if message == "the plan as edited: 2 steps, 3 proposed")));
     // Nothing designs the steps again, and each run is told the edited plan.
@@ -521,15 +527,18 @@ async fn one_budget_covers_every_step() {
         }
         resp
     });
-    let resp = plan(&fake, PlanRequest { run: RunRequest { check: Some("check-all".into()), ..request().run }, ..request() })
-        .await;
+    let resp =
+        plan(&fake, PlanRequest { run: RunRequest { check: Some("check-all".into()), ..request().run }, ..request() })
+            .await;
     assert!(started(&fake).is_empty());
     assert_eq!(fake.requests().len(), 1);
     let result = resp.result.as_deref().unwrap();
     assert_eq!((resp.uncounted_calls, result.uncounted_calls), (1, 1));
     assert_eq!(resp.remaining, STEPS);
     assert!(
-        result.summary.contains("1. Add step1.txt.: did not start: 1 model calls of the plan so far have an unknown cost"),
+        result
+            .summary
+            .contains("1. Add step1.txt.: did not start: 1 model calls of the plan so far have an unknown cost"),
         "{}",
         result.summary
     );

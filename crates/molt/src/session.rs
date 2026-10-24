@@ -151,6 +151,7 @@ impl Session {
             planner::RUN,
             planner::DESIGN,
             planner::CONTROL,
+            molt_api::plan::PLAN,
             fs::DIFF,
             fs::VIEW,
             fs::MERGE,
@@ -221,6 +222,15 @@ impl Session {
 
     pub async fn run(&self, req: &RunRequest, trace: &TraceId) -> anyhow::Result<RunResponse> {
         self.call(planner::RUN, req, RUN_MS, Some(trace)).await
+    }
+
+    /// Plan a task as steps, or with steps, carry them out (`planner.plan`).
+    pub async fn plan(
+        &self,
+        req: &molt_api::plan::PlanRequest,
+        trace: &TraceId,
+    ) -> anyhow::Result<molt_api::plan::PlanResponse> {
+        self.call(molt_api::plan::PLAN, req, RUN_MS, Some(trace)).await
     }
 
     /// Change the running run `run`: add to its requirements, pause it or let it go on.
