@@ -742,10 +742,13 @@ async fn main() -> anyhow::Result<ExitCode> {
         Cmd::Project { cmd } => project_cmd(cmd)?,
         Cmd::Env { cmd: EnvCmd::Doctor { workspace, sandbox_policy } } => {
             let workspace = workspace.canonicalize().with_context(|| format!("workspace {}", workspace.display()))?;
-            // The profiles of the --config file, if one is given.
+            // The profiles of the --config file if one is given, else the user config's.
             let user = match cli.config.as_deref() {
                 Some(path) => Config::load(path)?.environments,
-                None => Default::default(),
+                None => match molt::layers::user_path(&|name| std::env::var(name).ok()) {
+                    Some(path) if path.is_file() => Config::load(&path)?.environments,
+                    _ => Default::default(),
+                },
             };
             let policy = match sandbox_policy {
                 Some(path) => {

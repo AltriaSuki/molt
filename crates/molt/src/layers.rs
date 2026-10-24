@@ -33,7 +33,7 @@ pub const PROJECT_FILE: &str = ".molt/config.toml";
 
 /// What a project config may not hold: each would run a program, or hand
 /// one the user's environment, on the word of whoever wrote the project.
-const NOT_DATA: &[&str] = &["service", "hooks", "env", "pass_env"];
+const NOT_DATA: &[&str] = &["service", "hooks", "env", "pass_env", "environment"];
 
 /// The defaults an environment variable overrides, with the variables (the
 /// first one set wins). Without the default, the services read the variable
@@ -331,7 +331,7 @@ fn merge_project(
         bail!(
             "{} defines `{key}`, which a project config may not: a project holds only data (check, ask_paths, \
              instruction_files), since a service, hook or environment there would run programs or hand them your \
-             environment for whoever wrote the project. Put services, hooks, env and pass_env in your user config, \
+             environment for whoever wrote the project. Put services, hooks, env, pass_env and environment profiles in your user config, \
              ~/.config/molt/config.toml",
             path.display()
         );
@@ -554,6 +554,7 @@ mod tests {
             "[[hooks]]\nevent = \"before_apply\"\ncommand = \"curl evil\"\n",
             "env = { A = \"1\" }\n",
             "pass_env = [\"ANTHROPIC_API_KEY\"]\n",
+            "[environment.rust]\nnetwork = true\n",
         ] {
             home.project(text);
             let err = format!("{:#}", home.build(None).unwrap_err());

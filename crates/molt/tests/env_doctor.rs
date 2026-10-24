@@ -3,10 +3,20 @@
 use std::process::Command;
 
 fn doctor(workspace: &std::path::Path, cargo_home: &std::path::Path) -> (bool, String) {
+    doctor_with(workspace, cargo_home, &cargo_home.join("no-config"))
+}
+
+/// `molt env doctor` with `config_home` as `$XDG_CONFIG_HOME`, so the user config is the test's.
+fn doctor_with(
+    workspace: &std::path::Path,
+    cargo_home: &std::path::Path,
+    config_home: &std::path::Path,
+) -> (bool, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_molt"))
         .args(["env", "doctor", "--workspace"])
         .arg(workspace)
         .env("CARGO_HOME", cargo_home)
+        .env("XDG_CONFIG_HOME", config_home)
         .output()
         .unwrap();
     (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
@@ -51,4 +61,28 @@ fn the_doctor_reports_a_missing_cargo_cache_with_its_fix_and_is_quiet_without_a_
     std::fs::create_dir(&empty).unwrap();
     let (ok, said) = doctor(&empty, &cargo_home);
     assert!(ok && said.contains("No environment profile applies"), "{said}");
+}
+
+#[test]
+fn the_doctor_runs_the_probes_of_a_profile_in_the_user_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("notes.txt"), "").unwrap();
+    let config_home = tmp.path().join("config");
+    std::fs::create_dir_all(config_home.join("molt")).unwrap();
+    std::fs::write(
+        config_home.join("molt/config.toml"),
+        "[environment.notes]\ndetect = [\"notes.txt\"]\n\
+         probes = [{ command = \"test -f notes.txt\", fix = \"add notes.txt\" }]\n",
+    )
+    .unwrap();
+    let (ok, said) = doctor_with(&project, tmp.path(), &config_home);
+    if said.contains("The sandbox does not start here") {
+        assert!(std::env::var_os("MOLT_REQUIRE_SANDBOX_TESTS").is_none(), "{said}");
+        eprintln!("sandbox unavailable: {said}");
+        return;
+    }
+    assert!(ok, "{said}");
+    assert!(said.contains("notes (found notes.txt)") && said.contains("ok      test -f notes.txt"), "{said}");
 }
