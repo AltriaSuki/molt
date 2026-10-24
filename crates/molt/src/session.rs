@@ -38,6 +38,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::{self, RunForks, MEMORY, SERVICES};
 use crate::{Config, Running};
+use molt_planner::hooks::{self, Event, Hook, Place};
 
 /// Calls a session may make of each method. A person makes them one at a time.
 const CALLS: u64 = 100_000;
@@ -237,7 +238,9 @@ impl Session {
         }
         // A trace of its own, so the learning does not become part of the episode.
         let req = ConsolidateRequest { episode: trace.to_string(), workspace: self.workspace.clone(), model };
-        self.call(memory::CONSOLIDATE, req, LEARN_MS, None).await.map_err(|e| format!("{e:#}"))
+        let learned = self.call(memory::CONSOLIDATE, req, LEARN_MS, None).await.map_err(|e| format!("{e:#}"))?;
+        learn_after(&self.cli, &self.hooks, &self.workspace, trace, &learned).await;
+        Ok(learned)
     }
 
     /// Merge a result kept in `fork` into the workspace, and drop the fork.
@@ -250,9 +253,22 @@ impl Session {
     /// paths, so the audit log has what was chosen.
     pub async fn apply_only(&self, fork: &str, paths: &[String]) -> anyhow::Result<MergeResponse> {
         self.validate_fork(fork).await?;
+        if self.hooks.iter().any(|h| h.event == Event::ApplyBefore) {
+            let diff: DiffResponse = self
+                .call(fs::DIFF, DiffRequest { fork: fork.to_owned(), paths: paths.to_vec() }, DIFF_MS, None)
+                .await?;
+            let changes: Vec<String> = diff.changes.into_iter().map(|c| c.path).collect();
+            let payload = serde_json::json!({ "workspace": self.workspace, "fork": fork, "changes": changes });
+            let host = CliHooks { cli: &self.cli };
+            let decided =
+                hooks::decide(&host, &self.hooks, Event::ApplyBefore, Place::CopyOf(fork), None, &changes, payload);
+            if let Some(reason) = decided.await.denied {
+                anyhow::bail!("an apply.before hook refused the result: {reason}. It is kept in {fork}");
+            }
+        }
         let req = MergeRequest { fork: fork.to_owned(), drop: true, paths: paths.to_vec() };
-        let result = self.call(fs::MERGE, req, TREE_MS, None).await?;
-        self.notify_applied().await;
+        let result: MergeResponse = self.call(fs::MERGE, req, TREE_MS, None).await?;
+        self.notify_applied(&result).await;
         Ok(result)
     }
 
@@ -295,6 +311,7 @@ impl Session {
                     command: check.command.clone(),
                     timeout_ms: Some(CHECK_MS),
                     stream: false,
+                    stdin: None,
                 };
                 let ran: anyhow::Result<molt_api::shell::RunResponse> =
                     self.call(molt_api::shell::RUN, req, CHECK_MS.saturating_add(5000), None).await;
@@ -306,32 +323,12 @@ impl Session {
         Ok(Rechecked { all: all.changes, diff, check: ran, rules })
     }
 
-    async fn notify_applied(&self) {
-        let hooks: Vec<_> = self.hooks.iter().filter(|h| h.event == molt_planner::hooks::Event::AfterApply).collect();
-        if hooks.is_empty() {
-            return;
-        }
-        let fork: anyhow::Result<fs::ForkResponse> =
-            self.call(fs::FORK, fs::ForkRequest { workspace: self.workspace.clone() }, TREE_MS, None).await;
-        let Ok(fork) = fork else {
-            tracing::warn!("after_apply hooks could not get a private fork");
-            return;
-        };
-        for hook in hooks {
-            let req = molt_api::shell::RunRequest {
-                workspace: fork.fork.clone(),
-                command: hook.command.clone(),
-                timeout_ms: Some(hook.timeout_ms),
-                stream: false,
-            };
-            let result: anyhow::Result<molt_api::shell::RunResponse> =
-                self.call(molt_api::shell::RUN, req, hook.timeout_ms.saturating_add(5000), None).await;
-            if let Err(error) = result {
-                tracing::warn!(error = %error, "after_apply notification failed");
-            }
-        }
-        let _: anyhow::Result<fs::DropResponse> =
-            self.call(fs::DROP, fs::DropRequest { fork: fork.fork }, TREE_MS, None).await;
+    async fn notify_applied(&self, merged: &MergeResponse) {
+        let changes: Vec<String> = merged.changes.iter().map(|c| c.path.clone()).collect();
+        let payload = serde_json::json!({ "workspace": self.workspace, "changes": changes });
+        let host = CliHooks { cli: &self.cli };
+        let place = Place::CopyOf(&self.workspace);
+        hooks::decide(&host, &self.hooks, Event::AfterApply, place, None, &changes, payload).await;
     }
 
     /// Run `command` for the user, as the attempts' commands run: in a
@@ -355,6 +352,7 @@ impl Session {
             command: command.to_owned(),
             timeout_ms: Some(COMMAND_MS),
             stream: true,
+            stdin: None,
         };
         let ran = async {
             let opts = CallOpts { cap: None, budget: Budget::new(0, COMMAND_MS + 5000, 0), trace: Some(trace.clone()) };
@@ -599,6 +597,103 @@ fn versions(running: &Running, cfg: &Config) -> Vec<(String, String)> {
             Some((s.name.to_string(), short))
         })
         .collect()
+}
+
+/// The hooks' way to the shell and to forks from the front end's side of
+/// the bus, for the events that happen there: a kept result applied, and
+/// learning. Their decisions are in the audit as the shell's requests,
+/// each event on stdin, and replies, each answer on stdout; and in the log.
+pub(crate) struct CliHooks<'a> {
+    pub cli: &'a Service,
+}
+
+impl CliHooks<'_> {
+    async fn call<T: DeserializeOwned>(&self, target: &str, payload: impl Serialize, ms: u64) -> Result<T, String> {
+        let opts = CallOpts { cap: None, budget: Budget::new(0, ms, 0), trace: None };
+        let payload = serde_json::to_value(payload).map_err(|e| e.to_string())?;
+        let reply = self.cli.call(target, payload, opts).await.map_err(|e| e.to_string())?;
+        serde_json::from_value(reply).map_err(|e| format!("the answer to {target} is not what it should be: {e}"))
+    }
+}
+
+impl hooks::Host for CliHooks<'_> {
+    async fn shell(
+        &self,
+        workspace: &str,
+        command: &str,
+        stdin: String,
+        timeout_ms: u64,
+    ) -> Result<molt_api::shell::RunResponse, String> {
+        let req = molt_api::shell::RunRequest {
+            workspace: workspace.to_owned(),
+            command: command.to_owned(),
+            timeout_ms: Some(timeout_ms),
+            stream: false,
+            stdin: Some(stdin),
+        };
+        self.call(molt_api::shell::RUN, req, timeout_ms.saturating_add(5000)).await
+    }
+
+    async fn fork(&self, from: &str) -> Result<String, String> {
+        let fork: fs::ForkResponse =
+            self.call(fs::FORK, fs::ForkRequest { workspace: from.to_owned() }, TREE_MS).await?;
+        Ok(fork.fork)
+    }
+
+    async fn drop_fork(&self, fork: &str) {
+        if let Err(error) = self.call::<DropResponse>(fs::DROP, DropRequest { fork: fork.to_owned() }, TREE_MS).await {
+            tracing::warn!(fork, %error, "could not drop a hook's fork");
+        }
+    }
+
+    async fn note(&self, message: String) {
+        tracing::info!(target: "molt::hooks", "{message}");
+    }
+}
+
+/// [`learn_after`] from a front end that holds no capability for its calls yet.
+pub(crate) async fn learn_after_granted(
+    kernel: &molt_kernel::Kernel,
+    cli: &Service,
+    hooks: &[Hook],
+    workspace: &str,
+    trace: &TraceId,
+    learned: &ConsolidateResponse,
+) {
+    if !hooks.iter().any(|h| h.event == Event::LearnAfter) {
+        return;
+    }
+    for target in [fs::FORK, fs::DROP, molt_api::shell::RUN] {
+        if let Err(error) = agent::grant(kernel, cli, target, Budget::new(0, 0, 64)).await {
+            tracing::warn!(%error, "learn.after hooks cannot run");
+            return;
+        }
+    }
+    learn_after(cli, hooks, workspace, trace, learned).await;
+}
+
+/// Tell the `learn.after` hooks what memory learned from run `trace`, in a
+/// disposable fork of `workspace`. `cli` may call `fs.fork`, `fs.drop` and `shell.run`.
+pub(crate) async fn learn_after(
+    cli: &Service,
+    hooks: &[Hook],
+    workspace: &str,
+    trace: &TraceId,
+    learned: &ConsolidateResponse,
+) {
+    if !hooks.iter().any(|h| h.event == Event::LearnAfter) {
+        return;
+    }
+    let payload = serde_json::json!({
+        "run_id": trace.to_string(),
+        "workspace": workspace,
+        "added": learned.added.iter().map(|n| &n.id).collect::<Vec<_>>(),
+        "reinforced": learned.reinforced,
+        "contradicted": learned.contradicted,
+        "skipped": learned.skipped,
+    });
+    let host = CliHooks { cli };
+    hooks::decide(&host, hooks, Event::LearnAfter, Place::CopyOf(workspace), None, &[], payload).await;
 }
 
 #[cfg(test)]

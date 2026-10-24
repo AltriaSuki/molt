@@ -704,7 +704,12 @@ pub async fn run_task_as(
                         wait_until_up(kernel, &ran.cli, MEMORY, Instant::now() + LEARN_PROBE)
                             .await
                             .map_err(|e| format!("{e:#}"))?;
-                        consolidate(kernel, &ran.cli, &ran.trace, &workspace, learn.model).await
+                        let learned = consolidate(kernel, &ran.cli, &ran.trace, &workspace, learn.model).await?;
+                        crate::session::learn_after_granted(
+                            kernel, &ran.cli, &cfg.hooks, &workspace, &ran.trace, &learned,
+                        )
+                        .await;
+                        Ok(learned)
                     };
                     tokio::select! {
                         biased;
@@ -1510,7 +1515,7 @@ mod tests {
         std::fs::write(&outside, &config).unwrap();
         let trusted = resolve_config(Some(&outside), &workspace, None, None, None).unwrap();
         assert_eq!(trusted.hooks.len(), 1);
-        assert!(trusted.service("planner").unwrap().env["MOLT_HOOKS_JSON"].contains("before_apply"));
+        assert!(trusted.service("planner").unwrap().env["MOLT_HOOKS_JSON"].contains("result.ready"));
         let inside = workspace.join("config.toml");
         std::fs::write(&inside, config).unwrap();
         let ignored = resolve_config(Some(&inside), &workspace, None, None, None).unwrap();

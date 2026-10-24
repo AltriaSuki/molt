@@ -1657,6 +1657,7 @@ dependencies = [
  "molt-proto",
  "molt-sdk",
  "molt-transport",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

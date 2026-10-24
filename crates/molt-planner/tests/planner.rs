@@ -15,6 +15,7 @@ use molt_api::planner::{
 };
 use molt_api::progress::Progress;
 use molt_api::shell;
+use molt_planner::hooks::{Event, Hook};
 use molt_planner::{Bus, Config};
 use molt_proto::{Budget, ErrorCode, RemoteError, TraceId};
 use serde_json::{json, Value};
@@ -2285,6 +2286,261 @@ async fn without_review_no_reviewer_runs() {
     let fake = reviewed(|_| panic!("no review was asked for"));
     let resp = run(&fake, request(Some("check"), 1)).await;
     assert!(resp.review.is_none() && resp.applied);
+}
+
+// --- Lifecycle hooks -----------------------------------------------------------
+
+/// A hook command's answer on stdout, as `shell.run` returns it.
+fn says(stdout: &str) -> shell::RunResponse {
+    shell::RunResponse { stdout: stdout.to_owned(), ..exit(0, "") }
+}
+
+fn hooked(hooks: Vec<Hook>) -> Config {
+    Config { hooks, ..config() }
+}
+
+/// The event JSON each run of the hook `command` read on stdin.
+fn hook_events(fake: &Fake, command: &str) -> Vec<Value> {
+    fake.calls_to("shell.run")
+        .into_iter()
+        .filter(|c| c.payload["command"] == command)
+        .map(|c| serde_json::from_str(c.payload["stdin"].as_str().expect("a hook reads the event")).unwrap())
+        .collect()
+}
+
+fn noted(fake: &Fake, start: &str) -> bool {
+    fake.events().iter().any(|e| matches!(e, Progress::Note { message, .. } if message.starts_with(start)))
+}
+
+#[tokio::test]
+async fn a_tool_before_hook_stops_an_edit_under_migrations_and_the_model_reads_why() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => use_tools(
+                req,
+                &[
+                    ("edit_file", json!({ "path": "./migrations/001_init.sql", "old_string": "a", "new_string": "b" })),
+                    ("write_file", json!({ "path": "hello.txt", "content": "hi\n" })),
+                ],
+            ),
+            _ => done("Wrote hello.txt."),
+        },
+        |command, files| match command {
+            "guard" => says(r#"{"decision":"deny","reason":"migrations are frozen: add a new one instead"}"#),
+            _ => hello_check(command, files),
+        },
+    );
+    fake.set(|st| {
+        st.workspace.insert("migrations/001_init.sql".into(), "a\n".into());
+    });
+    let guard = Hook {
+        matcher: Some("edit_file|write_file".into()),
+        paths: vec!["migrations/**".into()],
+        ..Hook::new(Event::ToolBefore, "guard")
+    };
+    let resp = run_with(&fake, hooked(vec![guard]), request(Some("check"), 1)).await;
+
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert_eq!(fake.workspace()["migrations/001_init.sql"], "a\n", "the edit was not made");
+    assert_eq!(fake.workspace()["hello.txt"], "hi\n", "a call the hook does not match runs as before");
+    let results = fake.requests()[1].messages.last().unwrap()["content"].clone();
+    assert_eq!(results[0]["is_error"], true);
+    assert_eq!(
+        results[0]["content"],
+        "Not run: the user's tool.before hook refused this call: migrations are frozen: add a new one instead"
+    );
+    assert_ne!(results[1]["is_error"], true);
+    // Only the matching call ran the hook, with the event on its stdin, in the attempt's fork.
+    let events = hook_events(&fake, "guard");
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(
+        (event["hook_event_name"].as_str(), event["tool_name"].as_str()),
+        (Some("tool.before"), Some("edit_file"))
+    );
+    assert_eq!(event["paths"], json!(["./migrations/001_init.sql"]));
+    assert_eq!(event["tool_input"]["old_string"], "a");
+    assert_eq!((event["role"].as_str(), event["attempt"].as_u64()), (Some("attempt"), Some(0)));
+    assert_eq!(event["cwd"], "/scratch/fork-0");
+    assert_eq!(event["run_id"], "trace_test");
+    assert!(noted(&fake, "hook tool.before edit_file: deny: migrations are frozen"), "{:?}", fake.events());
+}
+
+#[tokio::test]
+async fn tool_hooks_annotate_and_modify_calls_and_tool_after_can_turn_a_result_into_an_error() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => use_tools(
+                req,
+                &[
+                    ("read_file", json!({ "path": "README.md" })),
+                    ("write_file", json!({ "path": "hi.txt", "content": "hi\n" })),
+                    ("list_files", json!({})),
+                ],
+            ),
+            _ => done("Wrote hello.txt."),
+        },
+        |command, files| match command {
+            "annotate" => says(r#"{"decision":"annotate","context":"README.md is generated: edit docs/ instead."}"#),
+            "rename" => says(r#"{"hookSpecificOutput":{"updatedInput":{"path":"hello.txt","content":"hi\n"}}}"#),
+            "object" => shell::RunResponse { exit_code: Some(2), ..exit(2, "listing is not allowed here\n") },
+            _ => hello_check(command, files),
+        },
+    );
+    let hooks = vec![
+        Hook { matcher: Some("read_file".into()), ..Hook::new(Event::ToolBefore, "annotate") },
+        Hook { matcher: Some("write_file".into()), ..Hook::new(Event::ToolBefore, "rename") },
+        Hook { matcher: Some("list_files".into()), ..Hook::new(Event::ToolAfter, "object") },
+    ];
+    let resp = run_with(&fake, hooked(hooks), request(Some("check"), 1)).await;
+
+    assert_eq!(resp.outcome, Outcome::Passed, "the changed write made hello.txt: {}", resp.summary);
+    assert_eq!(fake.workspace()["hello.txt"], "hi\n");
+    assert!(!fake.workspace().contains_key("hi.txt"));
+    let results = fake.requests()[1].messages.last().unwrap()["content"].clone();
+    assert_eq!(
+        results[0]["content"],
+        "# project\n\n\n[Context from the user's tool.before hook]\nREADME.md is generated: edit docs/ instead."
+    );
+    assert!(results[1]["content"].as_str().unwrap().starts_with("Wrote 3 bytes to hello.txt"), "{results}");
+    assert_eq!(results[2]["is_error"], true);
+    assert!(
+        results[2]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("The call ran, but the user's tool.after hook objected: listing is not allowed here"),
+        "{results}"
+    );
+    let after = &hook_events(&fake, "object")[0];
+    assert_eq!(after["tool_response"]["is_error"], false);
+    assert!(after["tool_response"]["content"].as_str().unwrap().contains("README.md"));
+    assert!(noted(&fake, "hook tool.before write_file: modify the input"));
+}
+
+#[tokio::test]
+async fn prompt_submit_hooks_can_refuse_a_task_or_add_to_it() {
+    let refuse = Hook::new(Event::PromptSubmit, "refuse");
+    let fake = Fake::new(|_| panic!("a refused task reaches no model"), |_, _| exit(2, "no tasks on Fridays\n"));
+    let bus: Arc<dyn Bus> = fake.clone();
+    let run = molt_planner::run(bus, Arc::new(hooked(vec![refuse])), request(Some("check"), 1), TraceId::random());
+    let refused = run.await.unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Denied);
+    assert_eq!(refused.message, "a prompt.submit hook refused the task: no tasks on Fridays");
+    assert_eq!(hook_events(&fake, "refuse")[0]["prompt"], "Add hello.txt saying hi.");
+    assert!(fake.forks_alive().is_empty(), "its disposable fork is dropped");
+
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        },
+        |command, files| match command {
+            "annotate" => says(r#"{"decision":"annotate","context":"Keep files ASCII."}"#),
+            _ => hello_check(command, files),
+        },
+    );
+    let resp =
+        run_with(&fake, hooked(vec![Hook::new(Event::PromptSubmit, "annotate")]), request(Some("check"), 1)).await;
+    assert_eq!(resp.outcome, Outcome::Passed);
+    let first = fake.requests()[0].messages[0].to_string();
+    assert!(
+        first
+            .contains("Add hello.txt saying hi.\\n\\n[Context from the user's prompt.submit hook]\\nKeep files ASCII."),
+        "{first}"
+    );
+}
+
+#[tokio::test]
+async fn a_check_after_hook_can_refuse_a_pass_once_and_the_attempt_hears_why() {
+    let refusals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = refusals.clone();
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 | 3 => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        },
+        move |command, files| match command {
+            "review" if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 => {
+                says(r#"{"decision":"deny","reason":"hello.txt needs a licence header"}"#)
+            }
+            _ => hello_check(command, files),
+        },
+    );
+    let resp = run_with(&fake, hooked(vec![Hook::new(Event::CheckAfter, "review")]), request(Some("check"), 1)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert_eq!(resp.attempts[0].check_runs, 2);
+    let told = last_text(&fake.requests()[2]);
+    assert!(
+        told.contains(
+            "passed, but the user's check.after hook did not accept the result: hello.txt needs a licence header"
+        ),
+        "{told}"
+    );
+    let event = &hook_events(&fake, "review")[0];
+    assert_eq!((event["check"]["command"].as_str(), event["check"]["passed"].as_bool()), (Some("check"), Some(true)));
+    let ran: Vec<bool> = fake
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            Progress::CheckRan { passed, .. } => Some(*passed),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ran, [false, true], "the progress shows the refused pass as a failure");
+}
+
+#[tokio::test]
+async fn a_failing_hook_denies_only_when_it_blocks_and_notification_hooks_cannot_deny() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => use_tools(req, &[("read_file", json!({ "path": "README.md" })), ("list_files", json!({}))]),
+            2 => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        },
+        |command, files| match command {
+            "slow" => shell::RunResponse { exit_code: None, timed_out: true, ..exit(0, "") },
+            "broken" => exit(1, "oops"),
+            "notify" => says(r#"{"decision":"deny","reason":"too late"}"#),
+            _ => hello_check(command, files),
+        },
+    );
+    let hooks = vec![
+        Hook {
+            matcher: Some("read_file".into()),
+            blocking: true,
+            timeout_ms: 50,
+            ..Hook::new(Event::ToolBefore, "slow")
+        },
+        Hook { matcher: Some("list_files".into()), ..Hook::new(Event::ToolBefore, "broken") },
+        Hook::new(Event::AfterApply, "notify"),
+        Hook::new(Event::RunFinished, "notify"),
+    ];
+    let resp = run_with(&fake, hooked(hooks), request(Some("check"), 1)).await;
+    assert!(resp.applied, "{}", resp.summary);
+    let results = fake.requests()[1].messages.last().unwrap()["content"].clone();
+    assert!(
+        results[0]["content"].as_str().unwrap().starts_with(
+            "Not run: the user's tool.before hook refused this call: the blocking hook failed: it timed out"
+        ),
+        "{results}"
+    );
+    assert_eq!(hook_events(&fake, "slow").len(), 1);
+    let timeouts: Vec<Value> = fake
+        .calls_to("shell.run")
+        .iter()
+        .filter(|c| c.payload["command"] == "slow")
+        .map(|c| c.payload["timeout_ms"].clone())
+        .collect();
+    assert_eq!(timeouts, [json!(50)], "a hook runs with its own timeout");
+    assert_ne!(results[1]["is_error"], true, "a hook that does not block is passed over when it fails");
+    assert!(noted(&fake, "hook tool.before list_files: allow by `broken` (exit Some(1)"));
+    assert!(noted(&fake, "hook apply.after: allow by `notify`"), "{:?}", fake.events());
+    assert!(noted(&fake, "hook run.end: allow by `notify`"));
+    assert_eq!(
+        hook_events(&fake, "notify").iter().map(|e| e["hook_event_name"].clone()).collect::<Vec<_>>(),
+        [json!("apply.after"), json!("run.end")]
+    );
+    assert!(fake.forks_alive().is_empty());
 }
 
 // --- Steering a run while it goes ----------------------------------------------

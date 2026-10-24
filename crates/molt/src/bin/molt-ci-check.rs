@@ -32,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
         command: args.command,
         timeout_ms: Some(args.timeout_ms),
         stream: false,
+        stdin: None,
     };
     let result = shell.handle(shell::RUN, serde_json::to_value(req)?).await;
     shell.shutdown().await;

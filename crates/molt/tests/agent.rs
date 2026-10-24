@@ -548,6 +548,26 @@ fn molt(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) -> to
     cmd
 }
 
+/// Start a session on `cfg`'s data dir, waiting out the lock of one just
+/// shut down. Another test's child, forked before it execs, can hold a
+/// copy of the lock's file descriptor for a moment after the kernel that
+/// took it is gone.
+async fn start_session(
+    cfg: &Config,
+    workspace: &str,
+    events: tokio::sync::mpsc::UnboundedSender<Progress>,
+) -> anyhow::Result<molt::session::Session> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match molt::session::Session::start(cfg, workspace, events.clone()).await {
+            Err(e) if format!("{e:#}").contains("is already running on") && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            result => return result,
+        }
+    }
+}
+
 #[tokio::test]
 async fn memory_learns_with_the_model_the_run_asked_for() {
     let server = fake_api(Fake::Greets).await;
@@ -1764,12 +1784,11 @@ fn the_cli_refuses_a_bad_setup_before_starting_anything() {
 
 #[tokio::test]
 async fn a_kept_session_result_survives_restart_and_refuses_workspace_conflicts() {
-    use molt::session::Session;
     let server = fake_api(Fake::Greets).await;
     let setup = Setup::new(&server);
     let workspace = setup.workspace.path().canonicalize().unwrap();
     let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
-    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    let session = start_session(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
     let mut req = setup.request(Some(CHECK), 1);
     req.apply = false;
     let response = session.run(&req, &molt_proto::TraceId::random()).await.unwrap();
@@ -1778,7 +1797,7 @@ async fn a_kept_session_result_survives_restart_and_refuses_workspace_conflicts(
     // A saved path from a different workspace cannot redirect a human's operation.
     let other = tempfile::tempdir().unwrap();
     let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
-    let wrong = Session::start(&setup.cfg, other.path().to_str().unwrap(), events).await.unwrap();
+    let wrong = start_session(&setup.cfg, other.path().to_str().unwrap(), events).await.unwrap();
     for error in [
         wrong.diff(&fork).await.unwrap_err(),
         wrong.apply(&fork).await.unwrap_err(),
@@ -1790,7 +1809,7 @@ async fn a_kept_session_result_survives_restart_and_refuses_workspace_conflicts(
     assert_eq!(setup.files(), ["README.txt"]);
     wrong.shutdown(std::slice::from_ref(&fork)).await;
     let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
-    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    let session = start_session(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
     assert!(session.diff(&fork).await.unwrap().patch.contains("+hello"));
     std::fs::write(workspace.join("greeting.txt"), "user's work\n").unwrap();
     let error = format!("{:#}", session.apply(&fork).await.unwrap_err());
@@ -1806,7 +1825,6 @@ async fn a_kept_session_result_survives_restart_and_refuses_workspace_conflicts(
 
 #[tokio::test]
 async fn session_undo_notifies_memory_and_cli_undo_refuses_its_lock_before_changing_git() {
-    use molt::session::Session;
     let server = fake_api(Fake::Greets).await;
     let setup = Setup::new(&server);
     let w = setup.workspace.path();
@@ -1819,7 +1837,7 @@ async fn session_undo_notifies_memory_and_cli_undo_refuses_its_lock_before_chang
     let config = setup.data.path().join("config.toml");
     std::fs::write(&config, toml::to_string(&setup.cfg).unwrap()).unwrap();
     let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
-    let session = Session::start(&setup.cfg, w.to_str().unwrap(), events).await.unwrap();
+    let session = start_session(&setup.cfg, w.to_str().unwrap(), events).await.unwrap();
     for locked_cli in [false, true] {
         let trace = molt_proto::TraceId::random();
         let before = molt::git::Before::look(w).unwrap();
@@ -1883,13 +1901,11 @@ async fn session_undo_notifies_memory_and_cli_undo_refuses_its_lock_before_chang
 /// what was learned.
 #[tokio::test]
 async fn a_session_shows_the_check_first_and_applies_only_when_asked() {
-    use molt::session::Session;
-
     let server = fake_api(Fake::DesignsThenGreets).await;
     let setup = Setup::new(&server);
     let workspace = setup.workspace.path().canonicalize().unwrap();
     let (events, mut progress) = tokio::sync::mpsc::unbounded_channel();
-    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    let session = start_session(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
     assert_eq!(session.memory_problem(), None);
     assert!(session.versions().iter().any(|(name, v)| name == "planner" && v.len() == 8), "{:?}", session.versions());
     let trace = molt_proto::TraceId::random();
@@ -2022,14 +2038,13 @@ async fn stop_early(setup: &Setup, session: &molt::session::Session) -> (RunResp
 
 #[tokio::test]
 async fn the_interfaces_session_keeps_a_stopped_runs_forks_to_resume_it_and_drops_them_when_told() {
-    use molt::session::Session;
     let server = fake_api(Fake::Greets).await;
     let setup = Setup::new(&server);
     let workspace = setup.workspace.path().canonicalize().unwrap();
     let runs = setup.data.path().join(molt::config::RUNS);
     let start = || async {
         let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
-        Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap()
+        start_session(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap()
     };
 
     // Quit: the session stops, and the stopped run's fork stays for the next one.
@@ -2087,17 +2102,11 @@ async fn lifecycle_formatting_is_rechecked_and_cannot_weaken_the_protected_check
         let mut setup = Setup::new(&server);
         let hooks = vec![
             Hook {
-                event: Event::BeforeApply,
-                command: command.into(),
                 blocking: true,
                 timeout_ms: if command == "sleep 10" { 20 } else { 5000 },
+                ..Hook::new(Event::ResultReady, command)
             },
-            Hook {
-                event: Event::AfterApply,
-                command: "printf notification > notification.txt".into(),
-                blocking: false,
-                timeout_ms: 5000,
-            },
+            Hook { timeout_ms: 5000, ..Hook::new(Event::AfterApply, "printf notification > notification.txt") },
         ];
         setup
             .cfg
@@ -2119,7 +2128,7 @@ async fn lifecycle_formatting_is_rechecked_and_cannot_weaken_the_protected_check
         assert!(setup.file("notification.txt").is_none(), "notifications only write in a disposable fork");
         assert!(events
             .iter()
-            .any(|e| matches!(e, Progress::Note { message, .. } if message.contains("hook BeforeApply"))));
+            .any(|e| matches!(e, Progress::Note { message, .. } if message.contains("hook result.ready"))));
         let audit = std::fs::read_to_string(setup.data.path().join("audit.jsonl")).unwrap();
         assert!(audit.contains("duration_ms") && audit.contains("shell.run"));
     }
@@ -2151,6 +2160,106 @@ async fn all_candidates_are_formatted_and_rechecked_before_selection() {
     assert!(resp.applied, "{resp:#?}");
     assert_eq!(resp.selection.as_ref().unwrap().candidates.len(), 2);
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n\n"));
+}
+
+#[tokio::test]
+async fn a_tool_before_hook_refuses_a_write_and_the_model_reads_why_and_what_a_check_hook_adds() {
+    use molt_planner::hooks::{Event, Hook};
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    // It decides from the event it reads on stdin, as a hook script does.
+    let guard = r#"if grep -q '"tool_name":"write_file"'; then printf '{"decision":"deny","reason":"greeting files are frozen"}'; fi"#;
+    let hooks = vec![
+        Hook {
+            matcher: Some("write_file|edit_file".into()),
+            paths: vec!["greeting.*".into()],
+            blocking: true,
+            timeout_ms: 5000,
+            ..Hook::new(Event::ToolBefore, guard)
+        },
+        Hook {
+            timeout_ms: 5000,
+            ..Hook::new(Event::CheckAfter, r#"printf '{"decision":"annotate","context":"Ask the owner first."}'"#)
+        },
+    ];
+    let env = &mut setup.cfg.service_mut("planner").unwrap().env;
+    env.insert("MOLT_HOOKS_JSON".into(), serde_json::to_string(&hooks).unwrap());
+    let req = RunRequest { max_check_rounds: Some(2), ..setup.request(Some(CHECK), 1) };
+    let (response, events) = setup.run(req).await;
+    assert!(!response.applied, "{}", response.summary);
+    assert!(setup.file("greeting.txt").is_none());
+    let bodies = bodies(&server).await;
+    let said = |text: &str| bodies.iter().any(|b| b["messages"].to_string().contains(text));
+    assert!(said("Not run: the user's tool.before hook refused this call: greeting files are frozen"));
+    assert!(said("[Context from the user's check.after hook]\\nAsk the owner first."));
+    let decision = "hook tool.before write_file: deny: greeting files are frozen";
+    assert!(events.iter().any(|e| matches!(e, Progress::Note { message, .. } if message.starts_with(decision))));
+    let audit = std::fs::read_to_string(setup.data.path().join("audit.jsonl")).unwrap();
+    assert!(audit.contains(decision), "the decision is in the audit");
+    assert!(audit.contains(r#"\"hook_event_name\":\"tool.before\""#), "and so is the event the hook read");
+    assert_requests_valid(&server).await;
+}
+
+#[tokio::test]
+async fn an_apply_before_hook_keeps_a_passing_result_out_of_the_workspace() {
+    use molt_planner::hooks::{Event, Hook};
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    let refuse = r#"printf '{"decision":"deny","reason":"greetings need a sign-off"}'"#;
+    let hooks = vec![
+        Hook { paths: vec!["greeting.txt".into()], timeout_ms: 5000, ..Hook::new(Event::ApplyBefore, refuse) },
+        Hook { timeout_ms: 5000, ..Hook::new(Event::AfterApply, "printf applied > applied.txt") },
+    ];
+    let env = &mut setup.cfg.service_mut("planner").unwrap().env;
+    env.insert("MOLT_HOOKS_JSON".into(), serde_json::to_string(&hooks).unwrap());
+    // Learning happens on this side, and so do its hooks.
+    setup.learn = true;
+    setup.cfg.hooks = vec![Hook::new(Event::LearnAfter, "cat > /dev/null")];
+    let (done, _) = setup.run_done(setup.request(Some(CHECK), 1)).await;
+    let learned = done.learned.expect("it learned").expect("it learned");
+    let audit = std::fs::read_to_string(setup.data.path().join("audit.jsonl")).unwrap();
+    assert!(audit.contains(r#"\"hook_event_name\":\"learn.after\""#), "the learn.after hook heard of it");
+    assert!(audit.contains(&format!(r#"\"added\":[\"{}\"]"#, learned.added[0].id)));
+    let response = done.run;
+    assert_eq!(response.outcome, Outcome::Passed);
+    assert!(!response.applied);
+    assert!(
+        response.summary.contains("an apply.before hook refused them: greetings need a sign-off"),
+        "{}",
+        response.summary
+    );
+    let fork = response.fork.expect("the result is kept");
+    assert_eq!(std::fs::read_to_string(Path::new(&fork).join("greeting.txt")).unwrap(), "hello\n");
+    assert!(setup.file("greeting.txt").is_none());
+}
+
+#[tokio::test]
+async fn a_kept_result_the_user_applies_passes_the_apply_hooks_too() {
+    use molt_planner::hooks::{Event, Hook};
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    let workspace = setup.workspace.path().canonicalize().unwrap();
+    let refuse = "grep -q greeting.txt && { echo 'greetings need a sign-off' >&2; exit 2; }";
+    setup.cfg.hooks = vec![Hook { paths: vec!["*.txt".into()], ..Hook::new(Event::ApplyBefore, refuse) }];
+    let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
+    let session = start_session(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    let req = RunRequest { apply: false, ..setup.request(Some(CHECK), 1) };
+    let fork = session.run(&req, &molt_proto::TraceId::random()).await.unwrap().fork.unwrap();
+    let error = format!("{:#}", session.apply(&fork).await.unwrap_err());
+    assert!(error.contains("an apply.before hook refused the result: greetings need a sign-off"), "{error}");
+    assert!(setup.file("greeting.txt").is_none());
+    assert!(Path::new(&fork).is_dir(), "the result is kept");
+    session.shutdown(std::slice::from_ref(&fork)).await;
+
+    setup.cfg.hooks = vec![Hook::new(Event::AfterApply, "cat > /dev/null")];
+    let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
+    let session = start_session(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    session.apply(&fork).await.unwrap();
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    session.shutdown(&[]).await;
+    let audit = std::fs::read_to_string(setup.data.path().join("audit.jsonl")).unwrap();
+    assert!(audit.contains(r#"\"hook_event_name\":\"apply.after\""#));
+    assert!(audit.contains(r#"\"changes\":[\"greeting.txt\"]"#));
 }
 
 #[tokio::test]
@@ -2251,13 +2360,12 @@ async fn the_ui_backend_finishes_without_terminal_reads_and_exits_when_the_pipe_
 /// output, stops it when asked, calls no model, and the audit log has it.
 #[tokio::test]
 async fn a_session_command_streams_its_output_from_the_sandbox_and_is_audited() {
-    use molt::session::Session;
     use tokio_util::sync::CancellationToken;
     let server = fake_api(Fake::Greets).await;
     let setup = Setup::new(&server);
     let workspace = setup.workspace.path().canonicalize().unwrap();
     let (events, mut progress) = tokio::sync::mpsc::unbounded_channel();
-    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    let session = start_session(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
     let trace = molt_proto::TraceId::random();
     // As the shell's own sandbox tests check it: the sandbox's home, and no host secret in reach.
     let secret = setup.data.path().join("host-secret");

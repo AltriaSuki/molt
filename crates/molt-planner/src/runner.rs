@@ -56,6 +56,9 @@ pub(crate) async fn run_cancellable(
     let mut ctx = Ctx::new(bus, cfg, trace, &req);
     ctx.cancel = cancel.clone();
     ctx.run_cancel = cancel;
+    // What the hooks leave is the task, a checkpoint's too: a resume does not ask them again.
+    ctx.task = crate::hooks::submit(&ctx).await.map_err(refused)?;
+    req.task = ctx.task.clone();
     if let Some(candidates) = routes {
         // Picked before anything else, so a checkpoint saves the workflow the run goes through.
         req.workflow = Some(pick(&mut ctx, &req, &candidates).await.to_owned());
@@ -80,6 +83,8 @@ pub(crate) async fn run_cancellable(
         run = %ctx.trace, workspace = %ctx.workspace, attempts = req.attempts, workflow = %ctx.workflow.name,
         "run started"
     );
+    let more = serde_json::json!({ "task": ctx.task, "workflow": ctx.workflow.name });
+    crate::hooks::notify_with(&ctx, crate::hooks::Event::RunStart, &[], more).await;
 
     let designed = designed_here(&req, &ctx.workflow);
     let settled = match settle_check(&ctx, &req).await? {
@@ -146,6 +151,8 @@ async fn resume_run(
     if saved.planner != env!("CARGO_PKG_VERSION") {
         ctx.note(format!("the checkpoint was saved by planner {}", saved.planner)).await;
     }
+    let more = serde_json::json!({ "task": ctx.task, "workflow": ctx.workflow.name, "resumed": resume.run });
+    crate::hooks::notify_with(&ctx, crate::hooks::Event::RunStart, &[], more).await;
 
     let (settled, designed) = if saved.settled {
         let check = saved.check.as_ref().map(|c| Check {
@@ -225,6 +232,11 @@ fn invalid(message: impl Into<String>) -> RemoteError {
 
 fn failed(message: impl Into<String>) -> RemoteError {
     RemoteError { code: ErrorCode::Failed, message: message.into() }
+}
+
+/// A run a hook did not let start.
+fn refused(message: String) -> RemoteError {
+    RemoteError { code: ErrorCode::Denied, message }
 }
 
 /// Whether this run designs its check: it is given none (a check with files
@@ -527,6 +539,7 @@ pub(crate) async fn design_cancellable(
     let mut ctx = Ctx::new(bus, cfg, trace, &req);
     ctx.cancel = cancel.clone();
     ctx.run_cancel = cancel.clone();
+    ctx.task = crate::hooks::submit(&ctx).await.map_err(refused)?;
     let picked = match &routes {
         Some(candidates) => Some(pick(&mut ctx, &req, candidates).await),
         None => None,
@@ -759,7 +772,8 @@ async fn race(
             }
         }
         if matches!(done.report.status, AttemptStatus::Failed | AttemptStatus::Error) {
-            crate::hooks::notify(ctx, crate::hooks::Event::AttemptFailed).await;
+            let more = serde_json::json!({ "attempt": done.report.index, "status": done.report.status });
+            crate::hooks::notify_with(ctx, crate::hooks::Event::AttemptFailed, &[], more).await;
         }
         finished.push(done);
     }
@@ -972,10 +986,23 @@ async fn deliver(
                     .push_str(&format!("\n\nNot applied: the review {what} the changes. They are kept in {fork}."));
                 keep = true;
             } else if req.apply && (outcome == Outcome::Passed || !resp.changes.is_empty()) {
-                match ctx.merge(&fork).await {
+                let paths: Vec<String> = resp.changes.iter().map(|c| c.path.clone()).collect();
+                let applying = crate::hooks::applying(ctx, &fork, done.report.index, &paths).await;
+                if let Some(context) = applying.as_ref().ok().filter(|c| !c.is_empty()) {
+                    resp.summary.push_str(&format!("\n\nFrom the apply.before hooks: {context}"));
+                }
+                let merged = match applying {
+                    Ok(_) => ctx.merge(&fork).await,
+                    Err(reason) => Err(RemoteError {
+                        code: ErrorCode::Denied,
+                        message: format!("an apply.before hook refused them: {reason}"),
+                    }),
+                };
+                match merged {
                     Ok(_) => {
                         resp.applied = true;
-                        crate::hooks::notify(ctx, crate::hooks::Event::AfterApply).await;
+                        let more = serde_json::json!({ "attempt": done.report.index, "changes": paths });
+                        crate::hooks::notify_with(ctx, crate::hooks::Event::AfterApply, &paths, more).await;
                     }
                     Err(e) => {
                         let what = if e.message.starts_with("partial:") {

@@ -164,6 +164,25 @@ async fn captures_output_and_exit_status() {
 }
 
 #[tokio::test]
+async fn a_command_reads_the_stdin_it_is_given_and_none_without_it() {
+    let env = Env::new();
+    let given = json!({ "workspace": "ws", "command": "wc -c; cat", "stdin": "{\"event\":\"tool.before\"}\n" });
+    let response: RunResponse = serde_json::from_value(env.call(given).await.unwrap()).unwrap();
+    assert!(response.success(), "{response:?}");
+    assert_eq!(response.stdout.trim(), "24", "wc reads all of it, and cat finds the pipe closed: {response:?}");
+    let none: RunResponse =
+        serde_json::from_value(env.call(json!({ "workspace": "ws", "command": "cat; echo done" })).await.unwrap())
+            .unwrap();
+    assert_eq!(none.stdout, "done\n");
+    // A command that reads none of a large input still finishes.
+    let ignored = json!({ "workspace": "ws", "command": "true", "stdin": "x".repeat(1 << 20) });
+    let ran: RunResponse = serde_json::from_value(env.call(ignored).await.unwrap()).unwrap();
+    assert!(ran.success(), "{ran:?}");
+    let too_much = json!({ "workspace": "ws", "command": "true", "stdin": "x".repeat(molt_api::shell::MAX_STDIN + 1) });
+    assert_eq!(env.call(too_much).await.unwrap_err().code, ErrorCode::Invalid);
+}
+
+#[tokio::test]
 async fn a_timeout_kills_the_whole_group_quickly() {
     let env = Env::new();
     let started = Instant::now();
