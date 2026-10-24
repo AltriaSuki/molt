@@ -471,8 +471,11 @@ impl Runtime {
         self.starting = false;
         match session {
             Ok(session) => {
-                let msg =
-                    Msg::SessionUp { versions: session.versions().to_vec(), memory_problem: session.memory_problem() };
+                let msg = Msg::SessionUp {
+                    versions: session.versions().to_vec(),
+                    memory_problem: session.memory_problem(),
+                    default_model: session.default_model().map(str::to_owned),
+                };
                 self.session = Some(session);
                 msg
             }
@@ -713,8 +716,8 @@ impl Runtime {
     }
 }
 
-/// `text` as the user leaves it in `$VISUAL` or `$EDITOR` (`vi` without
-/// either), run on the terminal while the interface steps aside.
+/// `text` as the user leaves it in `$VISUAL` or `$EDITOR` (see
+/// [`pick_editor`]), run on the terminal while the interface steps aside.
 fn edit_outside(
     terminal: &mut DefaultTerminal,
     pause: &Pause,
@@ -740,13 +743,38 @@ fn edit_outside(
     edited
 }
 
-/// Open `path`, a file or a directory, in `$VISUAL` or `$EDITOR` (`vi`
-/// without either) on the terminal while the interface steps aside.
+/// The editors tried, in order, when neither `$VISUAL` nor `$EDITOR` is set.
+const FALLBACK_EDITORS: [&str; 4] = ["vi", "nvim", "vim", "nano"];
+
+/// The editor to run: `$VISUAL`, else `$EDITOR`, else the first of
+/// [`FALLBACK_EDITORS`] that `installed` finds.
+fn pick_editor(var: impl Fn(&str) -> Option<String>, installed: impl Fn(&str) -> bool) -> Result<String, String> {
+    if let Some(editor) = ["VISUAL", "EDITOR"].into_iter().find_map(|v| var(v).filter(|e| !e.trim().is_empty())) {
+        return Ok(editor);
+    }
+    FALLBACK_EDITORS.into_iter().find(|e| installed(e)).map(str::to_owned).ok_or_else(|| {
+        format!(
+            "no editor found: set $EDITOR, for example EDITOR=nano (none of {} is on PATH)",
+            FALLBACK_EDITORS.join(", ")
+        )
+    })
+}
+
+/// Whether an executable file `name` is in a directory of `PATH`.
+fn on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            std::fs::metadata(dir.join(name)).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
+/// Open `path`, a file or a directory, in `$VISUAL` or `$EDITOR` (else the
+/// first of vi, nvim, vim and nano there is) on the terminal while the
+/// interface steps aside.
 fn step_aside(terminal: &mut DefaultTerminal, pause: &Pause, path: &Path) -> Result<(), String> {
-    let editor = ["VISUAL", "EDITOR"]
-        .iter()
-        .find_map(|v| std::env::var(v).ok().filter(|e| !e.trim().is_empty()))
-        .unwrap_or_else(|| "vi".into());
+    let editor = pick_editor(|v| std::env::var(v).ok(), on_path)?;
     pause.paused.store(true, Ordering::SeqCst);
     let reading = pause.reading.lock().unwrap_or_else(PoisonError::into_inner);
     let _ = execute!(std::io::stdout(), DisableFocusChange, DisableBracketedPaste);
@@ -774,6 +802,10 @@ fn step_aside(terminal: &mut DefaultTerminal, pause: &Pause, path: &Path) -> Res
     back.map_err(|e| format!("could not take the terminal back: {e}"))?;
     match status {
         Ok(s) if s.success() => Ok(()),
+        // What `sh` exits with when it cannot find the command.
+        Ok(s) if s.code() == Some(127) => {
+            Err(format!("{editor} was not found ({s}); set $EDITOR to an editor you have"))
+        }
         Ok(s) => Err(format!("{editor} {s}")),
         Err(e) => Err(format!("could not start {editor}: {e}")),
     }
@@ -947,6 +979,21 @@ impl Drop for Redirect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn without_visual_or_editor_the_first_installed_editor_opens_or_the_user_is_told_to_set_one() {
+        let unset = |_: &str| None;
+        assert_eq!(pick_editor(unset, |e| e == "vim" || e == "nano").as_deref(), Ok("vim"));
+        assert_eq!(pick_editor(unset, |e| e == "nvim" || e == "vi").as_deref(), Ok("vi"));
+        assert_eq!(pick_editor(unset, |e| e == "nano").as_deref(), Ok("nano"));
+        let err = pick_editor(unset, |_| false).unwrap_err();
+        assert!(err.contains("set $EDITOR") && err.contains("vi, nvim, vim, nano"), "{err}");
+        let set = |v: &str| (v == "EDITOR").then(|| "code --wait".to_owned());
+        assert_eq!(pick_editor(set, |_| false).as_deref(), Ok("code --wait"));
+        let both = |v: &str| Some(if v == "VISUAL" { " " } else { "hx" }.to_owned());
+        assert_eq!(pick_editor(both, |_| true).as_deref(), Ok("hx"), "a blank $VISUAL counts as unset");
+        assert!(on_path("sh") && !on_path("molt-no-such-editor"));
+    }
 
     #[test]
     fn an_interrupted_fork_whose_changes_cannot_be_listed_is_kept_while_it_exists() {

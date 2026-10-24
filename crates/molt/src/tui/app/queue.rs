@@ -332,7 +332,11 @@ mod tests {
         assert!(frame_text(&mut app).contains("1 queued"));
         assert_eq!(app.update(Msg::Stopped { kept: vec![], notes: vec![] }), [Action::StartSession]);
         assert!(app
-            .update(Msg::SessionUp { versions: vec![], memory_problem: Some("not configured".into()) })
+            .update(Msg::SessionUp {
+                versions: vec![],
+                memory_problem: Some("not configured".into()),
+                default_model: None
+            })
             .is_empty());
         let actions = type_in(&mut app, "/queue resume");
         assert!(matches!(actions.as_slice(), [Action::Run { req, .. }] if req.task == "second\nwith a second line"));

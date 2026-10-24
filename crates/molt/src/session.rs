@@ -69,6 +69,7 @@ pub struct Session {
     /// Where the planner keeps run checkpoints: a stopped run's forks there are kept for its resume.
     checkpoints: Option<PathBuf>,
     versions: Vec<(String, String)>,
+    default_model: Option<String>,
     hooks: Vec<molt_planner::hooks::Hook>,
 }
 
@@ -108,6 +109,7 @@ impl Session {
         match Self::join(cfg, &running, events).await {
             Ok((cli, memory)) => {
                 let versions = versions(&running, cfg);
+                let default_model = default_model(cfg);
                 Ok(Self {
                     running: Mutex::new(Some(running)),
                     cli,
@@ -117,6 +119,7 @@ impl Session {
                     forks: Mutex::new(RunForks::before(cfg)),
                     checkpoints: agent::checkpoint_dir(cfg),
                     versions,
+                    default_model,
                     hooks: cfg.hooks.clone(),
                 })
             }
@@ -204,6 +207,11 @@ impl Session {
     /// The live version of each service, by its first eight hex digits.
     pub fn versions(&self) -> &[(String, String)] {
         &self.versions
+    }
+
+    /// The model a run that names none is sent to, as the gateway resolves it.
+    pub fn default_model(&self) -> Option<&str> {
+        self.default_model.as_deref()
     }
 
     pub async fn design(&self, req: &RunRequest, trace: &TraceId) -> anyhow::Result<DesignResponse> {
@@ -569,6 +577,17 @@ impl Session {
     }
 }
 
+/// The model a run that names none goes to: the planner's
+/// `MOLT_PLANNER_MODEL`, else the gateway's default, resolved by the
+/// gateway's rules from the environment each service is launched with.
+fn default_model(cfg: &Config) -> Option<String> {
+    let lookup = |env: &[(String, String)], name: &str| env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+    let gateway = cfg.service("model")?.launch_env();
+    let planner = cfg.service("planner").map(|s| s.launch_env()).unwrap_or_default();
+    let named = lookup(&planner, "MOLT_PLANNER_MODEL");
+    molt_gateway::resolved_model(|name| lookup(&gateway, name), named.as_deref())
+}
+
 fn versions(running: &Running, cfg: &Config) -> Vec<(String, String)> {
     let registry = running.kernel().registry();
     cfg.services
@@ -580,4 +599,32 @@ fn versions(running: &Running, cfg: &Config) -> Vec<(String, String)> {
             Some((s.name.to_string(), short))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_model_is_the_planners_else_the_gateways_as_the_gateway_resolves_it() {
+        let config = |planner_env: &str| {
+            Config::parse(&format!(
+                r#"
+                [[service]]
+                name = "model"
+                exec = {{ command = "molt-gateway" }}
+                env = {{ MOLT_MODEL = "grok-4.5", MOLT_MODEL_ALIASES = '{{"fast":"openai/gpt-4.1-mini"}}' }}
+
+                [[service]]
+                name = "planner"
+                exec = {{ command = "molt-planner" }}
+                env = {{ {planner_env} }}
+                "#
+            ))
+            .unwrap()
+        };
+        assert_eq!(default_model(&config("")).as_deref(), Some("grok-4.5"));
+        assert_eq!(default_model(&config(r#"MOLT_PLANNER_MODEL = "fast""#)).as_deref(), Some("gpt-4.1-mini"));
+        assert_eq!(default_model(&Config::default()), None, "no gateway, no name to show");
+    }
 }

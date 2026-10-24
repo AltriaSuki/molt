@@ -119,7 +119,7 @@ impl App {
         let mut lines = Vec::new();
         match (&d.command, verify) {
             (Some(command), true) => {
-                lines.push(check_head(true));
+                lines.push(check_head(&task.check_by(true)));
                 lines.push(Line::from(vec![span("  $ ", Tone::Dim), span(clean_line(command), Tone::Plain)]));
                 for f in &d.files {
                     lines.push(Line::from(span(format!("  + {}", clean_line(&f.path)), Tone::Dim)));
@@ -129,7 +129,7 @@ impl App {
                 task.req.suite = d.suite;
             }
             (None, true) if !d.rubric.is_empty() => {
-                lines.push(check_head(true));
+                lines.push(check_head(&task.check_by(true)));
                 lines.extend(rubric_lines(&d.rubric.iter().map(|c| c.text.clone()).collect::<Vec<_>>()));
                 task.req.rubric = d.rubric;
             }
@@ -231,8 +231,7 @@ fn check_stops(d: &DesignResponse, existing: &[String]) -> Vec<String> {
     stops
 }
 
-pub(super) fn check_head(designed: bool) -> Line<'static> {
-    let by = if designed { "designed" } else { "yours" };
+pub(super) fn check_head(by: &str) -> Line<'static> {
     Line::from(vec![span("◆ check", Tone::Shell), span(format!("  {by}"), Tone::Dim)])
 }
 

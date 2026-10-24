@@ -327,6 +327,8 @@ pub enum Msg {
     SessionUp {
         versions: Vec<(String, String)>,
         memory_problem: Option<String>,
+        /// The model a task that names none runs on, as the gateway resolves it.
+        default_model: Option<String>,
     },
     SessionFailed(String),
     BackendFailed(String),
@@ -545,6 +547,8 @@ pub struct Task {
     notes_seen: HashSet<String>,
     /// Why confirm mode stopped for the user, in short labels.
     pub stops: Vec<String>,
+    /// The project command whose template gave the check, while the check is still its.
+    pub check_from: Option<String>,
     /// The latest version of the run's requirements; 0 is the task alone.
     pub version: u32,
     pub state: RunState,
@@ -577,6 +581,7 @@ impl Task {
             recalled_shown: false,
             notes_seen: HashSet::new(),
             stops: Vec::new(),
+            check_from: None,
             designer_preview: Preview::default(),
             role_previews: BTreeMap::new(),
             designer_retry: None,
@@ -585,6 +590,16 @@ impl Task {
             waiting: Vec::new(),
             asked: Vec::new(),
             carried: (0.0, 0),
+        }
+    }
+
+    /// Who the check is by, for its heading: `designed`, `yours`, or the
+    /// project command whose template gave it.
+    pub fn check_by(&self, designed: bool) -> String {
+        match &self.check_from {
+            Some(name) => format!("from /{name}"),
+            None if designed => "designed".into(),
+            None => "yours".into(),
         }
     }
 
@@ -668,6 +683,8 @@ pub struct App {
     /// The canonical workspace path, as requests name it.
     workspace_path: String,
     pub mode: Mode,
+    /// The model a task that names none runs on, once the services are up.
+    pub default_model: Option<String>,
     pub settings: Settings,
     preference_defaults: super::settings::Saved,
     preference_changes: Vec<super::settings::Change>,
@@ -797,6 +814,7 @@ impl App {
             workspace: clean_line(&workspace),
             workspace_path: workspace_path.to_owned(),
             mode: Mode::Confirm,
+            default_model: None,
             settings: Settings::default(),
             preference_defaults: super::settings::Saved::new(Mode::Confirm, Settings::default()),
             preference_changes: Vec::new(),
@@ -1064,8 +1082,9 @@ impl App {
                 self.quit = true;
                 vec![Action::Quit { keep: self.keep() }]
             }
-            Msg::SessionUp { versions, memory_problem } => {
+            Msg::SessionUp { versions, memory_problem, default_model } => {
                 self.startup_retries = 0;
+                self.default_model = default_model.map(|m| clean_line(&m));
                 self.retry_at = None;
                 if let Some(problem) = &memory_problem {
                     self.push(Line::from(span(format!("running without memory: {}", clean_line(problem)), Tone::Dim)));

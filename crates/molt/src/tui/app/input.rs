@@ -478,6 +478,10 @@ impl App {
                         d.command = Some(command.to_owned());
                         // The baseline was of the old command.
                         d.baseline = None;
+                        // And the check is the user's now, not the template's.
+                        if let Some(task) = &mut self.task {
+                            task.check_from = None;
+                        }
                     }
                     self.prompt = Some(Prompt::Check(d));
                     return Vec::new();

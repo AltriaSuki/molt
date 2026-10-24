@@ -21,7 +21,7 @@ impl App {
                     return;
                 }
                 task.check_shown = true;
-                let mut lines = vec![check_head(designed)];
+                let mut lines = vec![check_head(&task.check_by(designed))];
                 match command {
                     Some(c) => lines.push(Line::from(vec![span("  $ ", Tone::Dim), span(clean_line(&c), Tone::Plain)])),
                     None if !rubric.is_empty() => lines.extend(rubric_lines(&rubric)),
@@ -360,7 +360,7 @@ impl App {
         match resp.outcome {
             Outcome::Failed => {
                 self.push(Line::from(span("✗ no attempt passed", Tone::Bad)));
-                self.log.extend(block(summary, "  ", Tone::Dim));
+                self.log.extend(text::markdown(summary, "  ", Tone::Dim));
                 self.log.extend(cut_note);
             }
             Outcome::Passed | Outcome::Unverified | Outcome::Judged => {
@@ -374,7 +374,7 @@ impl App {
                     head.extend(size);
                 }
                 self.push(Line::from(head));
-                self.log.extend(block(summary, "  ", Tone::Plain));
+                self.log.extend(text::markdown(summary, "  ", Tone::Plain));
                 self.log.extend(cut_note);
                 for c in &resp.changes {
                     let kind = match c.kind {
