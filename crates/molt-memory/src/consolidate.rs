@@ -691,6 +691,7 @@ pub(crate) async fn consolidate(
         max_tokens: Some(cfg.max_tokens),
         output_schema: None,
         prompt: None,
+        attempt: None,
     };
     let (answer, spent) = match ask(bus, cfg, request, trace, deadline).await? {
         Ok(answered) => answered,

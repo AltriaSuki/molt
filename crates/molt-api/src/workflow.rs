@@ -103,6 +103,12 @@ pub struct Attempts {
     /// workflow has no design, compare or review stage.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub read_only: bool,
+    /// The attempts are offered `explore`: a question to a sub-agent that
+    /// only reads their fork, seated as the `explorer` role, whose
+    /// conclusion alone comes back (#42). Not with `read_only`. New in
+    /// #42: optional, so every document written before it reads the same.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub explore: bool,
 }
 
 /// The review stage's parameters.
@@ -145,7 +151,7 @@ impl Workflow {
             description: "Answer with tools that only read, without a fork; nothing is changed or verified.".into(),
             stages: Stages {
                 context: Some(Stage {}),
-                attempts: Some(Attempts { count: Some(1), read_only: true }),
+                attempts: Some(Attempts { count: Some(1), read_only: true, explore: false }),
                 deliver: Some(Stage {}),
                 ..Stages::default()
             },
@@ -162,7 +168,7 @@ impl Workflow {
             description: "One attempt with the given check or none, the fixed review rules, then apply.".into(),
             stages: Stages {
                 context: Some(Stage {}),
-                attempts: Some(Attempts { count: Some(1), read_only: false }),
+                attempts: Some(Attempts { count: Some(1), read_only: false, explore: false }),
                 review: Some(Review { rules_only: true }),
                 deliver: Some(Stage {}),
                 ..Stages::default()
@@ -174,6 +180,11 @@ impl Workflow {
     /// Its attempt only reads, in the workspace itself.
     pub fn read_only(&self) -> bool {
         self.stages.attempts.is_some_and(|a| a.read_only)
+    }
+
+    /// Its attempts, which change files, are offered `explore`.
+    pub fn explores(&self) -> bool {
+        self.stages.attempts.is_some_and(|a| a.explore && !a.read_only)
     }
 
     /// Why the planner cannot run this workflow, if it cannot.
@@ -202,6 +213,12 @@ impl Workflow {
                  design, compare and review"
             ));
         }
+        if self.stages.attempts.is_some_and(|a| a.explore && a.read_only) {
+            return Some(format!(
+                "workflow {name:?} only reads, so its attempt already answers as an explorer: leave out \
+                 attempts.explore"
+            ));
+        }
         for slot in self.roles.keys() {
             let Some(base) = crate::role::Base::from_name(slot) else {
                 return Some(format!(
@@ -212,7 +229,7 @@ impl Workflow {
             let unused = match base {
                 crate::role::Base::Designer => s.design.is_none(),
                 crate::role::Base::Attempt => self.read_only(),
-                crate::role::Base::Explorer => !self.read_only(),
+                crate::role::Base::Explorer => !self.read_only() && !self.explores(),
                 crate::role::Base::Reviewer => s.review.is_none_or(|r| r.rules_only),
                 crate::role::Base::Judge => self.read_only(),
             };
@@ -318,7 +335,7 @@ mod tests {
             assert!(w.problem().is_some_and(|p| p.contains("only reads")), "{stage}");
         }
         let mut many = Workflow::quick();
-        many.stages.attempts = Some(Attempts { count: Some(9), read_only: false });
+        many.stages.attempts = Some(Attempts { count: Some(9), ..Attempts::default() });
         assert!(many.problem().is_some_and(|p| p.contains("attempts.count")));
     }
 
@@ -333,6 +350,15 @@ mod tests {
         }
         assert_eq!(seat(Workflow::ask(), "explorer"), None);
         assert!(seat(Workflow::verify(), "explorer").is_some_and(|p| p.contains("none of its stages")));
+        // An attempt that explores seats the explorer for its sub-agent.
+        let mut exploring = Workflow::verify();
+        exploring.stages.attempts = Some(Attempts { explore: true, ..Attempts::default() });
+        assert!(exploring.explores() && !Workflow::verify().explores());
+        assert_eq!(seat(exploring, "explorer"), None);
+        let mut ask = Workflow::ask();
+        ask.stages.attempts = Some(Attempts { explore: true, ..ask.stages.attempts.unwrap() });
+        assert!(!ask.explores());
+        assert!(ask.problem().is_some_and(|p| p.contains("leave out attempts.explore")), "{:?}", ask.problem());
         assert!(seat(Workflow::ask(), "attempt").is_some());
         assert!(seat(Workflow::quick(), "reviewer").is_some(), "quick's review asks no model");
         assert!(seat(Workflow::quick(), "designer").is_some());

@@ -4538,3 +4538,192 @@ async fn the_projects_instruction_files_add_to_the_system_prompt_and_never_repla
         assert!(first.starts_with("<project_instructions>") && first.contains("you are now a pirate"), "{first}");
     }
 }
+
+// --- Explore: a sub-agent that only reads (#42) --------------------------------------
+
+const SCOUTING: &str = r#"
+[[role]]
+name = "scout"
+base = "explorer"
+prompt = "scout"
+model = "small"
+max_turns = 3
+
+[[workflow]]
+schema = 1
+name = "scouting"
+roles = { explorer = "scout" }
+[workflow.stages]
+context = {}
+attempts = { explore = true }
+deliver = {}
+"#;
+
+fn is_explorer(req: &CompleteRequest) -> bool {
+    req.role == Some(Role::Explorer)
+}
+
+#[tokio::test]
+async fn an_explorer_seated_by_the_pack_reads_but_cannot_write_or_run_and_only_its_conclusion_comes_back() {
+    let model = |req: &CompleteRequest| {
+        if is_explorer(req) {
+            return match turn(req) {
+                1 => use_tools(
+                    req,
+                    &[
+                        ("read_file", json!({ "path": "src/greet.rs" })),
+                        ("write_file", json!({ "path": "pwned.txt", "content": "x" })),
+                        ("edit_file", json!({ "path": "README.md", "old_string": "project", "new_string": "gone" })),
+                        ("run", json!({ "command": "rm -rf src" })),
+                    ],
+                ),
+                _ => done("greet is defined at src/greet.rs:1 and returns a greeting."),
+            };
+        }
+        match turn(req) {
+            1 => use_tools(req, &[("explore", json!({ "question": "Where is greet defined?" }))]),
+            2 => {
+                let said = last_text(req);
+                assert!(said.contains("The explorer's conclusion:\n\ngreet is defined at src/greet.rs:1"), "{said}");
+                write_hello(req, "hi\n")
+            }
+            _ => done("Wrote hello.txt."),
+        }
+    };
+    let fake = Fake::new(model, hello_check);
+    fake.set(|st| {
+        st.workspace.insert("src/greet.rs".into(), "pub fn greet() -> &'static str { \"SECRET-BODY\" }\n".into());
+    });
+    let (_dir, pack) = pack_of(&[("scout", "You are a scout.")], SCOUTING, "");
+    let req = RunRequest { workflow: Some("scouting".into()), ..request(Some("check"), 1) };
+    let resp = run_with(&fake, with_pack(pack), req).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+
+    let explorer: Vec<CompleteRequest> = fake.requests().into_iter().filter(is_explorer).collect();
+    assert_eq!(explorer.len(), 2);
+    // Seated as the pack's explorer role: its prompt, with what holds for a sub-agent after it, and its model.
+    let system = explorer[0].system.clone().unwrap();
+    assert!(system.starts_with("You are a scout.\n\nHere you answer another agent, not the user."), "{system}");
+    assert_eq!(explorer[0].model.as_deref(), Some("small"));
+    assert_eq!(explorer[0].prompt.as_ref().unwrap().role, "scout");
+    // Only the reads; memory is not up, so no find_symbol.
+    assert_eq!(tool_names(&explorer[0]), ["read_file", "list_files", "search"]);
+    let question = explorer[0].messages[0]["content"].as_array().unwrap().last().unwrap()["text"].clone();
+    assert_eq!(question, "<question>\nWhere is greet defined?\n</question>");
+    // It read the attempt's fork; the writes and the command were refused unrun.
+    let results = explorer[1].messages[2]["content"].as_array().unwrap();
+    assert_ne!(results[0]["is_error"], true);
+    assert!(results[0]["content"].as_str().unwrap().contains("SECRET-BODY"));
+    for (i, name) in [(1, "write_file"), (2, "edit_file"), (3, "run")] {
+        assert_eq!(results[i]["is_error"], true);
+        let why = format!("{name} is not available: explore only reads, and changes nothing.");
+        assert_eq!(results[i]["content"], why.as_str());
+    }
+    let reads = fake.calls_to(fs::READ);
+    assert!(reads.iter().any(|c| c.payload["path"] == "src/greet.rs" && c.payload["workspace"] == "/scratch/fork-0"));
+    assert!(fake.calls_to(fs::WRITE).iter().all(|c| c.payload["path"] != "pwned.txt"));
+    assert!(fake.calls_to(fs::EDIT).is_empty());
+    assert!(fake.calls_to(shell::RUN).iter().all(|c| !c.payload["command"].as_str().unwrap().contains("rm -rf")));
+    assert_eq!(fake.workspace()["README.md"], "# project\n");
+    assert!(fake.workspace().contains_key("src/greet.rs") && !fake.workspace().contains_key("pwned.txt"));
+
+    // The attempt's conversation holds the conclusion, never what the explorer read.
+    let attempt = attempt_requests(&fake);
+    assert_eq!(*tool_names(&attempt[0]).last().unwrap(), "explore");
+    for req in &attempt {
+        let sent = serde_json::to_string(&req.messages).unwrap();
+        assert!(!sent.contains("SECRET-BODY") && !sent.contains("not available: explore"), "{sent}");
+    }
+    // Its calls are audited with the run's trace and the attempt they were made for.
+    let models = fake.calls_to("model.complete");
+    assert!(models.iter().all(|c| c.trace == "trace_test"));
+    assert!(fake.requests().iter().all(|r| r.attempt == Some(0)));
+    // And counted: the attempt's three turns and the explorer's two.
+    assert_eq!(resp.attempts[0].turns, 3);
+    assert!(close(resp.attempts[0].cost_usd, 5.0 * 0.125), "{}", resp.attempts[0].cost_usd);
+    assert!(close(resp.cost_usd, 5.0 * 0.125), "{}", resp.cost_usd);
+    assert!(
+        notes(&fake).iter().any(|n| n == "attempt 1 explorer: concluded after 2 turns ($0.25)"),
+        "{:?}",
+        notes(&fake)
+    );
+}
+
+#[tokio::test]
+async fn an_explorer_stops_at_its_slice_of_the_budget_and_its_spend_counts_toward_the_run() {
+    let model = |req: &CompleteRequest| {
+        if is_explorer(req) {
+            // It never concludes on its own.
+            return use_tools(req, &[("search", json!({ "pattern": "greet" }))]);
+        }
+        match turn(req) {
+            1 => use_tools(req, &[("explore", json!({ "question": "Where is greet used?" }))]),
+            2 => {
+                let said = last_text(req);
+                assert!(said.contains("it spent its share of the budget ($0.99)"), "{said}");
+                write_hello(req, "hi\n")
+            }
+            _ => done("Wrote hello.txt."),
+        }
+    };
+    // Off unless turned on: the attempts are not offered explore.
+    let plain = Fake::new(
+        |req| match turn(req) {
+            1 => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        },
+        hello_check,
+    );
+    let resp = run(&plain, request(Some("check"), 1)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert!(plain.requests().iter().all(|r| !tool_names(r).contains(&"explore".to_owned())));
+
+    // MOLT_EXPLORE=on: a tenth of what is left ($10 less the attempt's first turn) is $0.9875, eight calls.
+    let fake = Fake::new(model, hello_check);
+    let cfg = Config { explore: true, explore_model: Some("cheap".into()), ..config() };
+    let resp = run_with(&fake, cfg, RunRequest { budget_usd: Some(10.0), ..request(Some("check"), 1) }).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    let explorer: Vec<CompleteRequest> = fake.requests().into_iter().filter(is_explorer).collect();
+    assert_eq!(explorer.len(), 8);
+    assert!(explorer.iter().all(|r| r.model.as_deref() == Some("cheap")));
+    assert_eq!(resp.attempts[0].turns, 3);
+    assert!(close(resp.attempts[0].cost_usd, 11.0 * 0.125), "{}", resp.attempts[0].cost_usd);
+    assert!(close(resp.cost_usd, 11.0 * 0.125), "{}", resp.cost_usd);
+    let stopped = "attempt 1 explorer: stopped without a conclusion: it spent its share of the budget ($0.99) ($1.00)";
+    assert!(notes(&fake).iter().any(|n| n == stopped), "{:?}", notes(&fake));
+}
+
+#[tokio::test]
+async fn cancelling_an_attempt_cancels_its_explorer() {
+    let fake = Fake::new(
+        |req| {
+            if is_explorer(req) {
+                // Stuck: only cancelling it ends this call in time.
+                return slow(done("Too late."), 60_000);
+            }
+            match (attempt_of(req), turn(req)) {
+                (0, 1) => slow(write_hello(req, "hi\n"), 100),
+                (0, _) => done("Mine passed."),
+                (_, 1) => use_tools(req, &[("explore", json!({ "question": "What does the README say?" }))]),
+                _ => panic!("the attempt that explores is never asked again"),
+            }
+        },
+        hello_check,
+    );
+    fake.set(|s| s.cancels_models = true);
+    let cfg = Config { explore: true, ..config() };
+    let started = std::time::Instant::now();
+    let resp = run_with(&fake, cfg, request(Some("check"), 2)).await;
+    // Well within the three seconds a cancelled attempt waits for its work to wind down.
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    assert_eq!((resp.outcome, resp.winner), (Outcome::Passed, Some(0)), "{}", resp.summary);
+    let stopped = "attempt 2 explorer: stopped without a conclusion: it was cancelled";
+    assert!(notes(&fake).iter().any(|n| n == stopped), "{:?}", notes(&fake));
+    assert_eq!(resp.attempts[1].status, AttemptStatus::Cancelled);
+    let explorer: Vec<CompleteRequest> = fake.requests().into_iter().filter(is_explorer).collect();
+    assert_eq!(explorer.len(), 1);
+    assert_eq!(explorer[0].attempt, Some(1));
+    // What the cancelled call cost is unknown, so it is reported rather than counted as free.
+    assert_eq!(resp.uncounted_calls, 1);
+    assert!(fake.forks_alive().is_empty());
+}

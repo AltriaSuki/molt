@@ -773,6 +773,10 @@ pub mod tools {
     /// Offered only to the call that picks a workflow for a run that names
     /// `auto`: the workflow, and why.
     pub const SUBMIT_ROUTE: &str = "submit_route";
+    /// Offered to the attempts of a workflow that explores (#42): ask a
+    /// question of a sub-agent that only reads the attempt's fork, and get
+    /// back its conclusion alone.
+    pub const EXPLORE: &str = "explore";
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ReadFile {
@@ -905,6 +909,12 @@ pub mod tools {
         #[serde(default)]
         pub task_quote: String,
         pub why: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Explore {
+        /// The question, on its own: the sub-agent sees only this.
+        pub question: String,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -16,7 +16,7 @@ byte, as before packs existed.
 | Name | Who speaks with it | Protected |
 | --- | --- | --- |
 | `attempt` | the attempts that carry out a task (`verify`, `quick`) | no |
-| `explorer` | the one attempt of `ask`, which only reads | no |
+| `explorer` | the one attempt of `ask`, which only reads, and the sub-agent of [`explore`](explore.md) | no |
 | `designer` | the check designer | no |
 | `vetter` | the vetter, which looks over a designed check | yes |
 | `reviewer` | the reviewer of a passing result | yes |
@@ -117,8 +117,10 @@ base's tools, messages and rules and these settings over the run's:
   always stay, and a call to any other is refused without running;
 - `model`, `effort`, `max_turns`: for its calls only (a run's
   `judge_model` still wins for the judge);
-- `budget_share`: for a role based on `designer` only, the share of the
-  run's budget designing may spend.
+- `budget_share`: for a role based on `designer`, the share of the run's
+  budget designing may spend; for one based on `explorer`, the share of
+  what an attempt has left that one `explore` call may spend
+  ([explore.md](explore.md)).
 
 A workflow's `roles` maps slots to roles. A slot it leaves out keeps the
 built-in role; a role in a slot none of its stages uses, an undeclared

@@ -77,8 +77,15 @@ pub(crate) fn builtin(kind: Builtin) -> &'static BuiltinTool {
 
 /// The names of the tools the planner answers itself, beyond its built-ins:
 /// a provided tool cannot take one.
-const ROLE_TOOLS: &[&str] =
-    &[t::SUBMIT_CHECK, t::SUBMIT_REVIEW, t::SUBMIT_JUDGEMENT, t::SUBMIT_VETTING, t::DISPUTE_CHECK, t::SUBMIT_ROUTE];
+const ROLE_TOOLS: &[&str] = &[
+    t::SUBMIT_CHECK,
+    t::SUBMIT_REVIEW,
+    t::SUBMIT_JUDGEMENT,
+    t::SUBMIT_VETTING,
+    t::DISPUTE_CHECK,
+    t::SUBMIT_ROUTE,
+    t::EXPLORE,
+];
 
 /// Whether `name` is the planner's own.
 pub(crate) fn reserved(name: &str) -> bool {

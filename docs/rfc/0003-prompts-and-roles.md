@@ -31,7 +31,7 @@ role in, mapped to a part of the pipeline that exists today:
 | --- | --- | --- | --- |
 | `designer` | `designer` | the `design` stage: designs the done-check | no |
 | `attempt` | `attempt`, followed by the paragraph about the done-check or the criteria | the `attempts` stage of `verify`, `quick` and any workflow that changes files | no |
-| `explorer` | `explorer` | the one attempt of a workflow whose `attempts.read_only` is set, such as `ask`: it reads and answers | no |
+| `explorer` | `explorer` | the one attempt of a workflow whose `attempts.read_only` is set, such as `ask`: it reads and answers; and, since #42, the sub-agent an attempt asks with `explore` in a workflow whose `attempts.explore` is set ([explore.md](../explore.md)) | no |
 | `reviewer` | `reviewer` | the `review` stage's model, when the review is not `rules_only` | yes |
 | `judge` | `judge` | judging a result against the run's rubric | yes |
 

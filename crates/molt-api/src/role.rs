@@ -20,8 +20,10 @@ pub enum Base {
     Designer,
     /// Carries out the task in its own fork (the `attempts` stage).
     Attempt,
-    /// Answers with tools that only read, in the workspace itself (the
-    /// attempt of a workflow whose `attempts.read_only` is set, such as `ask`).
+    /// Answers with tools that only read: in the workspace itself, as the
+    /// attempt of a workflow whose `attempts.read_only` is set (such as
+    /// `ask`), or in an attempt's fork, as the sub-agent its `explore` tool
+    /// asks (a workflow whose `attempts.explore` is set, #42).
     Explorer,
     /// Looks at a passing result before it is applied (the `review` stage).
     Reviewer,
@@ -77,7 +79,8 @@ pub struct RoleDecl {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
     /// The share of the run's budget it may spend, more than 0 and at most
-    /// 1. Read for designer roles only in this version.
+    /// one. Read for designer roles, and for explorer roles as the share of
+    /// what the attempt has left that one `explore` call may spend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_share: Option<f64>,
 }

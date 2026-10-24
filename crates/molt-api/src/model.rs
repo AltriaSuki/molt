@@ -33,6 +33,9 @@ pub enum Role {
     Judge,
     /// The planner picking a workflow for `auto`.
     Router,
+    /// The sub-agent an attempt asks a question with `explore`, which only
+    /// reads (#42). An older peer reads it as [`Role::Other`].
+    Explorer,
     /// Memory learning from a finished run.
     Memory,
     #[serde(other)]
@@ -49,6 +52,7 @@ impl Role {
             Self::Reviewer => "reviewer",
             Self::Judge => "judge",
             Self::Router => "router",
+            Self::Explorer => "explorer",
             Self::Memory => "memory",
             Self::Other => "planner",
         }
@@ -67,6 +71,7 @@ pub fn attempt_name(index: u32) -> String {
 pub fn speaker(role: Option<Role>, attempt: Option<u32>) -> String {
     match (role, attempt) {
         (None | Some(Role::Attempt), Some(a)) => attempt_name(a),
+        (Some(Role::Explorer), Some(a)) => format!("{} explorer", attempt_name(a)),
         (Some(role), _) => role.name().to_owned(),
         (None, None) => Role::Other.name().to_owned(),
     }
@@ -144,6 +149,11 @@ pub struct CompleteRequest {
     /// an older caller leaves it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<crate::role::PromptUse>,
+    /// The attempt the call is made for, its explorer's calls included, for
+    /// the audit log; the gateway does not send it to the model. New: an
+    /// older caller leaves it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
 }
 
 /// Token counts as the Messages API reports them. A count the API sends as
