@@ -22,6 +22,7 @@ byte, as before packs existed.
 | `reviewer` | the reviewer of a passing result | yes |
 | `judge` | the judge of a result against a rubric | yes |
 | `router` | the call that picks a workflow for `auto` | no |
+| `compactor` | the call that writes an attempt's notes on the turns its conversation leaves out, with `MOLT_COMPACT=model` ([do.md](do.md#long-tasks)) | no |
 
 `molt prompts list` prints each with its version (the first digits of the
 SHA-256 of its text) and whether it is built in or yours;

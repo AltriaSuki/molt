@@ -181,6 +181,16 @@ pub(crate) struct Conversation {
     /// How many messages the model last measured, and the tokens it counted
     /// for them, its reply included.
     pub(crate) known: Option<(usize, u64)>,
+    /// What it keeps of the turns it left out to fit, once it has left some out.
+    pub(crate) compacted: Option<crate::compact::Compacted>,
+    /// What holds now, from the run's own state, for the record of left-out
+    /// turns: set by whoever holds the conversation, never by the model.
+    pub(crate) standing: Option<String>,
+    /// The spend so far, for the same record, as of the turn it is written.
+    pub(crate) budget: Option<String>,
+    /// It may read left-out turns back with `earlier_result`, and have
+    /// notes written on them.
+    pub(crate) recall: bool,
 }
 
 impl Conversation {
@@ -202,6 +212,10 @@ impl Conversation {
             effort: None,
             prompt: None,
             known: None,
+            compacted: None,
+            standing: None,
+            budget: None,
+            recall: false,
         }
     }
 

@@ -519,6 +519,18 @@ pub(crate) async fn execute(
         .collect()
 }
 
+/// What the `read_file` call with `input` reads now in `fork`, as its
+/// result would say it, without hooks or a progress line: Molt's own look,
+/// to tell whether a file changed since an earlier read (see
+/// [`crate::compact`]). Only a read, so it changes nothing.
+pub(crate) async fn reread(ctx: &Ctx, fork: &str, input: &Value) -> Result<String, String> {
+    let call = ToolUse { id: String::new(), name: t::READ_FILE.into(), input: input.clone() };
+    match Tool::parse(&call, &ctx.tools, ToolRole::Attempt)? {
+        tool @ Tool::Read(_) => tool.execute(ctx, fork).await.map(|text| clip(text, MAX_RESULT)),
+        _ => Err("not a read".into()),
+    }
+}
+
 /// Run `tool` for `call` between the user's `tool.before` and `tool.after`
 /// hooks: one may refuse it or change its input, and what they add for the
 /// model to know comes after the result.

@@ -114,6 +114,7 @@ Defaults come from the environment:
 | `MOLT_EXPLORE`, `MOLT_EXPLORE_MODEL` | planner | `off`: `on` offers attempts `explore` in every workflow whose attempts change files; the model of its sub-agent, by default the explorer role's, else the run's (see [Explore](explore.md)) |
 | `MOLT_MAX_CHECK_ROUNDS`, `MOLT_CHECK_TIMEOUT_S` | planner | `3` check runs per attempt, `900` |
 | `MOLT_MAP_TOKENS` | planner | `3000` (the project map a run starts with; at most `32000`) |
+| `MOLT_COMPACT` | planner | `record`: Molt's own record of the turns a long conversation leaves out; `model` also has the `compactor` write the attempt's notes on them, one model call per fit (see [Long tasks](do.md#long-tasks)) |
 | `MOLT_CONTEXT_TOKENS` | planner | the model's context window: `200000` for Claude models, `128000` for others |
 | `MOLT_INSTRUCTION_FILES` | planner | `AGENTS.md,CLAUDE.md` (the project's instruction files; `none` reads none) |
 | `MOLT_SYNTAX_CHECK` | planner | `report` (see [Syntax errors after an edit](do.md#syntax-errors-after-an-edit)); `reject` or `off` |

@@ -8,6 +8,7 @@ mod agent;
 mod ask;
 mod attempt;
 pub mod checkpoint;
+pub mod compact;
 mod control;
 mod ctx;
 mod designer;
@@ -114,6 +115,10 @@ pub struct Config {
     /// planner, never from a request or a project; a project's own skills,
     /// in its `.molt/skills`, are read as data.
     pub skills_dir: Option<std::path::PathBuf>,
+    /// Have a model write an attempt's notes on the turns its conversation
+    /// leaves out to fit, beside Molt's own record of them (#108). Off by
+    /// default: each fit then costs one more model call.
+    pub compact_model: bool,
 }
 
 impl Default for Config {
@@ -145,6 +150,7 @@ impl Default for Config {
             tools: Vec::new(),
             pack: Arc::default(),
             skills_dir: None,
+            compact_model: false,
         }
     }
 }
@@ -155,7 +161,7 @@ impl Config {
     /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_EXPLORE`, `MOLT_EXPLORE_MODEL`, `MOLT_MAX_TOKENS`,
     /// `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
     /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES`,
-    /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL`, `MOLT_PROMPTS_DIR` and `MOLT_SKILLS_DIR`.
+    /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL`, `MOLT_PROMPTS_DIR`, `MOLT_SKILLS_DIR` and `MOLT_COMPACT`.
     ///
     /// | Variable | Default |
     /// |---|---|
@@ -176,6 +182,7 @@ impl Config {
     /// | `MOLT_ROUTE_MODEL` | unset: the run's model picks the workflow of a run that names `auto` |
     /// | `MOLT_PROMPTS_DIR` | unset: the built-in prompts; else the prompt pack to read ([`pack::Pack::load`]) |
     /// | `MOLT_SKILLS_DIR` | unset: no user skills; else the directory of the user's skills ([`skills`]) |
+    /// | `MOLT_COMPACT` | `record`: Molt's own record of the turns a conversation leaves out; `model` also has the `compactor` write notes on them ([`compact`]) |
     ///
     /// An empty variable counts as unset. A value that does not parse is an
     /// error, and so is a zero: none of these limits has a "no limit" value.
@@ -243,6 +250,11 @@ impl Config {
                 Some(v) => anyhow::bail!("MOLT_EXPLORE={v:?}: use on or off"),
             },
             explore_model: get("MOLT_EXPLORE_MODEL"),
+            compact_model: match get("MOLT_COMPACT").as_deref() {
+                None | Some("record") => false,
+                Some("model") => true,
+                Some(v) => anyhow::bail!("MOLT_COMPACT={v:?}: use record or model"),
+            },
             max_tokens: small("MOLT_MAX_TOKENS", d.max_tokens)?,
             model_timeout: Duration::from_secs(number("MOLT_MODEL_TIMEOUT_S", d.model_timeout.as_secs())?),
             check_timeout: Duration::from_secs(number("MOLT_CHECK_TIMEOUT_S", d.check_timeout.as_secs())?),
@@ -729,5 +741,13 @@ mod tests {
         assert!(runner::workflow(&cfg, Some("quick")).unwrap().explores());
         assert!(!runner::workflow(&cfg, Some("ask")).unwrap().explores());
         assert!(!runner::workflow(&Config::default(), None).unwrap().explores());
+    }
+
+    #[test]
+    fn a_model_writes_compaction_notes_only_when_the_planners_starter_says_so() {
+        assert!(!from(&[]).unwrap().compact_model);
+        assert!(!from(&[("MOLT_COMPACT", "record")]).unwrap().compact_model);
+        assert!(from(&[("MOLT_COMPACT", "model")]).unwrap().compact_model);
+        assert!(format!("{:#}", from(&[("MOLT_COMPACT", "yes")]).unwrap_err()).contains("use record or model"));
     }
 }
