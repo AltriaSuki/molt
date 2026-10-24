@@ -93,6 +93,10 @@ pub fn resolve_config(
             );
             cfg.services.iter_mut().for_each(|s| s.tools.clear());
         }
+        if !trusted && !cfg.mcp.is_empty() {
+            eprintln!("MCP servers in a project configuration are ignored; configure them in your user configuration");
+            cfg.mcp.clear();
+        }
         install_hooks(&mut cfg)?;
         require_services(&cfg).with_context(|| format!("{} cannot run tasks", path.display()))?;
         if let Some(dir) = data_dir {
@@ -317,6 +321,16 @@ pub fn environments(cfg: &mut Config) -> anyhow::Result<()> {
         exec.args.extend(["--environments".into(), json]);
     }
     Ok(())
+}
+
+/// Bridge the config's MCP servers, each as service `mcp-NAME` (see
+/// [`Config::install_mcp`]), with `molt-mcp` next to the running executable.
+/// Call it once the shell's sandbox options are set.
+pub fn mcp(cfg: &mut Config) -> anyhow::Result<()> {
+    if cfg.mcp.is_empty() {
+        return Ok(());
+    }
+    cfg.install_mcp(&bin_dir()?)
 }
 
 /// What the commands of a run in `workspace` will be missing, from cheap
@@ -904,6 +918,7 @@ pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::
         tui: cfg.tui.clone(),
         hooks: cfg.hooks.clone(),
         profiles: cfg.profiles.clone(),
+        mcp: Default::default(),
     };
     let running = crate::start(&alone).await?;
     let result = async {
@@ -1525,6 +1540,24 @@ mod tests {
         std::fs::write(&inside, config).unwrap();
         let ignored = resolve_config(Some(&inside), &workspace, None, None, None).unwrap();
         assert!(ignored.provided_tools().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_configuration_outside_the_project_can_add_mcp_servers() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        std::fs::create_dir(&workspace).unwrap();
+        let services = SERVICES
+            .iter()
+            .map(|name| format!("[[service]]\nname = \"{name}\"\nexec = {{ command = \"/bin/true\" }}\n"))
+            .collect::<String>();
+        let config = format!("{services}\n[mcp.issues]\ncommand = \"/opt/issues-mcp\"\n");
+        let outside = root.path().join("config.toml");
+        std::fs::write(&outside, &config).unwrap();
+        assert_eq!(resolve_config(Some(&outside), &workspace, None, None, None).unwrap().mcp.len(), 1);
+        let inside = workspace.join("config.toml");
+        std::fs::write(&inside, config).unwrap();
+        assert!(resolve_config(Some(&inside), &workspace, None, None, None).unwrap().mcp.is_empty());
     }
 
     #[test]

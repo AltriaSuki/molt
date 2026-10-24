@@ -68,6 +68,9 @@ enum Fake {
     Hangs(PathBuf),
     /// Attempts greet and, when they are offered this tool, call it too.
     GreetsWithTool(&'static str),
+    /// Attempts greet and, when they are offered the first of these tools,
+    /// make each call in turn, in the same turn.
+    GreetsWithCalls(Vec<(&'static str, Value)>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -170,6 +173,17 @@ impl Respond for FakeApi {
                 if body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == *tool)) =>
             {
                 (vec![write("greeting.txt", "hello\n"), tool_use(n, tool, json!({ "text": "hi" }))], "tool_use")
+            }
+            (Fake::GreetsWithCalls(calls), false, Turn::First)
+                if body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == calls[0].0)) =>
+            {
+                let mut content = vec![write("greeting.txt", "hello\n")];
+                for (i, (tool, input)) in calls.iter().enumerate() {
+                    let mut call = tool_use(n, tool, input.clone());
+                    call["id"] = json!(format!("toolu_{n:03}_{i}"));
+                    content.push(call);
+                }
+                (content, "tool_use")
             }
             (_, false, Turn::First | Turn::Feedback) => (vec![write("greeting.txt", "hello\n")], "tool_use"),
             (_, false, Turn::AfterTools) => {
@@ -2437,6 +2451,88 @@ async fn a_tool_a_configured_service_declares_is_offered_called_and_audited() {
             .find(|c| c["type"] == "tool_result" && c["content"].as_str().is_some_and(|t| t.contains("echo_back")))
             .expect("the tool's result went back to the model");
         assert!(result["content"].as_str().unwrap().contains("<tool_output tool=\"echo_back\">"), "{result}");
+    }
+    assert_requests_valid(&server).await;
+}
+
+/// An MCP server of the user's config, bridged as service `mcp-fake`: its
+/// tools are offered to attempts as `mcp__fake__*`, every call goes through
+/// the kernel into the audit log, a call beyond the planner's budget for it
+/// is refused by the kernel, and a server that crashes gives its call an
+/// error result while the run goes on. With `calls = 0` nothing is offered.
+#[tokio::test]
+async fn an_mcp_servers_tools_are_called_through_the_kernel_within_their_budget_and_survive_a_crash() {
+    let calls = vec![
+        ("mcp__fake__echo", json!({ "text": "hi" })),
+        ("mcp__fake__crash", json!({})),
+        ("mcp__fake__echo", json!({ "text": "again" })),
+    ];
+    let server = fake_api(Fake::GreetsWithCalls(calls)).await;
+    for budget in [0, 2] {
+        let mut setup = Setup::new(&server);
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().canonicalize().unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../molt-mcp/tests/fake_mcp_server.py");
+        std::fs::copy(script, dir_path.join("server.py")).unwrap();
+        let text = format!(
+            "[mcp.fake]\ncommand = \"/usr/bin/python3\"\nargs = [\"{0}/server.py\", \"{0}\"]\nmounts = [\"{0}\"]\n\
+             calls = {budget}\n[mcp.fake.tools.echo]\nread_only = true\n",
+            dir_path.display()
+        );
+        setup.cfg.mcp = Config::parse(&text).unwrap().mcp;
+        setup.cfg.install_mcp(&bin_dir()).unwrap();
+        let before = bodies(&server).await.len();
+        let (resp, _) = setup.run(setup.request(Some(CHECK), 1)).await;
+        assert_eq!(resp.outcome, Outcome::Passed, "the run goes on: {}", resp.summary);
+        let sent = bodies(&server).await;
+        let offered =
+            |b: &Value| b["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == "mcp__fake__echo"));
+        let audit = molt_kernel::audit::read_all(&setup.data.path().join("audit.jsonl")).await.unwrap();
+        let to_bridge = |e: &&AuditEvent| match e {
+            AuditEvent::Message { envelope } => envelope.to.to_string() == "mcp-fake.call",
+            AuditEvent::Denied { to, .. } => to.to_string() == "mcp-fake.call",
+            _ => false,
+        };
+        let events: Vec<&AuditEvent> = audit.iter().map(|e| &e.event).filter(to_bridge).collect();
+        if budget == 0 {
+            assert!(sent[before..].iter().all(|b| !offered(b)), "a server with calls = 0 offers nothing");
+            assert!(events.is_empty());
+            continue;
+        }
+        assert!(sent[before..].iter().any(offered));
+        let requests: Vec<&molt_proto::Envelope> = events
+            .iter()
+            .filter_map(|e| match e {
+                AuditEvent::Message { envelope } if envelope.kind == Kind::Request => Some(envelope),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requests.len(), 2, "the third call is refused before delivery");
+        assert!(requests.iter().all(|r| r.from.as_ref().map(|f| f.as_str()) == Some("planner")));
+        assert_eq!(requests[0].payload["tool"], "mcp__fake__echo");
+        assert_eq!(requests[0].payload["input"], json!({ "text": "hi" }));
+        let denied = events.iter().find_map(|e| match e {
+            AuditEvent::Denied { from, code, .. } => Some((from.as_str().to_owned(), *code)),
+            _ => None,
+        });
+        assert_eq!(denied, Some(("planner".to_owned(), molt_proto::ErrorCode::OverBudget)), "{events:?}");
+        let results: Vec<Value> = sent[before..]
+            .iter()
+            .flat_map(|b| b["messages"].as_array().cloned().unwrap_or_default())
+            .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+            .filter(|c| c["type"] == "tool_result" && c["content"].as_str().is_some_and(|t| t.contains("mcp")))
+            .collect();
+        let result = |needle: &str| {
+            results
+                .iter()
+                .find(|r| r["content"].as_str().unwrap().contains(needle))
+                .unwrap_or_else(|| panic!("no tool result with {needle:?} in {results:#?}"))
+        };
+        let echo = result("echo: hi");
+        assert!(echo["content"].as_str().unwrap().contains("<tool_output tool=\"mcp__fake__echo\">"));
+        assert!(echo["content"].as_str().unwrap().contains("data from outside the workspace"), "{echo}");
+        assert_eq!(result("crashing on purpose")["is_error"], true);
+        assert_eq!(results.iter().filter(|r| r["is_error"] == true).count(), 2, "{results:#?}");
     }
     assert_requests_valid(&server).await;
 }

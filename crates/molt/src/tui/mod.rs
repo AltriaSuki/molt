@@ -84,6 +84,7 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
     }
     agent::deps_cache(&mut cfg, &opts.deps_cache)?;
     agent::environments(&mut cfg)?;
+    agent::mcp(&mut cfg)?;
     agent::allow_web(&mut cfg, &opts.allow_web)?;
     if let Some(resolver) = &opts.web_resolver {
         cfg.web_resolver(resolver)?;
