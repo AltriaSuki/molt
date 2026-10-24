@@ -15,6 +15,7 @@ until phase 3 of the roadmap.
 | `find_symbol`, `recall` | `memory.symbols`, `memory.recall` | attempts and the designer, when memory is up |
 | `fetch_url` | `web.fetch` | attempts and the designer, when you allow web hosts |
 | `ask_user` | answered by you, through the interface | attempts of an interactive run |
+| `load_skill` | answered by the planner itself | attempts and `ask` runs, when the run has [skills](skills.md) |
 
 An `ask` run gets only the ones that read. The vetter, the reviewer and the
 judge get `read_file`, `list_files` and `search`.
