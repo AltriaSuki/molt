@@ -3587,6 +3587,28 @@ async fn asking_refuses_a_check_and_a_checkpoint() {
 }
 
 #[tokio::test]
+async fn auto_with_a_checkpoint_may_still_pick_ask_which_then_keeps_none() {
+    let fake = Fake::new(
+        |req| {
+            if is_router(req) {
+                let offered = last_text(req);
+                assert!(offered.contains("The workflows you may pick: ask, quick, verify."), "{offered}");
+                return submit_route(req, "ask");
+            }
+            done("It is a project with a README.")
+        },
+        |_, _| panic!("asking runs no command"),
+    );
+    let state = tempfile::tempdir().unwrap();
+    let cfg = Config { state_dir: Some(state.path().into()), ..config() };
+    let req = RunRequest { workflow: Some("auto".into()), checkpoint: true, ..request(None, 1) };
+    let resp = run_with(&fake, cfg, req).await;
+    assert_eq!(resp.workflow.as_deref(), Some("ask"), "{}", resp.summary);
+    assert_eq!(resp.checkpoint, None);
+    assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0, "an answer saves no checkpoint");
+}
+
+#[tokio::test]
 async fn quick_runs_exactly_one_attempt_without_designing_and_reviews_by_the_fixed_rules() {
     let fake = Fake::new(
         |req| {

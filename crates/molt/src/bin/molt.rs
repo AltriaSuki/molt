@@ -983,7 +983,7 @@ async fn resume_task(config: Option<&Path>, profile: Option<&str>, args: ResumeA
             eprintln!("no stopped run to resume in {}", agent::printable(&workspace));
         }
         for saved in &here {
-            println!("{}", agent::printable(&stopped_run(saved)));
+            println!("{}", agent::printable(&agent::stopped_run(saved)));
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -1005,29 +1005,6 @@ async fn resume_task(config: Option<&Path>, profile: Option<&str>, args: ResumeA
     req.design_budget_usd = args.common.design_budget_usd.or(req.design_budget_usd);
     eprintln!("resuming run {run}: {}", agent::printable(req.task.lines().next().unwrap_or_default()));
     execute(&cfg, req, TraceId::from_raw(&run), &args.common, stop).await
-}
-
-/// One line about a stopped run: its id, when it stopped, what it spent,
-/// its attempts and its task.
-fn stopped_run(saved: &checkpoint::Saved) -> String {
-    let ago = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |now| (now.as_millis() as u64).saturating_sub(saved.saved_ms) / 60_000);
-    let attempts: Vec<String> = saved
-        .attempts
-        .iter()
-        .map(|a| match &a.end {
-            Some(end) => format!("{}: {:?} after {} turns", a.index, end.status, a.turns).to_lowercase(),
-            None => format!("{}: stopped after {} turns", a.index, a.turns),
-        })
-        .collect();
-    let task: String = saved.request.task.lines().next().unwrap_or_default().chars().take(60).collect();
-    format!(
-        "{}  {ago} min ago  ${:.2}  [{}]  {task}",
-        saved.run,
-        saved.spend.cost_usd,
-        if attempts.is_empty() { "no attempt yet".to_owned() } else { attempts.join(", ") }
-    )
 }
 
 /// Carry out `req` under the run id `trace` and report it.

@@ -1967,6 +1967,70 @@ async fn a_checkpointed_run_that_runs_out_of_budget_is_resumed_with_its_fork() {
     assert!(!std::path::Path::new(&fork).exists());
 }
 
+/// A checkpointed run in `session` that stops early: the first model call spends its budget.
+async fn stop_early(setup: &Setup, session: &molt::session::Session) -> (RunResponse, molt_proto::TraceId) {
+    let mut req = setup.request(Some(CHECK), 1);
+    req.checkpoint = true;
+    req.budget_usd = Some(0.000_001);
+    let trace = molt_proto::TraceId::random();
+    let resp = tokio::time::timeout(RUN_LIMIT, session.run(&req, &trace)).await.expect("the run hung").unwrap();
+    (resp, trace)
+}
+
+#[tokio::test]
+async fn the_interfaces_session_keeps_a_stopped_runs_forks_to_resume_it_and_drops_them_when_told() {
+    use molt::session::Session;
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let workspace = setup.workspace.path().canonicalize().unwrap();
+    let runs = setup.data.path().join(molt::config::RUNS);
+    let start = || async {
+        let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
+        Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap()
+    };
+
+    // Quit: the session stops, and the stopped run's fork stays for the next one.
+    let session = start().await;
+    let (stopped, trace) = stop_early(&setup, &session).await;
+    assert_eq!(stopped.checkpoint.as_deref(), Some(trace.as_str()), "{stopped:#?}");
+    session.shutdown(&[]).await;
+    let saved = molt_planner::checkpoint::load(&runs, trace.as_str()).unwrap();
+    let fork = saved.attempts[0].fork.clone().expect("the attempt had a fork");
+    assert!(Path::new(&fork).is_dir(), "the fork outlives the session that made it");
+
+    // Reopen and continue: the run goes on in its fork, once, and its cost goes on.
+    let session = start().await;
+    let mut req = saved.request.clone();
+    req.resume = Some(molt_api::planner::Resume { run: trace.to_string(), retry: false });
+    req.budget_usd = Some(10.0);
+    let resumed = tokio::time::timeout(RUN_LIMIT, session.run(&req, &trace)).await.expect("the run hung").unwrap();
+    assert_eq!(resumed.outcome, Outcome::Passed, "{resumed:#?}");
+    assert!(resumed.applied && setup.file("greeting.txt").as_deref() == Some("hello\n"));
+    assert!(resumed.cost_usd > stopped.cost_usd, "{} then {}", stopped.cost_usd, resumed.cost_usd);
+    assert!(molt_planner::checkpoint::load(&runs, trace.as_str()).is_err(), "a finished run keeps no checkpoint");
+    let again = session.run(&req, &trace).await.unwrap_err();
+    assert!(format!("{again:#}").contains("no checkpoint"), "a finished run is not run again: {again:#}");
+
+    // Dropped from a later session: its fork and its checkpoint go.
+    std::fs::remove_file(workspace.join("greeting.txt")).unwrap();
+    let (_, dropped) = stop_early(&setup, &session).await;
+    session.shutdown(&[]).await;
+    let session = start().await;
+    let fork = molt_planner::checkpoint::load(&runs, dropped.as_str()).unwrap().forks().remove(0);
+    session.drop_run(dropped.as_str()).await.unwrap();
+    assert!(!Path::new(&fork).exists());
+    assert!(molt_planner::checkpoint::load(&runs, dropped.as_str()).is_err());
+
+    // Stopped by the user: the session drops its checkpoint, and its fork with it.
+    let (_, cancelled) = stop_early(&setup, &session).await;
+    let fork = molt_planner::checkpoint::load(&runs, cancelled.as_str()).unwrap().forks().remove(0);
+    session.shutdown_dropping(&[], Some(cancelled.as_str())).await;
+    assert!(molt_planner::checkpoint::load(&runs, cancelled.as_str()).is_err());
+    assert!(!Path::new(&fork).exists());
+    assert_eq!(setup.files(), ["README.txt"]);
+    setup.assert_forks_dropped();
+}
+
 #[tokio::test]
 async fn lifecycle_formatting_is_rechecked_and_cannot_weaken_the_protected_check() {
     use molt_planner::hooks::{Event, Hook};
@@ -2118,6 +2182,23 @@ async fn the_ui_backend_finishes_without_terminal_reads_and_exits_when_the_pipe_
     .unwrap();
     assert_eq!(result["Ran"]["result"]["Ok"]["applied"], true, "{result}");
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    // A result waits for the interface's decision when the interface dies: its fork stays, to be picked up.
+    std::fs::remove_file(setup.workspace.path().join("greeting.txt")).unwrap();
+    let mut req = setup.request(Some(CHECK), 1);
+    req.apply = false;
+    send(&mut input, json!({"Run":{"req":req,"trace":molt_proto::TraceId::random()}})).await;
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let msg = recv(&mut output).await;
+            if msg.get("Ran").is_some() {
+                break msg;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let fork = result["Ran"]["result"]["Ok"]["fork"].as_str().expect("kept in its fork").to_owned();
     drop(input);
     assert!(tokio::time::timeout(Duration::from_secs(15), child.wait()).await.unwrap().unwrap().success());
+    assert!(Path::new(&fork).is_dir(), "the fork outlives the interface that died");
 }

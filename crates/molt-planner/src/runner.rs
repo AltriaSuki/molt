@@ -47,7 +47,7 @@ pub(crate) async fn run_cancellable(
     }
     let mut req = req;
     let routes = routes(&req, &cfg)?;
-    let state = match (req.checkpoint, &cfg.state_dir) {
+    let mut state = match (req.checkpoint, &cfg.state_dir) {
         (false, _) => None,
         (true, Some(dir)) => Some(dir.clone()),
         (true, None) => return Err(invalid("this planner keeps no checkpoints: it was started without a state dir")),
@@ -58,6 +58,11 @@ pub(crate) async fn run_cancellable(
     if let Some(candidates) = routes {
         // Picked before anything else, so a checkpoint saves the workflow the run goes through.
         req.workflow = Some(pick(&mut ctx, &req, &candidates).await.to_owned());
+        if ctx.workflow.read_only() {
+            // An answer in one go has nothing to go on from: a checkpoint is for the workflows that change things.
+            req.checkpoint = false;
+            state = None;
+        }
     }
     if let Some(dir) = &state {
         let store = Store::create(dir, Saved::new(ctx.trace.as_str(), req.clone())).map_err(failed)?;
@@ -245,7 +250,12 @@ fn routes(req: &RunRequest, cfg: &Config) -> Result<Option<Vec<&'static str>>, R
         validate(req, cfg)?;
         return Ok(None);
     }
-    let with = |name: &str| RunRequest { workflow: Some(name.to_owned()), ..req.clone() };
+    // Under `auto`, a checkpoint is asked for whichever workflow is picked that keeps one.
+    let with = |name: &str| RunRequest {
+        workflow: Some(name.to_owned()),
+        checkpoint: req.checkpoint && !workflow(cfg, Some(name)).is_ok_and(|w| w.read_only()),
+        ..req.clone()
+    };
     let candidates: Vec<&'static str> =
         workflow::ROUTED.into_iter().filter(|name| validate(&with(name), cfg).is_ok()).collect();
     if candidates.is_empty() {

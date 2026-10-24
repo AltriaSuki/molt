@@ -85,6 +85,7 @@ sender from that.
 | Explicit DoH avoids fake-IP bootstrap while keeping private-address refusal, bounded answers and per-redirect host checks | `molt_web::resolver::tests`, `repeated_host_dns_failures_remove_fetch_url_and_refuse_stale_calls` |
 | Idle TUI undo notifies the current memory service; locked CLI undo leaves Git untouched and incomplete notices stay retryable | `session_undo_notifies_memory_and_cli_undo_refuses_its_lock_before_changing_git`, `tui::app::tests::quitting_waits_for_an_uninterruptible_git_operation_to_settle` |
 | An interrupted task's attempt forks are not dropped before the interface has looked at them; a fork whose changes cannot be listed is kept, and what the stopped task spent is counted, with unknown calls left uncounted | `runner::tests::a_cancelled_run_leaves_its_attempts_forks_to_a_caller_that_asked_for_them`, `tui::tests::an_interrupted_fork_whose_changes_cannot_be_listed_is_kept_while_it_exists`, `tui::app::tests::an_interrupt_counts_what_the_stopped_run_spent_and_keeps_unknown_calls_uncounted`, `tui::app::tests::a_single_esc_does_not_stop_a_running_task` |
+| An interface that stops mid-task keeps the run's checkpoint and forks; it goes on only when the user resumes it, under its own id and counted once, and cancelling or dropping it removes both; a damaged checkpoint or lost fork starts nothing | `crates/molt/tests/agent.rs` (`the_interfaces_session_keeps_a_stopped_runs_forks_to_resume_it_and_drops_them_when_told`), `tui::app::tests::a_task_cut_off_by_a_crash_goes_on_from_its_checkpoint_only_when_asked_and_its_cost_is_counted_once`, `stopping_a_checkpointed_task_drops_its_checkpoint_and_dropping_a_stopped_run_counts_what_it_spent`, `a_damaged_checkpoint_or_a_lost_fork_is_refused_with_why_and_starts_nothing` |
 | Kept results survive restart; conflicting applies leave user edits and the fork intact | `tui::app::tests::plan_results_are_browsable_and_remain_available_until_apply_or_discard_succeeds`, `a_kept_session_result_survives_restart_and_refuses_workspace_conflicts` |
 | Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
 | Commands build into a private writable directory outside the fork, and a result never carries the build artifacts commands leave in the fork: they are reported and not applied | `crates/molt/tests/agent.rs` (`build_output_of_the_check_is_left_out_of_the_result_and_the_workspace`), `crates/molt-tools/tests/fs.rs` (`build_artifacts_that_commands_leave_in_a_fork_are_reported_and_never_merged`), `crates/molt-tools/tests/sandbox.rs` (`build_output_goes_to_a_private_writable_directory_outside_the_fork_that_later_commands_reuse`) |
@@ -335,6 +336,27 @@ task and 4 MiB total; rejected drafts are retained. Invalid `@paths` pause the
 queue without losing the task; the planner reads files when the queued task starts. Queued tasks live in this interface session:
 quitting shows their full text for confirmation and prints it after the terminal
 is restored, with known credentials redacted. A crash does not save the queue.
+
+If the interface stops before a task is done (quit while it runs, a crash,
+the process killed), the next `molt` in the workspace picks up where it
+stopped, without calling a model: the earlier tasks' summaries later tasks
+are told about, what the session spent, and the task that was in flight. A
+task that changes things keeps a planner checkpoint as it runs (see
+"Checkpoints and `molt resume`"), and quitting or a crash keeps it and its
+forks: `/runs resume [RUN]` goes on with it under the same run id, with its
+check, protected paths, requirements and spend; `/runs discard [RUN]` drops it
+and its forks and counts what it spent. `/runs` lists the workspace's stopped
+runs, `molt do --checkpoint` ones included, and says why a damaged or
+incompatible checkpoint, or one whose fork is gone, cannot go on. Stopping the
+task with Esc is cancelling it: its checkpoint goes, and its work is kept as
+an interrupted result. `/pause` keeps the run in the interface. A check being
+designed or waiting for you, or an answer under `/ask`, is not checkpointed:
+its task is put back in the input to start again, and a design cut off counts
+as uncounted spend. A result that waited for your decision is kept (`/kept`).
+The session is saved privately per workspace whenever it changes, up to 1 MiB;
+a quit with nothing in flight removes it, so the next interface starts afresh.
+Only one kernel runs per data directory, so `molt resume` and the interface
+never go on with the same run at once.
 
 `/kept` lists this workspace's retained results with their task, outcome, age and
 change counts. Select with arrows, `d` inspects the current diff, Enter applies,
@@ -635,6 +657,8 @@ result in its fork, with exit status 3. A damaged checkpoint, one in another
 format, or one for another workspace is refused with the reason. The ten
 newest checkpoints are kept; older ones are removed with their forks when a
 new checkpointed run starts.
+With `--workflow auto`, a checkpoint is kept unless the planner picks a
+workflow that only reads (`ask`), which answers in one go and keeps none.
 
 With `--stream`, previews identify the attempt (or check designer), turn and
 model call. These are provisional text, not verified results. Thinking and
@@ -1310,11 +1334,11 @@ needed. Deleting an unfinished record loses its recovery material.
 - `--deps-cache` supports only Cargo; Go, Node and Python dependencies must be in the project (vendor, `node_modules`, `.venv`) or mounted with a policy, and the preflight that points this out is a file check, not a build. With `--deps-cache cargo`, crates missing from the host cache cannot be fetched, sources Cargo extracts privately are writable by later commands of the same workspace (as its build directory is), local-registry or directory sources named in the host Cargo config are not mounted, and the toolchain is not mounted for you. `molt sandbox suggest`, a generated policy draft, is not built yet.
 - The private build directories (`<data dir>/work/.molt/build`) are never cleaned up, and each Cargo slot a workspace used holds a full build; delete the directory to reclaim the space. A result's build artifacts are recognized by name and content, not by which command made them: a compiled file or a file under a top-level `target-*/` that an attempt makes with a command, rather than with its file tools, is left out too.
 - What an interrupted task in the interface spent comes from its progress events, which are best effort: a call whose events were lost is missing from the session total, and the stopped run's audit log is not read back to settle it. `r` after a stop does not take what the stopped attempts spent off the new run's budget.
-- After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none. A run with `--checkpoint` that stops keeps its forks for `molt resume`.
+- After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none. A run with `--checkpoint` that stops keeps its forks for `molt resume`. An interface (`molt`) that crashes or is killed removes no fork its session made: the one a result waited in is picked up as a kept result, and others stay in the scratch dir until removed by hand.
 - The check's designer is only told not to do the task, and told afterwards when it changed files beyond its check files: nothing stops it from spending its share of the budget that way. When its share runs out without a check, the run stops rather than falling back to a rubric, since a designer that submitted none has none to fall back to. `--criterion` gives criteria without commands; only a designed rubric can have criteria a command decides.
 - A rubric's model-judged criteria are a model's reading, not a proof: the judge can be wrong, and nothing but the criteria with a command checks the result. In the interface, a constraint that adds a check is refused while a run is being judged by a rubric.
 - Only `molt do --commit`, `molt resume --commit` and the interface's `/commit on` commit a result, always on the current branch (`--branch` is for `molt do` only). `molt undo` takes back only those commits, and refuses a file changed after the run rather than merging the revert into it (use `git revert` then).
-- A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet. Its task queue lives in memory: normal exit prints unexecuted tasks, while a crash loses them.
+- A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface's task queue lives in memory: normal exit prints unexecuted tasks, while a crash loses them.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.
 - Default recall matches keywords with stemming, so differently worded notes can be missed. Chinese, Japanese and Korean match on pairs of characters, so a query can also find a note where its pair spans two words, and a one-character query word finds only notes where that character stands alone. Optional offline word-vector recall needs a reviewed hash-pinned local model; its mean-pooling backend does not understand word order or supply a pretrained vocabulary.
