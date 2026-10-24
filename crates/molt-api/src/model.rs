@@ -38,6 +38,10 @@ pub enum Role {
     Explorer,
     /// Memory learning from a finished run.
     Memory,
+    /// The call that writes an attempt's notes on the turns its
+    /// conversation leaves out to fit (#108). An older peer reads it as
+    /// [`Role::Other`].
+    Compactor,
     #[serde(other)]
     Other,
 }
@@ -54,6 +58,7 @@ impl Role {
             Self::Router => "router",
             Self::Explorer => "explorer",
             Self::Memory => "memory",
+            Self::Compactor => "compactor",
             Self::Other => "planner",
         }
     }
@@ -72,6 +77,7 @@ pub fn speaker(role: Option<Role>, attempt: Option<u32>) -> String {
     match (role, attempt) {
         (None | Some(Role::Attempt), Some(a)) => attempt_name(a),
         (Some(Role::Explorer), Some(a)) => format!("{} explorer", attempt_name(a)),
+        (Some(Role::Compactor), Some(a)) => format!("{} compactor", attempt_name(a)),
         (Some(role), _) => role.name().to_owned(),
         (None, None) => Role::Other.name().to_owned(),
     }

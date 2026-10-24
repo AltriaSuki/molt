@@ -46,6 +46,9 @@ pub const ROUTER: &str = "router";
 pub const VETTER: &str = "vetter";
 /// The step designer: splits a task into the ordered steps of a plan (#47).
 pub const STEPS: &str = "steps";
+/// The compactor: writes an attempt's notes on the turns its conversation
+/// leaves out to fit, with `MOLT_COMPACT=model` (#108).
+pub const COMPACTOR: &str = crate::compact::COMPACTOR;
 
 /// Every built-in prompt, by name, in the order `molt prompts list` shows
 /// them. `attempt` is the part of an attempt's prompt that holds whatever
@@ -60,6 +63,7 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("judge", prompts::JUDGE_SYSTEM),
     (ROUTER, prompts::ROUTE_SYSTEM),
     (STEPS, prompts::STEPS_SYSTEM),
+    (COMPACTOR, crate::compact::COMPACTOR_SYSTEM),
 ];
 
 /// The built-in prompt `name`.
@@ -75,7 +79,7 @@ pub fn protected(name: &str) -> bool {
 
 /// Names a declared role cannot take: the planner's own roles.
 const RESERVED_ROLES: &[&str] =
-    &["designer", "attempt", "explorer", "reviewer", "judge", VETTER, ROUTER, STEPS, "memory", "planner"];
+    &["designer", "attempt", "explorer", "reviewer", "judge", VETTER, ROUTER, STEPS, COMPACTOR, "memory", "planner"];
 
 /// The lowercase hex SHA-256 of `text`: a prompt's version.
 pub fn sha256(text: &str) -> String {
@@ -269,6 +273,7 @@ impl Pack {
             vetter: self.seat(internal(VETTER), VETTER, true),
             router: self.seat(internal(ROUTER), ROUTER, false),
             steps: self.seat(internal(STEPS), STEPS, false),
+            compactor: self.seat(internal(COMPACTOR), COMPACTOR, false),
         })
     }
 
@@ -386,6 +391,7 @@ pub(crate) struct Seats {
     pub vetter: Seat,
     pub router: Seat,
     pub steps: Seat,
+    pub compactor: Seat,
 }
 
 impl Seats {
