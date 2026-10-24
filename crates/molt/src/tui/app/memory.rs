@@ -357,6 +357,10 @@ pub(super) fn snapshot_lines(snapshots: &[RecallSnapshot]) -> Vec<Line<'static>>
             "",
             Tone::Mem,
         ));
+        if !s.skills.is_empty() {
+            let offered: Vec<String> = s.skills.iter().map(|k| format!("{} ({})", k.name, k.source.as_str())).collect();
+            lines.extend(block(&format!("skills offered: {}", offered.join(", ")), "", Tone::Dim));
+        }
         if s.notes.is_empty() {
             lines.extend(block("no notes returned", "", Tone::Dim));
         }
@@ -646,10 +650,18 @@ mod tests {
             purpose: "context".into(),
             created_ms: 1,
             notes: vec![inspected_note()],
+            skills: vec![molt_api::agent_skills::OfferedSkill {
+                name: "pdf-tools".into(),
+                source: molt_api::agent_skills::SkillSource::User,
+                location: "/u/pdf-tools/SKILL.md".into(),
+                sha256: "ab".into(),
+                revision: None,
+            }],
         };
         app.update(Msg::UsedNotes { run: run.clone(), result: Ok(vec![record.clone()]) });
         let frame = frame_text(&mut app);
         assert!(frame.contains("captured_call") && frame.contains("revision 7") && frame.contains("Build with cargo"));
+        assert!(frame.contains("skills offered: pdf-tools (user)"), "{frame}");
         app.update(key(KeyCode::Esc));
         app.update(Msg::UsedNotes { run: run.clone(), result: Ok(vec![record]) });
         assert!(app.viewer.is_none());

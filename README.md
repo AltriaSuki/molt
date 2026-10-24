@@ -86,6 +86,7 @@ sender from that.
 | A benchmark run that fails on the model API is not counted as the agent's failure, and can be run again | `crates/molt-bench/src/agent.rs` (`a_run_that_failed_on_the_model_api…`), `crates/molt-bench/src/run.rs` (`a_benchmark_that_cannot_reach_the_model_stops`, `an_agent_that_crashes_is_charged_with_it`) |
 | Issue CI rejects PR triggers and probes the sandbox before model spend | `scripts/ci/test_issue_to_pr.py::test_only_labelled_open_issues_are_eligible`, `test_sandbox_failure_posts_a_summary_and_never_starts_a_model` |
 | A skill source cannot approve itself; only the CLI manages activation and withdrawal preserves evidence | `skills::tests::drafts_need_independent_evidence_and_disable_cannot_be_undone_by_learning`, `tests/service.rs::an_agent_cannot_manage_or_promote_its_own_skills` |
+| Agent Skills offer only names and descriptions first; `load_skill` reads nothing outside a skill, and a project skill's script never runs | `skills::tests::load_skill_reads_nothing_outside_the_skill_and_nothing_too_large`, `tests/agent.rs::a_users_skill_is_offered_by_name_and_read_through_load_skill_and_a_projects_script_never_runs` |
 | Queued tasks retain their submitted execution settings and wait for apply/discard/commit settlement | `tui::app::queue::tests::queued_tasks_snapshot_execution_settings_and_plain_input_still_steers_the_current_task`, `tui::app::queue::tests::a_queue_waits_for_apply_commit_and_discard_to_settle_before_starting_the_next_task` |
 | Explicit DoH avoids fake-IP bootstrap while keeping private-address refusal, bounded answers and per-redirect host checks | `molt_web::resolver::tests`, `repeated_host_dns_failures_remove_fetch_url_and_refuse_stale_calls` |
 | Idle TUI undo notifies the current memory service; locked CLI undo leaves Git untouched and incomplete notices stay retryable | `session_undo_notifies_memory_and_cli_undo_refuses_its_lock_before_changing_git`, `tui::app::status::tests::quitting_waits_for_an_uninterruptible_git_operation_to_settle` |
@@ -136,7 +137,7 @@ to generate per-service credentials, put the printed `authorization` block and
 | [Memory](docs/memory.md) | The project model, learned notes, notes for every project, offline semantic notes |
 | [Model providers and prices](docs/providers-and-prices.md) | The providers the gateway supports, and where model prices come from |
 | [Linux command isolation](docs/sandbox.md) | The sandbox, environment profiles and `molt env doctor`, dependencies offline |
-| [Declarative project skills](docs/skills.md) | Workflows memory drafts from verified runs, and how they are inspected, approved and withdrawn |
+| [Skills](docs/skills.md) | Agent Skills (`SKILL.md`) from you and the project, and workflows memory drafts from verified runs, and how they are inspected, approved, withdrawn and exported |
 | [Benchmark](docs/bench.md) | Running `molt bench` and what its results mean; the task format is in [bench/README.md](bench/README.md) |
 | [Recovering a workspace apply](docs/recovery.md) | How an apply into the workspace is journaled, and how to resume or undo one cut off part way |
 | [Known limits](docs/limits.md) | What does not work yet, and how cancellation and model settlement are counted |

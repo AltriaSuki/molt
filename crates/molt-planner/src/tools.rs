@@ -88,6 +88,7 @@ enum Tool {
     FindSymbol(t::FindSymbol),
     Recall(t::Recall),
     Fetch(t::FetchUrl),
+    LoadSkill(t::LoadSkill),
     Ask(t::AskUser),
     /// A tool a service declared, with the model's input as it gave it.
     Provided(Arc<ProvidedTool>, Value),
@@ -114,6 +115,8 @@ impl Tool {
             t::RECALL => Self::Recall(input(call)?),
             // Offered only when the planner may call web.fetch; otherwise the kernel refuses the call.
             t::FETCH_URL => Self::Fetch(input(call)?),
+            // Offered only when the run has skills; otherwise it answers that there are none.
+            t::LOAD_SKILL => Self::LoadSkill(input(call)?),
             // Offered only to the attempts of an interactive run; see `execute`.
             t::ASK_USER => Self::Ask(input(call)?),
             other => match tools.provided(other).filter(|_| tools.offers(role, false, other)) {
@@ -133,7 +136,13 @@ impl Tool {
     fn read_only(&self) -> bool {
         matches!(
             self,
-            Self::Read(_) | Self::List(_) | Self::Search(_) | Self::FindSymbol(_) | Self::Recall(_) | Self::Fetch(_)
+            Self::Read(_)
+                | Self::List(_)
+                | Self::Search(_)
+                | Self::FindSymbol(_)
+                | Self::Recall(_)
+                | Self::Fetch(_)
+                | Self::LoadSkill(_)
         ) || matches!(self, Self::Provided(tool, _) if tool.decl.read_only)
     }
 
@@ -148,6 +157,10 @@ impl Tool {
             Self::FindSymbol(f) => format!("find symbol {}", f.name),
             Self::Recall(r) => format!("recall {}", r.query),
             Self::Fetch(f) => format!("fetch {}", f.url),
+            Self::LoadSkill(l) => match &l.file {
+                Some(file) => format!("load skill {} {file}", l.name),
+                None => format!("load skill {}", l.name),
+            },
             Self::Ask(a) => format!("ask the user: {}", a.question),
             Self::Provided(tool, input) => format!("{} {input}", tool.decl.name),
         }
@@ -182,6 +195,7 @@ impl Tool {
             Self::FindSymbol(_) => t::FIND_SYMBOL,
             Self::Recall(_) => t::RECALL,
             Self::Fetch(_) => t::FETCH_URL,
+            Self::LoadSkill(_) => t::LOAD_SKILL,
             Self::Ask(_) => t::ASK_USER,
             Self::Provided(tool, _) => &tool.decl.name,
         }
@@ -287,6 +301,14 @@ impl Tool {
                         Err(error.into())
                     }
                 }
+            }
+            Self::LoadSkill(l) => {
+                if ctx.skills.is_empty() {
+                    return Err(Failure::Rejected("This run has no skills.".into()));
+                }
+                let skills = ctx.skills.clone();
+                let read = tokio::task::spawn_blocking(move || skills.load(&l.name, l.file.as_deref())).await;
+                read.map_err(|e| Failure::Rejected(format!("load_skill failed: {e}")))?.map_err(Failure::Rejected)
             }
             // `execute` asks for the attempt that made the call.
             Self::Ask(_) => Err(Failure::Rejected("ask_user cannot be used here".into())),

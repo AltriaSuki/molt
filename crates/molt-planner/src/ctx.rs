@@ -121,6 +121,8 @@ pub(crate) struct Ctx {
     web_health: Arc<Mutex<WebHealth>>,
     /// The `<project_instructions>` block, when the project has instruction files.
     pub instructions: Option<String>,
+    /// The Agent Skills found when the run started, and their `<skills>` block.
+    pub skills: Arc<crate::skills::Catalog>,
     /// The files the user pointed at, and their `<referenced_files>` block.
     pub files: Vec<String>,
     pub referenced: Option<String>,
@@ -277,6 +279,7 @@ impl Ctx {
             tools,
             web_health: Arc::default(),
             instructions: None,
+            skills: Arc::default(),
             files: req.files.clone(),
             referenced: None,
             cfg,
@@ -344,14 +347,15 @@ impl Ctx {
     }
 
     /// What the first message of every conversation starts with: the
-    /// project's instruction files, what memory knows, then the tasks before
-    /// this one in the user's conversation. The same in every conversation of
-    /// the run, so the prompt cache can share it.
+    /// project's instruction files, what memory knows, the skills' names,
+    /// then the tasks before this one in the user's conversation. The same in
+    /// every conversation of the run, so the prompt cache can share it.
     pub fn preamble(&self) -> Vec<&str> {
         self.instructions
             .iter()
             .chain(&self.referenced)
             .chain(&self.memory.context)
+            .chain(&self.skills.block)
             .chain(&self.earlier)
             .map(String::as_str)
             .collect()

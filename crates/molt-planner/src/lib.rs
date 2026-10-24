@@ -24,6 +24,7 @@ mod review;
 mod route;
 mod runner;
 mod select;
+pub mod skills;
 mod tools;
 mod vet;
 
@@ -99,6 +100,11 @@ pub struct Config {
     /// starts the planner, never from a request or a project. Its
     /// workflows are run by name, after those of `workflows`.
     pub pack: Arc<pack::Pack>,
+    /// The user's skills directory, whose `NAME/SKILL.md` skills each run
+    /// offers (issue #166). Like the pack, it comes from whoever starts the
+    /// planner, never from a request or a project; a project's own skills,
+    /// in its `.molt/skills`, are read as data.
+    pub skills_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -127,6 +133,7 @@ impl Default for Config {
             route_model: None,
             tools: Vec::new(),
             pack: Arc::default(),
+            skills_dir: None,
         }
     }
 }
@@ -136,7 +143,7 @@ impl Config {
     /// `MOLT_MAX_TURNS`, `MOLT_MAX_CHECK_ROUNDS`, `MOLT_BUDGET_USD`,
     /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_MAX_TOKENS`, `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
     /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES`,
-    /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL` and `MOLT_PROMPTS_DIR`.
+    /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL`, `MOLT_PROMPTS_DIR` and `MOLT_SKILLS_DIR`.
     ///
     /// | Variable | Default |
     /// |---|---|
@@ -154,6 +161,7 @@ impl Config {
     /// | `MOLT_SYNTAX_CHECK` | `report`; or `reject`, or `off` |
     /// | `MOLT_ROUTE_MODEL` | unset: the run's model picks the workflow of a run that names `auto` |
     /// | `MOLT_PROMPTS_DIR` | unset: the built-in prompts; else the prompt pack to read ([`pack::Pack::load`]) |
+    /// | `MOLT_SKILLS_DIR` | unset: no user skills; else the directory of the user's skills ([`skills`]) |
     ///
     /// An empty variable counts as unset. A value that does not parse is an
     /// error, and so is a zero: none of these limits has a "no limit" value.
@@ -249,6 +257,7 @@ impl Config {
             route_model: get("MOLT_ROUTE_MODEL"),
             tools,
             pack: Arc::new(pack),
+            skills_dir: get(skills::SKILLS_ENV).filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from),
         })
     }
 }

@@ -160,6 +160,14 @@ impl Layered {
                 origins.insert(format!("service.planner.env.{env}"), Origin::User(dir));
             }
         }
+        // The user's skills, for the planner: from this layer only, as the pack.
+        if let Some(dir) = crate::agent_skills::for_workspace(workspace, var)? {
+            let env = molt_planner::skills::SKILLS_ENV;
+            if let Some(planner) = config.service_mut("planner").filter(|p| !p.env.contains_key(env)) {
+                planner.env.insert(env.into(), dir.to_str().context("the skills directory path is not UTF-8")?.into());
+                origins.insert(format!("service.planner.env.{env}"), Origin::User(dir));
+            }
+        }
         Ok(Self { config, origins, base: Origin::Default, env })
     }
 
@@ -724,5 +732,29 @@ mod tests {
         std::fs::write(pack.join("pack.toml"), "[[role]]\nname = \"x\"\nbase = \"attempt\"\nprompt = \"none\"\n")
             .unwrap();
         assert!(format!("{:#}", home.build(None).unwrap_err()).contains("no prompt"));
+    }
+
+    #[test]
+    fn the_planner_reads_the_users_skills_and_a_project_cannot_point_it_elsewhere() {
+        let home = Home::new();
+        let env = molt_planner::skills::SKILLS_ENV;
+        let planner_env = |layered: &Layered| layered.config.service("planner").unwrap().env.get(env).cloned();
+        assert_eq!(planner_env(&home.build(None).unwrap()), None, "no skills directory yet");
+        let skills = home.dir.path().join("config/molt/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let layered = home.build(None).unwrap();
+        let canonical = skills.canonicalize().unwrap();
+        assert_eq!(planner_env(&layered).as_deref(), canonical.to_str());
+        assert_eq!(layered.origin(&format!("service.planner.env.{env}")), &Origin::User(canonical));
+        assert_eq!(planner_env(&home.build_with(None, &[(env, "none")]).unwrap()), None);
+        // A project's config cannot set the planner's variables, this one included.
+        home.project(&format!("[env]\n{env} = \"/tmp\"\n"));
+        assert!(home.build(None).is_err());
+        home.project("");
+        // Nor can the user's skills live where the agent's changes land.
+        let inside = home.workspace.join(".molt/skills");
+        std::fs::create_dir_all(&inside).unwrap();
+        let err = home.build_with(None, &[(env, inside.to_str().unwrap())]).unwrap_err();
+        assert!(format!("{err:#}").contains("inside the workspace"), "{err:#}");
     }
 }
