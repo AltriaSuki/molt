@@ -892,6 +892,27 @@ async fn a_refusal_fails_the_run_and_leaves_the_workspace_alone() {
 }
 
 #[tokio::test]
+async fn a_base_url_ending_in_v1_fails_with_how_to_fix_it_at_no_cost_and_memory_says_why_it_skipped() {
+    let server = MockServer::start().await;
+    let not_found = ResponseTemplate::new(404).set_body_string("404 page not found");
+    Mock::given(method("POST")).and(path("/v1/v1/messages")).respond_with(not_found).mount(&server).await;
+    let mut setup = Setup::new(&server);
+    setup.learn = true;
+    setup.cfg.service_mut("model").unwrap().env.insert("ANTHROPIC_BASE_URL".into(), format!("{}/v1", server.uri()));
+    let (done, _) = setup.run_done(setup.request(Some(CHECK), 1)).await;
+
+    let resp = done.run;
+    assert_eq!(resp.outcome, Outcome::Failed, "{resp:#?}");
+    let note = &resp.attempts[0].note;
+    assert!(note.contains("404") && note.contains("remove the trailing /v1"), "{note}");
+    assert_eq!(resp.uncounted_calls, 0, "a refused call was not billed");
+    let learned = done.learned.expect("asked to learn").unwrap_err();
+    assert_eq!(learned, "skipped: the run failed before any model call was answered");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1, "a 404 is not retried, and memory made no call");
+    setup.assert_forks_dropped();
+}
+
+#[tokio::test]
 async fn stopping_a_run_kills_the_commands_it_started() {
     let pids = tempfile::tempdir().unwrap();
     let pidfile = pids.path().join("sleep.pid");

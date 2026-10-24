@@ -42,6 +42,32 @@ unknown, as on the Anthropic path.
 The implementation follows the [Chat Completions reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
 and [streaming contract](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events).
 
+## When a model call fails
+
+The gateway retries what may pass on a second try (408, 409, 429, 5xx,
+timeouts, connections that fail) up to `MOLT_MODEL_RETRIES` times, waiting
+what `retry-after` says (at most 60 s) or backing off from one second. Each
+retry is announced before its wait: the TUI shows it in the attempt's box
+and in the status bar, as `model API 502, retrying in 60s (2/4)`, counting
+down, and `molt do` prints the same line.
+
+An error says what to fix where the status points at a setting:
+
+- a 404 from an `ANTHROPIC_BASE_URL` (or `OPENAI_BASE_URL`) that ends in
+  `/v1` says to remove it, since molt adds `/v1/messages` itself;
+- a 401 names the credential variables to check;
+- a model the API does not know, named one or two typos from an alias
+  (`--model sonet`), gets the alias suggested.
+
+A call the API refused with an error status (401, 403, 404 and the like,
+which come with no usage), or that the gateway refused before sending, was
+not billed: it settles at no cost and does not count among the calls of
+unknown cost. Any other failure, and a refusal that follows an attempt that
+timed out or was cut off, keeps the call's cost unknown. Memory does not
+learn from a run that failed before any model call was answered, and says
+so; it says when it skips learning because the budget is spent or because
+some calls' cost is unknown.
+
 ## Model prices
 
 The run budget (`--budget-usd`) holds only when molt knows what each model

@@ -9,6 +9,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// An error reply coded `denied` or `invalid` means the call was refused
+/// before anything was billed: by the kernel, by the gateway before any
+/// HTTP, or by the API with an error status (401, 403, 404, ...) after
+/// attempts none of which may have been billed. Every other error leaves
+/// the call's cost unknown.
 pub const COMPLETE: &str = "model.complete";
 
 /// Display context for an opt-in streaming call. The run and call ids come

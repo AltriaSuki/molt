@@ -317,8 +317,64 @@ async fn a_rejected_key_is_denied() {
     let err = gw.complete(request()).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Denied);
     assert!(err.message.contains("authentication_error: invalid x-api-key"), "{}", err.message);
+    assert!(err.message.contains("check ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN"), "{}", err.message);
     assert!(!err.message.contains("test-key"));
     assert_eq!(sent(&server).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_404_from_a_base_url_ending_in_v1_says_to_drop_it() {
+    let server = MockServer::start().await;
+    let not_found = || ResponseTemplate::new(404).set_body_string("404 page not found");
+    Mock::given(method("POST")).and(path("/v1/v1/messages")).respond_with(not_found()).mount(&server).await;
+    Mock::given(method("POST")).and(path("/other/v1/messages")).respond_with(not_found()).mount(&server).await;
+
+    let gw = Gateway::new(Config { base_url: format!("{}/v1", server.uri()), ..config(&server) }).unwrap();
+    let err = gw.complete(request()).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "a refusal: nothing was billed");
+    assert!(err.message.contains("returned 404: 404 page not found"), "{}", err.message);
+    assert!(
+        err.message
+            .contains("ANTHROPIC_BASE_URL ends in /v1 and molt adds /v1/messages itself: remove the trailing /v1"),
+        "{}",
+        err.message
+    );
+    assert_eq!(sent(&server).await.len(), 1);
+
+    // A 404 from any other base URL has some other cause.
+    let gw = Gateway::new(Config { base_url: format!("{}/other", server.uri()), ..config(&server) }).unwrap();
+    let err = gw.complete(request()).await.unwrap_err();
+    assert!(err.message.contains("404") && !err.message.contains("/v1"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn a_refusal_after_an_attempt_that_may_have_been_billed_is_not_reported_as_one() {
+    let server = MockServer::start().await;
+    answer_once_with(&server, ok(message("claude-opus-5-5")).set_delay(Duration::from_secs(2))).await;
+    answer_with(&server, ResponseTemplate::new(400).set_body_json(api_error("invalid_request_error", "no"))).await;
+    let gw = Gateway::new(Config { timeout: Duration::from_millis(300), ..config(&server) }).unwrap();
+
+    let err = gw.complete(request()).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Failed, "{}", err.message);
+    assert!(err.message.contains("returned 400") && err.message.contains("may have been billed"), "{}", err.message);
+    assert_eq!(sent(&server).await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_mistyped_model_alias_gets_the_closest_one_suggested() {
+    let server = MockServer::start().await;
+    let unknown = ResponseTemplate::new(404).set_body_json(api_error("not_found_error", "model: sonet"));
+    answer_with(&server, unknown).await;
+    let gw = Gateway::new(config(&server)).unwrap();
+
+    let err = gw.complete(CompleteRequest { model: Some("sonet".into()), ..request() }).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid);
+    assert!(err.message.contains(r#""sonet" is not a model alias: did you mean "sonnet"?"#), "{}", err.message);
+    assert_eq!(body(&sent(&server).await[0])["model"], "sonet", "an unknown name is sent as it is");
+
+    // A model id far from every alias gets no guess.
+    let err = gw.complete(CompleteRequest { model: Some("grok-4.5".into()), ..request() }).await.unwrap_err();
+    assert!(!err.message.contains("did you mean"), "{}", err.message);
 }
 
 #[tokio::test]
