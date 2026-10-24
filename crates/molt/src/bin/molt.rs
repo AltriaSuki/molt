@@ -472,6 +472,14 @@ enum SkillCmd {
     Used {
         run: String,
     },
+    /// Write a promoted skill as an Agent Skills SKILL.md: to stdout, or to
+    /// DIR/NAME/SKILL.md (for example ~/.config/molt/skills). Drafts and
+    /// disabled skills are not exported.
+    Export {
+        id: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -730,6 +738,10 @@ async fn main() -> anyhow::Result<ExitCode> {
             let config = cli.config.as_deref();
             let (workspace, project) = agent::locate(args.at.project.as_deref(), &args.at.workspace, config.is_some())?;
             let cfg = agent::memory_config(config, &workspace, args.at.data_dir.as_deref(), project.as_ref())?;
+            let export_to = match &args.cmd {
+                SkillCmd::Export { out, .. } => Some(out.clone()),
+                _ => None,
+            };
             let action = match args.cmd {
                 SkillCmd::List => Action::List,
                 SkillCmd::Draft { file, run } => {
@@ -744,10 +756,21 @@ async fn main() -> anyhow::Result<ExitCode> {
                 SkillCmd::Disable { id, reason } => Action::Disable { id, reason },
                 SkillCmd::Rollback { id, revision, reason } => Action::Rollback { id, revision, reason },
                 SkillCmd::Used { run } => Action::Used { run },
+                SkillCmd::Export { id, .. } => Action::Export { id },
             };
             let request = Request { workspace: workspace.to_str().context("workspace is not UTF-8")?.into(), action };
             let response = agent::call_memory(&cfg, MANAGE, serde_json::to_value(request)?).await?;
-            println!("{}", serde_json::to_string_pretty(&response)?);
+            if let Some(out) = export_to {
+                let skill: molt_api::skills::Skill =
+                    serde_json::from_value(response).context("memory's exported skill does not read")?;
+                let exported = molt::agent_skills::export(&skill);
+                match out {
+                    Some(dir) => println!("{}", molt::agent_skills::write(&exported, &dir)?.display()),
+                    None => print!("{}", exported.render()),
+                }
+            } else {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            }
         }
         Cmd::UiBackend => molt::tui::serve_backend().await?,
         Cmd::Run => {

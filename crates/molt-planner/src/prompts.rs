@@ -703,16 +703,16 @@ pub(crate) fn with_ask_user(tools: &[Value]) -> Vec<Value> {
 }
 
 /// The tools of an attempt, in a fixed order: the built-ins (with `memory`,
-/// the two that ask memory about the project; with `web`, `fetch_url`),
-/// then the provided tools attempts are offered.
-pub(crate) fn attempt_tools(reg: &Registry, memory: bool, web: bool) -> Vec<Value> {
-    reg.definitions(ToolRole::Attempt, false, memory, web)
+/// the two that ask memory about the project; with `web`, `fetch_url`; with
+/// `skills`, `load_skill`), then the provided tools attempts are offered.
+pub(crate) fn attempt_tools(reg: &Registry, memory: bool, web: bool, skills: bool) -> Vec<Value> {
+    reg.definitions(ToolRole::Attempt, false, memory, web, skills)
 }
 
 /// The reviewer's tools: reading and searching, and the read-only tools
 /// provided for reviewers, plus submit_review.
 pub(crate) fn reviewer_tools(reg: &Registry) -> Vec<Value> {
-    let mut tools = reg.definitions(ToolRole::Reviewer, true, false, false);
+    let mut tools = reg.definitions(ToolRole::Reviewer, true, false, false, false);
     tools.push(tool(
         t::SUBMIT_REVIEW,
         "Submit your review. This ends your work.",
@@ -738,7 +738,7 @@ pub(crate) fn reviewer_tools(reg: &Registry) -> Vec<Value> {
 /// The judge's tools: a reviewer's reads and the read-only tools provided
 /// for judges, plus submit_judgement.
 pub(crate) fn judge_tools(reg: &Registry) -> Vec<Value> {
-    let mut tools = reg.definitions(ToolRole::Judge, true, false, false);
+    let mut tools = reg.definitions(ToolRole::Judge, true, false, false, false);
     tools.push(tool(
         t::SUBMIT_JUDGEMENT,
         "Submit your judgement. This ends your work.",
@@ -769,7 +769,7 @@ pub(crate) fn judge_tools(reg: &Registry) -> Vec<Value> {
 /// The vetter's tools: a reviewer's reads and the read-only tools provided
 /// for vetters, plus submit_vetting.
 pub(crate) fn vetter_tools(reg: &Registry) -> Vec<Value> {
-    let mut tools = reg.definitions(ToolRole::Vetter, true, false, false);
+    let mut tools = reg.definitions(ToolRole::Vetter, true, false, false, false);
     tools.push(tool(
         t::SUBMIT_VETTING,
         "Submit what you found. This ends your work.",
@@ -806,8 +806,8 @@ pub(crate) fn vetter_tools(reg: &Registry) -> Vec<Value> {
 
 /// The tools of an attempt that runs against a done-check: an attempt's,
 /// plus dispute_check last, so the shared prefix stays cacheable.
-pub(crate) fn checked_attempt_tools(reg: &Registry, memory: bool, web: bool) -> Vec<Value> {
-    let mut tools = attempt_tools(reg, memory, web);
+pub(crate) fn checked_attempt_tools(reg: &Registry, memory: bool, web: bool, skills: bool) -> Vec<Value> {
+    let mut tools = attempt_tools(reg, memory, web, skills);
     tools.push(tool(
         t::DISPUTE_CHECK,
         "Say that the done-check contradicts the task, when an assertion of it expects what the task's own words \
@@ -835,14 +835,14 @@ pub(crate) fn checked_attempt_tools(reg: &Registry, memory: bool, web: bool) -> 
 
 /// The tools of an attempt that only reads: an attempt's that are
 /// read-only, none of which changes the workspace or runs a command.
-pub(crate) fn ask_tools(reg: &Registry, memory: bool, web: bool) -> Vec<Value> {
-    reg.definitions(ToolRole::Attempt, true, memory, web)
+pub(crate) fn ask_tools(reg: &Registry, memory: bool, web: bool, skills: bool) -> Vec<Value> {
+    reg.definitions(ToolRole::Attempt, true, memory, web, skills)
 }
 
 /// The designer's tools: the built-ins an attempt has, and the read-only
 /// tools provided for designers, plus submit_check.
-pub(crate) fn designer_tools(reg: &Registry, memory: bool, web: bool) -> Vec<Value> {
-    let mut tools = reg.definitions(ToolRole::Designer, false, memory, web);
+pub(crate) fn designer_tools(reg: &Registry, memory: bool, web: bool, skills: bool) -> Vec<Value> {
+    let mut tools = reg.definitions(ToolRole::Designer, false, memory, web, skills);
     tools.push(tool(
         t::SUBMIT_CHECK,
         "Submit the done-check you designed. This ends your work.",
@@ -935,7 +935,7 @@ mod tests {
     #[test]
     fn tools_are_strict_and_closed() {
         let reg = Registry::default();
-        let tools = designer_tools(&reg, true, true);
+        let tools = designer_tools(&reg, true, true, false);
         assert_eq!(tools.len(), 10);
         for tool in &tools {
             assert_eq!(tool["strict"], true);
@@ -945,15 +945,19 @@ mod tests {
                 assert!(props.contains_key(req.as_str().unwrap()));
             }
         }
-        assert_eq!(attempt_tools(&reg, true, true), tools[..9]);
+        assert_eq!(attempt_tools(&reg, true, true, false), tools[..9]);
         assert_eq!(tools[8]["name"], t::FETCH_URL);
-        assert_eq!(attempt_tools(&reg, true, false), tools[..8]);
+        assert_eq!(attempt_tools(&reg, true, false, false), tools[..8]);
+        // With skills, load_skill follows the other built-ins: the prefix before it is the same.
+        let skilled = designer_tools(&reg, true, true, true);
+        assert_eq!((skilled.len(), &skilled[..9], &skilled[9]["name"]), (11, &tools[..9], &json!(t::LOAD_SKILL)));
+        assert_eq!(skilled[9]["strict"], true);
         // Without memory, the same tools less memory's two: the shared prefix stays cacheable.
-        let plain = designer_tools(&reg, false, false);
+        let plain = designer_tools(&reg, false, false, false);
         assert_eq!(plain.len(), 7);
         assert_eq!(plain[..6], tools[..6]);
         assert_eq!(plain[6]["name"], t::SUBMIT_CHECK);
-        assert_eq!(attempt_tools(&reg, false, false), plain[..6]);
+        assert_eq!(attempt_tools(&reg, false, false, false), plain[..6]);
     }
 
     /// Every built-in tool list, as the model API got it before the tools
@@ -964,23 +968,29 @@ mod tests {
     fn the_built_in_tool_lists_the_model_gets_are_byte_for_byte_what_they_were() {
         let reg = Registry::default();
         let mut lists: Vec<(String, Vec<Value>)> = Vec::new();
-        for m in [false, true] {
-            for w in [false, true] {
-                lists.push((format!("attempt memory={m} web={w}"), attempt_tools(&reg, m, w)));
-                lists.push((format!("attempt+ask_user memory={m} web={w}"), with_ask_user(&attempt_tools(&reg, m, w))));
-                lists.push((format!("checked memory={m} web={w}"), checked_attempt_tools(&reg, m, w)));
-                lists.push((
-                    format!("checked+ask_user memory={m} web={w}"),
-                    with_ask_user(&checked_attempt_tools(&reg, m, w)),
-                ));
-                lists.push((format!("ask memory={m} web={w}"), ask_tools(&reg, m, w)));
-                lists.push((format!("designer memory={m} web={w}"), designer_tools(&reg, m, w)));
+        // The lists without skills come first, as they were; then those with load_skill (#166).
+        for s in [false, true] {
+            // Named as before when the run has no skills.
+            let skills = if s { " skills=true" } else { "" };
+            for m in [false, true] {
+                for w in [false, true] {
+                    let at = format!("memory={m} web={w}{skills}");
+                    lists.push((format!("attempt {at}"), attempt_tools(&reg, m, w, s)));
+                    lists.push((format!("attempt+ask_user {at}"), with_ask_user(&attempt_tools(&reg, m, w, s))));
+                    lists.push((format!("checked {at}"), checked_attempt_tools(&reg, m, w, s)));
+                    lists
+                        .push((format!("checked+ask_user {at}"), with_ask_user(&checked_attempt_tools(&reg, m, w, s))));
+                    lists.push((format!("ask {at}"), ask_tools(&reg, m, w, s)));
+                    lists.push((format!("designer {at}"), designer_tools(&reg, m, w, s)));
+                }
+            }
+            if !s {
+                lists.push(("reviewer".into(), reviewer_tools(&reg)));
+                lists.push(("judge".into(), judge_tools(&reg)));
+                lists.push(("vetter".into(), vetter_tools(&reg)));
+                lists.push(("router".into(), route_tools()));
             }
         }
-        lists.push(("reviewer".into(), reviewer_tools(&reg)));
-        lists.push(("judge".into(), judge_tools(&reg)));
-        lists.push(("vetter".into(), vetter_tools(&reg)));
-        lists.push(("router".into(), route_tools()));
         let pinned: Vec<(&str, &str)> = BUILTIN_TOOLS.lines().map(|l| l.split_once('\t').unwrap()).collect();
         assert_eq!(pinned.len(), lists.len());
         for ((name, tools), (pinned_name, pinned_json)) in lists.iter().zip(pinned) {

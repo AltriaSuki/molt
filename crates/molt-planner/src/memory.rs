@@ -52,6 +52,7 @@ pub(crate) async fn prepare(ctx: &Ctx) -> Memory {
         k: Some(NOTES),
         min_confidence: Some(MIN_CONFIDENCE),
         capture: Some("context".into()),
+        offered_skills: ctx.skills.offered(),
         ..Default::default()
     };
     let (notes, skills) = match ctx.call::<RecallResponse>(memory::RECALL, recall, Budget::new(0, PROBE_MS, 0)).await {

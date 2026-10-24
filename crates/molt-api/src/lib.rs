@@ -16,6 +16,7 @@
 //! `topic:progress`, and the `fs` service [`fs::FilesChanged`] events on
 //! `topic:fs.changed`.
 
+pub mod agent_skills;
 pub mod fs;
 pub mod memory;
 pub mod model;

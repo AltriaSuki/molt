@@ -873,6 +873,15 @@ pub(crate) fn validate_recall(req: &RecallRequest) -> Result<(), RemoteError> {
     if req.capture.is_some() && (req.include_review || req.workspace.is_none()) {
         return Err(invalid("captured recall requires a workspace and excludes notes awaiting review"));
     }
+    if !req.offered_skills.is_empty() && req.capture.as_deref() != Some("context") {
+        return Err(invalid("offered skills are recorded only with a captured context recall"));
+    }
+    if req.offered_skills.len() > molt_api::agent_skills::MAX_OFFERED {
+        return Err(invalid("a recall records at most 64 offered skills"));
+    }
+    if let Some(e) = req.offered_skills.iter().find_map(|s| s.validate().err()) {
+        return Err(invalid(e));
+    }
     if let Some(min) = req.min_confidence {
         if !min.is_finite() || !(0.0..=1.0).contains(&min) {
             return Err(invalid("min_confidence must be between 0 and 1"));
