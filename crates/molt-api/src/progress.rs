@@ -161,6 +161,27 @@ pub enum Progress {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         reason: String,
     },
+    /// The steps the plan `run` goes by, before the first starts
+    /// (`planner.plan`, #47): as the step designer wrote them, or as a
+    /// person edited them (`edited`). New: an older reader does not know it.
+    Planned {
+        run: String,
+        steps: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        edited: bool,
+    },
+    /// Step `step` (from 0) of the plan's `steps` starts, as a run of its
+    /// own under the plan's id: the events up to the next step are its.
+    /// `fork` holds the result of the steps before it, which its attempts
+    /// fork from. New: an older reader does not know it.
+    Step {
+        run: String,
+        step: u32,
+        steps: u32,
+        goal: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fork: Option<String>,
+    },
     /// Output of a streamed `shell.run`, whose trace id `run` is: whole
     /// lines where it can, in the order read, numbered from 0 so a gap
     /// shows. `cut` is the last event of a command whose output went past
@@ -202,6 +223,8 @@ impl Progress {
             | Self::State { run, .. }
             | Self::Recalled { run, .. }
             | Self::Routed { run, .. }
+            | Self::Planned { run, .. }
+            | Self::Step { run, .. }
             | Self::Output { run, .. } => run,
         }
     }

@@ -15,6 +15,7 @@ use anyhow::{anyhow, bail, Context};
 use molt_api::fs::ChangeKind;
 use molt_api::memory::{self, ConsolidateRequest, ConsolidateResponse};
 use molt_api::model::{attempt_name, speaker};
+use molt_api::plan::{self, PlanRequest, PlanResponse};
 use molt_api::planner::{
     self, AttemptStatus, Candidate, Outcome, Requirement, RunRequest, RunResponse, RunState, Verdict,
 };
@@ -626,6 +627,24 @@ pub struct Done {
     /// error when it could not: memory is down, the model failed, or the
     /// run was interrupted while memory was learning.
     pub learned: Option<Result<ConsolidateResponse, String>>,
+    /// With [`plan_task_as`], the plan: its steps and each step's run.
+    /// `run` is then the plan's result.
+    pub plan: Option<Box<PlanResponse>>,
+}
+
+/// What to ask the planner for.
+enum Ask {
+    Run(RunRequest),
+    Plan(PlanRequest),
+}
+
+impl Ask {
+    fn run(&self) -> &RunRequest {
+        match self {
+            Ask::Run(req) => req,
+            Ask::Plan(req) => &req.run,
+        }
+    }
 }
 
 /// Carry out one task: start the kernel and the services of `cfg`, ask the
@@ -654,9 +673,36 @@ pub async fn run_task_as(
     req: RunRequest,
     trace: TraceId,
     learn: Option<Learn>,
+    on_progress: impl FnMut(&Progress),
+    stop: impl Future<Output = ()>,
+) -> anyhow::Result<Done> {
+    carry_out(cfg, Ask::Run(req), trace, learn, on_progress, stop).await
+}
+
+/// [`run_task_as`] for a plan (`planner.plan`): its steps, each a run of
+/// its own, then its overall check. [`Done::run`] is the plan's result,
+/// and [`Done::plan`] the plan. A plan whose steps could not be planned is
+/// an error.
+pub async fn plan_task_as(
+    cfg: &Config,
+    req: PlanRequest,
+    trace: TraceId,
+    learn: Option<Learn>,
+    on_progress: impl FnMut(&Progress),
+    stop: impl Future<Output = ()>,
+) -> anyhow::Result<Done> {
+    carry_out(cfg, Ask::Plan(req), trace, learn, on_progress, stop).await
+}
+
+async fn carry_out(
+    cfg: &Config,
+    ask: Ask,
+    trace: TraceId,
+    learn: Option<Learn>,
     mut on_progress: impl FnMut(&Progress),
     stop: impl Future<Output = ()>,
 ) -> anyhow::Result<Done> {
+    let req = ask.run();
     require_services(cfg)?;
     if req.stream {
         require_stream_capability(cfg)?;
@@ -668,20 +714,20 @@ pub async fn run_task_as(
         Some(molt_api::workflow::AUTO) => true,
         name => molt_api::workflow::builtin(name).is_none_or(|w| w.stages.learn.is_some()),
     };
-    let learn = learn.filter(|_| learns(req.workflow.as_deref()));
     let running = crate::start(cfg).await?;
     // Before planner.run, the only caller that makes forks.
     let forks = RunForks::before(cfg);
     let workspace = req.workspace.clone();
     let budget_usd = req.budget_usd;
     let checkpointed = req.checkpoint || req.resume.is_some();
+    let learn = learn.filter(|_| learns(req.workflow.as_deref()));
     tokio::pin!(stop);
     let result = tokio::select! {
         // A Ctrl-C in a terminal also reaches the services, and the run may
         // fail from their exit at the same moment: the interruption wins.
         biased;
         () = &mut stop => Err(Interrupted.into()),
-        result = drive(&running, cfg, req, trace, &mut on_progress) => result,
+        result = drive(&running, cfg, ask, trace, &mut on_progress) => result,
     };
     let done = match result {
         Ok(ran) => {
@@ -718,7 +764,7 @@ pub async fn run_task_as(
                     }
                 }
             };
-            Ok(Done { run: ran.resp, learned })
+            Ok(Done { run: ran.resp, learned, plan: ran.plan })
         }
         Err(e) => Err(e),
     };
@@ -837,6 +883,7 @@ struct Ran {
     cli: Service,
     trace: TraceId,
     resp: RunResponse,
+    plan: Option<Box<PlanResponse>>,
     /// `None` without a memory service; an error when it did not come up.
     memory: Option<Result<(), String>>,
 }
@@ -844,7 +891,7 @@ struct Ran {
 async fn drive(
     running: &Running,
     cfg: &Config,
-    req: RunRequest,
+    ask: Ask,
     trace: TraceId,
     mut on_progress: impl FnMut(&Progress),
 ) -> anyhow::Result<Ran> {
@@ -864,12 +911,13 @@ async fn drive(
         on_progress(&Progress::Note { run: trace.to_string(), message });
     }
     grant(kernel, &cli, planner::RUN, Budget::new(0, 0, 1_000)).await?;
+    grant(kernel, &cli, plan::PLAN, Budget::new(0, 0, 1_000)).await?;
     grant(kernel, &cli, &format!("topic:subscribe:{}", progress::TOPIC), Budget::new(0, 0, 1_000)).await?;
     cli.subscribe(progress::TOPIC).await?;
 
     let mut preview = PreviewFilter::default();
     let reply = {
-        let call = call_planner(&cli, &req, &trace);
+        let call = call_planner(&cli, &ask, &trace);
         tokio::pin!(call);
         loop {
             tokio::select! {
@@ -890,8 +938,21 @@ async fn drive(
             }
         }
     };
-    let resp = serde_json::from_value(reply).context("the planner's result is not a planner.run response")?;
-    Ok(Ran { cli, trace, resp, memory })
+    let (resp, plan) = match ask {
+        Ask::Run(_) => {
+            (serde_json::from_value(reply).context("the planner's result is not a planner.run response")?, None)
+        }
+        Ask::Plan(_) => {
+            let mut plan: PlanResponse =
+                serde_json::from_value(reply).context("the planner's result is not a planner.plan response")?;
+            let Some(resp) = plan.result.take() else {
+                let why = plan.error.unwrap_or_else(|| "the planner answered with no result".to_owned());
+                bail!("{why} (${:.2} spent)", plan.cost_usd);
+            };
+            (*resp, Some(Box::new(plan)))
+        }
+    };
+    Ok(Ran { cli, trace, resp, plan, memory })
 }
 
 /// Have memory learn from the run `episode` in `workspace`. The call has a
@@ -1008,9 +1069,12 @@ pub(crate) async fn wait_until_up(
 /// `planner.run`, sent once. [`wait_until_up`] has shown that the planner is
 /// up, so any error now, `unavailable` from its crash included, may come
 /// after it got the request, and sending it again would start the run over.
-async fn call_planner(cli: &Service, req: &RunRequest, trace: &TraceId) -> anyhow::Result<Value> {
+async fn call_planner(cli: &Service, ask: &Ask, trace: &TraceId) -> anyhow::Result<Value> {
     let opts = CallOpts { cap: None, budget: Budget::new(0, RUN_MS, 0), trace: Some(trace.clone()) };
-    cli.call(planner::RUN, serde_json::to_value(req)?, opts).await.context("planner.run failed")
+    match ask {
+        Ask::Run(req) => cli.call(planner::RUN, serde_json::to_value(req)?, opts).await.context("planner.run failed"),
+        Ask::Plan(req) => cli.call(plan::PLAN, serde_json::to_value(req)?, opts).await.context("planner.plan failed"),
+    }
 }
 
 /// The progress event `msg` carries, if it is one of run `run`'s.
@@ -1056,6 +1120,10 @@ impl PreviewFilter {
         if let Progress::AttemptFinished { attempt, .. } = event {
             self.finished.insert(*attempt);
         }
+        // A plan's next step is a run of its own, whose attempts count from 0 again.
+        if let Progress::Step { .. } = event {
+            self.finished.clear();
+        }
         let Some(context) = event.model_call() else { return Some(false) };
         if context.attempt.is_some_and(|a| self.finished.contains(&a)) {
             return None;
@@ -1071,6 +1139,18 @@ impl PreviewFilter {
         self.calls.insert(context.call.clone(), (context.seq, matches!(event, Progress::ModelFinished { .. })));
         Some(gap)
     }
+}
+
+/// The line that says a plan's steps.
+pub fn planned_line(steps: &[String], edited: bool) -> String {
+    let numbered: Vec<String> = steps.iter().enumerate().map(|(i, goal)| format!("{}. {goal}", i + 1)).collect();
+    let how = if edited { " (as edited)" } else { "" };
+    format!("plan{how}: {} steps: {}", steps.len(), numbered.join(" "))
+}
+
+/// The line that says a plan's step `step` (from 0) of `steps` started.
+pub fn step_line(step: u32, steps: u32, goal: &str) -> String {
+    format!("step {}/{steps}: {goal}", step + 1)
 }
 
 /// One short line for the terminal, made [`printable`].
@@ -1130,6 +1210,8 @@ pub fn describe(event: &Progress) -> String {
         }
         Progress::Note { message, .. } => message.clone(),
         Progress::Routed { workflow, reason, .. } => routed_line(workflow, reason, "--workflow verify"),
+        Progress::Planned { steps, edited, .. } => planned_line(steps, *edited),
+        Progress::Step { step, steps, goal, .. } => step_line(*step, *steps, goal),
         Progress::Required { requirement, .. } => requirement_line(requirement),
         Progress::Adopted { attempt, version, turn, .. } => {
             format!("{}: follows requirements v{version} from turn {turn}", attempt_name(*attempt))
@@ -1209,6 +1291,25 @@ pub fn routed_line(workflow: &str, reason: &str, full: &str) -> String {
     } else {
         format!("handled as {workflow}{why} · {full} for the full workflow")
     }
+}
+
+/// A plan's steps and how each went, ahead of the [`report_at`] of its result.
+pub fn plan_report(plan: &PlanResponse) -> String {
+    let how = if plan.edited { format!(" (as edited; {} proposed)", plan.proposed.len()) } else { String::new() };
+    let mut lines = vec![format!("plan: {} steps{how}", plan.steps.len())];
+    for (i, goal) in plan.steps.iter().enumerate() {
+        let line = match plan.ran.get(i) {
+            Some(step) => {
+                let check = step.run.check.as_ref().map_or_else(String::new, |c| format!(", check: {}", c.command));
+                format!("  {}. {goal}: {}{check}, ${:.2}", i + 1, outcome_name(step.run.outcome), step.run.cost_usd)
+            }
+            None => format!("  {}. {goal}: not started", i + 1),
+        };
+        lines.push(line);
+    }
+    let mut out = printable(&lines.join("\n"));
+    out.push('\n');
+    out
 }
 
 pub fn report_at(resp: &RunResponse, workspace: Option<&str>) -> String {

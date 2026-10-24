@@ -389,6 +389,21 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             }
             wrap_all(&lines, width)
         }
+        Some(Prompt::Plan(plan)) | Some(Prompt::EditPlan(plan)) => {
+            let editing = matches!(app.prompt, Some(Prompt::EditPlan(_)));
+            let mut lines = super::app::plan_card(plan);
+            lines.push(Line::default());
+            lines.push(if editing {
+                keys(&[("enter", "save the steps"), ("shift+enter", "new line"), ("esc", "back")])
+            } else {
+                let run = match plan.steps.len() {
+                    1 => "run 1 step".to_owned(),
+                    n => format!("run {n} steps"),
+                };
+                keys(&[("enter", run.as_str()), ("e", "edit"), ("esc", "cancel")])
+            });
+            wrap_all(&lines, width)
+        }
         Some(Prompt::Apply { part, .. }) if part.checking => busy("checking again before it is applied"),
         Some(Prompt::Apply { part, .. }) if part.picking.is_some() => pick_lines(part),
         Some(Prompt::Apply { resp, .. }) => {
@@ -600,7 +615,7 @@ fn task_spend(task: &Task) -> (String, Tone) {
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
-    let waiting = matches!(app.prompt, Some(Prompt::Check(_) | Prompt::Apply { .. }))
+    let waiting = matches!(app.prompt, Some(Prompt::Check(_) | Prompt::Plan(_) | Prompt::Apply { .. }))
         || app.viewer.is_some()
         || app.transcript.is_some()
         || app.shortcuts.is_some();
@@ -612,6 +627,9 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         .border_style(style(if waiting { Tone::Dim } else { Tone::Shell }));
     if editing_check {
         block = block.title(Line::from(span(" check command ", Tone::Shell)));
+    }
+    if matches!(app.prompt, Some(Prompt::EditPlan(_))) {
+        block = block.title(Line::from(span(" plan steps, one per line ", Tone::Shell)));
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);

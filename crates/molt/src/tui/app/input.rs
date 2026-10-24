@@ -341,7 +341,7 @@ impl App {
         // One Esc stops the user's own command: it holds no work to lose.
         if key_is(&key, KeyCode::Esc)
             && self.input.text.is_empty()
-            && !matches!(self.prompt, Some(Prompt::EditCheck(_)))
+            && !matches!(self.prompt, Some(Prompt::EditCheck(_) | Prompt::EditPlan(_)))
             && self.shell.as_ref().is_some_and(|s| s.running())
         {
             return self.stop_command();
@@ -372,13 +372,14 @@ impl App {
     fn prompt_key(&mut self, key: KeyEvent) -> Vec<Action> {
         match &self.prompt {
             Some(Prompt::Check(_)) => return self.check_key(&key),
+            Some(Prompt::Plan(_)) => return self.plan_key(&key),
             Some(Prompt::Apply { .. }) => return self.apply_key(&key),
             Some(Prompt::Retry { .. }) => {
                 if let Some(actions) = self.retry_key(&key) {
                     return actions;
                 }
             }
-            Some(Prompt::EditCheck(_)) | None => {}
+            Some(Prompt::EditCheck(_) | Prompt::EditPlan(_)) | None => {}
         }
         let editing_check = matches!(self.prompt, Some(Prompt::EditCheck(_)));
         // While an `@path` has suggestions, the arrows pick one, Tab puts it
@@ -462,16 +463,21 @@ impl App {
                 return Vec::new();
             }
             KeyCode::Esc => {
-                if let Some(Prompt::EditCheck(d)) = self.prompt.take() {
-                    self.input.take();
-                    self.prompt = Some(Prompt::Check(d));
-                } else {
-                    self.input.take();
+                self.input.take();
+                // Back to the card the field was opened from.
+                match self.prompt.take() {
+                    Some(Prompt::EditCheck(d)) => self.prompt = Some(Prompt::Check(d)),
+                    Some(Prompt::EditPlan(plan)) => self.prompt = Some(Prompt::Plan(plan)),
+                    _ => {}
                 }
                 return Vec::new();
             }
             KeyCode::Enter => {
                 let line = self.input.take();
+                if let Some(Prompt::EditPlan(plan)) = self.prompt.take_if(|p| matches!(p, Prompt::EditPlan(_))) {
+                    self.edited_plan(&line, plan);
+                    return Vec::new();
+                }
                 if let Some(Prompt::EditCheck(mut d)) = self.prompt.take() {
                     let command = line.trim();
                     if !command.is_empty() && d.command.as_deref() != Some(command) {

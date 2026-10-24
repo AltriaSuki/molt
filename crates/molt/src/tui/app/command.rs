@@ -159,6 +159,7 @@ impl App {
                 return self.with_workflow(name, arg);
             }
             Some(Builtin::Continue) => return self.continue_task(arg),
+            Some(Builtin::Plan) => return self.plan_command(arg),
             Some(Builtin::Check) => {
                 self.settings.check = (!arg.is_empty()).then(|| arg.to_owned());
                 self.flash = Some(set("check", self.settings.check.as_deref().unwrap_or("designed for each task")));

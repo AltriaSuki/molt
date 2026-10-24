@@ -28,6 +28,7 @@ pub enum Builtin {
     Ask,
     Quick,
     Verify,
+    Plan,
     Continue,
     Attempts,
     Stream,
@@ -93,6 +94,7 @@ definitions! {
     Ask, "ask", "QUESTION", "answer with tools that only read; nothing changes, the answer is unverified", &[];
     Quick, "quick", "TASK", "one attempt, no designed check, the fixed review rules", &[];
     Verify, "verify", "[TASK]", "the full workflow: design a check, race, review; alone: the last task again", &[];
+    Plan, "plan", "TASK", "carry the task out in ordered steps, each a run with its own check; confirm the steps first", &[];
     Continue, "continue", "TASK", "go on from the last task with its whole conversation and its kept result", &[];
     Attempts, "attempts", "N", "attempts at once, 1 to 8", &["1", "2", "3", "4", "5", "6", "7", "8", "default"];
     Stream, "stream", "on|off", "model text previews for the next task", &["on", "off", "default"];

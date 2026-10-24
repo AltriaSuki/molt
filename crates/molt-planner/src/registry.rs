@@ -89,7 +89,7 @@ const ROLE_TOOLS: &[&str] = &[
 
 /// Whether `name` is the planner's own.
 pub(crate) fn reserved(name: &str) -> bool {
-    ROLE_TOOLS.contains(&name) || builtins().iter().any(|b| b.decl.name == name)
+    ROLE_TOOLS.contains(&name) || name == molt_api::plan::SUBMIT_PLAN || builtins().iter().any(|b| b.decl.name == name)
 }
 
 /// The tools of one run: the built-ins, and the provided tools the planner

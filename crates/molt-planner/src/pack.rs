@@ -44,6 +44,8 @@ const MAX_ROLE_TURNS: u32 = 1_000;
 pub const ROUTER: &str = "router";
 /// The vetter: looks over a designed check before the attempts start.
 pub const VETTER: &str = "vetter";
+/// The step designer: splits a task into the ordered steps of a plan (#47).
+pub const STEPS: &str = "steps";
 
 /// Every built-in prompt, by name, in the order `molt prompts list` shows
 /// them. `attempt` is the part of an attempt's prompt that holds whatever
@@ -57,6 +59,7 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("reviewer", prompts::REVIEWER_SYSTEM),
     ("judge", prompts::JUDGE_SYSTEM),
     (ROUTER, prompts::ROUTE_SYSTEM),
+    (STEPS, prompts::STEPS_SYSTEM),
 ];
 
 /// The built-in prompt `name`.
@@ -72,7 +75,7 @@ pub fn protected(name: &str) -> bool {
 
 /// Names a declared role cannot take: the planner's own roles.
 const RESERVED_ROLES: &[&str] =
-    &["designer", "attempt", "explorer", "reviewer", "judge", VETTER, ROUTER, "memory", "planner"];
+    &["designer", "attempt", "explorer", "reviewer", "judge", VETTER, ROUTER, STEPS, "memory", "planner"];
 
 /// The lowercase hex SHA-256 of `text`: a prompt's version.
 pub fn sha256(text: &str) -> String {
@@ -265,6 +268,7 @@ impl Pack {
             judge: seat(Base::Judge)?,
             vetter: self.seat(internal(VETTER), VETTER, true),
             router: self.seat(internal(ROUTER), ROUTER, false),
+            steps: self.seat(internal(STEPS), STEPS, false),
         })
     }
 
@@ -381,6 +385,7 @@ pub(crate) struct Seats {
     pub judge: Seat,
     pub vetter: Seat,
     pub router: Seat,
+    pub steps: Seat,
 }
 
 impl Seats {

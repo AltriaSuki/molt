@@ -18,6 +18,7 @@ mod instructions;
 mod judge;
 mod memory;
 pub mod pack;
+mod plan;
 mod prompts;
 mod referenced;
 mod registry;
@@ -429,6 +430,17 @@ pub async fn design(
     runner::design(bus, cfg, req, trace).await
 }
 
+/// Carry out a task as ordered steps, each its own run (`planner.plan`,
+/// see [`molt_api::plan`]); with `propose`, only design the steps.
+pub async fn plan(
+    bus: Arc<dyn Bus>,
+    cfg: Arc<Config>,
+    req: molt_api::plan::PlanRequest,
+    trace: TraceId,
+) -> Result<molt_api::plan::PlanResponse, RemoteError> {
+    plan::plan(bus, cfg, req, trace, CancellationToken::new()).await
+}
+
 /// Steer the run `req.run`, going on in this process (`planner.control`).
 /// A new requirement is announced on the run's progress.
 pub async fn control(bus: &dyn Bus, req: ControlRequest) -> Result<ControlResponse, RemoteError> {
@@ -514,6 +526,14 @@ async fn handle_cancellable(
         }
         "design" => {
             let response = runner::design_cancellable(bus, cfg, request(req.payload)?, req.trace_id, cancel).await?;
+            encode(serde_json::to_value(response))
+        }
+        "plan" => {
+            let asked = serde_json::from_value(req.payload).map_err(|e| RemoteError {
+                code: ErrorCode::Invalid,
+                message: format!("bad planner.plan request: {e}"),
+            })?;
+            let response = plan::plan(bus, cfg, asked, req.trace_id, cancel).await?;
             encode(serde_json::to_value(response))
         }
         other => Err(RemoteError { code: ErrorCode::Invalid, message: format!("no method {other:?}") }),
@@ -667,9 +687,11 @@ mod tests {
     #[tokio::test]
     async fn unknown_methods_and_bad_payloads_are_invalid() {
         let (bus, cfg): (Arc<dyn Bus>, _) = (Arc::new(NoBus), Arc::new(Config::default()));
-        let err = handle(bus.clone(), cfg.clone(), envelope("planner.plan", json!({}))).await.unwrap_err();
+        let err = handle(bus.clone(), cfg.clone(), envelope("planner.steer", json!({}))).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Invalid);
-        assert!(err.message.contains("no method \"plan\""), "{}", err.message);
+        assert!(err.message.contains("no method \"steer\""), "{}", err.message);
+        let err = handle(bus.clone(), cfg.clone(), envelope("planner.plan", json!({}))).await.unwrap_err();
+        assert!(err.code == ErrorCode::Invalid && err.message.contains("bad planner.plan request"), "{}", err.message);
 
         let err = handle(bus.clone(), cfg.clone(), envelope("planner.run", json!({ "task": 1 }))).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Invalid);
