@@ -9,12 +9,14 @@
 mod apply;
 mod build_dir;
 mod cargo_cache;
+pub mod env_profile;
 mod error;
 mod files;
 mod fork;
 mod paths;
 pub mod sandbox;
 mod shell;
+pub use env_profile::EnvProfile;
 pub use sandbox::{host_cargo_home, ExecutionPolicy, SandboxPolicy};
 mod walk;
 

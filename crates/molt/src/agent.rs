@@ -232,10 +232,27 @@ pub fn deps_cache(cfg: &mut Config, kinds: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Hand the config's environment profiles to the standard shell, which
+/// applies them with the built-in ones.
+pub fn environments(cfg: &mut Config) -> anyhow::Result<()> {
+    if cfg.environments.is_empty() {
+        return Ok(());
+    }
+    let json = serde_json::to_string(&cfg.environments)?;
+    let shell = cfg.service_mut("shell").context("[environment] profiles need the shell service")?;
+    let exec = shell.exec.as_mut().filter(|exec| standard_shell(exec));
+    let exec = exec.context("[environment] profiles need the molt-tools shell service")?;
+    if !exec.args.iter().any(|arg| arg == "--no-sandbox") {
+        exec.args.extend(["--environments".into(), json]);
+    }
+    Ok(())
+}
+
 /// What the commands of a run in `workspace` will be missing, from cheap
 /// file checks, with the fix for each: nothing when the shell is unconfined
-/// or has network.
-pub fn dependency_warnings(cfg: &Config, workspace: &Path) -> Vec<String> {
+/// or has network. `cargo_home` is the user's Cargo home, whose cache the
+/// Rust profile builds from when it has one.
+pub fn dependency_warnings(cfg: &Config, workspace: &Path, cargo_home: Option<&Path>) -> Vec<String> {
     let Some(exec) = cfg.service("shell").and_then(|shell| shell.exec.as_ref()).filter(|exec| standard_shell(exec))
     else {
         return Vec::new();
@@ -260,6 +277,10 @@ pub fn dependency_warnings(cfg: &Config, workspace: &Path) -> Vec<String> {
             _ => {}
         }
     }
+    let profiles = molt_tools::env_profile::profiles(&cfg.environments);
+    if profiles.get("rust").is_some_and(|rust| rust.cargo_cache) {
+        cargo |= cargo_home.is_some_and(|home| home.join("registry").is_dir());
+    }
     missing_dependencies(workspace, cargo)
 }
 
@@ -281,8 +302,8 @@ pub fn missing_dependencies(workspace: &Path, cargo: bool) -> Vec<String> {
     if remote_crates && !vendored && !cargo {
         missing.push(
             "Rust: Cargo.lock lists crates from a registry or git, which commands cannot download without network. \
-             To build from the crates in your Cargo cache, run with --deps-cache cargo (after `cargo fetch` on this \
-             machine)."
+             Run `cargo fetch` in the project on this machine: commands build offline from your Cargo cache \
+             (`molt env doctor` checks it)."
                 .to_owned(),
         );
     }
@@ -777,6 +798,7 @@ pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::
     let alone = Config {
         kernel: cfg.kernel.clone(),
         services: vec![service],
+        environments: Default::default(),
         confirm: cfg.confirm.clone(),
         tui: cfg.tui.clone(),
         hooks: cfg.hooks.clone(),
@@ -1279,7 +1301,7 @@ mod tests {
         std::fs::write(ws.join("requirements.txt"), "# pinned\nrequests==2.0\n").unwrap();
         let missing = missing_dependencies(ws, false);
         assert_eq!(missing.len(), 4, "{missing:#?}");
-        assert!(missing[0].starts_with("Rust:") && missing[0].contains("--deps-cache cargo"), "{}", missing[0]);
+        assert!(missing[0].starts_with("Rust:") && missing[0].contains("cargo fetch"), "{}", missing[0]);
         assert!(missing[1].starts_with("Go:") && missing[1].contains("go mod vendor"), "{}", missing[1]);
         assert!(missing[2].starts_with("Node:") && missing[2].contains("npm install"), "{}", missing[2]);
         assert!(missing[3].starts_with("Python:") && missing[3].contains(".venv"), "{}", missing[3]);
@@ -1303,13 +1325,20 @@ mod tests {
         std::fs::create_dir(&ws).unwrap();
         std::fs::write(ws.join("Cargo.lock"), "source = \"sparse+https://index.crates.io/\"\n").unwrap();
         let mut cfg = Config::agent(&ws, &tmp.path().join("data"), Path::new("/opt/molt/bin")).unwrap();
-        assert_eq!(dependency_warnings(&cfg, &ws).len(), 1);
+        let cargo_home = tmp.path().join("cargo");
+        assert_eq!(dependency_warnings(&cfg, &ws, Some(&cargo_home)).len(), 1, "no Cargo cache there");
         let mut cached = cfg.clone();
         deps_cache(&mut cached, &["cargo".into()]).unwrap();
-        assert!(dependency_warnings(&cached, &ws).is_empty());
+        assert!(dependency_warnings(&cached, &ws, None).is_empty());
         assert!(cached.service("shell").unwrap().pass_env.iter().any(|name| name == "CARGO_HOME"));
+        // The Rust profile builds from the user's Cargo cache by default, unless the user's profile says not to.
+        std::fs::create_dir_all(cargo_home.join("registry")).unwrap();
+        assert!(dependency_warnings(&cfg, &ws, Some(&cargo_home)).is_empty());
+        let mut own = cfg.clone();
+        own.environments.insert("rust".into(), molt_tools::EnvProfile::default());
+        assert_eq!(dependency_warnings(&own, &ws, Some(&cargo_home)).len(), 1);
         cfg.service_mut("shell").unwrap().exec.as_mut().unwrap().args.push("--no-sandbox".into());
-        assert!(dependency_warnings(&cfg, &ws).is_empty());
+        assert!(dependency_warnings(&cfg, &ws, None).is_empty());
     }
 
     #[test]

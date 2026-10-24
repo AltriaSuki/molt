@@ -7,12 +7,14 @@
 //! runs in), SIGHUP (that terminal closing) or SIGQUIT (`Ctrl-\`); they would
 //! outlive it otherwise.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use molt_sdk::Service;
-use molt_tools::{ExecutionPolicy, Fs, Roots, SandboxPolicy, Shell};
+use molt_tools::{env_profile, EnvProfile, ExecutionPolicy, Fs, Roots, SandboxPolicy, Shell};
 
 #[derive(Parser)]
 #[command(name = "molt-tools", version, about = "Molt's file and shell services")]
@@ -68,6 +70,10 @@ struct ShellArgs {
     /// $CARGO_HOME/registry and git (default ~/.cargo) read-only.
     #[arg(long, value_name = "KIND", value_parser = ["cargo"], conflicts_with = "no_sandbox")]
     deps_cache: Vec<String>,
+    /// The user's environment profiles, as JSON keyed by name, over the
+    /// built-in ones; molt passes them from its trusted config.
+    #[arg(long, value_name = "JSON", conflicts_with = "no_sandbox")]
+    environments: Option<String>,
 }
 
 #[derive(Args)]
@@ -133,6 +139,19 @@ async fn main() -> anyhow::Result<()> {
                 policy.environment.extend(args.sandbox_env);
                 if args.deps_cache.iter().any(|kind| kind == "cargo") {
                     policy.cargo_cache = Some(molt_tools::host_cargo_home()?);
+                }
+                let user: BTreeMap<String, EnvProfile> = match &args.environments {
+                    Some(json) => serde_json::from_str(json).context("--environments")?,
+                    None => BTreeMap::new(),
+                };
+                let profiles = env_profile::profiles(&user);
+                let root = roots.root.canonicalize()?;
+                let var = |name: &str| std::env::var_os(name);
+                for applied in env_profile::apply(&mut policy, &root, &[&root, &roots.scratch], &profiles, &var) {
+                    tracing::info!(profile = %applied.name, "environment profile");
+                    for note in applied.notes {
+                        tracing::warn!(profile = %applied.name, "{note}");
+                    }
                 }
                 ExecutionPolicy::Configured(policy)
             };

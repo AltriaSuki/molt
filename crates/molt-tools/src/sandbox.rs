@@ -1,4 +1,6 @@
 //! Trusted shell policy. No request payload or repository file can change it.
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context};
@@ -38,6 +40,10 @@ pub struct SandboxPolicy {
     /// from offline (`--deps-cache cargo`); see `cargo_cache`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cargo_cache: Option<PathBuf>,
+    /// Variables set for commands, over the passed ones; `$WORKSPACE`,
+    /// `$BUILD` and `$PATH` in a value are replaced (see `env_profile`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub set_env: BTreeMap<String, String>,
 }
 
 impl Default for SandboxPolicy {
@@ -52,13 +58,19 @@ impl Default for SandboxPolicy {
             open_files: 256,
             processes: 2048,
             cargo_cache: None,
+            set_env: BTreeMap::new(),
         }
     }
 }
 
 /// The Cargo home of this process's user: `CARGO_HOME`, else `~/.cargo`.
 pub fn host_cargo_home() -> anyhow::Result<PathBuf> {
-    let set = |name| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
+    cargo_home_from(&|name| std::env::var_os(name))
+}
+
+/// The Cargo home of the environment `var` reads.
+pub(crate) fn cargo_home_from(var: &dyn Fn(&str) -> Option<OsString>) -> anyhow::Result<PathBuf> {
+    let set = |name| var(name).filter(|value| !value.is_empty()).map(PathBuf::from);
     let home = match set("CARGO_HOME") {
         Some(home) => home,
         None => set("HOME")
@@ -116,7 +128,8 @@ impl SandboxPolicy {
             let meta = std::fs::metadata(path)?;
             ensure!(meta.is_dir() || meta.is_file(), "dependencies must be regular files or directories");
         }
-        for name in &self.environment {
+        ensure!(self.set_env.len() <= 32, "at most 32 variables to set");
+        for name in self.environment.iter().chain(self.set_env.keys()) {
             ensure!(
                 !name.is_empty()
                     && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
@@ -131,6 +144,10 @@ impl SandboxPolicy {
                 "service secrets and host HOME cannot be passed to a sandbox"
             );
         }
+        ensure!(
+            self.set_env.iter().all(|(name, value)| name != "TMPDIR" && !value.contains('\0')),
+            "TMPDIR cannot be set, and a value cannot hold a NUL byte"
+        );
         if let Some(home) = &self.cargo_cache {
             ensure!(
                 !self.environment.iter().any(|name| name == "CARGO_HOME"),
@@ -449,6 +466,16 @@ mod linux {
                 let mut entry = std::ffi::OsString::from(format!("{name}="));
                 entry.push(value);
                 command.arg(entry);
+            }
+        }
+        if let (Some(ws), Some(build)) = (workspace, build) {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            for (name, value) in &policy.set_env {
+                let value = value
+                    .replace("$WORKSPACE", &ws.to_string_lossy())
+                    .replace("$BUILD", &build.dir().to_string_lossy())
+                    .replace("$PATH", &path.to_string_lossy());
+                command.arg(format!("{name}={value}"));
             }
         }
         command.args(["HOME=/home/molt", "TMPDIR=/tmp"]);

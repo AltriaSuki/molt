@@ -20,6 +20,11 @@
 //! max_files = 10
 //! ask_paths = [".github/", "Cargo.toml"]
 //! always_ask = false
+//!
+//! [environment.python-venv]           # replaces the built-in profile of this name
+//! detect = [".venv/pyvenv.cfg"]
+//! env = { VIRTUAL_ENV = "$WORKSPACE/.venv", PATH = "$WORKSPACE/.venv/bin:$PATH" }
+//! read_only = ["/opt/python3.12"]
 //! ```
 
 use std::collections::BTreeMap;
@@ -156,6 +161,11 @@ pub struct Config {
     pub kernel: KernelSection,
     #[serde(default, rename = "service")]
     pub services: Vec<ServiceSection>,
+    /// Environment profiles of the user's, by name: each adds one or
+    /// replaces the built-in profile of its name (see
+    /// `molt_tools::env_profile`). They reach the standard shell service.
+    #[serde(default, rename = "environment", skip_serializing_if = "BTreeMap::is_empty")]
+    pub environments: BTreeMap<String, molt_tools::EnvProfile>,
     #[serde(default)]
     pub confirm: ConfirmSection,
     #[serde(default)]
@@ -347,7 +357,9 @@ impl Config {
         let changed = format!("topic:publish:{}", molt_api::fs::CHANGED);
         let mut fs = service("fs", Tier::Mutable, tools("fs")?)?;
         fs.requests = vec![request(&changed, Budget::new(0, 0, 100_000_000))?];
-        let shell = service("shell", Tier::Protected, tools("shell")?)?;
+        let mut shell = service("shell", Tier::Protected, tools("shell")?)?;
+        // Where the environment profiles find rustup and the Cargo cache.
+        shell.pass_env = names(&["CARGO_HOME", "RUSTUP_HOME"]);
         let mut memory_exec = bin("molt-memory")?;
         // The project model leaves out the data dir, with the forks in it, should it be inside the workspace.
         memory_exec.args = vec![
@@ -396,6 +408,7 @@ impl Config {
         Ok(Self {
             kernel: KernelSection { data_dir: data_dir.to_path_buf(), ..KernelSection::default() },
             services: vec![model, fs, shell, memory, planner],
+            environments: BTreeMap::new(),
             confirm: ConfirmSection::default(),
             tui: TuiSection::default(),
             hooks: Vec::new(),

@@ -160,12 +160,18 @@ fn layout(task: &Task, v: &mut Validation) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A fresh copy of the repo, with the solution and the hidden files laid
-/// over it as asked, and the tests or the check run in it.
+/// A fresh copy of the repo, set up as a smoke task says, with the solution
+/// and the hidden files laid over it as asked, and the tests or the check
+/// run in it.
 async fn prepared_run(task: &Task, solved: bool, hidden: bool) -> anyhow::Result<Ran> {
     let tmp = tempfile::Builder::new().prefix("molt-bench-validate-").tempdir()?;
     let ws = tmp.path().join("ws");
     task::copy_tree(&task.repo(), &ws)?;
+    // A smoke task's setup first, as before a run.
+    if let Some(setup) = task.spec.smoke.as_ref().and_then(|smoke| smoke.setup.as_deref()) {
+        let ran = proc::shell_in(&ws, setup, task.timeout(), task.network()).await?;
+        anyhow::ensure!(ran.success(), "its setup ended with {}:\n{}", ran.ending(), proc::tail_of(&ran.output, 1500));
+    }
     if solved {
         task::overlay(&task.solution(), &ws)?;
     }

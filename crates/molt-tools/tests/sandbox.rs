@@ -103,6 +103,31 @@ async fn build_output_goes_to_a_private_writable_directory_outside_the_fork_that
 }
 
 #[tokio::test]
+async fn variables_a_profile_sets_name_the_commands_workspace_and_build_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut policy = SandboxPolicy::default();
+    policy.set_env.insert("VIRTUAL_ENV".into(), "$WORKSPACE/.venv".into());
+    policy.set_env.insert("PATH".into(), "$WORKSPACE/.venv/bin:$PATH".into());
+    policy.set_env.insert("CACHE".into(), "$BUILD/cache".into());
+    let Some(env) = Env::new(policy).await else { return };
+    let fork = PathBuf::from(&env.fork).canonicalize().unwrap();
+    fs::create_dir_all(fork.join(".venv/bin")).unwrap();
+    fs::write(fork.join(".venv/bin/python"), "#!/bin/sh\necho venv\n").unwrap();
+    fs::set_permissions(fork.join(".venv/bin/python"), fs::Permissions::from_mode(0o755)).unwrap();
+    let ran = env.run("python && printf '%s\\n%s\\n' \"$VIRTUAL_ENV\" \"$CACHE\" && command -v cat").await;
+    assert!(ran.success(), "{ran:?}");
+    let lines: Vec<&str> = ran.stdout.lines().collect();
+    assert_eq!(lines[..2], ["venv", fork.join(".venv").to_str().unwrap()], "{ran:?}");
+    assert!(PathBuf::from(lines[2]).starts_with(env.roots.scratch.canonicalize().unwrap().join(".molt/build")));
+    assert!(lines[3].ends_with("/cat"), "the rest of PATH is kept: {ran:?}");
+    for (name, value) in [("ANTHROPIC_API_KEY", "x"), ("HOME", "/"), ("TMPDIR", "/x"), ("A", "nul\0")] {
+        let mut bad = SandboxPolicy::default();
+        bad.set_env.insert(name.into(), value.into());
+        assert!(bad.probe().is_err(), "{name} cannot be set");
+    }
+}
+
+#[tokio::test]
 async fn network_policy_and_read_only_dependencies_are_enforced() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
