@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::{self, Meter, Stop};
 use crate::checkpoint::{SavedAttempt, SavedEnd};
+use crate::compact::{self, Compacted};
 use crate::control;
 use crate::ctx::{Conversation, Ctx, Spend};
 use crate::tools::{self, Actor};
@@ -271,6 +272,7 @@ impl Attempt {
         let changed = self.changed_protected(fork, latest).await;
         self.version = latest;
         self.check = self.check_at(latest);
+        self.stand(conv);
         let mut text = prompts::new_requirements(&added, &changed);
         if checked {
             text.push_str(&format!("\n\n{}", prompts::RECHECK));
@@ -339,6 +341,7 @@ impl Attempt {
         let (fork, mut conv) = match resume {
             Some(saved) => {
                 let fork = saved.fork.clone().ok_or_else(|| End::error("it stopped before it had a fork"))?;
+                ctx.dir_instructions.restore(&ctx, self.index, saved.dir_instructions.clone());
                 // The fork must still be there, as the run left it.
                 ctx.diff(&fork).await.map_err(|e| End::error(format!("its fork {fork} cannot be used: {e}")))?;
                 ctx.track_fork(&fork);
@@ -347,6 +350,7 @@ impl Attempt {
                 let mut conv = Conversation::seated(seat, part, tools, Value::Null, Role::Attempt, Some(self.index));
                 conv.messages = saved.messages;
                 conv.known = saved.known;
+                conv.compacted = saved.compacted.map(|c| *c);
                 given = self.resume_point(&mut conv).await;
                 (fork, conv)
             }
@@ -405,6 +409,8 @@ impl Attempt {
                 (fork, conv)
             }
         };
+        conv.recall = seat.allows(compact::EARLIER_RESULT);
+        self.stand(&mut conv);
         self.save(&conv);
         // The final reply so far. The output limit can split it over several turns.
         let mut reply: Vec<String> = Vec::new();
@@ -417,6 +423,8 @@ impl Attempt {
                     // A clear step: what the user added since takes effect here.
                     self.adopt(&fork, &mut conv, false).await;
                     let resp = agent::turn(&ctx, &mut conv, max_turns, &mut self.meter, &self.cancel).await?;
+                    // The fit may have left out results that gave directory instructions.
+                    ctx.dir_instructions.sync(&ctx, self.index, &conv.messages);
                     let calls = resp.tool_uses();
                     if !calls.is_empty() {
                         reply.clear();
@@ -431,7 +439,9 @@ impl Attempt {
                             return Err(End::disputed(dispute));
                         }
                         let actor = Actor::Attempt { index: self.index, turn: self.meter.turns };
-                        let (results, explored) = self.or_cancel(self.execute(&fork, &calls, cut_off, actor)).await?;
+                        let compacted = conv.compacted.as_ref();
+                        let (results, explored) =
+                            self.or_cancel(self.execute(&fork, &calls, cut_off, actor, compacted)).await?;
                         // What its explorer spent is the attempt's too; the run already counts it.
                         self.meter.spend.absorb(&explored);
                         conv.push(user_blocks(results));
@@ -586,6 +596,8 @@ impl Attempt {
         let mut kept = Conversation::new(conv.system.clone(), conv.tools.clone(), Value::Null, conv.role, conv.attempt);
         kept.messages = conv.messages.clone();
         kept.known = conv.known;
+        kept.compacted = conv.compacted.clone();
+        kept.standing = conv.standing.clone();
         let limits = self.ctx.limits();
         let bound = crate::fit::Limits { tokens: limits.tokens, bytes: self.ctx.cfg.frame_bytes / 4 };
         if let Err(why) = kept.fit(bound) {
@@ -615,13 +627,26 @@ impl Attempt {
     /// else: the calls are refused unrun. `explore` calls run after the
     /// turn's other calls, one at a time, each with its slice of what is
     /// left.
-    async fn execute(&self, fork: &str, calls: &[ToolUse], cut_off: Option<&str>, actor: Actor) -> (Vec<Value>, Spend) {
+    async fn execute(
+        &self,
+        fork: &str,
+        calls: &[ToolUse],
+        cut_off: Option<&str>,
+        actor: Actor,
+        compacted: Option<&Compacted>,
+    ) -> (Vec<Value>, Spend) {
         let explores = self.explores();
         let is_dispute = |c: &ToolUse| self.check.is_some() && c.name == DISPUTE_CHECK;
         let is_explore = |c: &ToolUse| explores && c.name == EXPLORE;
-        let refused = |c: &ToolUse| self.read_only && !self.ctx.tools.offers(ToolRole::Attempt, true, &c.name);
-        let others: Vec<ToolUse> =
-            calls.iter().filter(|c| !is_dispute(c) && !is_explore(c) && !refused(c)).cloned().collect();
+        // Offered once turns were left out: it reads them back, so it is no tool before.
+        let is_earlier = |c: &ToolUse| compacted.is_some() && c.name == compact::EARLIER_RESULT;
+        let refused =
+            |c: &ToolUse| !is_earlier(c) && self.read_only && !self.ctx.tools.offers(ToolRole::Attempt, true, &c.name);
+        let others: Vec<ToolUse> = calls
+            .iter()
+            .filter(|c| !is_dispute(c) && !is_explore(c) && !is_earlier(c) && !refused(c))
+            .cloned()
+            .collect();
         let mut results = tools::execute(&self.ctx, fork, &others, cut_off, actor).await.into_iter();
         let mut spent = Spend::default();
         let mut explored = Vec::new();
@@ -636,9 +661,35 @@ impl Attempt {
             explored.push(tool_result(&call.id, e.text, e.is_error));
         }
         let mut explored = explored.into_iter();
+        let mut earlier = Vec::new();
+        for call in calls.iter().filter(|c| is_earlier(c)) {
+            let (text, is_error) = if cut_off == Some(call.id.as_str()) {
+                (prompts::CUT_OFF.to_owned(), true)
+            } else {
+                let detail = format!("{} {}", compact::EARLIER_RESULT, call.input["id"].as_str().unwrap_or("?"));
+                let ctx = &self.ctx;
+                let tool = compact::EARLIER_RESULT.to_owned();
+                ctx.progress(Progress::ToolCall {
+                    run: ctx.run_id(),
+                    attempt: self.index,
+                    turn: self.meter.turns,
+                    tool,
+                    detail,
+                })
+                .await;
+                compact::recall(ctx, fork, compacted, call).await
+            };
+            earlier.push(tool_result(&call.id, text, is_error));
+        }
+        let mut earlier = earlier.into_iter();
         let results = calls
             .iter()
             .map(|call| {
+                if is_earlier(call) {
+                    return earlier
+                        .next()
+                        .unwrap_or_else(|| tool_result(&call.id, "The tool failed unexpectedly.", true));
+                }
                 if refused(call) {
                     let why = format!("{} is not available: this task only reads, and changes nothing.", call.name);
                     return tool_result(&call.id, why, true);
@@ -725,6 +776,16 @@ impl Attempt {
         None
     }
 
+    /// What holds now for the conversation's record of left-out turns, from
+    /// the run's own state: what the user added up to the attempt's
+    /// version, the protected paths and the done-check.
+    fn stand(&self, conv: &mut Conversation) {
+        let added = self.ctx.control.upto(self.version);
+        let protected = self.ctx.control.protected(self.version);
+        conv.standing =
+            Some(prompts::standing(self.version, &added, &protected, self.check.as_ref().map(|c| c.command.as_str())));
+    }
+
     /// Save the attempt as it stands in the run's checkpoint.
     fn save(&self, conv: &Conversation) {
         let (fork, memory_tools, web_tools, skill_tools, meter, check_runs, version) = (
@@ -745,10 +806,12 @@ impl Attempt {
             saved.skill_tools = skill_tools;
             saved.messages = conv.messages.clone();
             saved.known = conv.known;
+            saved.compacted = conv.compacted.clone().map(Box::new);
             saved.turns = meter.turns;
             saved.check_runs = check_runs;
             saved.usage = meter.spend.usage;
             saved.cost_usd = meter.spend.cost_usd;
+            saved.dir_instructions = self.ctx.dir_instructions.saved(self.index);
         });
     }
 

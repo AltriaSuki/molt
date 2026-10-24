@@ -6,6 +6,7 @@ use molt_api::model::{CompleteResponse, STOP_MAX_TOKENS};
 use molt_proto::{ErrorCode, RemoteError};
 use tokio_util::sync::CancellationToken;
 
+use crate::compact;
 use crate::ctx::{Conversation, Ctx, Spend};
 
 /// Why a loop stopped before the model said it was done.
@@ -56,7 +57,12 @@ pub(crate) async fn turn(
     if ctx.over_budget() || ctx.over_cap() {
         return Err(Stop::Budget);
     }
-    match conv.fit(ctx.limits()) {
+    if conv.recall {
+        conv.budget = Some(budget_line(ctx, meter.turns, max_turns));
+    }
+    let limits = ctx.limits();
+    let before = conv.compacted.as_ref().map_or(0, |c| c.next);
+    match conv.fit(limits) {
         Ok(None) => {}
         Ok(Some(fitted)) => {
             let who = conv.speaker();
@@ -68,6 +74,35 @@ pub(crate) async fn turn(
             ctx.note(format!("{who}: {what} to fit the model's input (about {before} → {after} tokens)")).await;
         }
         Err(why) => return Err(Stop::Model(RemoteError { code: ErrorCode::Invalid, message: why })),
+    }
+    let left_out = conv.compacted.as_ref().is_some_and(|c| c.next > before);
+    if left_out && conv.recall && ctx.cfg.compact_model {
+        let summary = compact::summarize(ctx, conv, before, cancel).await;
+        if let Some(reply) = &summary.reply {
+            meter.spend.add(reply);
+        }
+        let who = conv.speaker();
+        match summary.notes {
+            Ok(notes) => {
+                if let Some(compacted) = &mut conv.compacted {
+                    compacted.notes = Some(notes);
+                }
+                conv.write_record();
+                // The notes fit in the room the record had; should they not, the record is made to fit again.
+                conv.fit(limits).map_err(|why| Stop::Model(RemoteError { code: ErrorCode::Invalid, message: why }))?;
+                ctx.note(format!("{who}: the compactor wrote notes on the turns left out")).await;
+            }
+            Err(why) => {
+                ctx.note(format!("{who}: no notes on the turns left out ({why}); Molt's own record of them stands"))
+                    .await
+            }
+        }
+    }
+    // Once turns are left out, an attempt may read them back; offered last, so the tools before stay cached.
+    if conv.recall && conv.compacted.is_some() && !conv.tools.iter().any(|t| t["name"] == compact::EARLIER_RESULT) {
+        let mut tools = conv.tools.as_ref().clone();
+        tools.push(compact::definition());
+        conv.tools = Arc::new(tools);
     }
     let resp = tokio::select! {
         // A reply that is already in wins a tie, so the loop's meter counts it too.
@@ -88,6 +123,21 @@ pub(crate) async fn turn(
     }
     conv.measured(&resp.usage);
     Ok(resp)
+}
+
+/// What the run has spent and the turns the loop has had, for the record of
+/// left-out turns: the run's own count, which no turn can change.
+fn budget_line(ctx: &Ctx, turns: u32, max_turns: u32) -> String {
+    let tally = ctx.tally();
+    let unknown = match tally.uncounted_calls() + ctx.carried_uncounted {
+        0 => String::new(),
+        n => format!(" and {n} calls of unknown cost"),
+    };
+    format!(
+        "- When this record was written, the run had spent ${:.2}{unknown} of its ${:.2} budget, and this \
+         conversation had had {turns} of its {max_turns} turns.",
+        tally.spend.cost_usd, ctx.budget_usd
+    )
 }
 
 /// The id of a tool call the output limit cut short. Only the last block of

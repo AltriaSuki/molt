@@ -289,12 +289,58 @@ model's input (`MOLT_CONTEXT_TOKENS` less `MOLT_MAX_TOKENS` for the reply,
 counted from what the model measured on the last call) and the bus frame
 (8 MiB for the whole request). When it would not, the oldest turns are left
 out, always a whole round trip, so no tool call loses its result and no
-assistant turn is changed. Molt adds a short record of what those turns did
-to the first message, after the task and the check, which are never cut. A
-single result too big to fit even alone is cut down, and says so. Progress
-notes each time this happens, and the full conversation stays in the audit
-log. When even that cannot fit, the attempt ends with an error that names
-the limit, the model's input or the transport frame.
+assistant turn is changed. A single result too big to fit even alone is cut
+down, and says so. Progress notes each time this happens, and the full
+conversation stays in the audit log. When even that cannot fit, the attempt
+ends with an error that names the limit, the model's input or the transport
+frame.
+
+What the left-out turns did goes into a record at the end of the first
+message, after the task and the check, which are never cut. The record is
+rebuilt at every fit, at most 24 KiB besides its first section, in this
+order:
+
+- **What holds now**, from the run's own state rather than from the turns:
+  the user's requirements as of the version the attempt works to, the
+  protected paths, the done-check, and what the run had spent when the
+  record was written. A requirement told to the attempt in a message that
+  is later left out is still here. Nothing the turns or a model wrote can
+  change this section.
+- The files the left-out turns wrote or edited, with the turns that did it,
+  and what failed in them: a tool call that failed, a command that did not
+  exit 0, a done-check that failed.
+- The attempt's notes, when a model writes them (below), marked as written
+  from the turns: where they and what holds now disagree, what holds now
+  wins.
+- A line for each left-out call with its result, and each message,
+  shortened, with an id such as `E12`, newest kept first. A read of a file
+  that a later turn wrote says so: it is not what the file holds now.
+
+Once turns are left out, an attempt is offered `earlier_result`, last in its
+tools: given an id, it returns that call's result or that message whole, as
+it was then, 16 KiB at a time. It never runs the call again: a write or a
+command read back says it already ran. A file read back is read once more,
+by Molt and without the user's tool hooks, only to say whether the file
+still reads the same; the attempt is told to read it again for what it
+holds now. A role whose `tools` leave `earlier_result` out is not offered
+it. Each conversation keeps its items' full text up to 1 MiB, oldest let go
+first (their record lines stay), and they are saved with the attempt's
+checkpoint, so `molt resume` goes on with the same ids. Thinking blocks are
+never kept.
+
+With `MOLT_COMPACT=model`, each fit that leaves turns out also has the
+`compactor` ([Prompts and roles](prompts.md#the-prompts)) write the
+attempt's notes on them: the changes that stand, the decisions and the
+evidence they rest on, what failed and why, the open questions and the next
+step, merged with its notes so far. It is one model call per fit, with the
+attempt's model unless the compactor's role names one; it is shown the task
+and up to 48 KiB of the left-out items as data, and is not previewed. What
+it costs counts toward the run and the attempt, as every call does, and it
+is not made once the run's budget is spent. When it fails, declines or does
+not submit notes, the notes stay as they were and Molt's own record stands,
+which progress says; a failure whose cost is unknown stops the run, as any
+model call of unknown cost does. The default, `MOLT_COMPACT=record`, makes
+no extra call.
 
 ### Project instructions
 
@@ -311,6 +357,37 @@ that they win over notes. They are read with `fs.read`, so the audit log
 records what each run saw, and the run's progress lists the files.
 `--no-memory` does not turn them off; `MOLT_INSTRUCTION_FILES` names other
 files, or `none`.
+
+A task often names no path: the attempt finds the code by searching. When an
+attempt's `read_file`, `list_files` or `search` reaches a directory the run
+has not looked in (a file's own directory and those above it, or every
+directory a search matched in), Molt reads that directory's instruction
+files and adds them to the call's result, as a `<directory_instructions>`
+block that names each file, the directory it applies to (`applies_to`) and
+its version (the start of its SHA-256). A rule there applies under that
+directory only. The first `write_file` or `edit_file` in a directory whose
+files the attempt has not been given is not made: its result gives them,
+and the attempt makes the change again if it still fits them. A file is
+given once; a file with the same text as one already given is named with
+`same_text_as`, and CLAUDE.md beside an identical AGENTS.md not at all.
+
+These files follow the same rules as the first ones: read through `fs.read`
+from the workspace (never from the attempt's fork, so an attempt that writes
+an instruction file is told that its text is its own change and is still
+given the project's), only inside the workspace and never under `.molt` or
+`.git`, at most 16 KiB of them in an attempt's conversation at a time, and
+only text that grants nothing. A file over that is cut or, with little room
+left, named with the reason, as is one that is a link out of the workspace
+or cannot be read, and progress says so. At most 8 new directories are
+looked in per call; the rest when a later call reaches them. What an attempt
+was given is saved with its checkpoint: after `molt resume`, a file that
+changed meanwhile is given again with `replaces` naming the version before.
+A file whose result a fit has left out of the conversation is given again
+the next time its directory is reached. Commands are not covered, since what
+a `run` will touch is not known before it runs: to get a directory's files
+before changing it with a command, list it (`list_files` with its path). The
+designer, the reviewer and an attempt's explorer get none of these
+files.
 
 ### Syntax errors after an edit
 

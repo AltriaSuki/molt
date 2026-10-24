@@ -131,6 +131,8 @@ pub(crate) struct Ctx {
     web_health: Arc<Mutex<WebHealth>>,
     /// The `<project_instructions>` block, when the project has instruction files.
     pub instructions: Option<String>,
+    /// The instruction files of directories each attempt reached as it worked.
+    pub dir_instructions: Arc<crate::scoped::Scoped>,
     /// The Agent Skills found when the run started, and their `<skills>` block.
     pub skills: Arc<crate::skills::Catalog>,
     /// The files the user pointed at, and their `<referenced_files>` block.
@@ -182,6 +184,16 @@ pub(crate) struct Conversation {
     /// How many messages the model last measured, and the tokens it counted
     /// for them, its reply included.
     pub(crate) known: Option<(usize, u64)>,
+    /// What it keeps of the turns it left out to fit, once it has left some out.
+    pub(crate) compacted: Option<crate::compact::Compacted>,
+    /// What holds now, from the run's own state, for the record of left-out
+    /// turns: set by whoever holds the conversation, never by the model.
+    pub(crate) standing: Option<String>,
+    /// The spend so far, for the same record, as of the turn it is written.
+    pub(crate) budget: Option<String>,
+    /// It may read left-out turns back with `earlier_result`, and have
+    /// notes written on them.
+    pub(crate) recall: bool,
 }
 
 impl Conversation {
@@ -203,6 +215,10 @@ impl Conversation {
             effort: None,
             prompt: None,
             known: None,
+            compacted: None,
+            standing: None,
+            budget: None,
+            recall: false,
         }
     }
 
@@ -295,6 +311,7 @@ impl Ctx {
             tools,
             web_health: Arc::default(),
             instructions: None,
+            dir_instructions: Arc::default(),
             skills: Arc::default(),
             files: req.files.clone(),
             referenced: None,

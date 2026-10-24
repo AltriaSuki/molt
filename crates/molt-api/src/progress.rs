@@ -324,6 +324,7 @@ mod tests {
         assert_eq!(speaker(Some(Role::Reviewer), None), "reviewer");
         assert_eq!(speaker(Some(Role::Judge), None), "judge");
         assert_eq!(speaker(Some(Role::Memory), None), "memory");
+        assert_eq!(speaker(Some(Role::Compactor), Some(1)), "attempt 2 compactor");
         assert_eq!(speaker(Some(Role::Explorer), Some(1)), "attempt 2 explorer");
         assert_eq!(speaker(None, None), "planner");
     }
