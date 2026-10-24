@@ -726,7 +726,8 @@ async fn main() -> anyhow::Result<ExitCode> {
         Cmd::UiBackend => molt::tui::serve_backend().await?,
         Cmd::Run => {
             let stop = molt::stop_signal()?;
-            let cfg = config()?;
+            let mut cfg = config()?;
+            agent::mcp(&mut cfg)?;
             let running = molt::start(&cfg).await?;
             tracing::info!(services = cfg.services.len(), "kernel running; Ctrl-C to stop");
             let signal = stop.await;
@@ -945,6 +946,7 @@ fn prepare(config: Option<&Path>, profile: Option<&str>, args: &RunArgs) -> anyh
     }
     agent::deps_cache(&mut cfg, &args.deps_cache)?;
     agent::environments(&mut cfg)?;
+    agent::mcp(&mut cfg)?;
     if args.no_memory {
         cfg.services.retain(|s| s.name.as_str() != agent::MEMORY);
     }

@@ -21,6 +21,7 @@ molt-memory = { path = "crates/molt-memory" }
 molt-bench = { path = "crates/molt-bench" }
 molt-syntax = { path = "crates/molt-syntax" }
 molt-web = { path = "crates/molt-web" }
+molt-mcp = { path = "crates/molt-mcp" }
 
 anyhow = "1"
 arc-swap = "1"
