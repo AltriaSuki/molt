@@ -282,3 +282,50 @@ async fn dropping_a_request_tears_down_its_namespace_without_stopping_other_requ
     .unwrap();
     assert!(next.success(), "{}", next.stderr);
 }
+
+#[tokio::test]
+async fn a_process_runs_in_the_sandbox_and_stopping_it_tears_down_children_that_create_sessions() {
+    use molt_api::shell::{ProcessState, ProcessStatus, StopResponse};
+    let Some(env) = Env::new(SandboxPolicy::default()).await else { return };
+    let base = env.roots.root.to_str().unwrap();
+    let command = format!(
+        "echo \"home=$HOME\"; ! sh -c 'echo changed > {base}/original' 2>/dev/null && echo confined; setsid sh -c 'trap \"\" TERM; while :; do echo x >> daemon-writes; sleep 0.02; done' & echo ready; cat"
+    );
+    let started: ProcessState = serde_json::from_value(
+        env.shell
+            .handle("start", json!({"workspace": env.fork, "command": command, "ready": "ready", "wait_ms": 5000}))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!((started.status, started.ready), (ProcessStatus::Running, Some(true)), "{started:?}");
+    assert!(started.output.contains("home=/home/molt\nconfined\n"), "{started:?}");
+    assert_eq!(fs::read_to_string(env.roots.root.join("original")).unwrap(), "host");
+    // Its input reaches it inside the sandbox.
+    let wrote = env.shell.handle("write", json!({"workspace": env.fork, "id": started.id, "input": "echoed\n"})).await;
+    assert!(wrote.is_ok(), "{wrote:?}");
+    let read: ProcessState = serde_json::from_value(
+        env.shell.handle("read", json!({"workspace": env.fork, "id": started.id, "wait_ms": 3000})).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(read.output, "echoed\n");
+    let writes = PathBuf::from(&env.fork).join("daemon-writes");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !writes.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let stopped: StopResponse =
+        serde_json::from_value(env.shell.handle("stop", json!({"workspace": env.fork})).await.unwrap()).unwrap();
+    assert_eq!(stopped.stopped[0].status, ProcessStatus::Stopped);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let before = fs::read(&writes).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(fs::read(&writes).unwrap(), before, "a setsid child outlived its stopped process");
+    // A process, like a command, runs only in a fork.
+    let err = env.shell.handle("start", json!({"workspace": base, "command": "touch must-not-exist"})).await;
+    assert!(err.is_err());
+    assert!(!env.roots.root.join("must-not-exist").exists());
+}

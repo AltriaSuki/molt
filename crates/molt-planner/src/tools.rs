@@ -99,6 +99,8 @@ enum Tool {
     Fetch(t::FetchUrl),
     LoadSkill(t::LoadSkill),
     Ask(t::AskUser),
+    /// A call about a background process (see [`crate::process`]).
+    Process(crate::process::Call),
     /// A tool a service declared, with the model's input as it gave it.
     Provided(Arc<ProvidedTool>, Value),
 }
@@ -111,6 +113,10 @@ impl Tool {
             serde_json::from_value(call.input.clone()).map_err(|e| {
                 format!("Invalid input for {}: {e}. Check the tool's input schema and try again.", call.name)
             })
+        }
+        // Offered only when processes are on; see `execute`.
+        if let Some(process) = crate::process::Call::parse(call) {
+            return process.map(Self::Process);
         }
         Ok(match call.name.as_str() {
             t::READ_FILE => Self::Read(input(call)?),
@@ -192,6 +198,7 @@ impl Tool {
                 None => format!("load skill {}", l.name),
             },
             Self::Ask(a) => format!("ask the user: {}", a.question),
+            Self::Process(p) => p.detail(),
             Self::Provided(tool, input) => format!("{} {input}", tool.decl.name),
         }
     }
@@ -227,6 +234,7 @@ impl Tool {
             Self::Fetch(_) => t::FETCH_URL,
             Self::LoadSkill(_) => t::LOAD_SKILL,
             Self::Ask(_) => t::ASK_USER,
+            Self::Process(p) => p.name(),
             Self::Provided(tool, _) => &tool.decl.name,
         }
     }
@@ -342,6 +350,7 @@ impl Tool {
             }
             // `execute` asks for the attempt that made the call.
             Self::Ask(_) => Err(Failure::Rejected("ask_user cannot be used here".into())),
+            Self::Process(p) => Ok(p.run(ctx, fork).await?),
             Self::Provided(tool, input) => {
                 let decl = &tool.decl;
                 let call = ToolCall { tool: decl.name.clone(), workspace, input };
@@ -458,6 +467,12 @@ pub(crate) async fn execute(
         };
         let tool = tool.and_then(|tool| match tool {
             Tool::Ask(_) if asker.is_none() => Err(no_ask.clone()),
+            // Only an attempt that changes files has processes, and only when they are on.
+            Tool::Process(_)
+                if !(ctx.processes && matches!(actor, Actor::Attempt { .. }) && !ctx.workflow.read_only()) =>
+            {
+                Err(format!("There is no tool named {:?}.", call.name))
+            }
             tool => Ok(tool),
         });
         let detail = match &tool {

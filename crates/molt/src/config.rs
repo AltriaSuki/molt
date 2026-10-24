@@ -319,6 +319,7 @@ const PLANNER_ENV: &[&str] = &[
     "MOLT_CONTEXT_TOKENS",
     "MOLT_INSTRUCTION_FILES",
     "MOLT_SYNTAX_CHECK",
+    "MOLT_PROCESSES",
 ];
 
 /// What the memory service reads from its environment (see `molt_memory::Config::from_env`).
@@ -473,6 +474,10 @@ impl Config {
             request(molt_api::shell::RUN, Budget::new(0, 0, 1_000_000))?,
             request(&format!("topic:publish:{}", molt_api::progress::TOPIC), Budget::new(0, 0, 10_000_000))?,
         ];
+        // Background processes run as commands do; the planner offers them only with MOLT_PROCESSES=on.
+        for method in [molt_api::shell::START, molt_api::shell::READ, molt_api::shell::WRITE, molt_api::shell::STOP] {
+            planner.requests.push(request(method, Budget::new(0, 0, 1_000_000))?);
+        }
         // What memory knows about the workspace; not remember, forget or consolidate.
         for method in [
             molt_api::memory::INDEX,
@@ -995,6 +1000,10 @@ mod tests {
                 "fs.*",
                 "shell.run",
                 "topic:publish:progress",
+                "shell.start",
+                "shell.read",
+                "shell.write",
+                "shell.stop",
                 "memory.index",
                 "memory.map",
                 "memory.recall",

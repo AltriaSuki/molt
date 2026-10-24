@@ -105,12 +105,18 @@ pass_env = [
   "MOLT_PLANNER_MODEL", "MOLT_MAX_TURNS", "MOLT_MAX_CHECK_ROUNDS", "MOLT_BUDGET_USD", "MOLT_EXPLORE",
   "MOLT_EXPLORE_MODEL", "MOLT_COMPACT", "MOLT_MAX_TOKENS", "MOLT_MODEL_TIMEOUT_S", "MOLT_CHECK_TIMEOUT_S", "MOLT_MAP_TOKENS", "MOLT_CONTEXT_TOKENS",
   "MOLT_INSTRUCTION_FILES", "MOLT_SYNTAX_CHECK",
+  "MOLT_PROCESSES",
 ]
 requests = [
   { target = "model.complete", budget = { tokens = 4000000000, calls = 1000000 } },
   { target = "fs.*", budget = { calls = 10000000 } },
   { target = "shell.run", budget = { calls = 1000000 } },
   { target = "topic:publish:progress", budget = { calls = 10000000 } },
+  # Background processes (start_process and the rest), offered with MOLT_PROCESSES=on.
+  { target = "shell.start", budget = { calls = 1000000 } },
+  { target = "shell.read", budget = { calls = 1000000 } },
+  { target = "shell.write", budget = { calls = 1000000 } },
+  { target = "shell.stop", budget = { calls = 1000000 } },
   { target = "memory.index", budget = { calls = 10000000 } },
   { target = "memory.map", budget = { calls = 10000000 } },
   { target = "memory.recall", budget = { calls = 10000000 } },

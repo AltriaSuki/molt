@@ -20,6 +20,7 @@ mod judge;
 mod memory;
 pub mod pack;
 mod plan;
+mod process;
 mod prompts;
 mod referenced;
 mod registry;
@@ -62,6 +63,9 @@ pub struct Config {
     /// Model for `explore`'s sub-agent when the explorer role names none;
     /// `None` uses the run's model.
     pub explore_model: Option<String>,
+    /// Offer attempts the process tools, to run a command in the background
+    /// while they work (#110), when the planner may call `shell.start`.
+    pub processes: bool,
     /// `max_tokens` for each model call.
     pub max_tokens: u32,
     /// Deadline for one model call.
@@ -132,6 +136,7 @@ impl Default for Config {
             design_share: 0.25,
             explore: false,
             explore_model: None,
+            processes: false,
             max_tokens: 32_000,
             model_timeout: Duration::from_secs(1200),
             check_timeout: Duration::from_secs(900),
@@ -158,7 +163,7 @@ impl Default for Config {
 impl Config {
     /// [`Config::default`] overridden by `MOLT_PLANNER_MODEL`,
     /// `MOLT_MAX_TURNS`, `MOLT_MAX_CHECK_ROUNDS`, `MOLT_BUDGET_USD`,
-    /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_EXPLORE`, `MOLT_EXPLORE_MODEL`, `MOLT_MAX_TOKENS`,
+    /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_EXPLORE`, `MOLT_EXPLORE_MODEL`, `MOLT_PROCESSES`, `MOLT_MAX_TOKENS`,
     /// `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
     /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES`,
     /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL`, `MOLT_PROMPTS_DIR`, `MOLT_SKILLS_DIR` and `MOLT_COMPACT`.
@@ -172,6 +177,7 @@ impl Config {
     /// | `MOLT_DESIGN_BUDGET_SHARE` | `0.25`: designing the check may spend a quarter of the run's budget |
     /// | `MOLT_EXPLORE` | `off`: only workflows that set `attempts.explore` offer `explore`; `on` for every one whose attempts change files |
     /// | `MOLT_EXPLORE_MODEL` | unset: `explore`'s sub-agent uses the explorer role's model, else the run's |
+    /// | `MOLT_PROCESSES` | `off`: `on` offers attempts `start_process`, `read_process`, `write_process` and `stop_process`, to run commands in the background |
     /// | `MOLT_MAX_TOKENS` | `32000` |
     /// | `MOLT_MODEL_TIMEOUT_S` | `1200` |
     /// | `MOLT_CHECK_TIMEOUT_S` | `900` |
@@ -244,6 +250,11 @@ impl Config {
             max_check_rounds: small("MOLT_MAX_CHECK_ROUNDS", d.max_check_rounds)?,
             budget_usd,
             design_share,
+            processes: match get("MOLT_PROCESSES").as_deref() {
+                None | Some("off" | "0" | "false") => false,
+                Some("on" | "1" | "true") => true,
+                Some(v) => anyhow::bail!("MOLT_PROCESSES={v:?}: use on or off"),
+            },
             explore: match get("MOLT_EXPLORE").as_deref() {
                 None | Some("off" | "0" | "false") => false,
                 Some("on" | "1" | "true") => true,
@@ -725,6 +736,14 @@ mod tests {
         let ok = json!({ "task": "t", "workspace": "/w" });
         let err = handle(bus, cfg, envelope("planner.run", ok)).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Unavailable);
+    }
+
+    #[test]
+    fn processes_are_off_unless_the_planners_starter_turns_them_on() {
+        assert!(!from(&[]).unwrap().processes);
+        assert!(from(&[("MOLT_PROCESSES", "on")]).unwrap().processes);
+        assert!(!from(&[("MOLT_PROCESSES", "off")]).unwrap().processes);
+        assert!(format!("{:#}", from(&[("MOLT_PROCESSES", "yes")]).unwrap_err()).contains("use on or off"));
     }
 
     #[test]

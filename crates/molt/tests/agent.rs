@@ -547,6 +547,7 @@ fn molt(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) -> to
         "MOLT_CONTEXT_TOKENS",
         "MOLT_INSTRUCTION_FILES",
         "MOLT_SYNTAX_CHECK",
+        "MOLT_PROCESSES",
         "MOLT_MEMORY_MODEL",
         "MOLT_MEMORY_EFFORT",
         "MOLT_MEMORY_MAX_TOKENS",
@@ -2806,4 +2807,60 @@ async fn molt_do_plan_runs_each_given_step_with_its_own_designed_check_then_the_
         if envelope.kind == Kind::Reply && envelope.payload["ran"].as_array().is_some_and(|r| r.len() == 2))));
     assert_requests_valid(&server).await;
     assert_forks_dropped(data.path());
+}
+
+/// Background processes (#110) through the real kernel and shell service:
+/// with `MOLT_PROCESSES=on` an attempt starts a server that runs on in its
+/// fork, the start says it is ready, the planner stops it at the attempt's
+/// final reply before the check, and nothing of it is left running.
+#[tokio::test]
+async fn a_process_an_attempt_starts_runs_until_its_final_reply_and_leaves_nothing_behind() {
+    use molt_api::planner::tools::START_PROCESS;
+    let marker = format!("molt-process-test-{}", std::process::id());
+    let command = format!("echo up; while :; do echo {marker} > /dev/null; sleep 0.05; done");
+    let calls = vec![(START_PROCESS, json!({ "command": command, "ready": "up", "timeout_s": 20 }))];
+    let server = fake_api(Fake::GreetsWithCalls(calls)).await;
+    let mut setup = Setup::new(&server);
+    setup.cfg.service_mut("planner").unwrap().env.insert("MOLT_PROCESSES".into(), "on".into());
+    let (resp, _) = setup.run(setup.request(Some(CHECK), 1)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+
+    let sent = bodies(&server).await;
+    let started = sent
+        .iter()
+        .flat_map(|b| b["messages"].as_array().cloned().unwrap_or_default())
+        .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+        .find(|c| c["type"] == "tool_result" && c["content"].as_str().is_some_and(|t| t.starts_with("Started process")))
+        .expect("the start's result went back to the model");
+    let text = started["content"].as_str().unwrap();
+    assert!(
+        text.contains("is running") && text.contains("Its ready text appeared.") && text.contains("up\n"),
+        "{text}"
+    );
+    let audit = molt_kernel::audit::read_all(&setup.data.path().join("audit.jsonl")).await.unwrap();
+    let requests = |to: &str| {
+        audit
+            .iter()
+            .filter(|e| {
+                matches!(&e.event, AuditEvent::Message { envelope }
+                if envelope.kind == Kind::Request && envelope.to.to_string() == to
+                    && envelope.from.as_ref().map(|f| f.as_str()) == Some("planner"))
+            })
+            .count()
+    };
+    assert_eq!(requests("shell.start"), 1);
+    assert!(requests("shell.stop") >= 2, "stopped at the final reply and at the attempt's end");
+    // Nothing that ran the command is left: not the sandbox, not the shell in it.
+    let alive: Vec<String> = std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())))
+        .filter(|e| {
+            std::fs::read(e.path().join("cmdline")).is_ok_and(|c| String::from_utf8_lossy(&c).contains(&marker))
+        })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(alive.is_empty(), "processes left running: {alive:?}");
+    assert_requests_valid(&server).await;
+    assert_forks_dropped(setup.data.path());
 }
