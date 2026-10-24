@@ -1,0 +1,640 @@
+//! Where the configuration comes from when no `--config` is given. Each
+//! layer goes over the ones before it:
+//!
+//! 1. the built-in agent setup ([`Config::agent`]);
+//! 2. the user's config, `~/.config/molt/config.toml` (or under
+//!    `$XDG_CONFIG_HOME`): trusted, so it may add or change services, hooks
+//!    and defaults, and define profiles;
+//! 3. the profile picked with `--profile`;
+//! 4. the project's `.molt/config.toml` in the workspace: data only, since
+//!    anyone who wrote the project wrote it;
+//! 5. environment variables, for the defaults they name ([`ENV_OVER`]);
+//! 6. the command line, and then the interface's saved settings, which the
+//!    callers apply.
+//!
+//! A file given with `--config` replaces layers 1 to 5, as it always has;
+//! `--profile` picks one of its own profiles.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context};
+use molt_proto::{Budget, CapRequest};
+use serde::Deserialize;
+use toml::{Table, Value};
+
+use crate::config::{secret_name, Config, WEB};
+
+/// The user's config, under `$XDG_CONFIG_HOME` or `~/.config`.
+pub const USER_FILE: &str = "molt/config.toml";
+/// The project's config, in the workspace.
+pub const PROJECT_FILE: &str = ".molt/config.toml";
+
+/// What a project config may not hold: each would run a program, or hand
+/// one the user's environment, on the word of whoever wrote the project.
+const NOT_DATA: &[&str] = &["service", "hooks", "env", "pass_env"];
+
+/// The defaults an environment variable overrides, with the variables (the
+/// first one set wins). Without the default, the services read the variable
+/// as they always have.
+pub const ENV_OVER: &[(&str, &[&str])] = &[
+    ("model", &["MOLT_PLANNER_MODEL", "MOLT_MODEL"]),
+    ("effort", &["MOLT_EFFORT"]),
+    ("budget", &["MOLT_BUDGET_USD"]),
+    ("memory_model", &["MOLT_MEMORY_MODEL"]),
+];
+
+/// The planner variable a project's `instruction_files` sets.
+const INSTRUCTION_FILES: &str = "MOLT_INSTRUCTION_FILES";
+
+/// Where a value comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Origin {
+    Default,
+    /// The file given with `--config`.
+    File(PathBuf),
+    User(PathBuf),
+    Profile(String),
+    Project(PathBuf),
+    Env(String),
+}
+
+impl fmt::Display for Origin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Default => write!(f, "built-in default"),
+            Self::File(path) => write!(f, "--config {}", path.display()),
+            Self::User(path) => write!(f, "user config {}", path.display()),
+            Self::Profile(name) => write!(f, "profile {name}"),
+            Self::Project(path) => write!(f, "project config {}", path.display()),
+            Self::Env(name) => write!(f, "environment {name}"),
+        }
+    }
+}
+
+/// The project's data config.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectFile {
+    /// The done-check when none is given.
+    check: Option<String>,
+    /// Paths the interface's confirm mode stops for, added to the user's.
+    #[serde(default)]
+    ask_paths: Vec<String>,
+    /// The instruction files the planner reads, in place of AGENTS.md and CLAUDE.md.
+    instruction_files: Option<Vec<String>>,
+}
+
+/// A configuration with where each of its values comes from.
+#[derive(Debug)]
+pub struct Layered {
+    pub config: Config,
+    /// By dotted key (`tui.model`, `service.web`, `service.model.env`); a
+    /// key not here has its parent's origin, or `base`.
+    origins: BTreeMap<String, Origin>,
+    base: Origin,
+    /// Defaults left out because an environment variable sets them: key, variable, value.
+    pub env: Vec<(String, String, String)>,
+}
+
+impl Layered {
+    /// The file given with `--config`, with `profile` over its `[tui]`.
+    pub fn file(path: &Path, profile: Option<&str>) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        Config::parse(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let mut table: Table = toml::from_str(&text)?;
+        let mut origins = BTreeMap::new();
+        use_profile(&mut table, profile, &mut origins)?;
+        Ok(Self { config: into_config(&table)?, origins, base: Origin::File(path.to_path_buf()), env: Vec::new() })
+    }
+
+    /// `defaults` with the user's config, `profile`, the project config of
+    /// `workspace` and the environment over it; `var` reads the environment.
+    pub fn build(
+        defaults: &Config,
+        workspace: &Path,
+        profile: Option<&str>,
+        var: &dyn Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<Self> {
+        let mut table = to_table(defaults).context("the built-in config does not convert to TOML")?;
+        let mut origins = BTreeMap::new();
+        if let Some(path) = user_path(var) {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => merge_user(&mut table, &text, &path, &mut origins)
+                    .with_context(|| format!("in {}", path.display()))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            }
+        }
+        use_profile(&mut table, profile, &mut origins)?;
+        let path = workspace.join(PROJECT_FILE);
+        let mut env = Vec::new();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => merge_project(&mut table, &text, &path, &mut origins, var, &mut env)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+        env.extend(yield_to_env(&mut table, &mut origins, var));
+        let mut config = into_config(&table)?;
+        // A web service the user added is one the planner may call, as with --allow-web.
+        if let Some(origin) = origins.get(&format!("service.{WEB}")).cloned() {
+            let fetch: molt_proto::Target = molt_api::web::FETCH.parse()?;
+            if let Some(planner) =
+                config.service_mut("planner").filter(|p| !p.requests.iter().any(|r| r.target == fetch))
+            {
+                planner.requests.push(CapRequest { target: fetch, budget: Budget::new(0, 0, 1_000_000) });
+                origins.insert("service.planner.requests".into(), origin);
+            }
+        }
+        Ok(Self { config, origins, base: Origin::Default, env })
+    }
+
+    /// Where the value at the dotted `key` comes from.
+    pub fn origin(&self, key: &str) -> &Origin {
+        let mut key = key;
+        loop {
+            if let Some(origin) = self.origins.get(key) {
+                return origin;
+            }
+            match key.rfind('.') {
+                Some(dot) => key = &key[..dot],
+                None => return &self.base,
+            }
+        }
+    }
+
+    /// The configuration as TOML, or with `origins` one `key = value` line
+    /// per value with where it comes from. Secret-looking service variables
+    /// are redacted.
+    pub fn show(&self, origins: bool) -> anyhow::Result<String> {
+        let mut table = to_table(&self.config)?;
+        if let Some(Value::Array(services)) = table.get_mut("service") {
+            for env in services.iter_mut().filter_map(|s| s.get_mut("env")).filter_map(Value::as_table_mut) {
+                for (_, value) in env.iter_mut().filter(|(name, _)| secret_name(name)) {
+                    *value = Value::String("<redacted>".into());
+                }
+            }
+        }
+        let mut out = String::new();
+        if origins {
+            let mut lines = Vec::new();
+            flatten("", &Value::Table(table), &mut lines);
+            for (key, value) in lines {
+                out.push_str(&format!("{key} = {value}  # {}\n", self.origin(&key)));
+            }
+        } else {
+            out.push_str(&toml::to_string(&table)?);
+        }
+        for (key, name, value) in &self.env {
+            out.push_str(&format!("# {key} is left to the environment: {name}={value}\n"));
+        }
+        Ok(out)
+    }
+}
+
+/// The user's config file: under `$XDG_CONFIG_HOME` when it is absolute, else `~/.config`.
+pub fn user_path(var: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let config = var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| var("HOME").filter(|home| !home.is_empty()).map(|home| Path::new(&home).join(".config")))?;
+    Some(config.join(USER_FILE))
+}
+
+fn to_table(config: &Config) -> anyhow::Result<Table> {
+    Ok(toml::from_str(&toml::to_string(config)?)?)
+}
+
+fn into_config(table: &Table) -> anyhow::Result<Config> {
+    Config::parse(&toml::to_string(table)?)
+}
+
+fn merge_user(
+    table: &mut Table,
+    text: &str,
+    path: &Path,
+    origins: &mut BTreeMap<String, Origin>,
+) -> anyhow::Result<()> {
+    // Parsed whole first, for errors with their line and the same checks as a --config file.
+    Config::parse(text)?;
+    let user: Table = toml::from_str(text)?;
+    let origin = Origin::User(path.to_path_buf());
+    for (key, value) in user {
+        match (key.as_str(), value) {
+            ("kernel", _) => bail!(
+                "[kernel] is not read from the user config: each workspace has its own data dir; pass --data-dir, \
+                 or give a whole config with --config"
+            ),
+            ("service", Value::Array(services)) => {
+                for service in services {
+                    let Value::Table(service) = service else { bail!("each [[service]] must be a table") };
+                    merge_service(table, service, &origin, origins)?;
+                }
+            }
+            ("hooks", value) => {
+                table.insert(key.clone(), value);
+                origins.insert(key, origin.clone());
+            }
+            (_, Value::Table(value)) => merge_tables(table, &key, value, &origin, origins),
+            (_, value) => {
+                table.insert(key.clone(), value);
+                origins.insert(key, origin.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A service of the user's config replaces the keys it gives of the
+/// service with its name, or is added when there is none.
+fn merge_service(
+    table: &mut Table,
+    service: Table,
+    origin: &Origin,
+    origins: &mut BTreeMap<String, Origin>,
+) -> anyhow::Result<()> {
+    let name = service.get("name").and_then(Value::as_str).context("a [[service]] has no name")?.to_owned();
+    let services = table.entry("service").or_insert_with(|| Value::Array(Vec::new()));
+    let Value::Array(services) = services else { bail!("service is not a list") };
+    let existing = services.iter_mut().filter_map(Value::as_table_mut).find(|s| s.get("name") == service.get("name"));
+    match existing {
+        Some(existing) => {
+            for (key, value) in service.into_iter().filter(|(key, _)| key != "name") {
+                origins.insert(format!("service.{name}.{key}"), origin.clone());
+                existing.insert(key, value);
+            }
+        }
+        None => {
+            origins.insert(format!("service.{name}"), origin.clone());
+            services.push(Value::Table(service));
+        }
+    }
+    Ok(())
+}
+
+/// `value` into the table at `key` of `table`, key by key, nested tables too.
+fn merge_tables(table: &mut Table, key: &str, value: Table, origin: &Origin, origins: &mut BTreeMap<String, Origin>) {
+    match table.get_mut(key) {
+        Some(Value::Table(into)) => merge_into(into, key, value, origin, origins),
+        _ => {
+            let mut into = Table::new();
+            merge_into(&mut into, key, value, origin, origins);
+            table.insert(key.to_owned(), Value::Table(into));
+        }
+    }
+}
+
+fn merge_into(into: &mut Table, path: &str, value: Table, origin: &Origin, origins: &mut BTreeMap<String, Origin>) {
+    for (name, value) in value {
+        let key = format!("{path}.{name}");
+        match (into.get_mut(&name), value) {
+            (Some(Value::Table(inner)), Value::Table(value)) => merge_into(inner, &key, value, origin, origins),
+            (_, value) => {
+                into.insert(name, value);
+                origins.insert(key, origin.clone());
+            }
+        }
+    }
+}
+
+/// Set the `[tui]` defaults `profile` gives.
+fn use_profile(table: &mut Table, profile: Option<&str>, origins: &mut BTreeMap<String, Origin>) -> anyhow::Result<()> {
+    let Some(name) = profile else { return Ok(()) };
+    let profiles = table.get("profile").and_then(Value::as_table);
+    let Some(chosen) = profiles.and_then(|p| p.get(name)).and_then(Value::as_table).cloned() else {
+        let known: Vec<&str> = profiles.map(|p| p.keys().map(String::as_str).collect()).unwrap_or_default();
+        if known.is_empty() {
+            bail!("there is no profile {name:?}: no config defines one; add [profile.{name}] to ~/.config/molt/config.toml");
+        }
+        bail!("there is no profile {name:?}; the profiles are {}", known.join(", "));
+    };
+    let tui = table.entry("tui").or_insert_with(|| Value::Table(Table::new()));
+    let tui = tui.as_table_mut().context("tui is not a table")?;
+    for (key, value) in chosen {
+        origins.insert(format!("tui.{key}"), Origin::Profile(name.to_owned()));
+        tui.insert(key, value);
+    }
+    Ok(())
+}
+
+fn merge_project(
+    table: &mut Table,
+    text: &str,
+    path: &Path,
+    origins: &mut BTreeMap<String, Origin>,
+    var: &dyn Fn(&str) -> Option<String>,
+    env: &mut Vec<(String, String, String)>,
+) -> anyhow::Result<()> {
+    let raw: Table = toml::from_str(text).with_context(|| format!("parsing {}", path.display()))?;
+    if let Some(key) = NOT_DATA.iter().find(|key| raw.contains_key(**key)) {
+        bail!(
+            "{} defines `{key}`, which a project config may not: a project holds only data (check, ask_paths, \
+             instruction_files), since a service, hook or environment there would run programs or hand them your \
+             environment for whoever wrote the project. Put services, hooks, env and pass_env in your user config, \
+             ~/.config/molt/config.toml",
+            path.display()
+        );
+    }
+    let project: ProjectFile = toml::from_str(text).with_context(|| format!("parsing {}", path.display()))?;
+    let origin = Origin::Project(path.to_path_buf());
+    if let Some(check) = project.check {
+        anyhow::ensure!(
+            !check.trim().is_empty() && check.len() <= 16 * 1024,
+            "{}: check is empty or exceeds 16 KiB; leave it out to have one designed",
+            path.display()
+        );
+        let tui = table.entry("tui").or_insert_with(|| Value::Table(Table::new()));
+        tui.as_table_mut().context("tui is not a table")?.insert("check".into(), Value::String(check));
+        origins.insert("tui.check".into(), origin.clone());
+    }
+    if !project.ask_paths.is_empty() {
+        anyhow::ensure!(
+            project.ask_paths.iter().all(|p| !p.trim().is_empty()),
+            "{}: ask_paths has an empty path",
+            path.display()
+        );
+        let confirm = table.entry("confirm").or_insert_with(|| Value::Table(Table::new()));
+        let confirm = confirm.as_table_mut().context("confirm is not a table")?;
+        let paths = confirm.entry("ask_paths").or_insert_with(|| Value::Array(Vec::new()));
+        let paths = paths.as_array_mut().context("confirm.ask_paths is not a list")?;
+        for added in project.ask_paths {
+            let added = Value::String(added);
+            if !paths.contains(&added) {
+                paths.push(added);
+            }
+        }
+        origins.insert("confirm.ask_paths".into(), origin.clone());
+    }
+    if let Some(files) = project.instruction_files {
+        anyhow::ensure!(
+            files.iter().all(|f| !f.is_empty() && f != "." && f != ".." && !f.contains(['/', '\\', ','])),
+            "{}: instruction_files are file names in the workspace root, without directories or commas",
+            path.display()
+        );
+        let joined = if files.is_empty() { "none".to_owned() } else { files.join(",") };
+        if let Some(value) = var(INSTRUCTION_FILES) {
+            env.push((format!("service.planner.env.{INSTRUCTION_FILES}"), INSTRUCTION_FILES.into(), value));
+        } else if let Some(planner) = services_mut(table).and_then(|s| s.iter_mut().find(|s| is_named(s, "planner"))) {
+            let planner = planner.as_table_mut().context("the planner service is not a table")?;
+            let vars = planner.entry("env").or_insert_with(|| Value::Table(Table::new()));
+            vars.as_table_mut().context("planner env is not a table")?.insert(INSTRUCTION_FILES.into(), joined.into());
+            origins.insert(format!("service.planner.env.{INSTRUCTION_FILES}"), origin);
+        }
+    }
+    Ok(())
+}
+
+fn services_mut(table: &mut Table) -> Option<&mut Vec<Value>> {
+    table.get_mut("service").and_then(Value::as_array_mut)
+}
+
+fn is_named(service: &Value, name: &str) -> bool {
+    service.get("name").and_then(Value::as_str) == Some(name)
+}
+
+/// Leave out each default of [`ENV_OVER`] whose variable is set, so the
+/// variable decides.
+fn yield_to_env(
+    table: &mut Table,
+    origins: &mut BTreeMap<String, Origin>,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String, String)> {
+    let Some(tui) = table.get_mut("tui").and_then(Value::as_table_mut) else { return Vec::new() };
+    let mut out = Vec::new();
+    for (key, names) in ENV_OVER {
+        if !tui.contains_key(*key) {
+            continue;
+        }
+        let set = names.iter().find_map(|name| var(name).filter(|v| !v.trim().is_empty()).map(|v| (*name, v)));
+        if let Some((name, value)) = set {
+            tui.remove(*key);
+            origins.insert(format!("tui.{key}"), Origin::Env(name.to_owned()));
+            out.push((format!("tui.{key}"), name.to_owned(), value));
+        }
+    }
+    out
+}
+
+/// `key = value` lines for each value under `value`; services by name.
+fn flatten(prefix: &str, value: &Value, out: &mut Vec<(String, String)>) {
+    let join = |key: &str| if prefix.is_empty() { key.to_owned() } else { format!("{prefix}.{key}") };
+    match value {
+        Value::Table(table) if !table.is_empty() => {
+            for (key, value) in table {
+                flatten(&join(key), value, out);
+            }
+        }
+        Value::Array(services) if prefix == "service" => {
+            for service in services {
+                let name = service.get("name").and_then(Value::as_str).unwrap_or("?");
+                let service = service.as_table().into_iter().flatten().filter(|(key, _)| *key != "name");
+                for (key, value) in service {
+                    flatten(&format!("service.{name}.{key}"), value, out);
+                }
+            }
+        }
+        value => out.push((prefix.to_owned(), value.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use molt_proto::Tier;
+
+    struct Home {
+        dir: tempfile::TempDir,
+        workspace: PathBuf,
+    }
+
+    impl Home {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().join("project");
+            std::fs::create_dir_all(workspace.join(".molt")).unwrap();
+            std::fs::create_dir_all(dir.path().join("config/molt")).unwrap();
+            Self { dir, workspace }
+        }
+
+        fn user(&self, text: &str) -> &Self {
+            std::fs::write(self.dir.path().join("config").join(USER_FILE), text).unwrap();
+            self
+        }
+
+        fn project(&self, text: &str) -> &Self {
+            std::fs::write(self.workspace.join(PROJECT_FILE), text).unwrap();
+            self
+        }
+
+        fn build_with(&self, profile: Option<&str>, env: &[(&str, &str)]) -> anyhow::Result<Layered> {
+            let config_home = self.dir.path().join("config").to_str().unwrap().to_owned();
+            let env: Vec<(String, String)> = env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+            let var = move |name: &str| match name {
+                "XDG_CONFIG_HOME" => Some(config_home.clone()),
+                _ => env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()),
+            };
+            let defaults = Config::agent(&self.workspace, Path::new("/data"), Path::new("/bin")).unwrap();
+            Layered::build(&defaults, &self.workspace, profile, &var)
+        }
+
+        fn build(&self, profile: Option<&str>) -> anyhow::Result<Layered> {
+            self.build_with(profile, &[])
+        }
+    }
+
+    #[test]
+    fn a_web_service_in_the_user_config_is_added_to_the_default_services() {
+        let home = Home::new();
+        home.user(
+            "[[service]]\nname = \"web\"\ntier = \"protected\"\nprovides = [\"web.*\"]\n\
+             exec = { command = \"molt-web\", args = [\"--allow\", \"docs.rs\"] }\n",
+        );
+        let layered = home.build(None).unwrap();
+        let names: Vec<&str> = layered.config.services.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["model", "fs", "shell", "memory", "planner", "web"]);
+        assert_eq!(layered.config.service("web").unwrap().tier, Tier::Protected);
+        let planner = layered.config.service("planner").unwrap();
+        assert!(
+            planner.requests.iter().any(|r| r.target.to_string() == molt_api::web::FETCH),
+            "the planner may call it"
+        );
+        assert!(matches!(layered.origin("service.web.exec"), Origin::User(_)));
+        assert_eq!(layered.origin("service.fs.exec"), &Origin::Default);
+    }
+
+    #[test]
+    fn a_user_service_with_a_default_name_changes_only_what_it_gives() {
+        let home = Home::new();
+        home.user("[[service]]\nname = \"model\"\nenv = { MOLT_MODEL = \"opus\" }\n\n[confirm]\nmax_lines = 50\n");
+        let layered = home.build(None).unwrap();
+        let model = layered.config.service("model").unwrap();
+        assert_eq!(model.env["MOLT_MODEL"], "opus");
+        assert_eq!(model.tier, Tier::Protected);
+        assert!(model.exec.as_ref().unwrap().command.ends_with("molt-gateway"));
+        assert_eq!(layered.config.services.len(), 5);
+        assert_eq!((layered.config.confirm.max_lines, layered.config.confirm.max_files), (50, 10));
+        assert!(matches!(layered.origin("service.model.env.MOLT_MODEL"), Origin::User(_)));
+        assert_eq!(layered.origin("service.model.exec"), &Origin::Default);
+        assert!(matches!(layered.origin("confirm.max_lines"), Origin::User(_)));
+        assert_eq!(layered.origin("confirm.max_files"), &Origin::Default);
+    }
+
+    #[test]
+    fn show_with_origins_names_where_each_value_comes_from_and_redacts_secrets() {
+        let home = Home::new();
+        home.user(
+            "[tui]\nattempts = 3\n\n[[service]]\nname = \"model\"\nenv = { ANTHROPIC_API_KEY = \"sk-very-secret\" }\n",
+        )
+        .project("check = \"cargo test\"\n");
+        let text = home.build(None).unwrap().show(true).unwrap();
+        let line = |key: &str| {
+            text.lines().find(|l| l.starts_with(&format!("{key} = "))).unwrap_or_else(|| panic!("no {key} in\n{text}"))
+        };
+        assert!(line("tui.attempts")
+            .ends_with(&format!("# user config {}", home.dir.path().join("config/molt/config.toml").display())));
+        assert!(line("tui.check").contains("\"cargo test\"  # project config"));
+        assert!(line("service.fs.tier").ends_with("# built-in default"));
+        assert!(line("kernel.data_dir").ends_with("# built-in default"));
+        assert!(line("service.model.env.ANTHROPIC_API_KEY").contains("<redacted>"));
+        assert!(!text.contains("sk-very-secret"));
+        for line in text.lines() {
+            assert!(line.contains("  # "), "every value has an origin: {line}");
+        }
+        let plain = home.build(None).unwrap().show(false).unwrap();
+        assert!(Config::parse(&plain).is_ok(), "without origins it is a config:\n{plain}");
+        assert!(!plain.contains("sk-very-secret"));
+    }
+
+    #[test]
+    fn a_project_config_with_services_hooks_or_environment_is_refused_with_why() {
+        let home = Home::new();
+        for text in [
+            "[[service]]\nname = \"evil\"\nexec = { command = \"sh\" }\n",
+            "[[hooks]]\nevent = \"before_apply\"\ncommand = \"curl evil\"\n",
+            "env = { A = \"1\" }\n",
+            "pass_env = [\"ANTHROPIC_API_KEY\"]\n",
+        ] {
+            home.project(text);
+            let err = format!("{:#}", home.build(None).unwrap_err());
+            assert!(err.contains("a project config may not") && err.contains("user config"), "{err}");
+        }
+        for text in ["[tui]\nmodel = \"opus\"\n", "[kernel]\nfsync = false\n", "instruction_files = [\"../x\"]\n"] {
+            home.project(text);
+            assert!(home.build(None).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_project_config_sets_its_data_over_the_user_config() {
+        let home = Home::new();
+        home.user("[tui]\ncheck = \"make test\"\n\n[confirm]\nask_paths = [\"db/\"]\n");
+        home.project("check = \"cargo test\"\nask_paths = [\"schema/\", \"db/\"]\ninstruction_files = [\"AGENTS.md\", \"NOTES.md\"]\n");
+        let layered = home.build(None).unwrap();
+        assert_eq!(layered.config.tui.check.as_deref(), Some("cargo test"));
+        assert_eq!(layered.config.confirm.ask_paths, ["db/", "schema/"]);
+        assert_eq!(layered.config.service("planner").unwrap().env[INSTRUCTION_FILES], "AGENTS.md,NOTES.md");
+        // The environment still decides.
+        let layered = home.build_with(None, &[(INSTRUCTION_FILES, "README.md")]).unwrap();
+        assert!(!layered.config.service("planner").unwrap().env.contains_key(INSTRUCTION_FILES));
+    }
+
+    #[test]
+    fn switching_profile_changes_the_model_attempts_and_budget() {
+        let home = Home::new();
+        home.user(
+            "[tui]\nmodel = \"sonnet\"\nattempts = 2\n\n\
+             [profile.cheap]\nmodel = \"haiku\"\nattempts = 1\nbudget = 0.5\n\n\
+             [profile.thorough]\nmodel = \"opus\"\nattempts = 4\nbudget = 10.0\neffort = \"high\"\n",
+        );
+        let tui = |profile| home.build(profile).unwrap().config.tui;
+        let base = tui(None);
+        assert_eq!((base.model.as_deref(), base.attempts, base.budget), (Some("sonnet"), Some(2), None));
+        let cheap = tui(Some("cheap"));
+        assert_eq!((cheap.model.as_deref(), cheap.attempts, cheap.budget), (Some("haiku"), Some(1), Some(0.5)));
+        let thorough = tui(Some("thorough"));
+        assert_eq!(
+            (thorough.model.as_deref(), thorough.attempts, thorough.budget),
+            (Some("opus"), Some(4), Some(10.0))
+        );
+        assert_eq!(home.build(Some("cheap")).unwrap().origin("tui.model"), &Origin::Profile("cheap".into()));
+        let err = home.build(Some("nope")).unwrap_err().to_string();
+        assert!(err.contains("cheap, thorough"), "{err}");
+        home.user("[profile.bad]\nattempts = 0\n");
+        assert!(home.build(None).is_err(), "profiles are checked like [tui]");
+    }
+
+    #[test]
+    fn an_environment_variable_overrides_a_configured_default() {
+        let home = Home::new();
+        home.user("[tui]\nmodel = \"sonnet\"\nattempts = 3\n");
+        let layered = home.build_with(None, &[("MOLT_MODEL", "haiku")]).unwrap();
+        assert_eq!(layered.config.tui.model, None, "the services read MOLT_MODEL");
+        assert_eq!(layered.config.tui.attempts, Some(3));
+        assert_eq!(layered.origin("tui.model"), &Origin::Env("MOLT_MODEL".into()));
+        assert!(layered.show(true).unwrap().contains("tui.model is left to the environment: MOLT_MODEL=haiku"));
+    }
+
+    #[test]
+    fn the_user_config_is_checked_like_a_config_file_and_keeps_kernel_settings_out() {
+        let home = Home::new();
+        home.user("[tui]\nattemps = 3\n");
+        assert!(format!("{:#}", home.build(None).unwrap_err()).contains("attemps"));
+        home.user("[kernel]\ndata_dir = \"/shared\"\n");
+        assert!(format!("{:#}", home.build(None).unwrap_err()).contains("[kernel]"));
+        home.user("");
+        assert_eq!(home.build(None).unwrap().config.services.len(), 5);
+    }
+
+    #[test]
+    fn a_config_file_takes_a_profile_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("molt.toml");
+        std::fs::write(&path, "[tui]\nattempts = 2\n\n[profile.fast]\nattempts = 1\n").unwrap();
+        assert_eq!(Layered::file(&path, None).unwrap().config.tui.attempts, Some(2));
+        let fast = Layered::file(&path, Some("fast")).unwrap();
+        assert_eq!(fast.config.tui.attempts, Some(1));
+        assert_eq!(fast.origin("tui.attempts"), &Origin::Profile("fast".into()));
+        assert_eq!(fast.origin("tui.mode"), &Origin::File(path.clone()));
+    }
+}

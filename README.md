@@ -90,6 +90,7 @@ sender from that.
 | Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
 | Commands build into a private writable directory outside the fork, and a result never carries the build artifacts commands leave in the fork: they are reported and not applied | `crates/molt/tests/agent.rs` (`build_output_of_the_check_is_left_out_of_the_result_and_the_workspace`), `crates/molt-tools/tests/fs.rs` (`build_artifacts_that_commands_leave_in_a_fork_are_reported_and_never_merged`), `crates/molt-tools/tests/sandbox.rs` (`build_output_goes_to_a_private_writable_directory_outside_the_fork_that_later_commands_reuse`) |
 | A request names a workflow and never defines one: only the planner's built-ins and its own configuration define workflows, and every result says what it was verified by (`command`, `judged`, `rules` or `none`) in the reply, `--json` and a `Molt-Verification` commit trailer | `crates/molt-planner/tests/planner.rs` (`a_request_can_name_a_workflow_but_only_one_the_planner_has`, `every_result_carries_its_verification_level`), `crates/molt/tests/agent.rs` (`the_verification_level_is_in_the_json_and_the_commit_trailers`) |
+| A project's `.molt/config.toml` holds only data: one with services, hooks, `env` or `pass_env` is refused with why | `layers::tests::a_project_config_with_services_hooks_or_environment_is_refused_with_why` |
 | A question (`ask`) makes no fork, designs no check and can change no file; `quick` runs exactly one attempt and designs nothing; the workflow `auto` picks is said before anything runs, never lighter than a given check allows, and the full one when the pick fails | `crates/molt-planner/tests/planner.rs` (`a_question_is_answered_in_the_workspace_without_a_fork_a_design_or_a_change`, `quick_runs_exactly_one_attempt_without_designing_and_reviews_by_the_fixed_rules`, `auto_picks_a_light_workflow_says_so_first_and_runs_it`, `with_a_check_auto_never_picks_ask_and_a_failed_pick_is_the_full_workflow`) |
 | Offline embedding models are hash-pinned and cannot reintroduce forgotten or cross-project notes | `semantic::tests::pinned_models_retrieve_synonyms_and_reject_changed_files`, `semantic::tests::synonyms_are_recalled_with_scores_and_snapshots_survive_forgetting` |
 
@@ -274,7 +275,8 @@ mode label stays yellow. A malformed or unsupported saved file is ignored with a
 single-line notice. Files use mode 0600 in the same private workspace state directory
 as history; values containing known credentials or common key patterns are not saved.
 
-The config passed with `--config` can set defaults, for example:
+The user config (see [Configuration layers](#configuration-layers)), or the
+config passed with `--config`, can set defaults, for example:
 
 ```toml
 [tui]
@@ -286,9 +288,8 @@ model = "sonnet"
 ```
 
 Commands entered this session override saved values, which override these config
-values, which override built-in defaults. Project command templates still affect
-only their own task and do not overwrite saved preferences. Changing defaults does not rewrite a run request already submitted for a task. Configuration
-files are still loaded only when explicitly selected.
+values (and a `--profile`'s), which override built-in defaults. Project command templates still affect
+only their own task and do not overwrite saved preferences. Changing defaults does not rewrite a run request already submitted for a task.
 
 If service startup fails transiently, the interface retries up to three times,
 after approximately 2, 5 and 15 seconds, and shows the countdown. Recognized
@@ -695,13 +696,67 @@ the review findings and names the kept fork for inspection.
 
 ### Config and secrets
 
-`molt do` reads a config file only when `--config` names one; it never picks
-up a `molt.toml` on its own, since one shipped in a project could run any
-command with your secrets. Without one it starts the default setup: the
+`molt do` reads a whole config file only when `--config` names one; it never
+picks up a `molt.toml` on its own, since one shipped in a project could run any
+command with your secrets. Without one it starts the default setup, with your
+user config and the project's data config over it (below): the
 gateway, `fs` and `shell` confined to the workspace with forks in
 `<data dir>/work`, memory with its database in `<data dir>/memory.db`, and
 the planner, using the service binaries installed next to `molt`. Data dirs that molt creates are private (0700), and it warns about
 an existing one that others can read.
+
+### Configuration layers
+
+Without `--config`, each layer goes over the ones before it:
+
+1. the built-in setup above;
+2. your user config, `~/.config/molt/config.toml` (`$XDG_CONFIG_HOME/molt/config.toml`
+   when that is set): trusted, so it may add services, change them, add
+   hooks, set `[tui]` and `[confirm]` defaults and define profiles. A
+   `[[service]]` with the name of a built-in one replaces the keys it gives
+   and keeps the rest; one with a new name is added. `[kernel]` is refused
+   there, since each workspace has its own data dir;
+3. the profile `--profile NAME` picks: a `[profile.NAME]` table with the keys
+   of `[tui]`, over them;
+4. the project's `.molt/config.toml` in the workspace, which may hold only data:
+   `check` (the default done-check), `ask_paths` (added to the paths confirm
+   mode stops for) and `instruction_files` (in place of `AGENTS.md` and
+   `CLAUDE.md`). A project config with `[[service]]`, `hooks`, `env` or
+   `pass_env` is refused with the reason, since whoever wrote the project
+   would choose what runs with your environment;
+5. environment variables: `MOLT_PLANNER_MODEL` or `MOLT_MODEL` over `model`,
+   `MOLT_EFFORT` over `effort`, `MOLT_BUDGET_USD` over `budget`,
+   `MOLT_MEMORY_MODEL` over `memory_model`, and `MOLT_INSTRUCTION_FILES` over
+   `instruction_files`;
+6. the command line, then the interface's saved settings and what you set in
+   the session.
+
+```toml
+# ~/.config/molt/config.toml
+[tui]
+model = "sonnet"
+attempts = 2
+
+[profile.cheap]
+model = "haiku"
+attempts = 1
+budget = 0.5
+
+# Added to the default services; the planner may call it, as with --allow-web.
+[[service]]
+name = "web"
+tier = "protected"
+provides = ["web.*"]
+exec = { command = "molt-web", args = ["--allow", "docs.rs"] }
+```
+
+`model`, `effort`, `attempts`, `budget` and `check` of `[tui]` are `molt do`'s
+defaults too where its flag is not given (`molt ask` takes `model`, `effort`
+and `budget`). `molt config show` prints the configuration in effect, and
+`--origin` prints one `key = value` line per value with the layer it comes
+from; secret-looking variables are redacted. With `--config FILE`, that file
+is the whole configuration, as before, and `--profile` picks one of its own
+`[profile.*]` tables.
 
 Services start with a scrubbed environment: `PATH`, `HOME`, the locale and a
 few more, plus what each is configured to receive. `ANTHROPIC_API_KEY` and
@@ -811,9 +866,10 @@ modes, run them as benchmark arms, such as
 
 ## Trusted lifecycle hooks
 
-An explicitly selected `--config /outside/project/molt.toml` may contain
-`[[hooks]]` entries. Files inside the workspace never supply hooks, even with
-`--config`; no project file is discovered automatically.
+An explicitly selected `--config /outside/project/molt.toml`, or the user
+config, may contain `[[hooks]]` entries. Files inside the workspace never
+supply hooks, even with `--config`, and a project's `.molt/config.toml` with
+hooks is refused.
 
 ```toml
 [[hooks]]
@@ -1270,6 +1326,7 @@ needed. Deleting an unfinished record loses its recovery material.
 
 - The default shell requires Linux x86_64 with bubblewrap 0.9+ and usable user namespaces. Unsupported hosts must explicitly choose --no-sandbox; namespace policy never silently falls back.
 - Model text streams with `--stream` in `molt do` and by default in the TUI (`/stream off` disables it); thinking is not shown and tool calls wait for the complete message. Preview delivery is best effort, and the final reply remains complete.
+- A project's `.molt/config.toml` takes `check`, `ask_paths` and `instruction_files` only: no project `suite` or command directory yet (commands stay in `.molt/commands`). The file is part of the workspace, so a result can change it like any file; confirm mode does not stop for it unless `ask_paths` names `.molt/`. Configs are re-read only when the interface starts.
 - The audit log records every message, file contents and model conversations included, and is never rotated; it grows with every run in a data dir.
 - Audit startup, verification and nonempty tail reads still scan the whole log, but memory is bounded by one record plus the requested tail. A record is limited to 16 MiB including its newline; oversized, malformed or unterminated records are refused, including on restart. The writer stops before persisting an oversized entry. `tail -n 0` opens the file without scanning; `read_all` intentionally retains every returned entry. Tail validates record syntax throughout the file, but only verification and startup check the hash chain.
 - Reading one trace back from the audit log scans the log from the start: there is no index yet. One read looks through at most 256 MiB and keeps to its deadline, and two run at once.
