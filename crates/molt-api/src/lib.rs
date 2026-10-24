@@ -9,7 +9,7 @@
 //! | `fs`      | `read write edit list search fork diff merge drop` | [`fs`] |
 //! | `shell`   | `run`                                      | [`shell`]     |
 //! | `memory`  | `remember recall forget retract consolidate index map symbols review correct` | [`memory`] |
-//! | `planner` | `run`                                      | [`planner`]   |
+//! | `planner` | `run design control`, `plan`               | [`planner`], [`plan`] |
 //! | `web`     | `fetch`                                    | [`web`]       |
 //!
 //! The planner also publishes [`progress::Progress`] events on
@@ -20,6 +20,7 @@ pub mod agent_skills;
 pub mod fs;
 pub mod memory;
 pub mod model;
+pub mod plan;
 pub mod planner;
 pub mod progress;
 pub mod role;

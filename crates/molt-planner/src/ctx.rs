@@ -144,6 +144,10 @@ pub(crate) struct Ctx {
     pub workflow: Arc<Workflow>,
     /// The task before this one that the run goes on from.
     pub continues: Option<Arc<molt_api::planner::Continuation>>,
+    /// Where the run's forks are made from, and so where its result is
+    /// merged: a step of a plan works on the result of the steps before it
+    /// (see [`crate::plan`]). `None`: the workspace.
+    pub base: Option<String>,
     /// Each role that has made a model call and its prompt, in the order
     /// they first did.
     spoke: Arc<Mutex<Vec<PromptUse>>>,
@@ -293,6 +297,7 @@ impl Ctx {
             earlier: crate::prompts::earlier_tasks(&req.earlier),
             workflow: Arc::new(workflow),
             continues: req.continues.clone().map(Arc::new),
+            base: None,
             spoke: Arc::default(),
         }
     }
@@ -516,7 +521,7 @@ impl Ctx {
     }
 
     pub async fn fork(&self) -> Result<String, RemoteError> {
-        self.fork_from(&self.workspace).await
+        self.fork_from(self.base.as_deref().unwrap_or(&self.workspace)).await
     }
 
     /// Copy a candidate for checks that can write build artifacts or alter files.

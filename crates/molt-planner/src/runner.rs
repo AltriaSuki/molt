@@ -46,6 +46,19 @@ pub(crate) async fn run_cancellable(
     if let Some(resume) = req.resume.clone() {
         return resume_run(bus, cfg, req, resume, trace, cancel).await;
     }
+    run_on(bus, cfg, req, trace, cancel, None).await
+}
+
+/// A new run whose forks are made from `base` rather than the workspace,
+/// so that its result is merged there: a step of a plan ([`crate::plan`]).
+pub(crate) async fn run_on(
+    bus: Arc<dyn Bus>,
+    cfg: Arc<Config>,
+    req: RunRequest,
+    trace: TraceId,
+    cancel: CancellationToken,
+    base: Option<String>,
+) -> Result<RunResponse, RemoteError> {
     let mut req = req;
     let routes = routes(&req, &cfg)?;
     let mut state = match (req.checkpoint, &cfg.state_dir) {
@@ -56,6 +69,7 @@ pub(crate) async fn run_cancellable(
     let mut ctx = Ctx::new(bus, cfg, trace, &req);
     ctx.cancel = cancel.clone();
     ctx.run_cancel = cancel;
+    ctx.base = base;
     // What the hooks leave is the task, a checkpoint's too: a resume does not ask them again.
     ctx.task = crate::hooks::submit(&ctx).await.map_err(refused)?;
     req.task = ctx.task.clone();
@@ -334,7 +348,7 @@ pub(crate) fn workflow(cfg: &Config, name: Option<&str>) -> Result<Workflow, Str
 
 /// The context stage: what the model is given besides the task. A workflow
 /// without it gives the model the task, the earlier tasks and the tools only.
-async fn gather_context(ctx: &mut Ctx) {
+pub(crate) async fn gather_context(ctx: &mut Ctx) {
     if ctx.workflow.stages.context.is_none() {
         return;
     }
@@ -634,7 +648,7 @@ fn inside(path: &str) -> bool {
 }
 
 /// Whether the planner can carry out `req`, with `cfg`'s default budget for one that sets none.
-fn validate(req: &RunRequest, cfg: &Config) -> Result<(), RemoteError> {
+pub(crate) fn validate(req: &RunRequest, cfg: &Config) -> Result<(), RemoteError> {
     let budget = req.budget_usd.unwrap_or(cfg.budget_usd);
     let flow = workflow(cfg, req.workflow.as_deref()).map_err(invalid)?;
     let kept = req.continues.as_ref().and_then(|c| c.fork.as_deref());
