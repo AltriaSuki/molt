@@ -29,7 +29,11 @@ pub(super) fn ctrl_key(c: char) -> Msg {
 }
 
 pub(super) fn up(app: &mut App) {
-    app.update(Msg::SessionUp { versions: vec![("planner".into(), "ab12cd34".into())], memory_problem: None });
+    app.update(Msg::SessionUp {
+        versions: vec![("planner".into(), "ab12cd34".into())],
+        memory_problem: None,
+        default_model: None,
+    });
 }
 
 pub(super) fn type_in(app: &mut App, text: &str) -> Vec<Action> {
@@ -46,7 +50,11 @@ pub(super) fn frame_text(app: &mut App) -> String {
 }
 
 pub(super) fn frame_rows(app: &mut App, width: u16) -> Vec<String> {
-    let backend = ratatui::backend::TestBackend::new(width, 40);
+    frame_rows_sized(app, width, 40)
+}
+
+pub(super) fn frame_rows_sized(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    let backend = ratatui::backend::TestBackend::new(width, height);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal.draw(|frame| crate::tui::view::draw(frame, app)).unwrap();
     let cells: Vec<String> = terminal.backend().buffer().content.iter().map(|c| c.symbol().to_owned()).collect();
@@ -66,7 +74,7 @@ pub(super) fn model_context(app: &App, attempt: Option<u32>, seq: u64) -> molt_a
 
 pub(super) fn queue_app() -> App {
     let mut app = App::new("/work/project", None);
-    app.update(Msg::SessionUp { versions: vec![], memory_problem: Some("not configured".into()) });
+    app.update(Msg::SessionUp { versions: vec![], memory_problem: Some("not configured".into()), default_model: None });
     app.mode = Mode::Plan;
     app.settings.check = Some("true".into());
     app

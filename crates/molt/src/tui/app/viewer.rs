@@ -177,11 +177,9 @@ impl App {
             pairs.extend([("ctrl+o", "open transcript"), ("pgup / pgdn", "scroll log")]);
         }
         pairs.extend([("ctrl+l", "redraw screen"), ("ctrl+z", "suspend interface"), ("ctrl+d twice", "quit")]);
-        let mut lines = vec![Line::from(span(context, Tone::Dim))];
-        lines.extend(pairs.into_iter().map(|(key, description)| {
-            Line::from(vec![span(format!("  {key:<24}"), Tone::Shell), span(description, Tone::Plain)])
-        }));
-        lines
+        let mut items = vec![super::command::Help::Head(context)];
+        items.extend(pairs.into_iter().map(|(key, what)| super::command::Help::Row(key.to_owned(), what.to_owned())));
+        super::command::help_lines(&items)
     }
 
     /// The transcript of the running task, or else of the last one; of the

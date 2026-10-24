@@ -179,4 +179,49 @@ mod tests {
         // A signal still quits at once.
         assert_eq!(app.update(Msg::Signal), [Action::Quit { keep: vec![] }]);
     }
+
+    #[test]
+    fn the_status_bar_names_the_resolved_default_model_and_its_sides_never_overlap_at_80_columns() {
+        let mut app = App::new("/work/project", None);
+        app.update(Msg::SessionUp { versions: vec![], memory_problem: None, default_model: Some("grok-4.5".into()) });
+        let status = |app: &mut App| frame_rows_sized(app, 80, 24).pop().unwrap();
+        assert!(status(&mut app).contains("grok-4.5 · $0.00"), "{}", status(&mut app));
+        assert!(!status(&mut app).contains("default model"));
+        // A model the user picked is named instead.
+        app.settings.model = Some("haiku".into());
+        assert!(status(&mut app).contains("haiku · $0.00") && !status(&mut app).contains("grok"));
+
+        // Both sides long: the left is cut where the right begins, a space between them.
+        app.settings.check = Some("grep -q '/// Split' src/lib.rs && cargo test --doc".into());
+        app.settings.attempts = Some(3);
+        app.settings.budget_usd = Some(2.0);
+        app.learning.insert("trace_learn".into());
+        app.earlier.push(Earlier {
+            task: "fix parser".into(),
+            outcome: Outcome::Passed,
+            summary: "Parsed.".into(),
+            changes: vec![],
+            applied: true,
+        });
+        let row = status(&mut app);
+        let right = row.find(['◐', '◓', '◑', '◒']).expect("the right side is shown");
+        assert!(row.trim_end().ends_with("learning  1 earlier task · /new") && !row.contains("/help"), "{row}");
+        let left = row[..right].trim_end();
+        assert!(row[..right].ends_with(' ') && left.ends_with('…'), "{row}");
+        let cut = left.trim_end_matches('…');
+        let full = " confirm (shift+tab)  haiku · 3 attempts · check: grep -q '/// Split' src/l… · $0.00 · $2.00/task";
+        assert!(full.starts_with(cut) && cut.len() > 20, "{row}");
+
+        // A long warning takes no more than half the bar when the left needs the room.
+        app.flash = Some("the gateway is retrying a call after a 529 overloaded reply; /log shows more".into());
+        let row = status(&mut app);
+        assert_eq!(row.chars().count(), 80);
+        let warning = row.find("the gateway").expect("the warning starts in view");
+        assert!(row[..warning].ends_with(' ') && row[..warning].trim_end().ends_with('…'), "{row}");
+        assert!(row.trim_end().ends_with('…') && row[warning..].chars().count() <= 40, "{row}");
+        // And all of the bar when the left leaves it.
+        app.settings = Settings::default();
+        app.flash = Some("ctrl+d again to quit".into());
+        assert!(status(&mut app).ends_with(" ctrl+d again to quit "), "{}", status(&mut app));
+    }
 }

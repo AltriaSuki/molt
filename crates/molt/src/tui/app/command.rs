@@ -316,8 +316,12 @@ impl App {
                         self.flash = Some("project command produced an empty task".into());
                         return Vec::new();
                     }
+                    let from_template = saved.check.is_none() && template.check.is_some();
                     let mut actions = self.submit_task(expanded);
                     self.settings = saved;
+                    if let Some(task) = self.task.as_mut().filter(|_| from_template) {
+                        task.check_from = Some(name.to_owned());
+                    }
                     // A repository-supplied check needs a look before any attempt runs.
                     if self.mode == Mode::Confirm {
                         if let Some(task) = &mut self.task {
@@ -352,27 +356,69 @@ impl App {
     }
 
     fn help(&self) -> Vec<Line<'static>> {
-        let mut lines = help();
+        let mut items = help_items();
         if !self.commands.is_empty() {
-            lines.push(Line::from(span("project commands", Tone::Dim)));
+            items.push(Help::Head("project commands"));
             for (name, c) in &self.commands {
-                lines.push(Line::from(vec![
-                    span(format!("  /{name} {}  ", clean_line(&c.hint)), Tone::Shell),
-                    span(clean_line(&c.description), Tone::Plain),
-                ]));
+                let label = match clean_line(&c.hint) {
+                    hint if hint.trim().is_empty() => format!("/{name}"),
+                    hint => format!("/{name} {hint}"),
+                };
+                items.push(Help::Row(label, clean_line(&c.description)));
             }
         }
-        lines
+        help_lines(&items)
     }
 }
 
-pub(super) fn help() -> Vec<Line<'static>> {
-    let row = |keys: &str, what: &str| {
-        Line::from(vec![span(format!("  {keys:<24} "), Tone::Shell), span(what.to_owned(), Tone::Plain)])
-    };
-    let head = |t: &str| Line::from(span(t.to_owned(), Tone::Dim));
-    let mut lines = vec![
-        head("tasks"),
+/// The widest the key column of `/help` and the shortcuts gets; a longer
+/// key or command has a line of its own, its description under the column.
+const KEY_COLUMN: usize = 24;
+
+/// A line of `/help`.
+pub(super) enum Help {
+    Head(&'static str),
+    Row(String, String),
+    Blank,
+}
+
+/// Keys or commands and what they do, the descriptions lined up in a column
+/// as wide as the longest key that fits [`KEY_COLUMN`], at least a space
+/// after every key.
+pub(super) fn help_lines(items: &[Help]) -> Vec<Line<'static>> {
+    let column = items
+        .iter()
+        .filter_map(|item| match item {
+            Help::Row(key, _) => Some(text::width(key)),
+            _ => None,
+        })
+        .filter(|&w| w <= KEY_COLUMN)
+        .max()
+        .unwrap_or(0);
+    let mut lines = Vec::new();
+    for item in items {
+        match item {
+            Help::Head(head) => lines.push(Line::from(span(*head, Tone::Dim))),
+            Help::Blank => lines.push(Line::default()),
+            Help::Row(key, what) if text::width(key) <= column => {
+                let pad = " ".repeat(column - text::width(key) + 1);
+                lines
+                    .push(Line::from(vec![span(format!("  {key}{pad}"), Tone::Shell), span(what.clone(), Tone::Plain)]))
+            }
+            Help::Row(key, what) => {
+                lines.push(Line::from(span(format!("  {key}"), Tone::Shell)));
+                lines
+                    .push(Line::from(vec![span(" ".repeat(column + 3), Tone::Plain), span(what.clone(), Tone::Plain)]));
+            }
+        }
+    }
+    lines
+}
+
+fn help_items() -> Vec<Help> {
+    let row = |keys: &str, what: &str| Help::Row(keys.to_owned(), what.to_owned());
+    let mut items = vec![
+        Help::Head("tasks"),
         row("enter", "run the task in the input"),
         row("shift+tab", "mode: plan only, confirm, auto"),
         row("tab", "complete a picked suggestion; otherwise show one attempt large"),
@@ -391,18 +437,23 @@ pub(super) fn help() -> Vec<Line<'static>> {
         row("ctrl+r", "search input history; again: older match; Enter runs; Tab/Esc edits; Ctrl+C cancels"),
         row("↑ / ↓", "the line above or below, then earlier inputs"),
         row("ctrl+d twice", "quit"),
-        Line::default(),
-        head("commands"),
+        Help::Blank,
+        Help::Head("commands"),
     ];
-    lines.extend(crate::tui::commands::BUILTINS.iter().map(|c| row(&c.label(), c.description)));
-    lines.extend([
-        Line::default(),
-        head("modes"),
+    items.extend(crate::tui::commands::BUILTINS.iter().map(|c| row(&c.label(), c.description)));
+    items.extend([
+        Help::Blank,
+        Help::Head("modes"),
         row("plan only", "results stay in their forks; the workspace is not changed"),
         row("confirm", "stop for the check or the result when one needs a look"),
         row("auto", "design the check and apply what passes"),
     ]);
-    lines
+    items
+}
+
+#[cfg(test)]
+pub(super) fn help() -> Vec<Line<'static>> {
+    help_lines(&help_items())
 }
 
 #[cfg(test)]
@@ -526,5 +577,98 @@ mod tests {
         assert!(matches!(type_in(&mut app, "another").as_slice(), [Action::Control { .. }]));
         assert!(app.input.text.is_empty());
         assert_eq!(type_in(&mut app, "/quit"), [Action::Quit { keep: vec![] }]);
+    }
+
+    #[test]
+    fn every_help_line_at_80_columns_leaves_a_space_between_command_and_description() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.commands.insert(
+            "release-notes-for-the-next-version".into(),
+            crate::tui::commands::Command {
+                hint: "[VERSION]".into(),
+                description: "draft the release notes".into(),
+                template: "notes".into(),
+                ..Default::default()
+            },
+        );
+        type_in(&mut app, "/help");
+        let rows = frame_rows_sized(&mut app, 80, 200);
+        let rows_of = |label: &str, what: &str| {
+            let at = rows.iter().position(|r| r.contains(&format!("  {label} "))).unwrap_or_else(|| {
+                panic!("{label} is not on a line of its own or followed by a space:\n{}", rows.join("\n"))
+            });
+            let words: String = what.split(' ').take(2).collect::<Vec<_>>().join(" ");
+            let after = &rows[at][rows[at].find(label).unwrap() + label.len()..];
+            assert!(
+                after.trim_start().starts_with(&words)
+                    || rows[at + 1].trim_start_matches(['│', ' ']).starts_with(&words),
+                "{label}: {what} is neither after it nor on the next line:\n{}\n{}",
+                rows[at],
+                rows[at + 1]
+            );
+        };
+        for definition in crate::tui::commands::BUILTINS {
+            rows_of(&definition.label(), definition.description);
+        }
+        rows_of("/release-notes-for-the-next-version [VERSION]", "draft the release notes");
+        rows_of("? (empty input)", "shortcuts for the current screen");
+        // The descriptions share one column; only a key too long for it has a line of its own.
+        let column = |label: &str| {
+            let row = rows.iter().find(|r| r.contains(&format!("  {label} "))).unwrap();
+            let start = row.find(label).unwrap() + label.len();
+            row[..start].chars().count() + row[start..].chars().take_while(|&c| c == ' ').count()
+        };
+        assert_eq!(column("/memory-used [run]"), column("/notify on|all|off"));
+        assert_eq!(column("/memory-model NAME"), column("enter"));
+    }
+
+    #[test]
+    fn a_project_commands_check_is_labelled_with_the_command_until_the_user_edits_it() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.commands.insert(
+            "doc".into(),
+            crate::tui::commands::Command {
+                template: "document $ARGUMENTS".into(),
+                check: Some("cargo doc --no-deps".into()),
+                ..Default::default()
+            },
+        );
+        assert!(type_in(&mut app, "/doc the parser").is_empty());
+        let frame = frame_text(&mut app);
+        assert!(frame.contains("◆ check  from /doc"), "{frame}");
+        assert!(!frame.contains("designed"), "{frame}");
+        app.update(key(KeyCode::Char('e')));
+        app.input.take();
+        type_in(&mut app, "cargo doc");
+        assert!(!frame_text(&mut app).contains("from /doc"));
+        // Run without stopping, the planner reports a check it did not design.
+        app.task = None;
+        app.prompt = None;
+        app.mode = Mode::Auto;
+        let actions = type_in(&mut app, "/doc the lexer");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        app.update(Msg::Progress(Progress::CheckReady {
+            run: trace.to_string(),
+            command: Some("cargo doc --no-deps".into()),
+            files: vec![],
+            designed: false,
+            rubric: vec![],
+        }));
+        assert!(log(&app).contains("◆ check  from /doc"), "{}", log(&app));
+        // A check of the user's own wins over the template's, and is theirs.
+        app.task = None;
+        app.settings.check = Some("make docs".into());
+        let actions = type_in(&mut app, "/doc the lexer");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        app.update(Msg::Progress(Progress::CheckReady {
+            run: trace.to_string(),
+            command: Some("make docs".into()),
+            files: vec![],
+            designed: false,
+            rubric: vec![],
+        }));
+        assert!(log(&app).ends_with("◆ check  yours\n  $ make docs"), "{}", log(&app));
     }
 }

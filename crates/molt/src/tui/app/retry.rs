@@ -44,7 +44,7 @@ impl App {
         let trace = TraceId::random();
         self.gap();
         self.echo(&req.task.clone());
-        let mut lines = vec![check_head(designed)];
+        let mut lines = vec![check_head(if designed { "designed" } else { "yours" })];
         if let Some(command) = &req.check {
             lines.push(Line::from(vec![span("  $ ", Tone::Dim), span(clean_line(command), Tone::Plain)]));
         }

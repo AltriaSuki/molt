@@ -306,8 +306,11 @@ fn live_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             let editing = matches!(app.prompt, Some(Prompt::EditCheck(_)));
             let attempts = app.task.as_ref().map_or(2, |t| t.req.attempts);
             let disputed = app.task.as_ref().is_some_and(|t| t.stops.iter().any(|s| s == super::app::DISPUTED));
+            let from = app.task.as_ref().and_then(|t| t.check_from.as_ref());
             let head = if disputed {
                 span("  disputed by an attempt", Tone::Warn)
+            } else if let Some(name) = from {
+                span(format!("  from /{}", clean_line(name)), Tone::Dim)
             } else {
                 span(format!("  designed · ${:.2}", d.cost_usd), Tone::Dim)
             };
@@ -690,7 +693,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
     let s = &app.settings;
-    let model = s.model.as_deref().unwrap_or("default model");
+    let model = s.model.as_deref().or(app.default_model.as_deref()).unwrap_or("default model");
     let mut parts = vec![model.to_owned()];
     if !app.queue.is_empty() {
         let paused = if app.queue_paused { " · paused" } else { "" };
@@ -768,14 +771,30 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         if let SessionState::Down(e) = &app.session {
             right.push(span(format!("{} ", text::fit(e, usize::from(area.width) / 3)), Tone::Bad));
         }
-        right.push(span("/help ", Tone::Dim));
+        // The pointer to /help is the first to go when the bar is full.
+        let used: usize = left.iter().chain(&right).map(|s| text::width(&s.content)).sum();
+        if used + "/help ".len() < usize::from(area.width) || right.is_empty() {
+            right.push(span("/help ", Tone::Dim));
+        }
     }
-    // The right side is drawn over the left one when they meet.
-    let rw = u16::try_from(right.iter().map(|s| text::width(&s.content)).sum::<usize>()).unwrap_or(0).min(area.width);
-    frame.render_widget(Paragraph::new(Line::from(left)), area);
-    let at = Rect { x: area.x + area.width - rw, width: rw, ..area };
-    frame.render_widget(Clear, at);
-    frame.render_widget(Paragraph::new(Line::from(right)), at);
+    frame.render_widget(Paragraph::new(status_line(left, right, usize::from(area.width))), area);
+}
+
+/// The status bar's two sides in `width` cells, a space at least between
+/// them. The right side, which says what needs the user now, takes the room
+/// the left leaves and may claim up to half the bar; whichever side is
+/// short of room is cut with `…`.
+fn status_line(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let spans_width = |spans: &[Span]| spans.iter().map(|s| text::width(&s.content)).sum::<usize>();
+    let (lw, rw) = (spans_width(&left), spans_width(&right));
+    let right_room = rw.min(width.saturating_sub(lw + 1).max(width / 2));
+    let right = text::fit_spans(right, right_room);
+    let left = text::fit_spans(left, width.saturating_sub(spans_width(&right) + 1));
+    let gap = width.saturating_sub(spans_width(&left) + spans_width(&right));
+    let mut line = left;
+    line.push(Span::raw(" ".repeat(gap)));
+    line.extend(right);
+    Line::from(line)
 }
 
 fn draw_memory(frame: &mut Frame, area: Rect, view: &MemoryView, tick: u64) {

@@ -7,7 +7,8 @@ restart. Type a task and press Enter. A task can run over several lines:
 Shift+Enter, Ctrl+J, or `\` then Enter starts a new one, and a paste keeps
 its line breaks and indentation (a paste of more than 20 lines shows as
 `[pasted #1: 143 lines]` and is sent in full). Ctrl+G opens the task in
-`$VISUAL` or `$EDITOR`.
+`$VISUAL` or `$EDITOR`; with neither set it tries `vi`, `nvim`, `vim` and
+`nano` in that order, and says to set `$EDITOR` when none is on `PATH`.
 
 In the default mode, **confirm**, a task can stop twice for you, and does
 only when something calls for a look; otherwise it runs through and the log
@@ -151,9 +152,22 @@ fixed values, such as `/effort` and `/model`, suggest those values next. Esc
 hides the list; editing brings it back. Tab otherwise still enlarges attempts.
 With an empty input, `?` opens shortcuts for the current screen, including check
 and apply confirmations and memory; `?` again or Esc closes them. In text, `?`
-is typed normally. `/help` lists all commands and keys. The services'
+is typed normally. `/help` lists all commands and keys, the descriptions in
+one column; a command too long for it has a line of its own with its
+description under the column. The services'
 log goes to `tui.log` in the data dir, and colors are left out under
 `NO_COLOR`.
+
+The status bar names the model a task runs on: the one `/model` set, else the
+default the gateway resolves from its environment (`MOLT_PLANNER_MODEL`, else
+`MOLT_MODEL`, with aliases expanded, such as `claude-opus-5-5` for `opus`).
+Its right side, what needs you now (a warning, a retry, `learning`), takes
+the room the left side leaves and up to half the bar; the side that runs out
+of room is cut with `…`, and the `/help` pointer goes first, so the two never
+overlap. Long lines in the log and the viewers wrap between words where they
+can. A result's summary is drawn rather than shown as Markdown: headings and
+`**bold**` in bold, list items as bullets; code in backticks or fences is left
+as it is.
 
 When the interface stops for you (a check or a result to confirm) or the
 services go down, it rings the terminal bell and, in terminals that show
@@ -336,6 +350,7 @@ Fix issue $ARGUMENTS and add a regression test.
 These defaults affect only that task. Explicit interface settings take precedence,
 and a template budget cannot raise an existing limit. Confirm mode shows a
 template's check before starting; auto and plan modes retain their existing rules.
+The check is headed `from /NAME` rather than `designed`, until you edit it.
 Templates cannot set modes, permissions or protected paths. `/help` lists project
 commands, and their argument hints and descriptions appear in the same live
 completion list as built-ins. Built-ins

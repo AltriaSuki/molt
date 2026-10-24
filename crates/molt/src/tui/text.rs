@@ -162,32 +162,131 @@ pub fn block(text: &str, indent: &str, tone: Tone) -> Vec<Line<'static>> {
     clean(text.trim_end()).into_iter().map(|l| Line::from(vec![Span::raw(indent.to_owned()), span(l, tone)])).collect()
 }
 
-/// `line` broken into lines at most `width` cells wide. Breaks fall
-/// between characters; each piece keeps the styles of its spans.
+/// Lines of a model's Markdown `text` in one tone, each after `indent`,
+/// with the markers that read as noise in a terminal drawn instead: a
+/// heading's `#`s become bold, a list's `-`, `*` or `+` a bullet, and
+/// `**bold**` bold. Code, in backticks or between ``` fences, is left as
+/// it is.
+pub fn markdown(text: &str, indent: &str, tone: Tone) -> Vec<Line<'static>> {
+    let base = style(tone);
+    let bold = base.add_modifier(Modifier::BOLD);
+    let mut fenced = false;
+    clean(text.trim_end())
+        .into_iter()
+        .map(|l| {
+            let mut spans = vec![Span::raw(indent.to_owned())];
+            let trimmed = l.trim_start();
+            let lead = &l[..l.len() - trimmed.len()];
+            if trimmed.starts_with("```") {
+                fenced = !fenced;
+                spans.push(Span::styled(l, base));
+            } else if fenced {
+                spans.push(Span::styled(l, base));
+            } else if let Some(heading) = heading(trimmed) {
+                spans.push(Span::raw(lead.to_owned()));
+                spans.extend(inline(heading, bold, bold));
+            } else if let Some(item) = ["- ", "* ", "+ "].iter().find_map(|m| trimmed.strip_prefix(m)) {
+                spans.push(Span::styled(format!("{lead}• "), base));
+                spans.extend(inline(item, base, bold));
+            } else {
+                spans.extend(inline(&l, base, bold));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// The text of an ATX heading, `# Title` to `###### Title`.
+fn heading(line: &str) -> Option<&str> {
+    let hashes = line.len() - line.trim_start_matches('#').len();
+    let rest = &line[hashes..];
+    ((1..=6).contains(&hashes) && rest.starts_with(' ')).then(|| rest.trim().trim_end_matches('#').trim_end())
+}
+
+/// `text` with `**bold**` outside code spans drawn in `bold`, the rest in `base`.
+fn inline(text: &str, base: Style, bold: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut piece = String::new();
+    let (mut code, mut strong) = (false, false);
+    let mut rest = text;
+    let push = |spans: &mut Vec<Span<'static>>, piece: &mut String, strong: bool| {
+        if !piece.is_empty() {
+            spans.push(Span::styled(std::mem::take(piece), if strong { bold } else { base }));
+        }
+    };
+    while let Some(c) = rest.chars().next() {
+        if c == '`' {
+            code = !code;
+        } else if !code && rest.starts_with("**") {
+            let after = &rest[2..];
+            let opens = !strong
+                && after.chars().next().is_some_and(|n| !n.is_whitespace())
+                && after.match_indices("**").any(|(i, _)| i > 0 && !after[..i].ends_with(char::is_whitespace));
+            let closes = strong && piece.chars().last().is_some_and(|p| !p.is_whitespace());
+            if opens || closes {
+                push(&mut spans, &mut piece, strong);
+                strong = !strong;
+                rest = after;
+                continue;
+            }
+        }
+        piece.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    push(&mut spans, &mut piece, strong);
+    spans
+}
+
+/// `line` broken into lines at most `width` cells wide. A break falls
+/// after a space, or next to a wide character, where there is one on the
+/// line so far; a word longer than the line is broken between characters.
+/// The space a break falls on is dropped. Each piece keeps the styles of
+/// its spans.
 pub fn wrap(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
     let width = usize::from(width.max(1));
     let mut out: Vec<Line<'static>> = Vec::new();
-    let mut current: Vec<Span<'static>> = Vec::new();
+    // The row being filled, a character at a time, and its width.
+    let mut row: Vec<(char, Style)> = Vec::new();
     let mut used = 0;
+    // Where `row` may be broken: the index of the first character to move.
+    let mut last_break: Option<usize> = None;
+    let emit = |row: &[(char, Style)], out: &mut Vec<Line<'static>>| {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for &(c, style) in row {
+            match spans.last_mut() {
+                Some(last) if last.style == style => last.content.to_mut().push(c),
+                _ => spans.push(Span::styled(c.to_string(), style)),
+            }
+        }
+        out.push(Line::from(spans).style(line.style));
+    };
     for s in &line.spans {
-        let mut piece = String::new();
         for c in s.content.chars() {
             let w = c.width().unwrap_or(0);
-            if used + w > width && used > 0 {
-                if !piece.is_empty() {
-                    current.push(Span::styled(std::mem::take(&mut piece), s.style));
-                }
-                out.push(Line::from(std::mem::take(&mut current)).style(line.style));
-                used = 0;
+            if w > 1 || row.last().is_some_and(|&(p, _)| p == ' ' || p.width().unwrap_or(0) > 1) {
+                last_break = Some(row.len());
             }
-            piece.push(c);
+            if used + w > width && used > 0 {
+                if c == ' ' {
+                    // The break falls on this space.
+                    emit(&row, &mut out);
+                    row.clear();
+                    used = 0;
+                    last_break = None;
+                    continue;
+                }
+                let at = last_break.filter(|&i| i > 0 && i < row.len()).unwrap_or(row.len());
+                let rest = row.split_off(at);
+                emit(&row, &mut out);
+                row = rest;
+                used = row.iter().map(|(c, _)| c.width().unwrap_or(0)).sum();
+                last_break = None;
+            }
+            row.push((c, s.style));
             used += w;
         }
-        if !piece.is_empty() {
-            current.push(Span::styled(piece, s.style));
-        }
     }
-    out.push(Line::from(current).style(line.style));
+    emit(&row, &mut out);
     out
 }
 
@@ -206,6 +305,11 @@ pub fn fit(text: &str, max: usize) -> String {
     if width(text) <= max {
         return text.to_owned();
     }
+    cut(text, max)
+}
+
+/// The start of `text` and `…`, in at most `max` cells (`…` alone when `max` is 0 or 1).
+fn cut(text: &str, max: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
     for c in text.chars() {
@@ -217,6 +321,32 @@ pub fn fit(text: &str, max: usize) -> String {
         used += w;
     }
     out.push('…');
+    out
+}
+
+/// `spans` cut to `max` cells, each keeping its style, with `…` (in the
+/// style of the span it cuts) when anything was cut.
+pub fn fit_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
+    let total: usize = spans.iter().map(|s| width(&s.content)).sum();
+    if total <= max {
+        return spans;
+    }
+    if max == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut used = 0;
+    for s in spans {
+        let w = width(&s.content);
+        if used + w < max {
+            used += w;
+            out.push(s);
+            continue;
+        }
+        // This span holds the cell the ellipsis goes in.
+        out.push(Span::styled(cut(&s.content, max - used), s.style));
+        break;
+    }
     out
 }
 
@@ -338,6 +468,48 @@ mod tests {
         // Wide characters take two cells and are never split.
         assert_eq!(texts(&wrap(&Line::from("数组末尾"), 5)), ["数组", "末尾"]);
         assert_eq!(texts(&wrap(&Line::from(""), 4)), [""]);
+    }
+
+    #[test]
+    fn wrapping_breaks_between_words_where_it_can() {
+        let line = Line::from(vec![span("the model's context ", Tone::Dim), span("window", Tone::Ok)]);
+        assert_eq!(texts(&wrap(&line, 16)), ["the model's ", "context window"]);
+        let wrapped = wrap(&line, 12);
+        assert_eq!(texts(&wrapped), ["the model's ", "context ", "window"]);
+        assert_eq!(wrapped[2].spans[0].style, style(Tone::Ok));
+        // The space a break falls on is not carried to the next line.
+        assert_eq!(texts(&wrap(&Line::from("abcd efgh"), 4)), ["abcd", "efgh"]);
+        // A word longer than the line still breaks inside it.
+        assert_eq!(texts(&wrap(&Line::from("a verylongword"), 5)), ["a ", "veryl", "ongwo", "rd"]);
+        assert_eq!(texts(&wrap(&Line::from("见 数组末尾"), 5)), ["见 数", "组末", "尾"]);
+    }
+
+    #[test]
+    fn a_summarys_markdown_is_drawn_not_shown() {
+        let lines = markdown(
+            "### What changed\n- **Parser**: trailing commas parse\n  * nested `**kwargs` stays\n\
+             Plain **bold** and a ** lone pair\n```\n# not a heading\n```",
+            "  ",
+            Tone::Plain,
+        );
+        assert_eq!(
+            texts(&lines),
+            [
+                "  What changed",
+                "  • Parser: trailing commas parse",
+                "    • nested `**kwargs` stays",
+                "  Plain bold and a ** lone pair",
+                "  ```",
+                "  # not a heading",
+                "  ```",
+            ]
+        );
+        let bold = style(Tone::Plain).add_modifier(Modifier::BOLD);
+        assert_eq!(lines[0].spans[2].style, bold);
+        assert_eq!((lines[1].spans[2].content.as_ref(), lines[1].spans[2].style), ("Parser", bold));
+        assert_eq!(lines[3].spans[2].style, bold);
+        assert!(lines[5].spans.iter().all(|s| s.style != bold));
+        assert_eq!(texts(&markdown("#hashtag\n####### seven", "", Tone::Plain)), ["#hashtag", "####### seven"]);
     }
 
     #[test]

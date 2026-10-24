@@ -144,13 +144,7 @@ impl Config {
             api_key,
             auth_token,
             base_url: base_url.trim_end_matches('/').to_owned(),
-            default_model: get("MOLT_MODEL").unwrap_or_else(|| {
-                if get("MOLT_PROVIDER").as_deref() == Some("openai") {
-                    "openai/gpt-4.1".into()
-                } else {
-                    "opus".into()
-                }
-            }),
+            default_model: default_model(&get),
             max_tokens: u32::try_from(positive("MOLT_MAX_TOKENS", 32_000)?).context("MOLT_MAX_TOKENS is too large")?,
             effort,
             timeout: Duration::from_secs(positive("MOLT_MODEL_TIMEOUT_S", 1200)?),
@@ -166,6 +160,29 @@ impl Config {
 
 /// The full model id for an alias (`opus`, `sonnet`, `haiku`); any other
 /// string is returned unchanged.
+/// `MOLT_MODEL`, else the default provider's own default.
+fn default_model(get: &impl Fn(&str) -> Option<String>) -> String {
+    get("MOLT_MODEL").unwrap_or_else(|| {
+        if get("MOLT_PROVIDER").as_deref() == Some("openai") {
+            "openai/gpt-4.1".into()
+        } else {
+            "opus".into()
+        }
+    })
+}
+
+/// The model id that a call naming `named`, or naming no model, goes to,
+/// as a gateway started with the environment `var` resolves it: aliases
+/// expanded and the provider prefix taken off. `None` when that environment
+/// would not resolve it (a malformed alias table, an empty model id). This
+/// lets an interface name the model before any call is made.
+pub fn resolved_model(var: impl Fn(&str) -> Option<String>, named: Option<&str>) -> Option<String> {
+    let get = |name: &str| var(name).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    let providers = provider::Providers::from_vars(&get).ok()?;
+    let named = named.map(str::trim).filter(|m| !m.is_empty()).map_or_else(|| default_model(&get), str::to_owned);
+    providers.resolve(&named).ok().map(|(_, id)| id)
+}
+
 pub fn resolve_model(name: &str) -> String {
     match name {
         "opus" => "claude-opus-5-5",
@@ -721,6 +738,20 @@ mod tests {
         assert_eq!(resolve_model("haiku"), "claude-haiku-4-5");
         assert_eq!(resolve_model("claude-opus-5"), "claude-opus-5");
         assert_eq!(resolve_model("Opus"), "Opus");
+    }
+
+    #[test]
+    fn the_default_model_is_named_as_a_call_without_one_would_resolve_it() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| vars.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_owned())
+        };
+        assert_eq!(resolved_model(env(&[]), None).as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(resolved_model(env(&[("MOLT_MODEL", "grok-4.5")]), None).as_deref(), Some("grok-4.5"));
+        assert_eq!(resolved_model(env(&[("MOLT_MODEL", " ")]), Some("haiku")).as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(resolved_model(env(&[("MOLT_PROVIDER", "openai")]), None).as_deref(), Some("gpt-4.1"));
+        let aliased = env(&[("MOLT_MODEL", "fast"), ("MOLT_MODEL_ALIASES", r#"{"fast":"openai/gpt-4.1-mini"}"#)]);
+        assert_eq!(resolved_model(aliased, None).as_deref(), Some("gpt-4.1-mini"));
+        assert_eq!(resolved_model(env(&[("MOLT_MODEL_ALIASES", "not json")]), None), None);
     }
 
     fn gateway() -> Gateway {
