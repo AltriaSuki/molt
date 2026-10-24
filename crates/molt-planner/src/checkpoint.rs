@@ -99,6 +99,9 @@ pub struct SavedAttempt {
     pub messages: Vec<Value>,
     #[serde(default)]
     pub known: Option<(usize, u64)>,
+    /// What its conversation keeps of the turns it left out to fit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted: Option<Box<crate::compact::Compacted>>,
     #[serde(default)]
     pub turns: u32,
     #[serde(default)]
@@ -161,6 +164,7 @@ impl Saved {
                     skill_tools: false,
                     messages: Vec::new(),
                     known: None,
+                    compacted: None,
                     turns: 0,
                     check_runs: 0,
                     usage: Usage::default(),

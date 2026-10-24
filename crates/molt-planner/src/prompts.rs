@@ -556,6 +556,28 @@ fn requirement_lines(requirements: &[Requirement]) -> String {
     s
 }
 
+/// What holds now for an attempt, from the run's own state, for the record
+/// of its left-out turns: the user's requirements as of `version`
+/// (`added`), the `protected` paths and the done-check.
+pub(crate) fn standing(version: u32, added: &[Requirement], protected: &[String], check: Option<&str>) -> String {
+    let mut s = String::from("- The task and everything above this record.");
+    if added.is_empty() {
+        s.push_str("\n- The user has added nothing to the task.");
+    } else {
+        s.push_str(&format!("\n- The user's requirements, at version {version}:"));
+        for line in requirement_lines(added).lines().skip(1) {
+            s.push_str(&format!("\n  {line}"));
+        }
+    }
+    if !protected.is_empty() {
+        s.push_str(&format!("\n- Leave these unchanged: {}", protected.join(", ")));
+    }
+    if let Some(check) = check {
+        s.push_str(&format!("\n- The done-check is `{check}`."));
+    }
+    s
+}
+
 /// The user turn telling an attempt what was added to its task since it
 /// last looked. `changed` are the protected paths its fork has changed.
 pub(crate) fn new_requirements(requirements: &[Requirement], changed: &[String]) -> String {
@@ -681,7 +703,7 @@ pub(crate) fn clip(s: String, max: usize) -> String {
     format!("{head}\n[... {cut} bytes cut ...]\n{tail}")
 }
 
-fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
+pub(crate) fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
         "name": name,
         "description": description,
