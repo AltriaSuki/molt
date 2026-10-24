@@ -551,7 +551,10 @@ fn draw_lanes(frame: &mut Frame, area: Rect, app: &App) {
                 .title(Line::from(span(format!(" {status} "), tone)).right_aligned());
             let inner = block.inner(cols[c]);
             frame.render_widget(block, cols[c]);
-            let preview = lane.preview.lines(inner.width, usize::from(inner.height).min(4));
+            let mut preview = lane.preview.lines(inner.width, usize::from(inner.height).min(4));
+            if let Some(retry) = lane.retry.as_ref().filter(|_| lane.status.is_none()) {
+                preview.push(Line::from(span(text::fit(&retry.line(), usize::from(inner.width)), Tone::Warn)));
+            }
             let history_height = usize::from(inner.height).saturating_sub(preview.len());
             let lines = wrap_all(&lane.lines, inner.width);
             let skip = lines.len().saturating_sub(history_height);
@@ -730,6 +733,8 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         right.push(span(format!("{} ", clean_line(flash)), Tone::Warn));
     } else if let Some(seconds) = app.retry_seconds() {
         right.push(span(format!("retrying in {seconds}s · /log "), Tone::Warn));
+    } else if let Some(retry) = app.task.as_ref().and_then(Task::retrying) {
+        right.push(span(format!("{} ", text::fit(&retry.line(), usize::from(area.width) / 2)), Tone::Warn));
     } else {
         if !app.learning.is_empty() {
             right.push(span(format!("{} learning  ", SPINNER[spin(app.tick)]), Tone::Mem));

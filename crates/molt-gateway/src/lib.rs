@@ -221,7 +221,7 @@ impl Gateway {
         req: CompleteRequest,
         within: Option<Duration>,
     ) -> Result<CompleteResponse, RemoteError> {
-        self.complete_observed(req, within, None).await
+        self.complete_observed(req, within, api::Observer::default()).await
     }
 
     /// Stream text previews to a bounded observer while keeping tool input,
@@ -236,19 +236,19 @@ impl Gateway {
         if req.stream.is_none() {
             return Err(RemoteError { code: ErrorCode::Invalid, message: "stream context is required".into() });
         }
-        self.complete_observed(req, within, Some(&mut on_text)).await
+        self.complete_observed(req, within, api::Observer { text: Some(&mut on_text), retry: None }).await
     }
 
     async fn complete_observed(
         &self,
         req: CompleteRequest,
         within: Option<Duration>,
-        on_text: Option<&mut (dyn FnMut(String) + Send)>,
+        observer: api::Observer<'_>,
     ) -> Result<CompleteResponse, RemoteError> {
         // A deadline too far off to represent is no deadline.
         let deadline = within.and_then(|d| Instant::now().checked_add(d));
-        let named = req.model.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or(&self.cfg.default_model);
-        let (provider, model) = self.cfg.providers.resolve(named)?;
+        let named = req.model.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or(&self.cfg.default_model).to_owned();
+        let (provider, model) = self.cfg.providers.resolve(&named)?;
         let api = match provider {
             provider::Provider::Anthropic => self.anthropic.as_ref(),
             provider::Provider::Openai => self.openai.as_ref(),
@@ -271,11 +271,12 @@ impl Gateway {
             "calling the Messages API"
         );
 
-        let msg = if on_text.is_some() {
-            api.create_observed(&call.body, call.fallbacks, deadline, on_text).await?
-        } else {
-            api.create(&call.body, call.fallbacks, deadline).await?
-        };
+        let msg = api.create(&call.body, call.fallbacks, deadline, observer).await.map_err(|mut e| {
+            if let Some(hint) = self.alias_hint(&named, &e) {
+                e.message.push_str(&hint);
+            }
+            e
+        })?;
         if !msg.usage.known() {
             return Err(RemoteError {
                 code: ErrorCode::Failed,
@@ -329,6 +330,54 @@ impl Gateway {
             price_source: priced.map(|(_, s)| s),
         })
     }
+}
+
+impl Gateway {
+    /// For a refused call that names a model which is no alias but is one
+    /// typo from one, such as `sonet`: which alias was likely meant.
+    fn alias_hint(&self, named: &str, error: &RemoteError) -> Option<String> {
+        if error.code != ErrorCode::Invalid || !error.message.to_ascii_lowercase().contains("model") {
+            return None;
+        }
+        let bare = named.strip_prefix("anthropic/").unwrap_or(named);
+        let aliases =
+            ["opus", "sonnet", "haiku"].into_iter().chain(self.cfg.providers.aliases.keys().map(String::as_str));
+        let best = closest_alias(bare, aliases)?;
+        Some(format!("; {named:?} is not a model alias: did you mean {best:?}?"))
+    }
+}
+
+/// The alias at most two edits from `name` (and closer than any other), when
+/// `name` is not itself one.
+fn closest_alias<'a>(name: &str, aliases: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let lower = name.to_ascii_lowercase();
+    let mut best: Option<(usize, &str)> = None;
+    for alias in aliases {
+        if name == alias {
+            return None;
+        }
+        let d = edit_distance(&lower, &alias.to_ascii_lowercase());
+        if best.is_none_or(|(b, _)| d < b) {
+            best = Some((d, alias));
+        }
+    }
+    best.filter(|&(d, _)| d <= 2.min(lower.chars().count() / 2)).map(|(_, a)| a)
+}
+
+/// Levenshtein distance over characters.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let next = (diagonal + usize::from(ca != cb)).min(row[j] + 1).min(row[j + 1] + 1);
+            diagonal = row[j + 1];
+            row[j + 1] = next;
+        }
+    }
+    row[b.len()]
 }
 
 /// Serve `model.complete` on `svc` until its link closes. A request's
@@ -413,6 +462,25 @@ async fn handle_observed(
             })?;
             let open: Mutex<Option<Open>> = Mutex::new(None);
             let streamed = request.stream.clone().zip(events.clone());
+            // Retries are announced for every call made over the bus, so a
+            // long wait on a failing API is visible without the log.
+            let attempt = request.stream.as_ref().and_then(|s| s.attempt);
+            let mut on_retry = events.clone().map(|events| {
+                let (trace, call) = (req.trace_id.clone(), call_id.to_string());
+                move |retry: api::Retry| {
+                    let event = Progress::ModelRetry {
+                        run: trace.to_string(),
+                        attempt,
+                        call: call.clone(),
+                        failure: retry.failure,
+                        delay_ms: u64::try_from(retry.delay.as_millis()).unwrap_or(u64::MAX),
+                        retry: retry.retry,
+                        retries: retry.retries,
+                    };
+                    let (events, trace) = (events.clone(), trace.clone());
+                    tokio::spawn(async move { publish(&events, &trace, event).await });
+                }
+            });
             let call = async {
                 if let Some((context, events)) = streamed {
                     let call = ModelCall {
@@ -441,22 +509,26 @@ async fn handle_observed(
                         })
                     });
                     *lock(&open) = Some(Open { context: call, publisher: Some(publisher) });
+                    let mut on_text = |text| {
+                        if let Some(open) = lock(&open).as_mut() {
+                            open.context.seq += 1;
+                            let _ = tx.try_send((open.context.seq, text));
+                        }
+                    };
+                    let retry = on_retry.as_mut().map(|f| f as &mut (dyn FnMut(api::Retry) + Send));
+                    let observer = api::Observer { text: Some(&mut on_text), retry };
                     let response = gateway
-                        .complete_streamed(
+                        .complete_observed(
                             request,
                             within.map(|limit| limit.saturating_sub(started.elapsed())),
-                            |text| {
-                                if let Some(open) = lock(&open).as_mut() {
-                                    open.context.seq += 1;
-                                    let _ = tx.try_send((open.context.seq, text));
-                                }
-                            },
+                            observer,
                         )
                         .await;
                     drop(tx);
                     response
                 } else {
-                    gateway.complete_within(request, within).await
+                    let retry = on_retry.as_mut().map(|f| f as &mut (dyn FnMut(api::Retry) + Send));
+                    gateway.complete_observed(request, within, api::Observer { text: None, retry }).await
                 }
             };
             let response = tokio::select! {
@@ -918,6 +990,83 @@ mod tests {
             assert!(matches!(seen.first(), Some(Progress::ModelStarted { .. })));
             assert!(matches!(seen.last(), Some(Progress::ModelFinished { .. })), "{seen:?}");
             assert_eq!(seen.iter().filter(|e| matches!(e, Progress::ModelFinished { .. })).count(), 1);
+        }
+    }
+
+    #[test]
+    fn a_name_one_or_two_edits_from_an_alias_suggests_it() {
+        let aliases = || ["opus", "sonnet", "haiku", "fast"].into_iter();
+        for (name, best) in [
+            ("sonet", Some("sonnet")),
+            ("Sonnet", Some("sonnet")),
+            ("opsu", Some("opus")),
+            ("haiko", Some("haiku")),
+            ("sonnet", None),
+            ("fast", None),
+            ("grok-4.5", None),
+            ("claude-sonnet-5-5", None),
+            ("op", None),
+        ] {
+            assert_eq!(closest_alias(name, aliases()), best, "{name}");
+        }
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("", "abc"), 3);
+    }
+
+    #[tokio::test]
+    async fn each_retry_is_announced_before_its_wait_with_its_number() {
+        let server = MockServer::start().await;
+        let mut cfg = from(&[("ANTHROPIC_API_KEY", "k")]).unwrap();
+        cfg.base_url = server.uri();
+        let gateway = Gateway::new(cfg).unwrap();
+        let sse = [
+            json!({"type":"message_start","message":{"id":"msg","model":"claude-opus-5-5","role":"assistant",
+                "type":"message","content":[],"usage":{"input_tokens":1,"output_tokens":1}}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+            json!({"type":"message_stop"}),
+        ]
+        .iter()
+        .map(|v| format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap()))
+        .collect::<String>();
+        let plain = json!({
+            "id": "msg", "model": "claude-opus-5-5", "content": [],
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        });
+        // Announced with or without previews, with the attempt when the caller says.
+        for stream in [None, Some(molt_api::model::StreamContext { attempt: Some(1), turn: 2 })] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(ResponseTemplate::new(502).insert_header("retry-after", "0"))
+                .up_to_n_times(2)
+                .mount(&server)
+                .await;
+            let answer = match stream {
+                Some(_) => ResponseTemplate::new(200).set_body_raw(sse.clone(), "text/event-stream"),
+                None => ResponseTemplate::new(200).set_body_json(plain.clone()),
+            };
+            Mock::given(method("POST")).and(path("/v1/messages")).respond_with(answer).mount(&server).await;
+            let attempt = stream.as_ref().and_then(|s| s.attempt);
+            let request = CompleteRequest { messages: vec![user_text("hi")], stream, ..Default::default() };
+            let request = envelope("model.complete", serde_json::to_value(request).unwrap());
+            let (run, call) = (request.trace_id.to_string(), request.id.to_string());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let events = Some(Events::Collect(seen.clone()));
+            let result = handle_observed(&gateway, request, events, CancellationToken::new()).await.unwrap();
+            assert!(result.get("error").is_none(), "{result}");
+            tokio::task::yield_now().await;
+            let retries: Vec<Progress> =
+                lock(&seen).iter().filter(|e| matches!(e, Progress::ModelRetry { .. })).cloned().collect();
+            let expected = |retry| Progress::ModelRetry {
+                run: run.clone(),
+                attempt,
+                call: call.clone(),
+                failure: "model API 502".into(),
+                delay_ms: 0,
+                retry,
+                retries: 4,
+            };
+            assert_eq!(retries, [expected(1), expected(2)]);
         }
     }
 

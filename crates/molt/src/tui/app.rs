@@ -454,6 +454,28 @@ pub struct Lane {
     /// When the TUI first heard of the attempt, and when it ended.
     pub started: Instant,
     pub ended: Option<Instant>,
+    /// The gateway is about to try one of the attempt's model calls again.
+    pub retry: Option<Retrying>,
+}
+
+/// A model call the gateway is about to try again, after it failed.
+#[derive(Clone, Debug)]
+pub struct Retrying {
+    pub call: String,
+    /// What failed, in a few words: `model API 502`.
+    pub failure: String,
+    /// When the retry starts.
+    pub at: Instant,
+    pub retry: u32,
+    pub retries: u32,
+}
+
+impl Retrying {
+    /// `model API 502, retrying in 60s (2/4)`, counting down.
+    pub fn line(&self) -> String {
+        let left = self.at.saturating_duration_since(Instant::now());
+        molt_api::progress::retry_line(&self.failure, left, self.retry, self.retries)
+    }
 }
 
 pub struct Task {
@@ -464,6 +486,9 @@ pub struct Task {
     settings: Settings,
     pub lanes: Vec<Lane>,
     pub designer_preview: Preview,
+    /// The gateway is about to try a model call of the check's design (or
+    /// another call of no attempt) again.
+    pub designer_retry: Option<Retrying>,
     /// The whole task's budget, as the user set it; `req.budget_usd` is
     /// what is left for the attempts once the check is designed.
     pub budget_usd: Option<f64>,
@@ -519,6 +544,7 @@ impl Task {
             notes_seen: HashSet::new(),
             stops: Vec::new(),
             designer_preview: Preview::default(),
+            designer_retry: None,
             version: 0,
             state: RunState::Running,
             waiting: Vec::new(),
@@ -538,6 +564,13 @@ impl Task {
     /// reply settles it.
     pub fn spend(&self) -> Spend {
         self.lanes.iter().fold(self.design_spend, |sum, lane| sum + lane.spend)
+    }
+
+    /// The retry to show in the status bar: the one that starts soonest, of
+    /// the design's and of attempts still running.
+    pub fn retrying(&self) -> Option<&Retrying> {
+        let lanes = self.lanes.iter().filter(|l| l.status.is_none()).filter_map(|l| l.retry.as_ref());
+        self.designer_retry.iter().chain(lanes).min_by_key(|r| r.at)
     }
 }
 

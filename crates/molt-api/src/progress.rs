@@ -42,6 +42,21 @@ pub enum Progress {
         cost_usd: Option<f64>,
         error: Option<String>,
     },
+    /// The gateway is about to retry a model call that failed, after
+    /// `delay_ms`. `failure` says what failed in a few words, such as
+    /// `model API 502`; this is retry `retry` of at most `retries`. New: an
+    /// older reader does not know it.
+    ModelRetry {
+        run: String,
+        /// The attempt the call belongs to, when the caller said.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<u32>,
+        call: String,
+        failure: String,
+        delay_ms: u64,
+        retry: u32,
+        retries: u32,
+    },
     /// The done-check is settled. `command` is `None` for an unverified run,
     /// or one judged by its `rubric` (the criteria's words).
     CheckReady {
@@ -154,7 +169,8 @@ impl Progress {
             Self::ModelStarted { context } | Self::ModelText { context, .. } | Self::ModelFinished { context, .. } => {
                 &context.run
             }
-            Self::CheckReady { run, .. }
+            Self::ModelRetry { run, .. }
+            | Self::CheckReady { run, .. }
             | Self::AttemptStarted { run, .. }
             | Self::ToolCall { run, .. }
             | Self::CheckRan { run, .. }
@@ -179,9 +195,28 @@ impl Progress {
     }
 }
 
+/// A retry as one line: `model API 502, retrying in 60s (2/4)`. `left` is
+/// the wait still ahead, which a display counts down.
+pub fn retry_line(failure: &str, left: std::time::Duration, retry: u32, retries: u32) -> String {
+    let secs = left.as_secs_f64().ceil() as u64;
+    let when = if secs == 0 { "retrying now".to_owned() } else { format!("retrying in {secs}s") };
+    format!("{failure}, {when} ({retry}/{retries})")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_retry_reads_as_one_line_that_counts_down() {
+        use std::time::Duration;
+        assert_eq!(retry_line("model API 502", Duration::from_secs(60), 2, 4), "model API 502, retrying in 60s (2/4)");
+        assert_eq!(
+            retry_line("model API 502", Duration::from_millis(1_200), 1, 4),
+            "model API 502, retrying in 2s (1/4)"
+        );
+        assert_eq!(retry_line("model API 502", Duration::ZERO, 1, 4), "model API 502, retrying now (1/4)");
+    }
 
     #[test]
     fn a_check_event_from_an_older_planner_still_parses() {

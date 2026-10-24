@@ -14,6 +14,7 @@ impl App {
                 self.log.push(Line::from(vec![span("◆ ", Tone::Shell), span(clean_line(&line), Tone::Dim)]));
             }
             Progress::CheckReady { command, files, designed, rubric, .. } => {
+                task.designer_retry = None;
                 if task.check_shown {
                     return;
                 }
@@ -58,8 +59,36 @@ impl App {
                     ]));
                 }
             }
+            Progress::ModelRetry { attempt, call, failure, delay_ms, retry, retries, .. } => {
+                let retrying = Retrying {
+                    call,
+                    failure: clean_line(&scrub(&failure, &self.secrets)),
+                    at: Instant::now() + Duration::from_millis(delay_ms),
+                    retry,
+                    retries,
+                };
+                match attempt {
+                    None => task.designer_retry = Some(retrying),
+                    Some(attempt) if attempt < task.req.attempts && attempt < 8 => {
+                        if !task.lanes.iter().any(|l| l.index == attempt) {
+                            task.lanes.push(Lane::new(attempt, None));
+                            task.lanes.sort_by_key(|l| l.index);
+                        }
+                        lane(task, attempt).expect("the lane was created").retry = Some(retrying);
+                    }
+                    Some(_) => {}
+                }
+            }
             event @ (Progress::ModelStarted { .. } | Progress::ModelText { .. } | Progress::ModelFinished { .. }) => {
                 let context = event.model_call().expect("a model event has a context");
+                // The call answers again: whatever retry it waited for has started.
+                let retried = |r: &Option<Retrying>| r.as_ref().is_some_and(|r| r.call == context.call);
+                if retried(&task.designer_retry) {
+                    task.designer_retry = None;
+                }
+                for lane in task.lanes.iter_mut().filter(|l| retried(&l.retry)) {
+                    lane.retry = None;
+                }
                 let attempt = context.attempt.filter(|&a| a < task.req.attempts && a < 8);
                 let settles = matches!(event, Progress::ModelFinished { .. });
                 if let Some(attempt) = attempt.filter(|_| task.req.stream || settles) {
@@ -122,6 +151,7 @@ impl App {
             }
             Progress::ToolCall { attempt, turn, detail, .. } => {
                 if let Some(lane) = lane(task, attempt) {
+                    lane.retry = None;
                     lane.turn = turn;
                     lane.push(Line::from(vec![
                         span(format!("{turn:>2} "), Tone::Dim),
@@ -147,6 +177,7 @@ impl App {
             }
             Progress::AttemptFinished { attempt, status, .. } => {
                 if let Some(lane) = lane(task, attempt) {
+                    lane.retry = None;
                     if let Some(line) = lane.preview.finish("ended; final preview event unavailable", true) {
                         lane.push(line);
                     }
@@ -457,6 +488,7 @@ impl Lane {
             spend: Spend::default(),
             started: Instant::now(),
             ended: None,
+            retry: None,
         }
     }
 
@@ -585,6 +617,51 @@ mod tests {
 
         app.update(Msg::Ran { trace, result: Ok(passed(false, Some("fork"))) });
         assert!((app.spent_usd - 0.3).abs() < 1e-9, "the reply settles the run once: {}", app.spent_usd);
+    }
+
+    #[test]
+    fn a_retry_shows_in_the_attempts_box_and_the_status_bar_until_the_call_answers() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        type_in(&mut app, "implement it");
+        let run = app.task.as_ref().unwrap().trace.to_string();
+        app.update(Msg::Progress(Progress::ModelStarted { context: model_context(&app, Some(0), 0) }));
+        app.update(Msg::Progress(Progress::ModelRetry {
+            run: run.clone(),
+            attempt: Some(0),
+            call: "fake-stream".into(),
+            failure: "model API 502".into(),
+            delay_ms: 60_000,
+            retry: 2,
+            retries: 4,
+        }));
+        let line = "model API 502, retrying in 60s (2/4)";
+        let rows = frame_rows(&mut app, 140);
+        assert!(rows.iter().any(|r| r.contains('│') && r.contains(line)), "in the attempt's box:\n{}", rows.join("\n"));
+        assert!(rows.last().unwrap().contains(line), "in the status bar:\n{}", rows.join("\n"));
+
+        // Once the call answers, the retry is over.
+        let context = model_context(&app, Some(0), 1);
+        app.update(Msg::Progress(Progress::ModelText { context, text: "working".into() }));
+        assert!(!frame_text(&mut app).contains("retrying"));
+
+        // A retry of the check's design shows in the status bar.
+        app.update(Msg::Progress(Progress::ModelRetry {
+            run,
+            attempt: None,
+            call: "design".into(),
+            failure: "could not reach the model API".into(),
+            delay_ms: 0,
+            retry: 1,
+            retries: 4,
+        }));
+        let rows = frame_rows(&mut app, 140);
+        assert!(
+            rows.last().unwrap().contains("could not reach the model API, retrying now (1/4)"),
+            "{}",
+            rows.join("\n")
+        );
     }
 
     #[test]
