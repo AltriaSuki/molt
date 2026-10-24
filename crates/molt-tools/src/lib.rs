@@ -14,6 +14,7 @@ mod error;
 mod files;
 mod fork;
 mod paths;
+mod process;
 pub mod sandbox;
 mod shell;
 pub use env_profile::EnvProfile;
@@ -184,6 +185,8 @@ pub struct Shell {
     /// `bash`, or `sh` when there is no bash on `PATH`.
     program: PathBuf,
     running: Arc<shell::Groups>,
+    /// The processes started with `shell.start`, whose groups are in `running` too.
+    processes: Arc<process::Processes>,
     policy: Option<Arc<SandboxPolicy>>,
     cargo: Option<Arc<cargo_cache::CargoCache>>,
 }
@@ -206,23 +209,32 @@ impl Shell {
         }
         let cargo = policy.as_ref().and_then(|p| p.cargo_cache.as_deref()).map(cargo_cache::CargoCache::open);
         let cargo = cargo.transpose()?.map(Arc::new);
-        Ok(Self { roots, program: shell::find_shell(), running: Arc::default(), policy: policy.map(Arc::new), cargo })
+        Ok(Self {
+            roots,
+            program: shell::find_shell(),
+            running: Arc::default(),
+            processes: Arc::default(),
+            policy: policy.map(Arc::new),
+            cargo,
+        })
     }
 
-    /// Kill every command still running, with everything it started. Call
-    /// it before the service exits: each command has a process group of its
-    /// own, which neither a signal to the service nor its exit reaches.
+    /// Kill every command and process still running, with everything it
+    /// started. Call it before the service exits: each has a process group
+    /// of its own, which neither a signal to the service nor its exit reaches.
     pub async fn shutdown(&self) {
+        self.processes.stop_all();
         self.running.terminate_all();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         self.kill_all();
     }
 
     pub fn kill_all(&self) {
+        self.processes.stop_all();
         self.running.kill_all();
     }
 
-    /// Handle one `shell` method (`run`) with its request payload.
+    /// Handle one `shell` method (`run`, `start`, `read`, `write`, `stop`) with its request payload.
     pub async fn handle(&self, method: &str, payload: Value) -> Result<Value, RemoteError> {
         self.handle_cancellable(method, payload, CancellationToken::new()).await
     }
@@ -233,26 +245,54 @@ impl Shell {
         payload: Value,
         cancel: CancellationToken,
     ) -> Result<Value, RemoteError> {
-        self.handle_streaming(method, payload, cancel, None).await
+        self.handle_streaming(None, method, payload, cancel, None).await
+    }
+
+    /// [`Shell::handle_cancellable`] for `caller`: a process it starts is
+    /// its alone (see [`molt_api::shell`]).
+    pub async fn handle_from(
+        &self,
+        caller: &str,
+        method: &str,
+        payload: Value,
+        cancel: CancellationToken,
+    ) -> Result<Value, RemoteError> {
+        self.handle_streaming(Some(caller), method, payload, cancel, None).await
     }
 
     async fn handle_streaming(
         &self,
+        caller: Option<&str>,
         method: &str,
         payload: Value,
         cancel: CancellationToken,
         sink: Option<shell::Sink>,
     ) -> Result<Value, RemoteError> {
         let method = method.strip_prefix("shell.").unwrap_or(method);
-        match method {
+        let policy = self.policy.as_deref().map(|policy| (policy, self.cargo.clone()));
+        let cx = || process::Ctx {
+            roots: &self.roots,
+            program: &self.program,
+            groups: &self.running,
+            processes: &self.processes,
+            sandbox: policy.clone(),
+            caller,
+        };
+        let reply = match method {
             "run" => {
                 let req = parse("shell", method, payload)?;
-                let policy = self.policy.as_deref().map(|policy| (policy, self.cargo.clone()));
-                let reply = shell::run(&self.roots, &self.program, &self.running, policy, req, cancel, sink).await?;
-                serde_json::to_value(reply).map_err(|e| failed(e.to_string()))
+                let policy = policy.clone();
+                serde_json::to_value(
+                    shell::run(&self.roots, &self.program, &self.running, policy, req, cancel, sink).await?,
+                )
             }
-            _ => Err(invalid(format!("unknown method shell.{method}"))),
-        }
+            "start" => serde_json::to_value(process::start(cx(), parse("shell", method, payload)?, cancel).await?),
+            "read" => serde_json::to_value(process::read(cx(), parse("shell", method, payload)?, cancel).await?),
+            "write" => serde_json::to_value(process::write(cx(), parse("shell", method, payload)?).await?),
+            "stop" => serde_json::to_value(process::stop(cx(), parse("shell", method, payload)?).await?),
+            _ => return Err(invalid(format!("unknown method shell.{method}"))),
+        };
+        reply.map_err(|e| failed(e.to_string()))
     }
 }
 
@@ -335,12 +375,14 @@ pub async fn serve_shell(svc: Arc<Service>, shell: Arc<Shell>) {
         let (shell, publisher) = (shell.clone(), publisher.clone());
         async move {
             let method = method_of(&req)?;
+            // The kernel stamps the sender: a process is the sender's alone.
+            let caller = req.from.as_ref().map(|from| from.to_string());
             let wanted = req.payload.get("stream").and_then(Value::as_bool) == Some(true);
             if !(report && wanted) {
-                return shell.handle_cancellable(&method, req.payload, cancel).await;
+                return shell.handle_streaming(caller.as_deref(), &method, req.payload, cancel, None).await;
             }
             let (sink, published) = shell::stream(publisher, req.trace_id.clone());
-            let reply = shell.handle_streaming(&method, req.payload, cancel, Some(sink)).await;
+            let reply = shell.handle_streaming(caller.as_deref(), &method, req.payload, cancel, Some(sink)).await;
             // The output goes out before the reply that ends it; a stalled bus does not hold the reply.
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), published).await;
             reply

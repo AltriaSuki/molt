@@ -24,6 +24,48 @@ With `MOLT_EXPLORE=on`, or a workflow that sets `attempts.explore`, the
 attempts also get `explore`, last: a question to a sub-agent that reads
 their fork and returns only its conclusion (see [explore.md](explore.md)).
 
+## Background processes
+
+With `MOLT_PROCESSES=on` in the planner's environment, attempts also get
+four tools to run a command that keeps going while they work, such as a dev
+server, a file watcher or an interactive program (#110). They come after
+the other built-ins and before `explore`; off, the tool lists are as they
+were.
+
+| Tool | Calls | What it does |
+| --- | --- | --- |
+| `start_process` | `shell.start` | Starts `command` and answers with its id and what it printed so far. Given `ready`, text the program prints once it is up, it waits for it (`timeout_s`, default 30, at most 120) and says whether it appeared or the command exited first. |
+| `read_process` | `shell.read` | What the process printed since the last read, standard output and error together, and whether it is still running or how it ended. `wait_s` (at most 30) waits for output when there is none yet. |
+| `write_process` | `shell.write` | Writes `input` to its standard input, at most 64 KiB; `close` closes it after. Fails once the process has ended. |
+| `stop_process` | `shell.stop` | Stops it with everything it started. Stopping it again answers the same. |
+
+A process runs as `run`'s commands do: in the attempt's fork, in the same
+sandbox, with the same environment, limits and network policy, in a process
+group of its own; with `--no-sandbox` it is unconfined as they are. Its id
+is random and good only in the fork and for the caller that started it: an
+id from another attempt, an earlier run, or one already forgotten finds
+nothing. Only attempts that change files get the tools; the designer, the
+reviewer, the judge, an explorer and an `ask` run do not.
+
+Every process of an attempt is stopped when the model gives its final reply,
+before its work is checked, so the check sees the fork with nothing else
+changing it, and again when the attempt ends, whether it passed, failed,
+lost the race or was cancelled. The shell service also stops a process when
+its fork is removed, when it has run 30 minutes, and when the service stops.
+
+The shell service's bounds: 4 processes running at once per workspace and
+caller and 8 in all, the latest 1 MiB of each one's output kept (a read
+past what was kept says how many bytes it missed), at most 32 KiB of output
+in one answer (its start and end, the middle counted as omitted), 64 KiB of
+input per write. An ended process is remembered for 10 minutes, or until
+the attempt ends. Its input and output are pipes, not a terminal.
+
+The planner holds `shell.start`, `shell.read`, `shell.write` and
+`shell.stop` in the default setup, and offers the tools only when it holds
+`shell.start` and `MOLT_PROCESSES` is on. A process grants nothing a `run`
+command does not have: a command may already run for an hour in the same
+sandbox.
+
 ## Adding a tool of your own
 
 A tool is served by a service you run: a program that connects to the bus

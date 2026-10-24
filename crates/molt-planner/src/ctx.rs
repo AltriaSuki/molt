@@ -122,6 +122,9 @@ pub(crate) struct Ctx {
     /// The planner may read the web (it holds a capability for `web.fetch`):
     /// attempts are offered `fetch_url`.
     pub web: bool,
+    /// Attempts are offered the process tools: the planner's starter turned
+    /// them on and the planner holds a capability for `shell.start`.
+    pub processes: bool,
     /// The tools this run may offer: the built-ins, and the provided tools
     /// whose method the planner holds a capability for.
     pub tools: Arc<Registry>,
@@ -262,6 +265,7 @@ impl Ctx {
     pub fn new(bus: Arc<dyn Bus>, cfg: Arc<Config>, trace: TraceId, req: &RunRequest) -> Self {
         let model = req.model.clone().filter(|m| !m.trim().is_empty()).or_else(|| cfg.default_model.clone());
         let web = bus.holds(molt_api::web::FETCH);
+        let processes = cfg.processes && bus.holds(molt_api::shell::START);
         let tools = Arc::new(Registry::new(&cfg.tools, |target| bus.holds(target)));
         let budget_usd = req.budget_usd.unwrap_or(cfg.budget_usd);
         // The request was validated, which resolved its workflow.
@@ -287,6 +291,7 @@ impl Ctx {
             interactive: req.interactive,
             memory: Memory::default(),
             web,
+            processes,
             tools,
             web_health: Arc::default(),
             instructions: None,
@@ -394,7 +399,7 @@ impl Ctx {
             message: format!("encoding a {target} request: {e}"),
         })?;
         // Cleanup and fork bookkeeping must finish even after cancellation.
-        let cleanup = matches!(target, fs::FORK | fs::DROP | fs::DIFF);
+        let cleanup = matches!(target, fs::FORK | fs::DROP | fs::DIFF | molt_api::shell::STOP);
         if !cleanup && self.cancel.is_cancelled() {
             return Err(RemoteError {
                 code: ErrorCode::Cancelled,
@@ -402,8 +407,9 @@ impl Ctx {
             });
         }
         // A provided tool may take as long as a command, and stops with the attempt as one does.
-        let reply = if matches!(target, model::COMPLETE | molt_api::shell::RUN) || self.tools.is_provided_target(target)
-        {
+        let waits =
+            matches!(target, model::COMPLETE | molt_api::shell::RUN | molt_api::shell::START | molt_api::shell::READ);
+        let reply = if waits || self.tools.is_provided_target(target) {
             self.bus.call_cancellable(target, payload, budget, &self.trace, &self.cancel).await?
         } else {
             self.bus.call(target, payload, budget, &self.trace).await?
