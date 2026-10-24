@@ -113,6 +113,9 @@ pub struct SavedAttempt {
     /// The version of the run's requirements it works to.
     #[serde(default)]
     pub requirements: u32,
+    /// The instruction files of directories it reached that it was given.
+    #[serde(default, skip_serializing_if = "crate::scoped::Saved::is_empty")]
+    pub dir_instructions: crate::scoped::Saved,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -167,6 +170,7 @@ impl Saved {
                     cost_usd: 0.0,
                     end: None,
                     requirements: 0,
+                    dir_instructions: Default::default(),
                 });
                 self.attempts.len() - 1
             }

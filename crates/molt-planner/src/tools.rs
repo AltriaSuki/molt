@@ -155,6 +155,27 @@ impl Tool {
         ) || matches!(self, Self::Provided(tool, _) if tool.decl.read_only)
     }
 
+    /// The path a read, list or search reaches, for the instruction files of
+    /// its directories (see [`crate::scoped`]), and whether it searches.
+    fn reached(&self) -> (Option<crate::scoped::Reach>, bool) {
+        use crate::scoped::Reach;
+        match self {
+            Self::Read(r) => (Some(Reach { path: r.path.clone(), dir: false }), false),
+            Self::List(l) => (l.path.clone().map(|path| Reach { path, dir: true }), false),
+            Self::Search(s) => (s.path.clone().map(|path| Reach { path, dir: true }), true),
+            _ => (None, false),
+        }
+    }
+
+    /// The file a write or edit changes.
+    fn changes(&self) -> Option<&str> {
+        match self {
+            Self::Write(w) => Some(&w.path),
+            Self::Edit(e) => Some(&e.path),
+            _ => None,
+        }
+    }
+
     fn detail(&self) -> String {
         match self {
             Self::Read(r) => format!("read {}", r.path),
@@ -456,11 +477,34 @@ pub(crate) async fn execute(
             }
             Ok(tool) if tool.read_only() => {
                 let (ctx, fork, call) = (ctx.clone(), fork.to_owned(), call.clone());
-                reads.spawn(async move { (i, hooked(tool, &call, &ctx, &fork, actor).await) });
+                let (reach, search) = tool.reached();
+                reads.spawn(async move {
+                    let result = hooked(tool, &call, &ctx, &fork, actor).await;
+                    let result = match actor {
+                        Actor::Attempt { index, .. } => {
+                            crate::scoped::after_read(&ctx, index, &call.id, reach, search, result).await
+                        }
+                        _ => result,
+                    };
+                    (i, result)
+                });
             }
             Ok(tool) => {
                 collect(&mut reads, &mut results).await;
-                results[i] = Some(flatten(hooked(tool, call, ctx, fork, actor).await));
+                let result = match (actor, tool.changes().map(str::to_owned)) {
+                    // Its directories' instruction files come before the first change there.
+                    (Actor::Attempt { index, .. }, Some(path)) => {
+                        match crate::scoped::before_change(ctx, index, &call.id, &path).await {
+                            Err(refused) => Err(refused),
+                            Ok(held) => {
+                                let result = hooked(tool, call, ctx, fork, actor).await;
+                                crate::scoped::after_change(ctx, &path, held, result)
+                            }
+                        }
+                    }
+                    _ => hooked(tool, call, ctx, fork, actor).await,
+                };
+                results[i] = Some(flatten(result));
             }
         }
     }

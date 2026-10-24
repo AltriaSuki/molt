@@ -3,7 +3,8 @@
 //! what not to touch, the style to follow).
 //!
 //! They are read once when a run starts, through `fs.read` like any other
-//! file, so what was read is in the audit log. They are text only: they go
+//! file, so what was read is in the audit log. Those of directories an
+//! attempt reaches later are given to it as it works ([`crate::scoped`]). They are text only: they go
 //! into the first message as data, never into the system prompt (which is
 //! shared by every run and cached), and they grant nothing. No command in
 //! them runs, and they change neither the sandbox nor the done-check.
@@ -20,7 +21,7 @@ pub(crate) const MAX_BYTES: usize = 16 * 1024;
 /// others, so a task naming many paths does not read without end.
 const MAX_DIRS: usize = 8;
 /// Lines asked for in one read; [`MAX_BYTES`] cuts the text anyway.
-const READ_LINES: u64 = 4_000;
+pub(crate) const READ_LINES: u64 = 4_000;
 
 /// One instruction file as read.
 struct File {
