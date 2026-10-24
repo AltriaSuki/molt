@@ -2073,17 +2073,11 @@ async fn lifecycle_formatting_is_rechecked_and_cannot_weaken_the_protected_check
         let mut setup = Setup::new(&server);
         let hooks = vec![
             Hook {
-                event: Event::BeforeApply,
-                command: command.into(),
                 blocking: true,
                 timeout_ms: if command == "sleep 10" { 20 } else { 5000 },
+                ..Hook::new(Event::ResultReady, command)
             },
-            Hook {
-                event: Event::AfterApply,
-                command: "printf notification > notification.txt".into(),
-                blocking: false,
-                timeout_ms: 5000,
-            },
+            Hook { timeout_ms: 5000, ..Hook::new(Event::AfterApply, "printf notification > notification.txt") },
         ];
         setup
             .cfg
@@ -2105,7 +2099,7 @@ async fn lifecycle_formatting_is_rechecked_and_cannot_weaken_the_protected_check
         assert!(setup.file("notification.txt").is_none(), "notifications only write in a disposable fork");
         assert!(events
             .iter()
-            .any(|e| matches!(e, Progress::Note { message, .. } if message.contains("hook BeforeApply"))));
+            .any(|e| matches!(e, Progress::Note { message, .. } if message.contains("hook result.ready"))));
         let audit = std::fs::read_to_string(setup.data.path().join("audit.jsonl")).unwrap();
         assert!(audit.contains("duration_ms") && audit.contains("shell.run"));
     }
@@ -2137,6 +2131,107 @@ async fn all_candidates_are_formatted_and_rechecked_before_selection() {
     assert!(resp.applied, "{resp:#?}");
     assert_eq!(resp.selection.as_ref().unwrap().candidates.len(), 2);
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n\n"));
+}
+
+#[tokio::test]
+async fn a_tool_before_hook_refuses_a_write_and_the_model_reads_why_and_what_a_check_hook_adds() {
+    use molt_planner::hooks::{Event, Hook};
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    // It decides from the event it reads on stdin, as a hook script does.
+    let guard = r#"if grep -q '"tool_name":"write_file"'; then printf '{"decision":"deny","reason":"greeting files are frozen"}'; fi"#;
+    let hooks = vec![
+        Hook {
+            matcher: Some("write_file|edit_file".into()),
+            paths: vec!["greeting.*".into()],
+            blocking: true,
+            timeout_ms: 5000,
+            ..Hook::new(Event::ToolBefore, guard)
+        },
+        Hook {
+            timeout_ms: 5000,
+            ..Hook::new(Event::CheckAfter, r#"printf '{"decision":"annotate","context":"Ask the owner first."}'"#)
+        },
+    ];
+    let env = &mut setup.cfg.service_mut("planner").unwrap().env;
+    env.insert("MOLT_HOOKS_JSON".into(), serde_json::to_string(&hooks).unwrap());
+    let req = RunRequest { max_check_rounds: Some(2), ..setup.request(Some(CHECK), 1) };
+    let (response, events) = setup.run(req).await;
+    assert!(!response.applied, "{}", response.summary);
+    assert!(setup.file("greeting.txt").is_none());
+    let bodies = bodies(&server).await;
+    let said = |text: &str| bodies.iter().any(|b| b["messages"].to_string().contains(text));
+    assert!(said("Not run: the user's tool.before hook refused this call: greeting files are frozen"));
+    assert!(said("[Context from the user's check.after hook]\\nAsk the owner first."));
+    let decision = "hook tool.before write_file: deny: greeting files are frozen";
+    assert!(events.iter().any(|e| matches!(e, Progress::Note { message, .. } if message.starts_with(decision))));
+    let audit = std::fs::read_to_string(setup.data.path().join("audit.jsonl")).unwrap();
+    assert!(audit.contains(decision), "the decision is in the audit");
+    assert!(audit.contains(r#"\"hook_event_name\":\"tool.before\""#), "and so is the event the hook read");
+    assert_requests_valid(&server).await;
+}
+
+#[tokio::test]
+async fn an_apply_before_hook_keeps_a_passing_result_out_of_the_workspace() {
+    use molt_planner::hooks::{Event, Hook};
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    let refuse = r#"printf '{"decision":"deny","reason":"greetings need a sign-off"}'"#;
+    let hooks = vec![
+        Hook { paths: vec!["greeting.txt".into()], timeout_ms: 5000, ..Hook::new(Event::ApplyBefore, refuse) },
+        Hook { timeout_ms: 5000, ..Hook::new(Event::AfterApply, "printf applied > applied.txt") },
+    ];
+    let env = &mut setup.cfg.service_mut("planner").unwrap().env;
+    env.insert("MOLT_HOOKS_JSON".into(), serde_json::to_string(&hooks).unwrap());
+    // Learning happens on this side, and so do its hooks.
+    setup.learn = true;
+    setup.cfg.hooks = vec![Hook::new(Event::LearnAfter, "cat > /dev/null")];
+    let (done, _) = setup.run_done(setup.request(Some(CHECK), 1)).await;
+    let learned = done.learned.expect("it learned").expect("it learned");
+    let audit = std::fs::read_to_string(setup.data.path().join("audit.jsonl")).unwrap();
+    assert!(audit.contains(r#"\"hook_event_name\":\"learn.after\""#), "the learn.after hook heard of it");
+    assert!(audit.contains(&format!(r#"\"added\":[\"{}\"]"#, learned.added[0].id)));
+    let response = done.run;
+    assert_eq!(response.outcome, Outcome::Passed);
+    assert!(!response.applied);
+    assert!(
+        response.summary.contains("an apply.before hook refused them: greetings need a sign-off"),
+        "{}",
+        response.summary
+    );
+    let fork = response.fork.expect("the result is kept");
+    assert_eq!(std::fs::read_to_string(Path::new(&fork).join("greeting.txt")).unwrap(), "hello\n");
+    assert!(setup.file("greeting.txt").is_none());
+}
+
+#[tokio::test]
+async fn a_kept_result_the_user_applies_passes_the_apply_hooks_too() {
+    use molt::session::Session;
+    use molt_planner::hooks::{Event, Hook};
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    let workspace = setup.workspace.path().canonicalize().unwrap();
+    let refuse = "grep -q greeting.txt && { echo 'greetings need a sign-off' >&2; exit 2; }";
+    setup.cfg.hooks = vec![Hook { paths: vec!["*.txt".into()], ..Hook::new(Event::ApplyBefore, refuse) }];
+    let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
+    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    let req = RunRequest { apply: false, ..setup.request(Some(CHECK), 1) };
+    let fork = session.run(&req, &molt_proto::TraceId::random()).await.unwrap().fork.unwrap();
+    let error = format!("{:#}", session.apply(&fork).await.unwrap_err());
+    assert!(error.contains("an apply.before hook refused the result: greetings need a sign-off"), "{error}");
+    assert!(setup.file("greeting.txt").is_none());
+    assert!(Path::new(&fork).is_dir(), "the result is kept");
+    session.shutdown(std::slice::from_ref(&fork)).await;
+
+    setup.cfg.hooks = vec![Hook::new(Event::AfterApply, "cat > /dev/null")];
+    let (events, _progress) = tokio::sync::mpsc::unbounded_channel();
+    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    session.apply(&fork).await.unwrap();
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    session.shutdown(&[]).await;
+    let audit = std::fs::read_to_string(setup.data.path().join("audit.jsonl")).unwrap();
+    assert!(audit.contains(r#"\"hook_event_name\":\"apply.after\""#));
+    assert!(audit.contains(r#"\"changes\":[\"greeting.txt\"]"#));
 }
 
 #[tokio::test]

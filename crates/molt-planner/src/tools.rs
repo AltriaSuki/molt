@@ -47,6 +47,24 @@ pub(crate) enum Actor {
 }
 
 impl Actor {
+    /// What a hook is told made the call.
+    fn role_name(self) -> &'static str {
+        match self {
+            Self::Designer => "designer",
+            Self::Attempt { .. } => "attempt",
+            Self::Reviewer => "reviewer",
+            Self::Judge => "judge",
+            Self::Vetter => "vetter",
+        }
+    }
+
+    fn attempt(self) -> Option<u32> {
+        match self {
+            Self::Attempt { index, .. } => Some(index),
+            _ => None,
+        }
+    }
+
     /// The role its tools are offered for.
     fn role(self) -> ToolRole {
         match self {
@@ -341,6 +359,7 @@ pub(crate) async fn run_command(
         command: command.to_owned(),
         timeout_ms: Some(timeout_ms),
         stream: false,
+        stdin: None,
     };
     let _busy = ctx.control.busy(format!("the command `{}`", prompts::head(command.lines().next().unwrap_or(""), 80)));
     ctx.call(shell::RUN, req, Budget::new(0, timeout_ms.saturating_add(SHELL_GRACE_MS), 0)).await
@@ -392,12 +411,12 @@ pub(crate) async fn execute(
                 results[i] = Some(flatten(asked));
             }
             Ok(tool) if tool.read_only() => {
-                let (ctx, fork) = (ctx.clone(), fork.to_owned());
-                reads.spawn(async move { (i, tool.execute(&ctx, &fork).await) });
+                let (ctx, fork, call) = (ctx.clone(), fork.to_owned(), call.clone());
+                reads.spawn(async move { (i, hooked(tool, &call, &ctx, &fork, actor).await) });
             }
             Ok(tool) => {
                 collect(&mut reads, &mut results).await;
-                results[i] = Some(flatten(tool.execute(ctx, fork).await));
+                results[i] = Some(flatten(hooked(tool, call, ctx, fork, actor).await));
             }
         }
     }
@@ -410,6 +429,51 @@ pub(crate) async fn execute(
             tool_result(&call.id, clip(text, MAX_RESULT), is_error)
         })
         .collect()
+}
+
+/// Run `tool` for `call` between the user's `tool.before` and `tool.after`
+/// hooks: one may refuse it or change its input, and what they add for the
+/// model to know comes after the result.
+async fn hooked(tool: Tool, call: &ToolUse, ctx: &Ctx, fork: &str, actor: Actor) -> Result<String, String> {
+    use crate::hooks::{self, Event};
+    if !hooks::around_tools(ctx) {
+        return tool.execute(ctx, fork).await;
+    }
+    let (role, attempt) = (actor.role_name(), actor.attempt());
+    let place = hooks::tool_place(ctx, fork);
+    let payload = hooks::tool_payload(ctx, role, attempt, &call.name, &call.input);
+    let paths = hooks::input_paths(&call.input);
+    let before = hooks::decide(ctx, &ctx.cfg.hooks, Event::ToolBefore, place, Some(&call.name), &paths, payload).await;
+    let mut context = before.context_text(Event::ToolBefore);
+    if let Some(reason) = before.denied {
+        return Err(format!("Not run: the user's tool.before hook refused this call: {reason}{context}"));
+    }
+    let (tool, input) = match before.tool_input {
+        None => (tool, call.input.clone()),
+        Some(input) => {
+            let changed = ToolUse { input, ..call.clone() };
+            match Tool::parse(&changed, &ctx.tools, actor.role()) {
+                Ok(tool) => (tool, changed.input),
+                Err(e) => return Err(format!("Not run: the user's tool.before hook changed the input badly: {e}")),
+            }
+        }
+    };
+    let result = tool.execute(ctx, fork).await;
+    let (text, is_error) = match &result {
+        Ok(text) | Err(text) => (text, result.is_err()),
+    };
+    let mut payload = hooks::tool_payload(ctx, role, attempt, &call.name, &input);
+    payload["tool_response"] = serde_json::json!({ "content": text, "is_error": is_error });
+    let paths = hooks::input_paths(&input);
+    let after = hooks::decide(ctx, &ctx.cfg.hooks, Event::ToolAfter, place, Some(&call.name), &paths, payload).await;
+    context.push_str(&after.context_text(Event::ToolAfter));
+    match (result, after.denied) {
+        (Ok(text) | Err(text), Some(reason)) => {
+            Err(format!("{text}\n\nThe call ran, but the user's tool.after hook objected: {reason}{context}"))
+        }
+        (Ok(text), None) => Ok(format!("{text}{context}")),
+        (Err(text), None) => Err(format!("{text}{context}")),
+    }
 }
 
 fn flatten(result: Result<String, String>) -> (String, bool) {

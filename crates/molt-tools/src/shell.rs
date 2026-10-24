@@ -118,6 +118,10 @@ pub(crate) async fn run(
         return Err(RemoteError { code: ErrorCode::Cancelled, message: "command cancelled before start".into() });
     }
     let limit = Duration::from_millis(req.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1, MAX_TIMEOUT_MS));
+    if req.stdin.as_ref().is_some_and(|input| input.len() > molt_api::shell::MAX_STDIN) {
+        let message = format!("stdin is over {} bytes: give the command less input", molt_api::shell::MAX_STDIN);
+        return Err(RemoteError { code: ErrorCode::Invalid, message });
+    }
 
     let (mut cmd, guard) = match policy {
         Some(policy) => {
@@ -130,7 +134,7 @@ pub(crate) async fn run(
     cmd.arg("-c")
         .arg(&req.command)
         .current_dir(&ws)
-        .stdin(Stdio::null())
+        .stdin(if req.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -153,6 +157,16 @@ pub(crate) async fn run(
     let mut readers = tokio::task::JoinSet::new();
     readers.spawn(drain(child.stdout.take(), stdout.clone(), sink.clone().map(|s| (s, false))));
     readers.spawn(drain(child.stderr.take(), stderr.clone(), sink.map(|s| (s, true))));
+    // Written on its own, so a command that reads none of it cannot hold up
+    // the call; closed when written, or when the request ends.
+    let mut writer = tokio::task::JoinSet::new();
+    if let (Some(mut pipe), Some(input)) = (child.stdin.take(), req.stdin) {
+        writer.spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            // A command that exits without reading it all closes the pipe: that is its choice.
+            let _ = pipe.write_all(input.as_bytes()).await;
+        });
+    }
 
     // Prefer an already-finished command in a cancellation/completion tie.
     let (status, timed_out, cancelled) = tokio::select! {
@@ -163,6 +177,7 @@ pub(crate) async fn run(
     };
     let duration = started.elapsed();
     group.kill();
+    writer.abort_all();
     let status = status.map_err(|e| failed(format!("waiting for the command: {e}")))?;
     let _ = tokio::time::timeout(GRACE, async { while readers.join_next().await.is_some() {} }).await;
     // Whatever escaped the group (a daemon that called setsid) may still hold a pipe.

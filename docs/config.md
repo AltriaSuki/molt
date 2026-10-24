@@ -125,39 +125,127 @@ must be above 0.
 
 ## Trusted lifecycle hooks
 
-An explicitly selected `--config /outside/project/molt.toml`, or the user
-config, may contain `[[hooks]]` entries. Files inside the workspace never
-supply hooks, even with `--config`, and a project's `.molt/config.toml` with
-hooks is refused.
+Your user config, or an explicitly selected `--config /outside/project/molt.toml`,
+may contain `[[hooks]]` entries. Files inside the workspace never supply
+hooks, even with `--config`, and a project's `.molt/config.toml` with hooks is
+refused. Hooks are not part of the model-editable `RunRequest`.
 
 ```toml
+# Never edit a migration that exists: add a new one.
 [[hooks]]
-event = "before_apply"
-command = "cargo fmt"
-blocking = true
-timeout_ms = 30000
+event = "tool.before"
+matcher = "edit_file|write_file"   # a regex the whole tool name must match
+paths = ["migrations/**"]          # globs over workspace paths
+command = "echo 'migrations are frozen: add a new one instead' >&2; exit 2"
+blocking = true                    # a hook that fails or times out denies
+timeout_ms = 5000
 
 [[hooks]]
-event = "run_finished"
+event = "result.ready"             # was before_apply
+command = "cargo fmt"
+blocking = true
+
+[[hooks]]
+event = "run.end"                  # was run_finished
 command = "printf 'Molt finished\\n'"
 ```
 
-Supported events are `before_apply`, `after_apply`, `run_finished`, and
-`attempt_failed`. Only `before_apply` may block. Its commands run sequentially
-in each passing candidate's isolated fork after acceptance, before ranking, diff, review
-and application. The authoritative check files are restored, protected paths
-are checked, and acceptance runs again even if a nonblocking formatter failed.
-A failing check or blocking hook keeps the result in its fork and applies
-nothing. Retained results (including the TUI's confirm mode) are prepared the
-same way before they are shown, so the diff/review covers the formatted result.
+### Events
 
-Notification hooks run in a separate disposable fork and cannot change the
-applied workspace. `after_apply` is also sent when the TUI user applies a kept
-result; `run_finished` means the planner finished, not that the user accepted a
-kept result. All commands use the existing shell sandbox, environment scrubbing,
-process-tree cleanup and bounded output. They do not gain host network or
-notification access. Shell requests/results record output, exit status and
-elapsed time in the audit; planner notes identify the lifecycle event. Timeouts
-are 1–600000 ms, commands at most 8192 bytes, and at most 32 hooks are accepted.
-An interrupted or resumed run may deliver notifications again; use idempotent
-notification commands. Hooks are not part of the model-editable RunRequest.
+| Event | When | Its hook can |
+|---|---|---|
+| `run.start` | a run starts, or resumes, once its context is gathered | only hear of it |
+| `prompt.submit` | a new run's (or `planner.design`'s) task, before any model sees it | deny (the run does not start), modify (`prompt`), annotate (added to the task) |
+| `tool.before` | before each tool call of the designer, an attempt, the reviewer, judge or vetter | deny (the model gets the reason as the call's error result), modify (`tool_input`), annotate (after the result) |
+| `tool.after` | after each such call, with its result | deny (the result becomes an error, with the reason after it), annotate |
+| `check.after` | an attempt ran the done-check | deny (a pass does not count; the attempt is told why), annotate (after the check's feedback) |
+| `result.ready` | each passing result, in its own fork, after acceptance and before ranking | change the fork (a formatter), deny (that result is not applied) |
+| `apply.before` | the chosen result, just before it is merged, by the run or when you apply a kept result | deny (it stays in its fork), annotate (added to the summary) |
+| `apply.after` | a result was merged | only hear of it |
+| `run.end` | the planner finished the run | only hear of it |
+| `learn.after` | memory learned from a run (`molt do` and the interface) | only hear of it |
+| `attempt.failed` | an attempt failed | only hear of it |
+
+The names before these (`before_apply`, `after_apply`, `run_finished`,
+`attempt_failed`) still read, as the events in the table they became, and
+so do Claude Code's `PreToolUse`, `PostToolUse` and `UserPromptSubmit`.
+`matcher` is only for the tool events; `paths` for the tool events (the
+call's `path`, and `paths` when its input has a list) and for `result.ready`,
+`apply.before` and `apply.after` (the result's changed paths). A hook with
+`paths` runs only when one of those paths matches one of its globs: `*` and
+`?` stay within a directory, `**` crosses them, and `./` and `..` are taken
+out of a path first. A shell command has no paths: a `run` call is matched
+by its name, and its command is in `tool_input.command`. To be sure no change
+under a path is applied, whatever made it, give an `apply.before` hook the
+same `paths`.
+
+### The event and the answer
+
+A hook gets the event as one JSON object on its standard input:
+
+```json
+{"hook_event_name": "tool.before", "run_id": "…", "workspace": "/home/me/project",
+ "cwd": "/…/work/fork-…", "role": "attempt", "attempt": 0,
+ "tool_name": "edit_file", "tool_input": {"path": "migrations/001_init.sql", "old_string": "…", "new_string": "…"},
+ "paths": ["migrations/001_init.sql"]}
+```
+
+`tool.after` adds `tool_response` (`content`, `is_error`); `prompt.submit`
+has `prompt`; `check.after` has `check` (`command`, `passed`, `exit_code`,
+`timed_out` and the end of its `output`); `result.ready`, `apply.before`
+and `apply.after` have the `changes`; `run.start` has the `task` and
+`workflow`; `attempt.failed` the `attempt` and its `status`; `learn.after`
+the notes `added`, `reinforced` and `contradicted`.
+
+It answers with how it ends and what it prints:
+
+- exit 0 with nothing on standard output, or output that is not a JSON
+  object (a formatter's report), allows;
+- exit 0 with a JSON object decides:
+  `{"decision": "allow"}`,
+  `{"decision": "deny", "reason": "migrations are frozen"}`,
+  `{"decision": "modify", "tool_input": {…}}` (or `"prompt": "…"`),
+  `{"decision": "annotate", "context": "Run sqlx prepare after this."}`.
+  `context` may come with any decision. Claude Code's answers read too:
+  `"decision": "block"` or `"approve"`, `"continue": false` with
+  `stopReason`, and `hookSpecificOutput` with `permissionDecision`
+  (`allow`, `deny`; `ask` denies, as there is no one to ask mid-run),
+  `permissionDecisionReason`, `updatedInput` and `additionalContext`;
+- exit 2 denies, with standard error as the reason, as in Claude Code;
+- any other exit, a timeout, or an answer that does not read is a failure:
+  a `blocking` hook's failure denies, any other's is noted and passed over.
+
+The hooks of an event run one after another in the order you wrote them,
+each told what those before it changed; the first deny ends it. What an
+event's hook cannot do (a `run.end` hook's deny, say) is noted as ignored.
+Only the events with a deny in the table may set `blocking`. Context is the
+user's word, so the model reads it as such, after what it is added to; keep
+it short.
+
+### Where hooks run, and the record
+
+Every hook runs through the shell service: in its sandbox, with environment
+scrubbing, process-tree cleanup, bounded output and its own `timeout_ms`.
+They do not gain host network or notification access. A tool hook runs in
+the fork the call works in, which it may change as the model's own commands
+may; the hooks of an attempt that only reads, which works in your
+workspace, run in a disposable fork of it. `check.after` and `result.ready`
+hooks run in the attempt's fork; the others in a disposable fork of the
+workspace or result, dropped after, so they cannot change what is applied.
+After `result.ready` hooks the authoritative check files are restored,
+protected paths are checked, and acceptance runs again even if a
+nonblocking formatter failed. A failing check or a denying hook keeps the
+result in its fork and applies nothing. Retained results (including the
+TUI's confirm mode) are prepared the same way before they are shown, so
+the diff and review cover the formatted result.
+
+The audit log has each hook's shell request, with the event as its stdin,
+and its reply, with the answer as its stdout, exit status and elapsed
+time. The planner also notes each decision on the run's progress, which
+the audit log records as it reaches your terminal or the interface:
+``hook tool.before edit_file: deny: migrations are frozen: add a new one instead by `echo 'migrations are frozen: add a new one instead' >&2; exit 2` (exit Some(2), 12 ms, timed_out=false)``.
+The hooks of a kept result you apply, and of learning, run from the front
+end, which logs their decisions. Timeouts are 1–600000 ms, commands at most
+8192 bytes, and at most 32 hooks are accepted. An interrupted or resumed
+run may deliver notifications again, and a resumed run does not ask
+`prompt.submit` again; use idempotent notification commands.

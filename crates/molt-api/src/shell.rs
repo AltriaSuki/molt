@@ -1,8 +1,9 @@
 //! The `shell` service: run a command in a workspace.
 //!
 //! Commands run under `bash -c` (or `sh -c`) with the workspace as working
-//! directory, no stdin, their own process group (killed whole on timeout),
-//! and an environment without Molt or API secrets.
+//! directory, no stdin unless the request gives one ([`RunRequest::stdin`]),
+//! their own process group (killed whole on timeout) and an environment
+//! without Molt or API secrets.
 //!
 //! A request that sets [`RunRequest::stream`] also has the command's output
 //! published as it comes, on `topic:progress` as
@@ -25,7 +26,14 @@ pub struct RunRequest {
     /// Publish the output while the command runs (see the module docs).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stream: bool,
+    /// Text for the command's standard input, which is closed after it;
+    /// without it the command reads nothing. At most [`MAX_STDIN`] bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<String>,
 }
+
+/// The most standard input a request may give.
+pub const MAX_STDIN: usize = 4 << 20;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunResponse {

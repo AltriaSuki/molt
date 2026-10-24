@@ -487,6 +487,10 @@ impl Attempt {
             let ran = self.or_cancel(self.run_check(&fork, &check)).await??;
             self.check_runs += 1;
             let passed = ran.success();
+            // The user's check.after hooks may refuse a pass, and add to what the attempt is told.
+            let hooked = crate::hooks::checked(&ctx, &fork, self.index, &check.command, &ran).await;
+            let refused = hooked.denied.as_ref().filter(|_| passed);
+            let passed = passed && refused.is_none();
             ctx.progress(Progress::CheckRan {
                 run: ctx.run_id(),
                 attempt: self.index,
@@ -507,15 +511,26 @@ impl Attempt {
                 continue;
             }
             if self.check_runs >= ctx.max_check_rounds {
-                let note = format!(
-                    "the done-check still failed ({}):\n{}",
-                    prompts::ending(&ran),
-                    prompts::output_tail(&ran, NOTE_TAIL)
-                );
+                let note = match refused {
+                    Some(reason) => format!("the done-check passed, but a check.after hook refused it: {reason}"),
+                    None => format!(
+                        "the done-check still failed ({}):\n{}",
+                        prompts::ending(&ran),
+                        prompts::output_tail(&ran, NOTE_TAIL)
+                    ),
+                };
                 return Err(End::new(AttemptStatus::Failed, note));
             }
             asked = false;
-            conv.push(user_text(prompts::check_failed(&check.command, &ran)));
+            let feedback = match refused {
+                Some(reason) => format!(
+                    "The done-check `{}` passed, but the user's check.after hook did not accept the result: \
+                     {reason}\n\nFix that, then reply when you are done.",
+                    check.command
+                ),
+                None => prompts::check_failed(&check.command, &ran),
+            };
+            conv.push(user_text(format!("{feedback}{}", hooked.context_text(crate::hooks::Event::CheckAfter))));
             self.save(&conv);
         }
     }
