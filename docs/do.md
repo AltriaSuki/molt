@@ -358,6 +358,37 @@ records what each run saw, and the run's progress lists the files.
 `--no-memory` does not turn them off; `MOLT_INSTRUCTION_FILES` names other
 files, or `none`.
 
+A task often names no path: the attempt finds the code by searching. When an
+attempt's `read_file`, `list_files` or `search` reaches a directory the run
+has not looked in (a file's own directory and those above it, or every
+directory a search matched in), Molt reads that directory's instruction
+files and adds them to the call's result, as a `<directory_instructions>`
+block that names each file, the directory it applies to (`applies_to`) and
+its version (the start of its SHA-256). A rule there applies under that
+directory only. The first `write_file` or `edit_file` in a directory whose
+files the attempt has not been given is not made: its result gives them,
+and the attempt makes the change again if it still fits them. A file is
+given once; a file with the same text as one already given is named with
+`same_text_as`, and CLAUDE.md beside an identical AGENTS.md not at all.
+
+These files follow the same rules as the first ones: read through `fs.read`
+from the workspace (never from the attempt's fork, so an attempt that writes
+an instruction file is told that its text is its own change and is still
+given the project's), only inside the workspace and never under `.molt` or
+`.git`, at most 16 KiB of them in an attempt's conversation at a time, and
+only text that grants nothing. A file over that is cut or, with little room
+left, named with the reason, as is one that is a link out of the workspace
+or cannot be read, and progress says so. At most 8 new directories are
+looked in per call; the rest when a later call reaches them. What an attempt
+was given is saved with its checkpoint: after `molt resume`, a file that
+changed meanwhile is given again with `replaces` naming the version before.
+A file whose result a fit has left out of the conversation is given again
+the next time its directory is reached. Commands are not covered, since what
+a `run` will touch is not known before it runs: to get a directory's files
+before changing it with a command, list it (`list_files` with its path). The
+designer, the reviewer and an attempt's explorer get none of these
+files.
+
 ### Syntax errors after an edit
 
 When an attempt writes or edits a file in a language the project model

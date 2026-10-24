@@ -26,6 +26,7 @@ mod registry;
 mod review;
 mod route;
 mod runner;
+pub mod scoped;
 mod select;
 pub mod skills;
 mod tools;

@@ -128,6 +128,8 @@ pub(crate) struct Ctx {
     web_health: Arc<Mutex<WebHealth>>,
     /// The `<project_instructions>` block, when the project has instruction files.
     pub instructions: Option<String>,
+    /// The instruction files of directories each attempt reached as it worked.
+    pub dir_instructions: Arc<crate::scoped::Scoped>,
     /// The Agent Skills found when the run started, and their `<skills>` block.
     pub skills: Arc<crate::skills::Catalog>,
     /// The files the user pointed at, and their `<referenced_files>` block.
@@ -304,6 +306,7 @@ impl Ctx {
             tools,
             web_health: Arc::default(),
             instructions: None,
+            dir_instructions: Arc::default(),
             skills: Arc::default(),
             files: req.files.clone(),
             referenced: None,

@@ -336,6 +336,7 @@ impl Attempt {
         let (fork, mut conv) = match resume {
             Some(saved) => {
                 let fork = saved.fork.clone().ok_or_else(|| End::error("it stopped before it had a fork"))?;
+                ctx.dir_instructions.restore(&ctx, self.index, saved.dir_instructions.clone());
                 // The fork must still be there, as the run left it.
                 ctx.diff(&fork).await.map_err(|e| End::error(format!("its fork {fork} cannot be used: {e}")))?;
                 ctx.track_fork(&fork);
@@ -417,6 +418,8 @@ impl Attempt {
                     // A clear step: what the user added since takes effect here.
                     self.adopt(&fork, &mut conv, false).await;
                     let resp = agent::turn(&ctx, &mut conv, max_turns, &mut self.meter, &self.cancel).await?;
+                    // The fit may have left out results that gave directory instructions.
+                    ctx.dir_instructions.sync(&ctx, self.index, &conv.messages);
                     let calls = resp.tool_uses();
                     if !calls.is_empty() {
                         reply.clear();
@@ -783,6 +786,7 @@ impl Attempt {
             saved.check_runs = check_runs;
             saved.usage = meter.spend.usage;
             saved.cost_usd = meter.spend.cost_usd;
+            saved.dir_instructions = self.ctx.dir_instructions.saved(self.index);
         });
     }
 
