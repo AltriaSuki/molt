@@ -93,7 +93,7 @@ async fn run_baseline(ctx: &Arc<Ctx>, fork: &str, command: &str, files: &[(Strin
 
 async fn work(ctx: &Arc<Ctx>, fork: &str) -> Design {
     let seat = ctx.seats().designer;
-    let tools = prompts::designer_tools(&ctx.tools, ctx.memory.up, ctx.web);
+    let tools = prompts::designer_tools(&ctx.tools, ctx.memory.up, ctx.web, !ctx.skills.is_empty());
     let first = prompts::designer_first_message(&ctx.task, &ctx.preamble());
     let mut conv = Conversation::seated(&seat, "", tools, first, Role::Designer, None);
     let max_turns = seat.max_turns.unwrap_or(MAX_TURNS);

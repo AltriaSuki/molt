@@ -344,6 +344,8 @@ async fn gather_context(ctx: &mut Ctx) {
     if ctx.workflow.stages.context.is_none() {
         return;
     }
+    // Before memory, whose snapshot of the run's context records the skills it offers.
+    ctx.skills = std::sync::Arc::new(crate::skills::discover(ctx).await);
     ctx.memory = memory::prepare(ctx).await;
     ctx.instructions = instructions::gather(ctx).await;
     ctx.referenced = referenced::gather(ctx).await;

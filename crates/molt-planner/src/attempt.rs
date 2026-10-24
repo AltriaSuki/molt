@@ -156,6 +156,7 @@ pub(crate) async fn run(
         fork: None,
         memory_tools: ctx.memory.up,
         web_tools: ctx.web,
+        skill_tools: !ctx.skills.is_empty(),
         version: ctx.control.version(),
         read_only: ctx.workflow.read_only(),
         conversation: Vec::new(),
@@ -169,6 +170,7 @@ pub(crate) async fn run(
         attempt.fork = saved.fork.clone();
         attempt.memory_tools = saved.memory_tools;
         attempt.web_tools = saved.web_tools;
+        attempt.skill_tools = saved.skill_tools;
         attempt.version = saved.requirements;
     }
     attempt.check = attempt.check_at(attempt.version);
@@ -230,6 +232,8 @@ struct Attempt {
     memory_tools: bool,
     /// It is offered `fetch_url`.
     web_tools: bool,
+    /// It is offered `load_skill`.
+    skill_tools: bool,
     /// The version of the run's requirements it works to.
     version: u32,
     /// It works in the workspace itself with tools that only read.
@@ -316,9 +320,9 @@ impl Attempt {
             (None, true) => "",
         };
         let tools = match self.check {
-            _ if self.read_only => prompts::ask_tools(&ctx.tools, self.memory_tools, self.web_tools),
-            Some(_) => prompts::checked_attempt_tools(&ctx.tools, self.memory_tools, self.web_tools),
-            None => prompts::attempt_tools(&ctx.tools, self.memory_tools, self.web_tools),
+            _ if self.read_only => prompts::ask_tools(&ctx.tools, self.memory_tools, self.web_tools, self.skill_tools),
+            Some(_) => prompts::checked_attempt_tools(&ctx.tools, self.memory_tools, self.web_tools, self.skill_tools),
+            None => prompts::attempt_tools(&ctx.tools, self.memory_tools, self.web_tools, self.skill_tools),
         };
         // A read-only `ask` attempt may only read, so it is not offered the question either.
         let tools = if ctx.interactive && !self.read_only { prompts::with_ask_user(&tools) } else { tools };
@@ -698,14 +702,22 @@ impl Attempt {
 
     /// Save the attempt as it stands in the run's checkpoint.
     fn save(&self, conv: &Conversation) {
-        let (fork, memory_tools, web_tools, meter, check_runs, version) =
-            (self.fork.clone(), self.memory_tools, self.web_tools, self.meter, self.check_runs, self.version);
+        let (fork, memory_tools, web_tools, skill_tools, meter, check_runs, version) = (
+            self.fork.clone(),
+            self.memory_tools,
+            self.web_tools,
+            self.skill_tools,
+            self.meter,
+            self.check_runs,
+            self.version,
+        );
         self.ctx.save(|s| {
             let saved = s.attempt(self.index);
             saved.requirements = version;
             saved.fork = fork;
             saved.memory_tools = memory_tools;
             saved.web_tools = web_tools;
+            saved.skill_tools = skill_tools;
             saved.messages = conv.messages.clone();
             saved.known = conv.known;
             saved.turns = meter.turns;

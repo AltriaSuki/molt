@@ -752,6 +752,9 @@ pub mod tools {
     pub const FIND_SYMBOL: &str = "find_symbol";
     pub const RECALL: &str = "recall";
     pub const FETCH_URL: &str = "fetch_url";
+    /// Offered when the run has Agent Skills: read one's instructions, or a
+    /// file of its directory.
+    pub const LOAD_SKILL: &str = "load_skill";
     /// Offered only to attempts of an interactive run: ask the person a
     /// question, and wait a while for the answer.
     pub const ASK_USER: &str = "ask_user";
@@ -841,6 +844,14 @@ pub mod tools {
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct FetchUrl {
         pub url: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct LoadSkill {
+        pub name: String,
+        /// A file of the skill's directory, relative to it; none for its instructions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub file: Option<String>,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

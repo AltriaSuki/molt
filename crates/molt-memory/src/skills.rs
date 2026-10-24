@@ -268,12 +268,37 @@ pub(crate) async fn manage(
             let rows = stmt.query_map([ws], |r| Ok(json!({"id":r.get::<_,String>(0)?,"active":r.get::<_,Option<i64>>(1)?,"disabled":r.get::<_,bool>(2)?,"revision":r.get::<_,i64>(3)?,"skill":serde_json::from_str::<Value>(&r.get::<_,String>(4)?).map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?})))?.collect::<rusqlite::Result<Vec<_>>>().map(|v| json!(v));
             rows
         }).map_err(error::db),
+        Action::Export { id } => db.read(|c| export(c, &ws, &id)).map_err(error::db),
         Action::Used { run } => db.read(|c| {
             let mut stmt = c.prepare("SELECT snapshot FROM skill_uses WHERE workspace=?1 AND run=?2 ORDER BY call,id")?;
             let rows = stmt.query_map(params![ws,run], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>().map(|v| json!(v.into_iter().filter_map(|s| serde_json::from_str::<Value>(&s).ok()).collect::<Vec<_>>()));
             rows
         }).map_err(error::db),
     }
+}
+
+/// The promoted revision of the enabled skill `id`, for writing it out as
+/// a `SKILL.md`. Only what a person promoted after two independent
+/// evaluations leaves memory this way: a draft, a disabled or rolled-back
+/// skill, or a revision that no longer counts as evaluated is refused.
+fn export(c: &rusqlite::Connection, ws: &str, id: &str) -> rusqlite::Result<Value> {
+    let refuse = |why: &str| Err(rusqlite::Error::InvalidParameterName(why.into()));
+    let head: Option<(Option<i64>, bool)> = c
+        .query_row("SELECT active,disabled FROM skill_heads WHERE workspace=?1 AND id=?2", params![ws, id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?;
+    let Some((active, disabled)) = head else { return refuse("this project has no skill with that id") };
+    let Some(active) = active.filter(|_| !disabled) else {
+        return refuse(
+            "only a promoted, enabled skill is exported: evaluate it on two independent runs and promote it first",
+        );
+    };
+    let skill = version(c, ws, id, active as u64)?;
+    if !ready(&skill) {
+        return refuse("the promoted revision lacks two independent successful evaluations");
+    }
+    Ok(json!(skill))
 }
 
 fn change(
@@ -426,7 +451,11 @@ mod tests {
             )
         })
         .unwrap();
+        let exported = |id: &str| db.read(|c| export(c, "/w", id));
+        assert!(exported(&s.id).is_err(), "an evaluated draft is not exported before a person promotes it");
         change(&db, "/w", &s.id, Some(1), "promote", "manual", "t").unwrap();
+        assert_eq!(serde_json::from_value::<Skill>(exported(&s.id).unwrap()).unwrap(), s);
+        assert!(exported("skill_none").is_err());
         assert_eq!(discover(&db, "/w", "repair parser", Some(("use", "call"))).unwrap().len(), 1);
         assert!(discover(&db, "/w", "parser", Some(("before", "empty"))).unwrap().is_empty());
         assert!(discover(&db, "/other", "parser", None).unwrap().is_empty());
@@ -445,6 +474,7 @@ mod tests {
         };
         let (learned, _) = crate::notes::remember(&db, learned, 1).unwrap();
         change(&db, "/w", &s.id, None, "disable", "unsafe", "t").unwrap();
+        assert!(exported(&s.id).is_err(), "a disabled skill is not exported");
         let gone = crate::recall(
             &db,
             &molt_api::memory::RecallRequest { workspace: Some("/w".into()), ..Default::default() },

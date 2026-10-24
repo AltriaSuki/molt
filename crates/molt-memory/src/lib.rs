@@ -414,15 +414,14 @@ impl Memory {
                 if r.capture.is_some() && req.from.as_ref().map(|s| s.as_str()) != Some("planner") {
                     return Err(invalid("only the kernel-identified planner may capture run context"));
                 }
+                if r.offered_skills.iter().any(|s| s.source == molt_api::agent_skills::SkillSource::Learned) {
+                    return Err(invalid("memory records the learned skills it offers itself"));
+                }
+                // Before the learned skills are selected, which records them for a captured recall.
+                notes::validate_recall(&r)?;
                 let run = req.trace_id.to_string();
                 let call = req.id.to_string();
                 let context = (r.workspace.clone(), r.query.clone(), r.capture.is_some(), run.clone(), call.clone());
-                let user = self.user.clone();
-                let notes = self
-                    .blocking(move |db| {
-                        review::recall(db, &r, path.as_deref(), user.as_deref(), Some((&run, &call)), now)
-                    })
-                    .await?;
                 let skills = if let (Some(ws), query, captured, run, call) = context {
                     self.blocking(move |db| {
                         skills::discover(db, &ws, &query, captured.then_some((run.as_str(), call.as_str())))
@@ -431,6 +430,22 @@ impl Memory {
                 } else {
                     Vec::new()
                 };
+                // The context's snapshot names every skill it offered, the learned ones included.
+                if r.capture.as_deref() == Some("context") {
+                    r.offered_skills.extend(skills.iter().map(|s| molt_api::agent_skills::OfferedSkill {
+                        name: s.spec.name.clone(),
+                        source: molt_api::agent_skills::SkillSource::Learned,
+                        location: s.id.clone(),
+                        sha256: String::new(),
+                        revision: Some(s.revision),
+                    }));
+                }
+                let user = self.user.clone();
+                let notes = self
+                    .blocking(move |db| {
+                        review::recall(db, &r, path.as_deref(), user.as_deref(), Some((&run, &call)), now)
+                    })
+                    .await?;
                 reply(RecallResponse { notes, skills })
             }
             "skills" => {

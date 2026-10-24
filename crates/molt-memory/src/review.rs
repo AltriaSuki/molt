@@ -215,6 +215,7 @@ pub(crate) fn recall(
                 purpose: purpose.clone(),
                 created_ms: now,
                 notes: found.clone(),
+                skills: req.offered_skills.clone(),
             };
             // A replay of the same envelope must not rewrite historical data.
             let previous: Option<String> = tx

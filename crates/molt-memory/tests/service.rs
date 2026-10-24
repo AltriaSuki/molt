@@ -467,3 +467,42 @@ async fn undo_withdraws_evidence_from_both_project_and_promoted_user_notes() {
     let found: RecallResponse = setup.call("memory.recall", json!({"workspace":"app"})).await;
     assert!(found.notes.is_empty());
 }
+
+#[tokio::test]
+async fn a_context_recall_keeps_the_skills_its_run_was_offered() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+    let db = Arc::new(Db::in_memory().unwrap());
+    let writer = Writer { service: "memory".into(), version: "v1".into() };
+    let memory = Memory::new(db.clone(), &root, Config::default(), writer, Arc::new(NoBus)).unwrap();
+    let offered = json!([
+        { "name": "pdf-tools", "source": "user", "location": "/home/u/.config/molt/skills/pdf-tools/SKILL.md", "sha256": "ab" },
+        { "name": "deploy", "source": "project", "location": ".molt/skills/deploy/SKILL.md", "sha256": "cd" },
+    ]);
+    let trace = TraceId::random();
+    let start = json!({ "query": "fix it", "workspace": "app", "capture": "context", "offered_skills": offered });
+    let mut msg = Envelope::request(trace.clone(), "memory.recall".parse().unwrap(), CapId::random(), start.clone());
+    msg.from = Some(ServiceId::new("planner").unwrap());
+    memory.handle(msg).await.unwrap();
+    let ws = root.join("app");
+    let kept = molt_memory::recall_snapshots(&db, ws.to_str().unwrap(), trace.as_str()).unwrap();
+    assert_eq!(kept.len(), 1);
+    let names: Vec<(&str, &str)> = kept[0].skills.iter().map(|s| (s.name.as_str(), s.source.as_str())).collect();
+    assert_eq!(names, [("pdf-tools", "user"), ("deploy", "project")]);
+    assert_eq!(serde_json::to_value(&kept[0].skills).unwrap(), offered);
+
+    let refuse = |payload: Value| {
+        let mut msg = Envelope::request(TraceId::random(), "memory.recall".parse().unwrap(), CapId::random(), payload);
+        msg.from = Some(ServiceId::new("planner").unwrap());
+        msg
+    };
+    let mut forged = start.clone();
+    forged["offered_skills"][0]["source"] = json!("learned");
+    let e = memory.handle(refuse(forged)).await.unwrap_err();
+    assert!(e.message.contains("itself"), "{e:?}");
+    let mut uncaptured = start;
+    uncaptured.as_object_mut().unwrap().remove("capture");
+    let e = memory.handle(refuse(uncaptured)).await.unwrap_err();
+    assert!(e.message.contains("captured context"), "{e:?}");
+}

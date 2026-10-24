@@ -179,6 +179,10 @@ pub struct RecallRequest {
     /// The planner uses `context` or `tool` when it injects the returned text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<String>,
+    /// The Agent Skills the run's first message offers, for a captured
+    /// recall to keep in its snapshot with the learned skills it offers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered_skills: Vec<crate::agent_skills::OfferedSkill>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +293,10 @@ pub struct RecallSnapshot {
     pub purpose: String,
     pub created_ms: u64,
     pub notes: Vec<Recalled>,
+    /// The skills the same context offered: the Agent Skills found when the
+    /// run started, and the learned skills this recall selected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<crate::agent_skills::OfferedSkill>,
 }
 
 /// Attach dependency files, mark temporary experience, or confirm a stale

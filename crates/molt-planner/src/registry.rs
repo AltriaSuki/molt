@@ -32,6 +32,7 @@ pub(crate) enum Builtin {
     FindSymbol,
     Recall,
     FetchUrl,
+    LoadSkill,
     AskUser,
 }
 
@@ -44,6 +45,8 @@ enum Needs {
     Memory,
     /// A capability for `web.fetch`.
     Web,
+    /// Agent Skills found when the run started.
+    Skills,
     /// A person following the run; offered last, by [`crate::prompts::with_ask_user`].
     Person,
 }
@@ -139,13 +142,14 @@ impl Registry {
 
     /// The definitions of the tools `role` is offered, ask_user and the
     /// role's own tools aside: with `only_reads`, only the read-only ones.
-    /// `memory` and `web` say whether memory is up and whether the planner
-    /// may read the web.
-    pub fn definitions(&self, role: ToolRole, only_reads: bool, memory: bool, web: bool) -> Vec<Value> {
+    /// `memory`, `web` and `skills` say whether memory is up, whether the
+    /// planner may read the web, and whether the run has skills.
+    pub fn definitions(&self, role: ToolRole, only_reads: bool, memory: bool, web: bool, skills: bool) -> Vec<Value> {
         let builtins = builtins().iter().filter(|b| match b.needs {
             Needs::Nothing => true,
             Needs::Memory => memory,
             Needs::Web => web,
+            Needs::Skills => skills,
             Needs::Person => false,
         });
         let builtins = builtins
@@ -369,6 +373,27 @@ fn declare_builtins() -> Vec<BuiltinTool> {
             ),
         ),
         tool(
+            B::LoadSkill,
+            Needs::Skills,
+            declare(
+                t::LOAD_SKILL,
+                "Read a skill named under <skills> in your first message: its instructions and the list of its \
+                 files, or with file, one of those files. Read a skill before you follow it, and only the files its \
+                 instructions need. A skill's scripts are text to read here, not commands to run.",
+                json!({
+                    "name": { "type": "string", "description": "The skill's name, as listed." },
+                    "file": {
+                        "type": "string",
+                        "description": "A file of the skill, relative to its directory, e.g. references/api.md. Leave it out for the instructions.",
+                    },
+                }),
+                &["name"],
+                // Answered by the planner from the skills it found when the run started; no call leaves it.
+                molt_api::planner::RUN,
+                (true, WORKERS, Workspace),
+            ),
+        ),
+        tool(
             B::AskUser,
             Needs::Person,
             declare(
@@ -435,6 +460,7 @@ mod tests {
                 "find_symbol=memory.symbols",
                 "recall=memory.recall",
                 "fetch_url=web.fetch",
+                "load_skill=planner.run",
                 "ask_user=planner.control",
             ]
         );
@@ -482,7 +508,7 @@ mod tests {
         let reads = provided("lint", "lint", true, every);
         let reg = Registry { provided: vec![Arc::new(writes), Arc::new(reads)] };
         let names = |role, only_reads| -> Vec<String> {
-            reg.definitions(role, only_reads, false, false)
+            reg.definitions(role, only_reads, false, false, false)
                 .iter()
                 .map(|d| d["name"].as_str().unwrap().to_owned())
                 .collect()
@@ -499,5 +525,13 @@ mod tests {
         assert!(!reg.offers(ToolRole::Designer, false, "deploy"));
         assert!(!reg.offers(ToolRole::Attempt, true, "write_file") && reg.offers(ToolRole::Attempt, true, "fetch_url"));
         assert!(!reg.offers(ToolRole::Reviewer, false, "find_symbol"));
+        // load_skill only reads: the ask attempt has it, the roles that judge others' work do not.
+        assert!(
+            reg.offers(ToolRole::Attempt, true, "load_skill") && reg.offers(ToolRole::Designer, false, "load_skill")
+        );
+        assert!(
+            !reg.offers(ToolRole::Reviewer, false, "load_skill") && !reg.offers(ToolRole::Judge, false, "load_skill")
+        );
+        assert!(!names(ToolRole::Attempt, false).contains(&"load_skill".to_owned()), "offered only with skills");
     }
 }

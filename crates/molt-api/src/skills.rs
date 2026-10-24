@@ -47,6 +47,9 @@ pub struct Request {
     pub action: Action,
 }
 
+/// What `memory.skills` is asked to do. `export` returns the promoted
+/// revision of an enabled skill, for `molt skill export`: a draft, or a
+/// skill that is disabled, is not exported.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
@@ -57,4 +60,5 @@ pub enum Action {
     Disable { id: String, reason: String },
     Rollback { id: String, revision: u64, reason: String },
     Used { run: String },
+    Export { id: String },
 }
