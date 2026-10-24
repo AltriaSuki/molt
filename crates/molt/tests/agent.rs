@@ -2263,8 +2263,10 @@ async fn a_session_command_streams_its_output_from_the_sandbox_and_is_audited() 
             streamed.push((text, stderr));
         }
     }
-    assert!(streamed.contains(&("hi\n".to_owned(), false)), "{streamed:?}");
-    assert!(streamed.contains(&("oops\n".to_owned(), true)), "{streamed:?}");
+    // Chunks that arrive together go out as one event, so read each stream whole.
+    let stream = |err: bool| streamed.iter().filter(|(_, e)| *e == err).map(|(t, _)| t.as_str()).collect::<String>();
+    assert_eq!(stream(false), "hi\n", "{streamed:?}");
+    assert!(stream(true).lines().any(|line| line == "oops"), "{streamed:?}");
     assert!(!workspace.join("written.txt").exists(), "the command ran in a fork that was dropped");
     assert_eq!(setup.files(), ["README.txt"]);
 
