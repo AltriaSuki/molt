@@ -18,7 +18,7 @@ use crate::checkpoint::{SavedAttempt, SavedEnd};
 use crate::control;
 use crate::ctx::{Conversation, Ctx, Spend};
 use crate::tools::{self, Actor};
-use crate::{explore, judge, prompts};
+use crate::{explore, judge, process, prompts};
 
 /// Bytes of check output kept in a failed attempt's note.
 const NOTE_TAIL: usize = 2000;
@@ -178,6 +178,10 @@ pub(crate) async fn run(
         Ok(summary) => (AttemptStatus::Passed, String::new(), summary, None),
         Err(end) => (end.status, end.note, String::new(), end.dispute),
     };
+    // However it ended, nothing it started runs on.
+    if let Some(fork) = attempt.fork.as_deref().filter(|_| attempt.processes()) {
+        process::stop_all(&ctx, fork).await;
+    }
     // Stopped with the run, it can go on when the run is resumed; a dispute is its own end.
     let resumable = status == AttemptStatus::Cancelled && ctx.run_cancel.is_cancelled() && dispute.is_none();
     let (meter, check_runs, version) = (attempt.meter, attempt.check_runs, attempt.version);
@@ -327,6 +331,7 @@ impl Attempt {
         // A read-only `ask` attempt may only read, so it is not offered the question either.
         let tools = if ctx.interactive && !self.read_only { prompts::with_ask_user(&tools) } else { tools };
         let max_turns = seat.max_turns.unwrap_or(ctx.max_turns);
+        let tools = if self.processes() { process::with_processes(tools) } else { tools };
         // Last, after ask_user: without it the list is what it was.
         let tools = if self.explores() { explore::with_explore(tools) } else { tools };
         // A final reply the model gave before the run stopped, still to be checked.
@@ -453,6 +458,18 @@ impl Attempt {
                     std::mem::take(&mut reply).join("\n\n")
                 }
             };
+            // The work is checked as it stands, with nothing it started still changing it.
+            if self.processes() {
+                let stopped = process::stop_all(&ctx, &fork).await;
+                if stopped > 0 {
+                    let s = if stopped == 1 { "" } else { "es" };
+                    ctx.note(format!(
+                        "{}: stopped its {stopped} process{s} at its final reply",
+                        attempt_name(self.index)
+                    ))
+                    .await;
+                }
+            }
             // Added to while the model worked: it goes over its work first.
             if self.adopt(&fork, &mut conv, true).await {
                 asked = false;
@@ -576,6 +593,14 @@ impl Attempt {
             return;
         }
         self.conversation = kept.messages;
+    }
+
+    /// It is offered the process tools: they are on, it changes files, and
+    /// its role may have them.
+    fn processes(&self) -> bool {
+        !self.read_only
+            && self.ctx.processes
+            && self.ctx.seats().attempt.allows(molt_api::planner::tools::START_PROCESS)
     }
 
     /// It is offered `explore`: its workflow explores, it changes files,

@@ -85,6 +85,10 @@ const ROLE_TOOLS: &[&str] = &[
     t::DISPUTE_CHECK,
     t::SUBMIT_ROUTE,
     t::EXPLORE,
+    t::START_PROCESS,
+    t::READ_PROCESS,
+    t::WRITE_PROCESS,
+    t::STOP_PROCESS,
 ];
 
 /// Whether `name` is the planner's own.

@@ -777,6 +777,13 @@ pub mod tools {
     /// question of a sub-agent that only reads the attempt's fork, and get
     /// back its conclusion alone.
     pub const EXPLORE: &str = "explore";
+    /// Offered to attempts when the planner's starter turns processes on
+    /// (#110): start a command that runs on in the background, read its new
+    /// output, write to its input, and stop it.
+    pub const START_PROCESS: &str = "start_process";
+    pub const READ_PROCESS: &str = "read_process";
+    pub const WRITE_PROCESS: &str = "write_process";
+    pub const STOP_PROCESS: &str = "stop_process";
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ReadFile {
@@ -915,6 +922,39 @@ pub mod tools {
     pub struct Explore {
         /// The question, on its own: the sub-agent sees only this.
         pub question: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct StartProcess {
+        pub command: String,
+        /// Text the program prints once it is up, to wait for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ready: Option<String>,
+        /// How long to wait for `ready`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub timeout_s: Option<u64>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ReadProcess {
+        pub id: String,
+        /// How long to wait for output when there is none yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub wait_s: Option<u64>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct WriteProcess {
+        pub id: String,
+        pub input: String,
+        /// Close its input after this, so it reads to the end.
+        #[serde(default)]
+        pub close: bool,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct StopProcess {
+        pub id: String,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

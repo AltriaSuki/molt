@@ -35,7 +35,7 @@ const MAX_TIMEOUT_MS: u64 = 3_600_000;
 const HEAD_BYTES: usize = 8 * 1024;
 const TAIL_BYTES: usize = 24 * 1024;
 /// How long output may keep arriving after the command exited and its group was killed.
-const GRACE: Duration = Duration::from_millis(500);
+pub(crate) const GRACE: Duration = Duration::from_millis(500);
 /// Removed from the command's environment: the service's bus secret and API keys.
 const HIDDEN_PREFIXES: [&[u8]; 3] = [b"MOLT_", b"ANTHROPIC_", b"OPENAI_"];
 /// Output a streamed command publishes at most; the reply has the rest of its start and end.
@@ -123,31 +123,8 @@ pub(crate) async fn run(
         return Err(RemoteError { code: ErrorCode::Invalid, message });
     }
 
-    let (mut cmd, guard) = match policy {
-        Some(policy) => {
-            let (cmd, guard) =
-                policy.prepare(roots, &ws, program, &build).map_err(|e| failed(format!("sandbox: {e:#}")))?;
-            (cmd, Some(guard))
-        }
-        None => (Command::new(program), None),
-    };
-    cmd.arg("-c")
-        .arg(&req.command)
-        .current_dir(&ws)
-        .stdin(if req.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    if policy.is_none() {
-        cmd.env_clear().envs(child_env());
-        // Unconfined, the same private directories, unless the user's
-        // environment already chose where builds go.
-        for (name, value) in build.env() {
-            if std::env::var_os(name).is_none() {
-                cmd.env(name, value);
-            }
-        }
-    }
+    let (mut cmd, guard) = command(roots, program, policy, &ws, &build, &req.command)?;
+    cmd.stdin(if req.stdin.is_some() { Stdio::piped() } else { Stdio::null() });
     let started = Instant::now();
     let (mut child, group) = Group::spawn(&mut cmd, groups, &cancel, guard.as_ref().map(|guard| guard.info.clone()))?;
 
@@ -202,6 +179,40 @@ pub(crate) async fn run(
     })
 }
 
+/// `command` under `program -c` in the canonical workspace `ws`, in the
+/// sandbox `policy` describes (keep the guard while it runs) or unconfined
+/// without the service's secrets, in a process group of its own, with its
+/// output piped. Its standard input is left for the caller to set.
+pub(crate) fn command(
+    roots: &Roots,
+    program: &Path,
+    policy: Option<&SandboxPolicy>,
+    ws: &Path,
+    build: &build_dir::BuildDir,
+    command: &str,
+) -> Result<(Command, Option<sandbox::Guard>), RemoteError> {
+    let (mut cmd, guard) = match policy {
+        Some(policy) => {
+            let (cmd, guard) =
+                policy.prepare(roots, ws, program, build).map_err(|e| failed(format!("sandbox: {e:#}")))?;
+            (cmd, Some(guard))
+        }
+        None => (Command::new(program), None),
+    };
+    cmd.arg("-c").arg(command).current_dir(ws).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+    if policy.is_none() {
+        cmd.env_clear().envs(child_env());
+        // Unconfined, the same private directories, unless the user's
+        // environment already chose where builds go.
+        for (name, value) in build.env() {
+            if std::env::var_os(name).is_none() {
+                cmd.env(name, value);
+            }
+        }
+    }
+    Ok((cmd, guard))
+}
+
 /// What package managers and network clients print when they cannot reach
 /// the network or a registry, lowercased.
 const OFFLINE_SIGNS: &[&str] = &[
@@ -233,7 +244,10 @@ fn looks_offline(output: &str) -> bool {
     OFFLINE_SIGNS.iter().any(|sign| output.contains(sign))
 }
 
-async fn terminate(group: &Group, child: &mut tokio::process::Child) -> std::io::Result<std::process::ExitStatus> {
+pub(crate) async fn terminate(
+    group: &Group,
+    child: &mut tokio::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
     group.term();
     // Keep the leader unreaped during grace so its process-group id cannot be reused.
     tokio::time::sleep(GRACE).await;
@@ -252,7 +266,7 @@ fn child_env() -> Vec<(OsString, OsString)> {
 
 /// A command's process group, listed in [`Groups`] while it lives. Killed
 /// when dropped too, so a cancelled request does not leave its command running.
-struct Group {
+pub(crate) struct Group {
     // A pgid of 0 would mean our own group.
     pgid: Option<libc::pid_t>,
     groups: Arc<Groups>,
@@ -260,7 +274,7 @@ struct Group {
 }
 
 impl Group {
-    fn spawn(
+    pub(crate) fn spawn(
         command: &mut Command,
         groups: &Arc<Groups>,
         cancel: &CancellationToken,
@@ -283,13 +297,13 @@ impl Group {
         Ok((child, Self { pgid, groups: groups.clone(), info }))
     }
 
-    fn term(&self) {
+    pub(crate) fn term(&self) {
         if let Some(pgid) = self.pgid {
             term_group(pgid, self.info.as_deref());
         }
     }
 
-    fn kill(&self) {
+    pub(crate) fn kill(&self) {
         if let Some(pgid) = self.pgid {
             killpg(pgid);
         }
@@ -434,7 +448,7 @@ impl Publisher {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
