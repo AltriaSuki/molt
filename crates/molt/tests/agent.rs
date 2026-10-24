@@ -787,11 +787,11 @@ async fn molt_do_prints_a_disputed_check_and_exits_nonzero() {
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(stdout.starts_with("outcome: failed, the check was disputed\n"), "{stdout}");
-    assert!(stdout.contains("The done-check was disputed: attempt 0 found that it contradicts the task."), "{stdout}");
+    assert!(stdout.contains("The done-check was disputed: attempt 1 found that it contradicts the task."), "{stdout}");
     assert!(stdout.contains("The check asserts: the check greps greeting.txt for hello"), "{stdout}");
     assert!(stdout.contains("The task says: \"Write a greeting into greeting.txt.\""), "{stdout}");
     assert!(stdout.contains(&format!("To reproduce: `{CHECK}`")), "{stdout}");
-    assert!(stderr.contains("attempt 0 disputed the check"), "{stderr}");
+    assert!(stderr.contains("attempt 1 disputed the check"), "{stderr}");
     assert!(!workspace.path().join("greeting.txt").exists());
 
     // With --json the dispute is a field of its own, and the attempt is not a failed one.

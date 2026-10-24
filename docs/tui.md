@@ -71,7 +71,7 @@ refused. `/pause` starts no new model call, command or check until `/resume`;
 the status bar says what is still finishing (`pausing; waiting for attempt 1:
 a model call`) and then `paused`.
 An attempt can also ask you something only you can decide
-(`? attempt 0 asks  Tabs or spaces?`, with numbered options when it has
+(`? attempt 1 asks  Tabs or spaces?`, with numbered options when it has
 some). It waits for the answer while the other attempts go on; what you type
 next answers it, an option by its number or in your own words, and becomes
 the next version of the requirements, which every attempt follows. A run asks
@@ -289,7 +289,10 @@ starts.
 Ctrl+O opens the run's transcript: each model turn's text, the tools it
 called with their arguments, and what they returned, read from the audit log
 as the run goes and still there after it ends. With one attempt drawn large
-(Tab), `o` opens that attempt's turns alone. `j`/`k` scroll, `{`/`}` jump
+(Tab), `o` opens that attempt's turns alone. Each turn is headed by whose it
+was: `attempt 2`, `designer`, `vetter`, `reviewer`, `judge` or `router`
+(`planner` for a run from a planner that did not say). Attempts are counted
+from 1 here, in their boxes and in `molt do`, alike. `j`/`k` scroll, `{`/`}` jump
 between turns, `e` unfolds long text and `v` opens the whole transcript in
 `$VISUAL` or `$EDITOR`. Where the audit log cannot be read, the tool calls the
 run published show instead.

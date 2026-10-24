@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use molt_api::model::{tool_result, user_blocks, user_text, STOP_MAX_TOKENS};
+use molt_api::model::{tool_result, user_blocks, user_text, Role, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{Conflict, SubmitVetting, SUBMIT_VETTING};
 use serde_json::Value;
 
@@ -29,7 +29,8 @@ pub(crate) async fn vet(
     files: &[(String, String)],
 ) -> Result<Vec<Conflict>, String> {
     let first = prompts::vetter_first_message(&ctx.task, &ctx.preamble(), command, files);
-    let mut conv = Conversation::new(prompts::VETTER_SYSTEM, Arc::new(prompts::vetter_tools()), first, None);
+    let mut conv =
+        Conversation::new(prompts::VETTER_SYSTEM, Arc::new(prompts::vetter_tools()), first, Role::Vetter, None);
     let mut meter = Meter::default();
     let mut nudged = false;
     loop {

@@ -59,7 +59,7 @@ pub(crate) async fn turn(
     match conv.fit(ctx.limits()) {
         Ok(None) => {}
         Ok(Some(fitted)) => {
-            let who = conv.attempt.map_or("the check's designer".to_owned(), |n| format!("attempt {n}"));
+            let who = conv.speaker();
             let (before, after) = fitted.tokens;
             let mut what = format!("{} earlier messages left out", fitted.left_out);
             if fitted.cut > 0 {

@@ -8,7 +8,7 @@ use molt_api::fs::{self, EntryKind};
 use molt_api::memory::{
     self, ForkSymbolsRequest, ForkSymbolsResponse, RecallRequest, RecallResponse, SymbolsRequest, SymbolsResponse,
 };
-use molt_api::model::{tool_result, ToolUse};
+use molt_api::model::{tool_result, Role, ToolUse};
 use molt_api::planner::tools as t;
 use molt_api::progress::Progress;
 use molt_api::shell;
@@ -387,10 +387,11 @@ async fn report(ctx: &Ctx, actor: Actor, tool: &str, detail: &str) {
             ctx.progress(Progress::ToolCall { run: ctx.run_id(), attempt: index, turn, tool: tool.to_owned(), detail })
                 .await
         }
-        Actor::Designer => ctx.note(format!("check designer: {detail}")).await,
-        Actor::Reviewer => ctx.note(format!("reviewer: {detail}")).await,
-        Actor::Judge => ctx.note(format!("judge: {detail}")).await,
-        Actor::Vetter => ctx.note(format!("check vetter: {detail}")).await,
+        // Named as their model calls are, so a tool line and a preview agree.
+        Actor::Designer => ctx.note(format!("{}: {detail}", Role::Designer.name())).await,
+        Actor::Reviewer => ctx.note(format!("{}: {detail}", Role::Reviewer.name())).await,
+        Actor::Judge => ctx.note(format!("{}: {detail}", Role::Judge.name())).await,
+        Actor::Vetter => ctx.note(format!("{}: {detail}", Role::Vetter.name())).await,
     }
 }
 

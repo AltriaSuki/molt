@@ -246,8 +246,10 @@ new checkpointed run starts.
 With `--workflow auto`, a checkpoint is kept unless the planner picks a
 workflow that only reads (`ask`), which answers in one go and keeps none.
 
-With `--stream`, previews identify the attempt (or check designer), turn and
-model call. These are provisional text, not verified results. Thinking and
+With `--stream`, previews identify whose call it is, its turn and the model
+call: `attempt 1` (attempts are counted from 1, as in the TUI), `designer`,
+`vetter`, `reviewer`, `judge` or `router`, as in
+`reviewer, turn 3, call msg_…`. The tool lines of each say the same name. These are provisional text, not verified results. Thinking and
 partial tool arguments are not displayed; tools execute only after the entire
 message, including its JSON inputs, has been received and validated. A broken
 or malformed stream fails the call without retrying its partial answer. HTTP

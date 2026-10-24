@@ -465,12 +465,14 @@ async fn handle_observed(
             // Retries are announced for every call made over the bus, so a
             // long wait on a failing API is visible without the log.
             let attempt = request.stream.as_ref().and_then(|s| s.attempt);
+            let role = request.role;
             let mut on_retry = events.clone().map(|events| {
                 let (trace, call) = (req.trace_id.clone(), call_id.to_string());
                 move |retry: api::Retry| {
                     let event = Progress::ModelRetry {
                         run: trace.to_string(),
                         attempt,
+                        role,
                         call: call.clone(),
                         failure: retry.failure,
                         delay_ms: u64::try_from(retry.delay.as_millis()).unwrap_or(u64::MAX),
@@ -486,6 +488,7 @@ async fn handle_observed(
                     let call = ModelCall {
                         run: req.trace_id.to_string(),
                         attempt: context.attempt,
+                        role,
                         turn: context.turn,
                         call: call_id.to_string(),
                         seq: 0,
@@ -916,7 +919,8 @@ mod tests {
         let gateway = Gateway::new(cfg).unwrap();
         let request = CompleteRequest {
             messages: vec![user_text("hi")],
-            stream: Some(molt_api::model::StreamContext { attempt: Some(0), turn: 1 }),
+            stream: Some(molt_api::model::StreamContext { attempt: None, turn: 1 }),
+            role: Some(molt_api::model::Role::Reviewer),
             ..Default::default()
         };
         let request = envelope("model.complete", serde_json::to_value(request).unwrap());
@@ -926,6 +930,8 @@ mod tests {
             .unwrap();
         assert!(result.get("error").is_none(), "{result}");
         let seen = lock(&seen).clone();
+        // Every event names the caller's role, so a preview says it is the reviewer's.
+        assert!(seen.iter().all(|e| e.speaker().as_deref() == Some("reviewer")), "{seen:?}");
         let kinds: Vec<&str> = seen
             .iter()
             .map(|e| match e {
@@ -1033,7 +1039,9 @@ mod tests {
             "usage": { "input_tokens": 1, "output_tokens": 1 }
         });
         // Announced with or without previews, with the attempt when the caller says.
-        for stream in [None, Some(molt_api::model::StreamContext { attempt: Some(1), turn: 2 })] {
+        let attempt_stream = Some(molt_api::model::StreamContext { attempt: Some(1), turn: 2 });
+        use molt_api::model::Role;
+        for (stream, role) in [(None, Some(Role::Judge)), (attempt_stream, Some(Role::Attempt)), (None, None)] {
             server.reset().await;
             Mock::given(method("POST"))
                 .and(path("/v1/messages"))
@@ -1047,7 +1055,7 @@ mod tests {
             };
             Mock::given(method("POST")).and(path("/v1/messages")).respond_with(answer).mount(&server).await;
             let attempt = stream.as_ref().and_then(|s| s.attempt);
-            let request = CompleteRequest { messages: vec![user_text("hi")], stream, ..Default::default() };
+            let request = CompleteRequest { messages: vec![user_text("hi")], stream, role, ..Default::default() };
             let request = envelope("model.complete", serde_json::to_value(request).unwrap());
             let (run, call) = (request.trace_id.to_string(), request.id.to_string());
             let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1060,6 +1068,7 @@ mod tests {
             let expected = |retry| Progress::ModelRetry {
                 run: run.clone(),
                 attempt,
+                role,
                 call: call.clone(),
                 failure: "model API 502".into(),
                 delay_ms: 0,

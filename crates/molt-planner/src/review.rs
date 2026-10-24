@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use molt_api::fs::{Change, ChangeKind};
-use molt_api::model::{tool_result, user_blocks, user_text, ToolUse, STOP_MAX_TOKENS};
+use molt_api::model::{tool_result, user_blocks, user_text, Role, ToolUse, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{SubmitReview, SUBMIT_REVIEW};
 use molt_api::planner::{CheckSpec, Requirement, Review, ReviewDetails, Verdict};
 use serde_json::Value;
@@ -190,7 +190,8 @@ async fn model(ctx: &Arc<Ctx>, winner: &Winner<'_>, rules: &[String]) -> Result<
         truncated,
         winner.requirements,
     );
-    let mut conv = Conversation::new(prompts::REVIEWER_SYSTEM, Arc::new(prompts::reviewer_tools()), first, None);
+    let mut conv =
+        Conversation::new(prompts::REVIEWER_SYSTEM, Arc::new(prompts::reviewer_tools()), first, Role::Reviewer, None);
     let mut meter = Meter::default();
     // The winner is decided; only the run's own end stops its review.
     let cancel = ctx.run_cancel.clone();

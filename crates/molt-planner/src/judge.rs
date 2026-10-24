@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use molt_api::model::{tool_result, user_blocks, user_text, STOP_MAX_TOKENS};
+use molt_api::model::{tool_result, user_blocks, user_text, Role, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{SubmitJudgement, SUBMIT_JUDGEMENT};
 use molt_api::planner::{Criterion, Finding};
 use serde_json::Value;
@@ -72,7 +72,8 @@ pub(crate) async fn judge(
         let reply = clip(reply.to_owned(), MAX_REPLY);
         let requirements = ctx.control.upto(version);
         let first = prompts::judge_first_message(&ctx.task, &requirements, &asked, &reply, &patch, truncated);
-        let mut conv = Conversation::new(prompts::JUDGE_SYSTEM, Arc::new(prompts::judge_tools()), first, None);
+        let mut conv =
+            Conversation::new(prompts::JUDGE_SYSTEM, Arc::new(prompts::judge_tools()), first, Role::Judge, None);
         conv.model = ctx.judge_model.clone();
         for judged in model(ctx, fork, &mut conv, &asked, cancel).await? {
             let i = judged.criterion as usize - 1;

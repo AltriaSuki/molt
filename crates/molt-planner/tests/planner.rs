@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use molt_api::fs::{self, Change, ChangeKind};
 use molt_api::memory;
-use molt_api::model::{CompleteRequest, CompleteResponse, Usage};
+use molt_api::model::{CompleteRequest, CompleteResponse, Role, Usage};
 use molt_api::planner::{
     AttemptStatus, CheckSpec, Constraint, Control, ControlRequest, ControlResponse, Criterion, Earlier, Outcome,
     Requirement, Review, RunRequest, RunResponse, RunState, Select, Verdict, Verification,
@@ -752,7 +752,7 @@ async fn check_rounds_are_limited() {
     assert_eq!((a.status, a.turns, a.check_runs), (AttemptStatus::Failed, 2, 2));
     assert!(a.note.contains("still broken"), "{}", a.note);
     assert!(resp.summary.contains("No attempt passed the done-check `check`"), "{}", resp.summary);
-    assert!(resp.summary.contains("attempt 0: failed"), "{}", resp.summary);
+    assert!(resp.summary.contains("attempt 1: failed"), "{}", resp.summary);
     assert!(fake.calls_to("fs.merge").is_empty());
     assert!(fake.forks_alive().is_empty());
 }
@@ -1852,7 +1852,7 @@ async fn a_long_task_leaves_out_its_earliest_turns_to_fit_and_still_finishes() {
         assert_eq!(fake.calls_to(fs::WRITE).len(), 1, "{name}");
         assert!(
             fake.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
-            if message.starts_with("attempt 0: ") && message.contains("earlier messages left out"))),
+            if message.starts_with("attempt 1: ") && message.contains("earlier messages left out"))),
             "{name}"
         );
     }
@@ -2456,7 +2456,7 @@ async fn a_paused_run_starts_nothing_new_until_it_goes_on() {
     // The model call already running cannot be stopped: the run says it waits for it.
     let paused = steer(&fake, "trace_pause", Control::Pause).await.unwrap();
     assert_eq!(paused.state, RunState::Pausing);
-    assert_eq!(paused.waiting, ["attempt 0: a model call"]);
+    assert_eq!(paused.waiting, ["attempt 1: a model call"]);
     tokio::time::sleep(Duration::from_millis(600)).await;
     // Its reply is in, and nothing new has started: not even the tools it asked for.
     assert_eq!(fake.requests().len(), 1);
@@ -2783,7 +2783,7 @@ async fn without_the_budget_to_wait_all_takes_the_first_at_once() {
             _ => None,
         })
         .expect("the run says why it did not wait");
-    assert!(note.starts_with("attempt 0 passed; $0.15 of the budget is left, less than it cost ($0.25)"), "{note}");
+    assert!(note.starts_with("attempt 1 passed; $0.15 of the budget is left, less than it cost ($0.25)"), "{note}");
 }
 
 // --- Rubrics for tasks no command can check (#75) -----------------------------
@@ -2904,6 +2904,40 @@ async fn a_writing_task_is_judged_criterion_by_criterion_and_unmet_ones_go_back(
     let ready = fake.events().into_iter().find(|e| matches!(e, Progress::CheckReady { .. })).unwrap();
     let Progress::CheckReady { command, rubric, .. } = ready else { unreachable!() };
     assert_eq!((command, rubric.len()), (None, 2));
+}
+
+/// The role a call should name, told by the tools it was offered.
+fn role_by_tools(req: &CompleteRequest) -> Role {
+    match () {
+        _ if is_designer(req) => Role::Designer,
+        _ if is_vetter(req) => Role::Vetter,
+        _ if is_reviewer(req) => Role::Reviewer,
+        _ if is_judge(req) => Role::Judge,
+        _ if is_router(req) => Role::Router,
+        _ => Role::Attempt,
+    }
+}
+
+#[tokio::test]
+async fn every_model_call_names_its_role_so_the_reviewer_and_the_judge_are_not_the_designer() {
+    let fake = reviewed(|req| submit_review(req, "approve", &[]));
+    let resp = run(&fake, RunRequest { review: true, ..request(Some("check"), 1) }).await;
+    assert!(resp.applied, "{}", resp.summary);
+    let judged = poem(title_judge);
+    let req = RunRequest { task: "Write a short poem in poem.md.".into(), ..request(None, 1) };
+    assert_eq!(run(&judged, req).await.outcome, Outcome::Judged);
+
+    let requests: Vec<CompleteRequest> = fake.requests().into_iter().chain(judged.requests()).collect();
+    for wanted in [Role::Designer, Role::Attempt, Role::Reviewer, Role::Judge] {
+        assert!(requests.iter().any(|r| role_by_tools(r) == wanted), "no {wanted:?} call");
+    }
+    for r in &requests {
+        assert_eq!(r.role, Some(role_by_tools(r)), "{:?}", r.tools);
+        // Only an attempt's call carries an attempt index.
+        if let Some(stream) = &r.stream {
+            assert_eq!(stream.attempt.is_some(), r.role == Some(Role::Attempt));
+        }
+    }
 }
 
 #[tokio::test]
@@ -3049,7 +3083,7 @@ async fn a_check_that_contradicts_the_task_goes_back_to_the_designer() {
     assert_eq!(names, ["read_file", "list_files", "search", "submit_vetting"]);
     assert!(close(resp.cost_usd, 0.125 * requests.len() as f64), "{}", resp.cost_usd);
     assert!(fake.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
-        if message == "check vetter: 1 conflict with the task; back to the designer")));
+        if message == "vetter: 1 conflict with the task; back to the designer")));
 }
 
 #[tokio::test]
@@ -3121,7 +3155,7 @@ async fn a_vetter_that_does_not_finish_lets_the_check_through_and_says_it_was_no
     // A failed call's cost is unknown, never free.
     assert_eq!(design.uncounted_calls, 1);
     assert!(fake.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
-        if message.starts_with("check vetter: did not finish (the model call failed: overloaded)"))));
+        if message.starts_with("vetter: did not finish (the model call failed: overloaded)"))));
 }
 
 // --- The design's share of the budget (#137) ---------------------------------
@@ -3308,12 +3342,12 @@ async fn an_attempt_that_disputes_the_check_ends_the_run_with_the_dispute_not_a_
     assert_eq!(dispute.task_quote, "Add hello.txt saying hi.");
     assert_eq!(dispute.reproduce, "sh tests/check.sh");
     assert!(
-        resp.summary.starts_with("The done-check was disputed: attempt 0 found that it contradicts the task."),
+        resp.summary.starts_with("The done-check was disputed: attempt 1 found that it contradicts the task."),
         "{}",
         resp.summary
     );
     assert!(resp.summary.contains("To reproduce: `sh tests/check.sh`"), "{}", resp.summary);
-    assert!(resp.summary.contains("- attempt 0: disputed"), "{}", resp.summary);
+    assert!(resp.summary.contains("- attempt 1: disputed"), "{}", resp.summary);
     // The disputing attempt stopped without a check run and is not a failed attempt; the other failed as usual.
     let (a, b) = (&resp.attempts[0], &resp.attempts[1]);
     assert_eq!((a.status, a.check_runs, a.turns), (AttemptStatus::Cancelled, 0, 2));

@@ -134,7 +134,14 @@ impl App {
                             lane.push(line);
                         }
                     }
-                    None => self.log.extend(task.designer_preview.feed(&event)),
+                    None => {
+                        // A planner that does not name roles: every such call is the designer's, as before.
+                        let preview = match context.role {
+                            None | Some(Role::Designer) => &mut task.designer_preview,
+                            Some(role) => task.role_previews.entry(role).or_default(),
+                        };
+                        self.log.extend(preview.feed(&event));
+                    }
                     _ => {}
                 }
             }
@@ -206,7 +213,7 @@ impl App {
                 }
                 let words = scrub(&text, &self.secrets);
                 for (i, l) in text::clean(&words).into_iter().enumerate() {
-                    let head = if i == 0 { format!("? attempt {attempt} asks  ") } else { "  ".to_owned() };
+                    let head = if i == 0 { format!("? {} asks  ", attempt_name(attempt)) } else { "  ".to_owned() };
                     self.log.push(Line::from(vec![span(head, Tone::Warn), span(l, Tone::Plain)]));
                 }
                 for (i, option) in options.iter().enumerate() {
@@ -632,6 +639,7 @@ mod tests {
         app.update(Msg::Progress(Progress::ModelRetry {
             run: run.clone(),
             attempt: Some(0),
+            role: Some(Role::Attempt),
             call: "fake-stream".into(),
             failure: "model API 502".into(),
             delay_ms: 60_000,
@@ -652,6 +660,7 @@ mod tests {
         app.update(Msg::Progress(Progress::ModelRetry {
             run,
             attempt: None,
+            role: Some(Role::Designer),
             call: "design".into(),
             failure: "could not reach the model API".into(),
             delay_ms: 0,
@@ -777,6 +786,62 @@ mod tests {
         let trace = app.task.as_ref().unwrap().trace.clone();
         assert!(app.update(Msg::Designed { trace, result: Err("cancelled".into()), existing: vec![] }).is_empty());
         assert!(app.task.is_none() && app.prompt.is_none());
+    }
+
+    #[test]
+    fn reviewer_and_judge_previews_are_named_and_not_hidden_by_the_designers_turns() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "implement it");
+        let call = |app: &App, role, id: &str, turn, seq| molt_api::progress::ModelCall {
+            role: Some(role),
+            call: id.into(),
+            turn,
+            ..model_context(app, None, seq)
+        };
+        // The designer got to turn 5; the reviewer and the judge start at turn 1.
+        for (role, id, turn, text) in [
+            (Role::Designer, "d", 5, "a check"),
+            (Role::Reviewer, "r", 1, "the exit flag is a false positive"),
+            (Role::Judge, "j", 1, "every criterion is met"),
+        ] {
+            app.update(Msg::Progress(Progress::ModelStarted { context: call(&app, role, id, turn, 0) }));
+            app.update(Msg::Progress(Progress::ModelText {
+                context: call(&app, role, id, turn, 1),
+                text: text.into(),
+            }));
+            let context = call(&app, role, id, turn, 2);
+            app.update(Msg::Progress(Progress::ModelFinished {
+                context,
+                usage: Some(Default::default()),
+                cost_usd: Some(0.01),
+                error: None,
+            }));
+        }
+        let shown = log(&app);
+        assert!(shown.contains("designer preview finished: a check"), "{shown}");
+        assert!(shown.contains("reviewer preview finished: the exit flag is a false positive"), "{shown}");
+        assert!(shown.contains("judge preview finished: every criterion is met"), "{shown}");
+    }
+
+    #[test]
+    fn a_question_names_its_attempt_as_the_attempt_boxes_do() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        type_in(&mut app, "implement it");
+        let run = app.task.as_ref().unwrap().trace.to_string();
+        app.update(Msg::Progress(Progress::AttemptStarted { run: run.clone(), attempt: 0, fork: None }));
+        app.update(Msg::Progress(Progress::Asked {
+            run,
+            attempt: 0,
+            question: 1,
+            text: "Tabs or spaces?".into(),
+            options: vec![],
+        }));
+        assert!(log(&app).contains("? attempt 1 asks  Tabs or spaces?"), "{}", log(&app));
+        let rows = frame_rows(&mut app, 140);
+        assert!(rows.iter().any(|r| r.contains(" attempt 1 ")), "the box is attempt 1 too:\n{}", rows.join("\n"));
     }
 
     #[test]
