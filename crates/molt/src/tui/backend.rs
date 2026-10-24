@@ -150,6 +150,8 @@ pub(super) async fn serve() -> anyhow::Result<()> {
         before: None,
     };
     let mut keep = Vec::new();
+    // The interface went without saying what to keep: it crashed or was killed.
+    let mut orphaned = false;
     let result = loop {
         tokio::select! {
             frame = incoming.recv() => {
@@ -159,8 +161,8 @@ pub(super) async fn serve() -> anyhow::Result<()> {
                         Ok(action) => rt.exec(action),
                         Err(e) => break Err(e.into()),
                     },
-                    Ok(None) => break Ok(()),
-                    Err(e) => break Err(e),
+                    Ok(None) => { orphaned = true; break Ok(()) },
+                    Err(e) => { orphaned = true; break Err(e) },
                 }
             },
             Some(session) = started.recv() => {
@@ -179,7 +181,11 @@ pub(super) async fn serve() -> anyhow::Result<()> {
         }
     }
     if let Some(session) = rt.session.take() {
-        session.shutdown(&keep).await;
+        if orphaned {
+            session.abandon().await;
+        } else {
+            session.shutdown(&keep).await;
+        }
     }
     reader.abort();
     collector.abort();
