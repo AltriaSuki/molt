@@ -86,10 +86,12 @@ sender from that.
 | Explicit DoH avoids fake-IP bootstrap while keeping private-address refusal, bounded answers and per-redirect host checks | `molt_web::resolver::tests`, `repeated_host_dns_failures_remove_fetch_url_and_refuse_stale_calls` |
 | Idle TUI undo notifies the current memory service; locked CLI undo leaves Git untouched and incomplete notices stay retryable | `session_undo_notifies_memory_and_cli_undo_refuses_its_lock_before_changing_git`, `tui::app::tests::quitting_waits_for_an_uninterruptible_git_operation_to_settle` |
 | An interrupted task's attempt forks are not dropped before the interface has looked at them; a fork whose changes cannot be listed is kept, and what the stopped task spent is counted, with unknown calls left uncounted | `runner::tests::a_cancelled_run_leaves_its_attempts_forks_to_a_caller_that_asked_for_them`, `tui::tests::an_interrupted_fork_whose_changes_cannot_be_listed_is_kept_while_it_exists`, `tui::app::tests::an_interrupt_counts_what_the_stopped_run_spent_and_keeps_unknown_calls_uncounted`, `tui::app::tests::a_single_esc_does_not_stop_a_running_task` |
+| An interface that stops mid-task keeps the run's checkpoint and forks; it goes on only when the user resumes it, under its own id and counted once, and cancelling or dropping it removes both; a damaged checkpoint or lost fork starts nothing | `crates/molt/tests/agent.rs` (`the_interfaces_session_keeps_a_stopped_runs_forks_to_resume_it_and_drops_them_when_told`), `tui::app::tests::a_task_cut_off_by_a_crash_goes_on_from_its_checkpoint_only_when_asked_and_its_cost_is_counted_once`, `stopping_a_checkpointed_task_drops_its_checkpoint_and_dropping_a_stopped_run_counts_what_it_spent`, `a_damaged_checkpoint_or_a_lost_fork_is_refused_with_why_and_starts_nothing` |
 | Kept results survive restart; conflicting applies leave user edits and the fork intact | `tui::app::tests::plan_results_are_browsable_and_remain_available_until_apply_or_discard_succeeds`, `a_kept_session_result_survives_restart_and_refuses_workspace_conflicts` |
 | Project command templates cannot set permissions or modes, and their checks are confirmed before attempts | `tui::app::tests::project_commands_set_one_request_and_confirm_their_check`, `tui::commands::tests::bad_files_conflicts_and_escaping_symlinks_do_not_block_other_commands` |
 | Commands build into a private writable directory outside the fork, and a result never carries the build artifacts commands leave in the fork: they are reported and not applied | `crates/molt/tests/agent.rs` (`build_output_of_the_check_is_left_out_of_the_result_and_the_workspace`), `crates/molt-tools/tests/fs.rs` (`build_artifacts_that_commands_leave_in_a_fork_are_reported_and_never_merged`), `crates/molt-tools/tests/sandbox.rs` (`build_output_goes_to_a_private_writable_directory_outside_the_fork_that_later_commands_reuse`) |
 | A request names a workflow and never defines one: only the planner's built-ins and its own configuration define workflows, and every result says what it was verified by (`command`, `judged`, `rules` or `none`) in the reply, `--json` and a `Molt-Verification` commit trailer | `crates/molt-planner/tests/planner.rs` (`a_request_can_name_a_workflow_but_only_one_the_planner_has`, `every_result_carries_its_verification_level`), `crates/molt/tests/agent.rs` (`the_verification_level_is_in_the_json_and_the_commit_trailers`) |
+| A project's `.molt/config.toml` holds only data: one with services, hooks, `env` or `pass_env` is refused with why | `layers::tests::a_project_config_with_services_hooks_or_environment_is_refused_with_why` |
 | A question (`ask`) makes no fork, designs no check and can change no file; `quick` runs exactly one attempt and designs nothing; the workflow `auto` picks is said before anything runs, never lighter than a given check allows, and the full one when the pick fails | `crates/molt-planner/tests/planner.rs` (`a_question_is_answered_in_the_workspace_without_a_fork_a_design_or_a_change`, `quick_runs_exactly_one_attempt_without_designing_and_reviews_by_the_fixed_rules`, `auto_picks_a_light_workflow_says_so_first_and_runs_it`, `with_a_check_auto_never_picks_ask_and_a_failed_pick_is_the_full_workflow`) |
 | Offline embedding models are hash-pinned and cannot reintroduce forgotten or cross-project notes | `semantic::tests::pinned_models_retrieve_synonyms_and_reject_changed_files`, `semantic::tests::synonyms_are_recalled_with_scores_and_snapshots_survive_forgetting` |
 
@@ -274,7 +276,8 @@ mode label stays yellow. A malformed or unsupported saved file is ignored with a
 single-line notice. Files use mode 0600 in the same private workspace state directory
 as history; values containing known credentials or common key patterns are not saved.
 
-The config passed with `--config` can set defaults, for example:
+The user config (see [Configuration layers](#configuration-layers)), or the
+config passed with `--config`, can set defaults, for example:
 
 ```toml
 [tui]
@@ -286,9 +289,8 @@ model = "sonnet"
 ```
 
 Commands entered this session override saved values, which override these config
-values, which override built-in defaults. Project command templates still affect
-only their own task and do not overwrite saved preferences. Changing defaults does not rewrite a run request already submitted for a task. Configuration
-files are still loaded only when explicitly selected.
+values (and a `--profile`'s), which override built-in defaults. Project command templates still affect
+only their own task and do not overwrite saved preferences. Changing defaults does not rewrite a run request already submitted for a task.
 
 If service startup fails transiently, the interface retries up to three times,
 after approximately 2, 5 and 15 seconds, and shows the countdown. Recognized
@@ -335,6 +337,27 @@ task and 4 MiB total; rejected drafts are retained. Invalid `@paths` pause the
 queue without losing the task; the planner reads files when the queued task starts. Queued tasks live in this interface session:
 quitting shows their full text for confirmation and prints it after the terminal
 is restored, with known credentials redacted. A crash does not save the queue.
+
+If the interface stops before a task is done (quit while it runs, a crash,
+the process killed), the next `molt` in the workspace picks up where it
+stopped, without calling a model: the earlier tasks' summaries later tasks
+are told about, what the session spent, and the task that was in flight. A
+task that changes things keeps a planner checkpoint as it runs (see
+"Checkpoints and `molt resume`"), and quitting or a crash keeps it and its
+forks: `/runs resume [RUN]` goes on with it under the same run id, with its
+check, protected paths, requirements and spend; `/runs discard [RUN]` drops it
+and its forks and counts what it spent. `/runs` lists the workspace's stopped
+runs, `molt do --checkpoint` ones included, and says why a damaged or
+incompatible checkpoint, or one whose fork is gone, cannot go on. Stopping the
+task with Esc is cancelling it: its checkpoint goes, and its work is kept as
+an interrupted result. `/pause` keeps the run in the interface. A check being
+designed or waiting for you, or an answer under `/ask`, is not checkpointed:
+its task is put back in the input to start again, and a design cut off counts
+as uncounted spend. A result that waited for your decision is kept (`/kept`).
+The session is saved privately per workspace whenever it changes, up to 1 MiB;
+a quit with nothing in flight removes it, so the next interface starts afresh.
+Only one kernel runs per data directory, so `molt resume` and the interface
+never go on with the same run at once.
 
 `/kept` lists this workspace's retained results with their task, outcome, age and
 change counts. Select with arrows, `d` inspects the current diff, Enter applies,
@@ -635,6 +658,8 @@ result in its fork, with exit status 3. A damaged checkpoint, one in another
 format, or one for another workspace is refused with the reason. The ten
 newest checkpoints are kept; older ones are removed with their forks when a
 new checkpointed run starts.
+With `--workflow auto`, a checkpoint is kept unless the planner picks a
+workflow that only reads (`ask`), which answers in one go and keeps none.
 
 With `--stream`, previews identify the attempt (or check designer), turn and
 model call. These are provisional text, not verified results. Thinking and
@@ -672,13 +697,67 @@ the review findings and names the kept fork for inspection.
 
 ### Config and secrets
 
-`molt do` reads a config file only when `--config` names one; it never picks
-up a `molt.toml` on its own, since one shipped in a project could run any
-command with your secrets. Without one it starts the default setup: the
+`molt do` reads a whole config file only when `--config` names one; it never
+picks up a `molt.toml` on its own, since one shipped in a project could run any
+command with your secrets. Without one it starts the default setup, with your
+user config and the project's data config over it (below): the
 gateway, `fs` and `shell` confined to the workspace with forks in
 `<data dir>/work`, memory with its database in `<data dir>/memory.db`, and
 the planner, using the service binaries installed next to `molt`. Data dirs that molt creates are private (0700), and it warns about
 an existing one that others can read.
+
+### Configuration layers
+
+Without `--config`, each layer goes over the ones before it:
+
+1. the built-in setup above;
+2. your user config, `~/.config/molt/config.toml` (`$XDG_CONFIG_HOME/molt/config.toml`
+   when that is set): trusted, so it may add services, change them, add
+   hooks, set `[tui]` and `[confirm]` defaults and define profiles. A
+   `[[service]]` with the name of a built-in one replaces the keys it gives
+   and keeps the rest; one with a new name is added. `[kernel]` is refused
+   there, since each workspace has its own data dir;
+3. the profile `--profile NAME` picks: a `[profile.NAME]` table with the keys
+   of `[tui]`, over them;
+4. the project's `.molt/config.toml` in the workspace, which may hold only data:
+   `check` (the default done-check), `ask_paths` (added to the paths confirm
+   mode stops for) and `instruction_files` (in place of `AGENTS.md` and
+   `CLAUDE.md`). A project config with `[[service]]`, `hooks`, `env` or
+   `pass_env` is refused with the reason, since whoever wrote the project
+   would choose what runs with your environment;
+5. environment variables: `MOLT_PLANNER_MODEL` or `MOLT_MODEL` over `model`,
+   `MOLT_EFFORT` over `effort`, `MOLT_BUDGET_USD` over `budget`,
+   `MOLT_MEMORY_MODEL` over `memory_model`, and `MOLT_INSTRUCTION_FILES` over
+   `instruction_files`;
+6. the command line, then the interface's saved settings and what you set in
+   the session.
+
+```toml
+# ~/.config/molt/config.toml
+[tui]
+model = "sonnet"
+attempts = 2
+
+[profile.cheap]
+model = "haiku"
+attempts = 1
+budget = 0.5
+
+# Added to the default services; the planner may call it, as with --allow-web.
+[[service]]
+name = "web"
+tier = "protected"
+provides = ["web.*"]
+exec = { command = "molt-web", args = ["--allow", "docs.rs"] }
+```
+
+`model`, `effort`, `attempts`, `budget` and `check` of `[tui]` are `molt do`'s
+defaults too where its flag is not given (`molt ask` takes `model`, `effort`
+and `budget`). `molt config show` prints the configuration in effect, and
+`--origin` prints one `key = value` line per value with the layer it comes
+from; secret-looking variables are redacted. With `--config FILE`, that file
+is the whole configuration, as before, and `--profile` picks one of its own
+`[profile.*]` tables.
 
 Services start with a scrubbed environment: `PATH`, `HOME`, the locale and a
 few more, plus what each is configured to receive. `ANTHROPIC_API_KEY` and
@@ -788,9 +867,10 @@ modes, run them as benchmark arms, such as
 
 ## Trusted lifecycle hooks
 
-An explicitly selected `--config /outside/project/molt.toml` may contain
-`[[hooks]]` entries. Files inside the workspace never supply hooks, even with
-`--config`; no project file is discovered automatically.
+An explicitly selected `--config /outside/project/molt.toml`, or the user
+config, may contain `[[hooks]]` entries. Files inside the workspace never
+supply hooks, even with `--config`, and a project's `.molt/config.toml` with
+hooks is refused.
 
 ```toml
 [[hooks]]
@@ -1247,6 +1327,7 @@ needed. Deleting an unfinished record loses its recovery material.
 
 - The default shell requires Linux x86_64 with bubblewrap 0.9+ and usable user namespaces. Unsupported hosts must explicitly choose --no-sandbox; namespace policy never silently falls back.
 - Model text streams with `--stream` in `molt do` and by default in the TUI (`/stream off` disables it); thinking is not shown and tool calls wait for the complete message. Preview delivery is best effort, and the final reply remains complete.
+- A project's `.molt/config.toml` takes `check`, `ask_paths` and `instruction_files` only: no project `suite` or command directory yet (commands stay in `.molt/commands`). The file is part of the workspace, so a result can change it like any file; confirm mode does not stop for it unless `ask_paths` names `.molt/`. Configs are re-read only when the interface starts.
 - The audit log records every message, file contents and model conversations included, and is never rotated; it grows with every run in a data dir.
 - Audit startup, verification and nonempty tail reads still scan the whole log, but memory is bounded by one record plus the requested tail. A record is limited to 16 MiB including its newline; oversized, malformed or unterminated records are refused, including on restart. The writer stops before persisting an oversized entry. `tail -n 0` opens the file without scanning; `read_all` intentionally retains every returned entry. Tail validates record syntax throughout the file, but only verification and startup check the hash chain.
 - Reading one trace back from the audit log scans the log from the start: there is no index yet. One read looks through at most 256 MiB and keeps to its deadline, and two run at once.
@@ -1254,11 +1335,11 @@ needed. Deleting an unfinished record loses its recovery material.
 - Only Cargo's cache is mounted for you (by the `rust` profile, or `--deps-cache cargo`); Go, Node and Python dependencies must be in the project (vendor, `node_modules`, `.venv`) or mounted with a policy. The preflight before a run is a file check, not a build; `molt env doctor` runs the profiles' probes, but not before every run. No profile opens the network only to package registries: commands have all of it (a user profile or policy with `network`) or none. A user profile replaces the built-in profile of its name whole, and user profiles come only from a `--config` file until there is a user config. With the Cargo cache, crates missing from it cannot be fetched, sources Cargo extracts privately are writable by later commands of the same workspace (as its build directory is), and local-registry or directory sources named in the host Cargo config are not mounted. `molt sandbox suggest`, a generated policy draft, is not built yet.
 - The private build directories (`<data dir>/work/.molt/build`) are never cleaned up, and each Cargo slot a workspace used holds a full build; delete the directory to reclaim the space. A result's build artifacts are recognized by name and content, not by which command made them: a compiled file or a file under a top-level `target-*/` that an attempt makes with a command, rather than with its file tools, is left out too.
 - What an interrupted task in the interface spent comes from its progress events, which are best effort: a call whose events were lost is missing from the session total, and the stopped run's audit log is not read back to settle it. `r` after a stop does not take what the stopped attempts spent off the new run's budget.
-- After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none. A run with `--checkpoint` that stops keeps its forks for `molt resume`.
+- After an interrupted run, forks are removed only from a scratch dir inside the data dir (the default); a configured scratch elsewhere may be shared with other runs and is left alone. A `molt do` killed outright (SIGKILL) removes none. A run with `--checkpoint` that stops keeps its forks for `molt resume`. An interface (`molt`) that crashes or is killed removes no fork its session made: the one a result waited in is picked up as a kept result, and others stay in the scratch dir until removed by hand.
 - The check's designer is only told not to do the task, and told afterwards when it changed files beyond its check files: nothing stops it from spending its share of the budget that way. When its share runs out without a check, the run stops rather than falling back to a rubric, since a designer that submitted none has none to fall back to. `--criterion` gives criteria without commands; only a designed rubric can have criteria a command decides.
 - A rubric's model-judged criteria are a model's reading, not a proof: the judge can be wrong, and nothing but the criteria with a command checks the result. In the interface, a constraint that adds a check is refused while a run is being judged by a rubric.
 - Only `molt do --commit`, `molt resume --commit` and the interface's `/commit on` commit a result, always on the current branch (`--branch` is for `molt do` only). `molt undo` takes back only those commits, and refuses a file changed after the run rather than merging the revert into it (use `git revert` then).
-- A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface (`molt ui`) does not save checkpoints yet. Its task queue lives in memory: normal exit prints unexecuted tasks, while a crash loses them.
+- A checkpoint is saved whole at each boundary, so a long conversation makes each save bigger. The interface's task queue lives in memory: normal exit prints unexecuted tasks, while a crash loses them.
 - Promotion updates the registry pointer but does not yet restart the running service; hot swap with in-flight draining lands with milestone 6.
 - Call-cycle checks at the gate remain future work.
 - Default recall matches keywords with stemming, so differently worded notes can be missed. Chinese, Japanese and Korean match on pairs of characters, so a query can also find a note where its pair spans two words, and a one-character query word finds only notes where that character stands alone. Optional offline word-vector recall needs a reviewed hash-pinned local model; its mean-pooling backend does not understand word order or supply a pretrained vocabulary.

@@ -25,6 +25,7 @@ use molt_tools::SandboxPolicy;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::layers::Layered;
 use crate::project::{Project, Registry};
 use crate::{Config, Running};
 
@@ -57,63 +58,114 @@ const LEARN_PROBE: Duration = Duration::from_secs(10);
 pub struct Interrupted;
 
 /// The configuration `molt do` runs with: the file at `path` when one is
-/// given (it must define the agent [`SERVICES`]), otherwise [`Config::agent`]
-/// for the canonical `workspace`, with the service executables next to the
-/// running one. No file is ever picked up on its own: one in the project
-/// could run any command with the user's secrets. `data_dir` replaces the
-/// configured data dir; the default setup otherwise uses `project`'s, or
-/// [`default_data_dir`] without one, and has memory keep the notes about the
-/// project under its id and the user's notes for every project next to the
-/// registry ([`Registry::user_db`]).
+/// given (it must define the agent [`SERVICES`]), otherwise [`layered`] for
+/// the canonical `workspace`, with the service executables next to the
+/// running one. `profile` picks the file's, or the user config's, profile.
+/// No file in the project is picked up as a config: one there could run any
+/// command with the user's secrets, so its `.molt/config.toml` holds only
+/// data. `data_dir` replaces the configured data dir; the default setup
+/// otherwise uses `project`'s, or [`default_data_dir`] without one, and has
+/// memory keep the notes about the project under its id and the user's
+/// notes for every project next to the registry ([`Registry::user_db`]).
 pub fn resolve_config(
     path: Option<&Path>,
     workspace: &Path,
     data_dir: Option<&Path>,
     project: Option<&Project>,
+    profile: Option<&str>,
 ) -> anyhow::Result<Config> {
     if let Some(path) = path {
-        let mut cfg = Config::load(path)?;
+        let mut cfg = Layered::file(path, profile)?.config;
         let trusted = !path.canonicalize()?.starts_with(workspace);
         if !trusted && !cfg.hooks.is_empty() {
             eprintln!("lifecycle hooks in a project configuration are ignored; keep trusted hook configuration outside the project");
             cfg.hooks.clear();
         }
-        molt_planner::hooks::validate(&cfg.hooks)?;
-        let hooks = serde_json::to_string(&cfg.hooks)?;
-        if let Some(planner) = cfg.service_mut("planner") {
-            planner.env.insert("MOLT_HOOKS_JSON".into(), hooks);
-        }
+        install_hooks(&mut cfg)?;
         require_services(&cfg).with_context(|| format!("{} cannot run tasks", path.display()))?;
         if let Some(dir) = data_dir {
             cfg.kernel.data_dir = dir.to_path_buf();
         }
         return Ok(cfg);
     }
-    if ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"]
-        .iter()
-        .all(|name| std::env::var(name).ok().is_none_or(|key| key.trim().is_empty()))
-    {
+    let data_dir = chosen_data_dir(workspace, data_dir, project)?;
+    // Checked before the directory is created, and again once it exists.
+    let data_dir = resolved(&data_dir).with_context(|| format!("data dir {}", data_dir.display()))?;
+    outside(workspace, &data_dir)?;
+    let mut cfg = layered(workspace, &data_dir, project, profile)?.config;
+    let credential = |name: &&str| {
+        let set = |value: Option<&String>| value.is_some_and(|key| !key.trim().is_empty());
+        set(std::env::var(name).ok().as_ref()) || set(cfg.service("model").and_then(|m| m.env.get(*name)))
+    };
+    if !["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"].iter().any(credential) {
         bail!(
             "ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or OPENAI_API_KEY is not set: export your provider credential, or pass --config with services of your own"
         );
     }
-    let data_dir = match (data_dir, project) {
-        (Some(dir), _) => dir.to_path_buf(),
-        (None, Some(project)) => project.data_dir.clone(),
-        (None, None) => default_data_dir(workspace)?,
-    };
-    // Checked before the directory is created, and again once it exists.
-    let data_dir = resolved(&data_dir).with_context(|| format!("data dir {}", data_dir.display()))?;
-    outside(workspace, &data_dir)?;
+    install_hooks(&mut cfg)?;
+    require_services(&cfg).context("the user config leaves the agent unable to run tasks")?;
     crate::lock::create_private_dir(&data_dir)?;
-    let data_dir = data_dir.canonicalize().with_context(|| format!("data dir {}", data_dir.display()))?;
-    outside(workspace, &data_dir)?;
-    let mut cfg = Config::agent(workspace, &data_dir, &bin_dir()?)?;
-    if let Some(project) = project {
-        cfg.for_project(&project.id, &project_paths(project, workspace))?;
-        cfg.with_user_db(&Registry::user()?.user_db())?;
-    }
+    let canonical = data_dir.canonicalize().with_context(|| format!("data dir {}", data_dir.display()))?;
+    outside(workspace, &canonical)?;
+    anyhow::ensure!(canonical == data_dir, "the data dir {} moved while molt started", data_dir.display());
     Ok(cfg)
+}
+
+/// Hand the planner the config's lifecycle hooks, once they are checked.
+fn install_hooks(cfg: &mut Config) -> anyhow::Result<()> {
+    molt_planner::hooks::validate(&cfg.hooks)?;
+    let hooks = serde_json::to_string(&cfg.hooks)?;
+    if let Some(planner) = cfg.service_mut("planner") {
+        planner.env.insert("MOLT_HOOKS_JSON".into(), hooks);
+    }
+    Ok(())
+}
+
+/// `data_dir`, else `project`'s, else the default one of `workspace`.
+fn chosen_data_dir(workspace: &Path, data_dir: Option<&Path>, project: Option<&Project>) -> anyhow::Result<PathBuf> {
+    match (data_dir, project) {
+        (Some(dir), _) => Ok(dir.to_path_buf()),
+        (None, Some(project)) => Ok(project.data_dir.clone()),
+        (None, None) => default_data_dir(workspace),
+    }
+}
+
+/// The default setup for `workspace` and `project` with its data in
+/// `data_dir`, and the user's config, `profile`, the project's data config
+/// and the environment over it (see [`crate::layers`]).
+pub fn layered(
+    workspace: &Path,
+    data_dir: &Path,
+    project: Option<&Project>,
+    profile: Option<&str>,
+) -> anyhow::Result<Layered> {
+    let mut defaults = Config::agent(workspace, data_dir, &bin_dir()?)?;
+    if let Some(project) = project {
+        defaults.for_project(&project.id, &project_paths(project, workspace))?;
+        defaults.with_user_db(&Registry::user()?.user_db())?;
+    }
+    Layered::build(&defaults, workspace, profile, &|name| std::env::var(name).ok())
+}
+
+/// What `molt config show` prints: what [`resolve_config`] would run with,
+/// with where each value comes from. Nothing is created.
+pub fn show_config(
+    path: Option<&Path>,
+    workspace: &Path,
+    data_dir: Option<&Path>,
+    project: Option<&Project>,
+    profile: Option<&str>,
+) -> anyhow::Result<Layered> {
+    if let Some(path) = path {
+        let mut layered = Layered::file(path, profile)?;
+        if let Some(dir) = data_dir {
+            layered.config.kernel.data_dir = dir.to_path_buf();
+        }
+        return Ok(layered);
+    }
+    let data_dir = chosen_data_dir(workspace, data_dir, project)?;
+    let data_dir = resolved(&data_dir).with_context(|| format!("data dir {}", data_dir.display()))?;
+    layered(workspace, &data_dir, project, profile)
 }
 
 /// The workspace to work in and its project: the project `named` (by id or
@@ -375,11 +427,7 @@ pub fn memory_config(
             cfg
         }
         None => {
-            let data_dir = match (data_dir, project) {
-                (Some(dir), _) => dir.to_path_buf(),
-                (None, Some(project)) => project.data_dir.clone(),
-                (None, None) => default_data_dir(workspace)?,
-            };
+            let data_dir = chosen_data_dir(workspace, data_dir, project)?;
             if !data_dir.is_dir() {
                 bail!(
                     "molt has not run in {} yet (no data dir at {}); memory starts with the first `molt do`",
@@ -388,12 +436,7 @@ pub fn memory_config(
                 );
             }
             let data_dir = data_dir.canonicalize().with_context(|| format!("data dir {}", data_dir.display()))?;
-            let mut cfg = Config::agent(workspace, &data_dir, &bin_dir()?)?;
-            if let Some(project) = project {
-                cfg.for_project(&project.id, &project_paths(project, workspace))?;
-                cfg.with_user_db(&Registry::user()?.user_db())?;
-            }
-            cfg
+            layered(workspace, &data_dir, project, None)?.config
         }
     };
     cfg.service(MEMORY).context("the config has no memory service")?;
@@ -652,6 +695,29 @@ pub fn checkpoint_dir(cfg: &Config) -> Option<PathBuf> {
     args.iter().skip_while(|a| *a != "--state").nth(1).map(PathBuf::from)
 }
 
+/// One line about a stopped run: its id, when it stopped, what it spent,
+/// its attempts and its task.
+pub fn stopped_run(saved: &molt_planner::checkpoint::Saved) -> String {
+    let ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |now| (now.as_millis() as u64).saturating_sub(saved.saved_ms) / 60_000);
+    let attempts: Vec<String> = saved
+        .attempts
+        .iter()
+        .map(|a| match &a.end {
+            Some(end) => format!("{}: {:?} after {} turns", a.index, end.status, a.turns).to_lowercase(),
+            None => format!("{}: stopped after {} turns", a.index, a.turns),
+        })
+        .collect();
+    let task: String = saved.request.task.lines().next().unwrap_or_default().chars().take(60).collect();
+    format!(
+        "{}  {ago} min ago  ${:.2}  [{}]  {task}",
+        saved.run,
+        saved.spend.cost_usd,
+        if attempts.is_empty() { "no attempt yet".to_owned() } else { attempts.join(", ") }
+    )
+}
+
 fn require_stream_capability(cfg: &Config) -> anyhow::Result<()> {
     let target: Target = format!("topic:publish:{}", progress::TOPIC).parse()?;
     let allowed =
@@ -802,6 +868,7 @@ pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::
         confirm: cfg.confirm.clone(),
         tui: cfg.tui.clone(),
         hooks: cfg.hooks.clone(),
+        profiles: cfg.profiles.clone(),
     };
     let running = crate::start(&alone).await?;
     let result = async {
@@ -1353,12 +1420,12 @@ mod tests {
         let config = format!("{services}\n[[hooks]]\nevent = \"before_apply\"\ncommand = \"true\"\nblocking = true\n");
         let outside = root.path().join("config.toml");
         std::fs::write(&outside, &config).unwrap();
-        let trusted = resolve_config(Some(&outside), &workspace, None, None).unwrap();
+        let trusted = resolve_config(Some(&outside), &workspace, None, None, None).unwrap();
         assert_eq!(trusted.hooks.len(), 1);
         assert!(trusted.service("planner").unwrap().env["MOLT_HOOKS_JSON"].contains("before_apply"));
         let inside = workspace.join("config.toml");
         std::fs::write(&inside, config).unwrap();
-        let ignored = resolve_config(Some(&inside), &workspace, None, None).unwrap();
+        let ignored = resolve_config(Some(&inside), &workspace, None, None, None).unwrap();
         assert!(ignored.hooks.is_empty());
         assert_eq!(ignored.service("planner").unwrap().env["MOLT_HOOKS_JSON"], "[]");
     }

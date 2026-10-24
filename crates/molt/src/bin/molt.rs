@@ -26,6 +26,10 @@ struct Cli {
     /// read one only when this is given.
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
+    /// Use the `[profile.NAME]` defaults of the user config (or of the
+    /// --config file): model, effort, attempts, budget and the rest of `[tui]`.
+    #[arg(long, global = true, value_name = "NAME")]
+    profile: Option<String>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -99,6 +103,26 @@ enum Cmd {
     },
     /// Create NATS secrets (if missing) and print the nats-server settings for them.
     NatsConfig,
+    /// See the configuration a run in a workspace uses.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Print the configuration in effect: the built-in setup with the user
+    /// config (~/.config/molt/config.toml), the --profile, the project's
+    /// .molt/config.toml and the environment over it, or the --config file.
+    /// Secret-looking variables are redacted.
+    Show {
+        /// Print one `key = value` line per value, with the layer it comes from.
+        #[arg(long)]
+        origin: bool,
+        #[command(flatten)]
+        at: MemoryAt,
+    },
 }
 
 #[derive(Args)]
@@ -118,9 +142,9 @@ struct DoArgs {
     /// and no check is designed.
     #[arg(long, value_name = "TEXT", value_parser = criterion, conflicts_with_all = ["check", "no_check"])]
     criterion: Vec<String>,
-    /// Parallel attempts.
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=8))]
-    attempts: u32,
+    /// Parallel attempts [default: `[tui] attempts` of the config, else 2].
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=8))]
+    attempts: Option<u32>,
     /// How to pick among attempts that pass: `first` takes the first and
     /// cancels the rest; `wait:<seconds>` gives the others that long to pass
     /// too, and `all` lets every attempt finish, then the passing ones are
@@ -669,6 +693,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                 deps_cache: args.deps_cache,
                 allow_web: args.allow_web,
                 web_resolver: args.web_resolver,
+                profile: cli.profile,
             };
             for fork in molt::tui::run(opts).await? {
                 eprintln!("kept: {}", agent::printable(&fork));
@@ -708,9 +733,9 @@ async fn main() -> anyhow::Result<ExitCode> {
             tracing::info!(signal, "stopping");
             running.shutdown().await;
         }
-        Cmd::Do(args) => return do_task(cli.config.as_deref(), args).await,
-        Cmd::Ask(args) => return ask(cli.config.as_deref(), args).await,
-        Cmd::Resume(args) => return resume_task(cli.config.as_deref(), args).await,
+        Cmd::Do(args) => return do_task(cli.config.as_deref(), cli.profile.as_deref(), args).await,
+        Cmd::Ask(args) => return ask(cli.config.as_deref(), cli.profile.as_deref(), args).await,
+        Cmd::Resume(args) => return resume_task(cli.config.as_deref(), cli.profile.as_deref(), args).await,
         Cmd::Undo(args) => return undo_cmd(cli.config.as_deref(), args).await,
         Cmd::Apply(args) => return apply_cmd(cli.config.as_deref(), args).await,
         Cmd::Memory { cmd } => memory_cmd(cli.config.as_deref(), cmd).await?,
@@ -748,6 +773,18 @@ async fn main() -> anyhow::Result<ExitCode> {
             for e in molt_kernel::audit::tail(&path, n).await? {
                 println!("{}", serde_json::json!({ "seq": e.seq, "ts_ms": e.ts_ms, "event": e.event }));
             }
+        }
+        Cmd::Config { cmd: ConfigCmd::Show { origin, at } } => {
+            let config = cli.config.as_deref();
+            let (workspace, project) = agent::locate(at.project.as_deref(), &at.workspace, config.is_some())?;
+            let layered = agent::show_config(
+                config,
+                &workspace,
+                at.data_dir.as_deref(),
+                project.as_ref(),
+                cli.profile.as_deref(),
+            )?;
+            print!("{}", layered.show(origin)?);
         }
         Cmd::NatsConfig => {
             let cfg = config()?;
@@ -868,9 +905,9 @@ fn cfg_scratch(args: &[String]) -> anyhow::Result<PathBuf> {
 }
 
 /// The config and canonical workspace a run of `molt do` or `molt resume` uses.
-fn prepare(config: Option<&Path>, args: &RunArgs) -> anyhow::Result<(Config, String)> {
+fn prepare(config: Option<&Path>, profile: Option<&str>, args: &RunArgs) -> anyhow::Result<(Config, String)> {
     let (workspace, project) = agent::locate(args.project.as_deref(), &args.workspace, config.is_some())?;
-    let mut cfg = agent::resolve_config(config, &workspace, args.data_dir.as_deref(), project.as_ref())?;
+    let mut cfg = agent::resolve_config(config, &workspace, args.data_dir.as_deref(), project.as_ref(), profile)?;
     if let Some(path) = config {
         eprintln!("config: {}", agent::printable(&path.display().to_string()));
     }
@@ -921,22 +958,27 @@ fn prepare(config: Option<&Path>, args: &RunArgs) -> anyhow::Result<(Config, Str
     Ok((cfg, workspace))
 }
 
-async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode> {
+async fn do_task(config: Option<&Path>, profile: Option<&str>, args: DoArgs) -> anyhow::Result<ExitCode> {
     // From the start, so that no signal leaves services running.
     let stop = molt::stop_signal()?;
-    let (cfg, workspace) = prepare(config, &args.common)?;
+    let (cfg, workspace) = prepare(config, profile, &args.common)?;
     let mut req = RunRequest::new(args.task, workspace);
-    req.check = args.check;
+    // The configured check, unless one is given or none is wanted.
+    let configured = (!args.no_check && args.criterion.is_empty()).then(|| cfg.tui.check.clone()).flatten();
+    if let (None, Some(check)) = (&args.check, &configured) {
+        eprintln!("check: {} (from the config; --check replaces it)", agent::printable(check));
+    }
+    req.check = args.check.or(configured);
     req.verify = !args.no_check;
     req.rubric = args.criterion.into_iter().map(|text| Criterion { text, command: None }).collect();
-    req.attempts = args.attempts;
+    req.attempts = args.attempts.or(cfg.tui.attempts).unwrap_or(2);
     req.select = args.select;
-    req.model = args.model;
-    req.effort = args.effort;
+    req.model = args.model.or_else(|| cfg.tui.model.clone());
+    req.effort = args.effort.or(cfg.tui.effort);
     req.max_turns = args.max_turns;
     req.syntax_check = args.syntax_check;
     req.judge_model = args.judge_model;
-    req.budget_usd = args.common.budget_usd;
+    req.budget_usd = args.common.budget_usd.or(cfg.tui.budget);
     req.design_budget_usd = args.common.design_budget_usd;
     req.apply = !args.common.no_apply;
     req.stream = args.common.stream;
@@ -946,24 +988,24 @@ async fn do_task(config: Option<&Path>, args: DoArgs) -> anyhow::Result<ExitCode
     execute(&cfg, req, TraceId::random(), &args.common, stop).await
 }
 
-async fn ask(config: Option<&Path>, args: AskArgs) -> anyhow::Result<ExitCode> {
+async fn ask(config: Option<&Path>, profile: Option<&str>, args: AskArgs) -> anyhow::Result<ExitCode> {
     let stop = molt::stop_signal()?;
-    let (cfg, workspace) = prepare(config, &args.common)?;
+    let (cfg, workspace) = prepare(config, profile, &args.common)?;
     let mut req = RunRequest::new(args.question, workspace);
     req.workflow = Some(molt_api::workflow::ASK.to_owned());
     req.attempts = 1;
-    req.model = args.model;
-    req.effort = args.effort;
+    req.model = args.model.or_else(|| cfg.tui.model.clone());
+    req.effort = args.effort.or(cfg.tui.effort);
     req.max_turns = args.max_turns;
-    req.budget_usd = args.common.budget_usd;
+    req.budget_usd = args.common.budget_usd.or(cfg.tui.budget);
     req.apply = !args.common.no_apply;
     req.stream = args.common.stream;
     execute(&cfg, req, TraceId::random(), &args.common, stop).await
 }
 
-async fn resume_task(config: Option<&Path>, args: ResumeArgs) -> anyhow::Result<ExitCode> {
+async fn resume_task(config: Option<&Path>, profile: Option<&str>, args: ResumeArgs) -> anyhow::Result<ExitCode> {
     let stop = molt::stop_signal()?;
-    let (cfg, workspace) = prepare(config, &args.common)?;
+    let (cfg, workspace) = prepare(config, profile, &args.common)?;
     let dir = agent::checkpoint_dir(&cfg).context("this config's planner keeps no checkpoints (it has no --state)")?;
     let here: Vec<checkpoint::Saved> = checkpoint::list(&dir)
         .into_iter()
@@ -981,7 +1023,7 @@ async fn resume_task(config: Option<&Path>, args: ResumeArgs) -> anyhow::Result<
             eprintln!("no stopped run to resume in {}", agent::printable(&workspace));
         }
         for saved in &here {
-            println!("{}", agent::printable(&stopped_run(saved)));
+            println!("{}", agent::printable(&agent::stopped_run(saved)));
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -1003,29 +1045,6 @@ async fn resume_task(config: Option<&Path>, args: ResumeArgs) -> anyhow::Result<
     req.design_budget_usd = args.common.design_budget_usd.or(req.design_budget_usd);
     eprintln!("resuming run {run}: {}", agent::printable(req.task.lines().next().unwrap_or_default()));
     execute(&cfg, req, TraceId::from_raw(&run), &args.common, stop).await
-}
-
-/// One line about a stopped run: its id, when it stopped, what it spent,
-/// its attempts and its task.
-fn stopped_run(saved: &checkpoint::Saved) -> String {
-    let ago = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |now| (now.as_millis() as u64).saturating_sub(saved.saved_ms) / 60_000);
-    let attempts: Vec<String> = saved
-        .attempts
-        .iter()
-        .map(|a| match &a.end {
-            Some(end) => format!("{}: {:?} after {} turns", a.index, end.status, a.turns).to_lowercase(),
-            None => format!("{}: stopped after {} turns", a.index, a.turns),
-        })
-        .collect();
-    let task: String = saved.request.task.lines().next().unwrap_or_default().chars().take(60).collect();
-    format!(
-        "{}  {ago} min ago  ${:.2}  [{}]  {task}",
-        saved.run,
-        saved.spend.cost_usd,
-        if attempts.is_empty() { "no attempt yet".to_owned() } else { attempts.join(", ") }
-    )
 }
 
 /// Carry out `req` under the run id `trace` and report it.
@@ -1210,7 +1229,7 @@ async fn undo_cmd(config: Option<&Path>, args: UndoArgs) -> anyhow::Result<ExitC
 
 async fn apply_cmd(config: Option<&Path>, args: ApplyArgs) -> anyhow::Result<ExitCode> {
     let (workspace, project) = agent::locate(args.at.project.as_deref(), &args.at.workspace, config.is_some())?;
-    let cfg = agent::resolve_config(config, &workspace, args.at.data_dir.as_deref(), project.as_ref())?;
+    let cfg = agent::resolve_config(config, &workspace, args.at.data_dir.as_deref(), project.as_ref(), None)?;
     let workspace = workspace.to_str().context("the workspace path is not UTF-8")?.to_owned();
     let (events, _) = tokio::sync::mpsc::unbounded_channel();
     let session = molt::session::Session::start(&cfg, &workspace, events).await?;

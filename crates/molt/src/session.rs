@@ -28,6 +28,7 @@ use molt_api::planner::{
     self, CheckSpec, Control, ControlRequest, ControlResponse, DesignResponse, RunRequest, RunResponse,
 };
 use molt_api::progress::{self, Progress};
+use molt_planner::checkpoint;
 use molt_proto::{Budget, ServiceId, TraceId};
 use molt_sdk::{CallOpts, Service};
 use serde::de::DeserializeOwned;
@@ -62,6 +63,8 @@ pub struct Session {
     memory: Option<Result<(), String>>,
     memory_db: Option<PathBuf>,
     forks: Mutex<Option<RunForks>>,
+    /// Where the planner keeps run checkpoints: a stopped run's forks there are kept for its resume.
+    checkpoints: Option<PathBuf>,
     versions: Vec<(String, String)>,
     hooks: Vec<molt_planner::hooks::Hook>,
 }
@@ -109,6 +112,7 @@ impl Session {
                     memory,
                     memory_db: agent::memory_db(cfg),
                     forks: Mutex::new(RunForks::before(cfg)),
+                    checkpoints: agent::checkpoint_dir(cfg),
                     versions,
                     hooks: cfg.hooks.clone(),
                 })
@@ -454,14 +458,63 @@ impl Session {
     }
 
     /// Stop the services and the kernel, and remove the forks the session
-    /// left behind, except those in `keep`.
+    /// left behind, except those in `keep` and those of runs that stopped
+    /// with a checkpoint, which a resume goes on in.
     pub async fn shutdown(&self, keep: &[String]) {
+        self.shutdown_dropping(keep, None).await
+    }
+
+    /// [`Session::shutdown`], and the checkpoint of run `drop` is removed
+    /// once the planner has stopped: that run is not to go on.
+    pub async fn shutdown_dropping(&self, keep: &[String], drop: Option<&str>) {
         let running = self.running.lock().unwrap_or_else(PoisonError::into_inner).take();
         if let Some(running) = running {
             running.shutdown().await;
         }
+        let mut keep: Vec<String> = keep.to_vec();
+        if let Some(dir) = &self.checkpoints {
+            if let Some(path) = drop.and_then(|run| checkpoint::path(dir, run).ok()) {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!("could not remove the checkpoint {}: {e}", path.display());
+                    }
+                }
+            }
+            keep.extend(checkpoint::list(dir).into_iter().filter_map(|(_, saved)| saved.ok()).flat_map(|s| s.forks()));
+        }
         if let Some(forks) = self.forks.lock().unwrap_or_else(PoisonError::into_inner).take() {
             forks.remove_new(&keep.iter().map(String::as_str).collect::<Vec<_>>());
+        }
+    }
+
+    /// Stop the services and the kernel and remove no fork: the interface
+    /// that would have said which to keep is gone, and one may hold a result
+    /// it was waiting on.
+    pub async fn abandon(&self) {
+        let running = self.running.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(running) = running {
+            running.shutdown().await;
+        }
+        self.forks.lock().unwrap_or_else(PoisonError::into_inner).take();
+    }
+
+    /// Drop the stopped run `run`: its forks, then its checkpoint. A fork
+    /// already gone is no error. Not for a run that is going on.
+    pub async fn drop_run(&self, run: &str) -> anyhow::Result<()> {
+        let dir = self.checkpoints.as_deref().context("this config's planner keeps no checkpoints")?;
+        let path = checkpoint::path(dir, run).map_err(|e| anyhow::anyhow!(e))?;
+        // A damaged checkpoint names no fork to drop; it goes all the same.
+        if let Ok(saved) = checkpoint::load(dir, run) {
+            for fork in saved.forks() {
+                if Path::new(&fork).exists() {
+                    self.discard(&fork).await.with_context(|| format!("dropping {fork}"))?;
+                }
+            }
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
         }
     }
 }
