@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use molt_api::model::{tool_result, user_blocks, user_text, Role, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{Conflict, SubmitVetting, SUBMIT_VETTING};
+use molt_proto::tool::ToolRole;
 use serde_json::Value;
 
 use crate::agent::{self, Meter, Stop};
@@ -29,8 +30,13 @@ pub(crate) async fn vet(
     files: &[(String, String)],
 ) -> Result<Vec<Conflict>, String> {
     let first = prompts::vetter_first_message(&ctx.task, &ctx.preamble(), command, files);
-    let mut conv =
-        Conversation::new(prompts::VETTER_SYSTEM, Arc::new(prompts::vetter_tools()), first, Role::Vetter, None);
+    let mut conv = Conversation::new(
+        prompts::VETTER_SYSTEM,
+        Arc::new(prompts::vetter_tools(&ctx.tools)),
+        first,
+        Role::Vetter,
+        None,
+    );
     let mut meter = Meter::default();
     let mut nudged = false;
     loop {
@@ -57,11 +63,11 @@ pub(crate) async fn vet(
         }
         let cut_off = agent::cut_off(&resp);
         let reads: Vec<_> =
-            calls.iter().filter(|c| prompts::REVIEWER_READS.contains(&c.name.as_str())).cloned().collect();
+            calls.iter().filter(|c| ctx.tools.offers(ToolRole::Vetter, true, &c.name)).cloned().collect();
         let mut read_results = tools::execute(ctx, fork, &reads, cut_off, Actor::Vetter).await.into_iter();
         let mut results: Vec<Value> = Vec::new();
         for call in &calls {
-            if prompts::REVIEWER_READS.contains(&call.name.as_str()) {
+            if ctx.tools.offers(ToolRole::Vetter, true, &call.name) {
                 let next = read_results.next();
                 results.push(next.unwrap_or_else(|| tool_result(&call.id, "The tool failed unexpectedly.", true)));
             } else if call.name == SUBMIT_VETTING && cut_off == Some(call.id.as_str()) {

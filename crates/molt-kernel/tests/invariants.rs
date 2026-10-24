@@ -114,6 +114,7 @@ fn manifest(name: &str, tier: Tier, requests: &[(&str, u64)]) -> Manifest {
             .map(|(t, n)| CapRequest { target: target(t), budget: Budget::new(*n, 0, 0) })
             .collect(),
         exec: None,
+        tools: Vec::new(),
     }
 }
 

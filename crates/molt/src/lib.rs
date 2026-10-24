@@ -123,6 +123,8 @@ fn check_socket_paths(cfg: &Config) -> anyhow::Result<()> {
 }
 
 async fn launch_all(kernel: &Kernel, cfg: &Config, secrets: Option<&Secrets>) -> anyhow::Result<()> {
+    // The planner learns the services' tools from the same manifests the kernel installs.
+    let tools = cfg.provided_tools()?;
     for svc in &cfg.services {
         kernel.install(svc.manifest()?).await?;
         let secret: Option<Secret> = match secrets {
@@ -136,7 +138,11 @@ async fn launch_all(kernel: &Kernel, cfg: &Config, secrets: Option<&Secrets>) ->
         };
         let limits = Limits { memory_bytes: svc.memory_mb.map(|m| m * 1024 * 1024), cpu_secs: svc.cpu_secs };
         let restart = RestartPolicy { max_restarts: svc.max_restarts, ..RestartPolicy::default() };
-        kernel.launch_with_env(&svc.name, secret, limits, restart, svc.launch_env()).await?;
+        let mut env = svc.launch_env();
+        if svc.name.as_str() == "planner" && !tools.is_empty() {
+            env.push((molt_planner::TOOLS_ENV.into(), serde_json::to_string(&tools)?));
+        }
+        kernel.launch_with_env(&svc.name, secret, limits, restart, env).await?;
         tracing::info!(service = %svc.name, "launched");
     }
     Ok(())

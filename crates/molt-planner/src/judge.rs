@@ -12,6 +12,7 @@ use std::sync::Arc;
 use molt_api::model::{tool_result, user_blocks, user_text, Role, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{SubmitJudgement, SUBMIT_JUDGEMENT};
 use molt_api::planner::{Criterion, Finding};
+use molt_proto::tool::ToolRole;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -72,8 +73,13 @@ pub(crate) async fn judge(
         let reply = clip(reply.to_owned(), MAX_REPLY);
         let requirements = ctx.control.upto(version);
         let first = prompts::judge_first_message(&ctx.task, &requirements, &asked, &reply, &patch, truncated);
-        let mut conv =
-            Conversation::new(prompts::JUDGE_SYSTEM, Arc::new(prompts::judge_tools()), first, Role::Judge, None);
+        let mut conv = Conversation::new(
+            prompts::JUDGE_SYSTEM,
+            Arc::new(prompts::judge_tools(&ctx.tools)),
+            first,
+            Role::Judge,
+            None,
+        );
         conv.model = ctx.judge_model.clone();
         for judged in model(ctx, fork, &mut conv, &asked, cancel).await? {
             let i = judged.criterion as usize - 1;
@@ -117,11 +123,11 @@ async fn model(
         }
         let cut_off = agent::cut_off(&resp);
         let reads: Vec<_> =
-            calls.iter().filter(|c| prompts::REVIEWER_READS.contains(&c.name.as_str())).cloned().collect();
+            calls.iter().filter(|c| ctx.tools.offers(ToolRole::Judge, true, &c.name)).cloned().collect();
         let mut read_results = tools::execute(ctx, fork, &reads, cut_off, Actor::Judge).await.into_iter();
         let mut results: Vec<Value> = Vec::new();
         for call in &calls {
-            if prompts::REVIEWER_READS.contains(&call.name.as_str()) {
+            if ctx.tools.offers(ToolRole::Judge, true, &call.name) {
                 let next = read_results.next();
                 results.push(next.unwrap_or_else(|| tool_result(&call.id, "The tool failed unexpectedly.", true)));
             } else if call.name == SUBMIT_JUDGEMENT && cut_off != Some(call.id.as_str()) {

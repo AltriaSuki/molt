@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::tool::ToolDecl;
 use crate::{Budget, ServiceId, Target};
 
 /// Content hash of one service version, e.g. `sha256:ab12…`.
@@ -55,4 +56,32 @@ pub struct Manifest {
     pub requests: Vec<CapRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exec: Option<Exec>,
+    /// Tools the service offers the planner's model, each on a method it
+    /// provides (RFC 0002). Left out when there are none, so a manifest
+    /// without tools keeps the version id it always had.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDecl>,
+}
+
+impl Manifest {
+    /// What is wrong with the service's tool declarations, if anything:
+    /// each must be well formed, have a name of its own, and target a
+    /// method the service provides. A declaration grants nothing; whoever
+    /// calls the method still needs a capability for it.
+    pub fn validate_tools(&self) -> Result<(), String> {
+        let mut names = std::collections::BTreeSet::new();
+        for tool in &self.tools {
+            tool.validate().map_err(|e| format!("service {}: {e}", self.name))?;
+            if !names.insert(tool.name.as_str()) {
+                return Err(format!("service {} declares the tool {:?} twice", self.name, tool.name));
+            }
+            if !self.provides.iter().any(|p| p.covers(&tool.target)) {
+                return Err(format!(
+                    "service {}: tool {:?} targets {}, which the service does not provide",
+                    self.name, tool.name, tool.target
+                ));
+            }
+        }
+        Ok(())
+    }
 }

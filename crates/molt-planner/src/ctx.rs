@@ -20,6 +20,7 @@ use crate::checkpoint::{Saved, SavedSpend, Store};
 use crate::control::Control;
 use crate::fit::Limits;
 use crate::memory::Memory;
+use crate::registry::Registry;
 use crate::{Bus, Config};
 
 /// Deadline for reading, writing, listing and searching files.
@@ -112,6 +113,9 @@ pub(crate) struct Ctx {
     /// The planner may read the web (it holds a capability for `web.fetch`):
     /// attempts are offered `fetch_url`.
     pub web: bool,
+    /// The tools this run may offer: the built-ins, and the provided tools
+    /// whose method the planner holds a capability for.
+    pub tools: Arc<Registry>,
     web_health: Arc<Mutex<WebHealth>>,
     /// The `<project_instructions>` block, when the project has instruction files.
     pub instructions: Option<String>,
@@ -209,6 +213,7 @@ impl Ctx {
     pub fn new(bus: Arc<dyn Bus>, cfg: Arc<Config>, trace: TraceId, req: &RunRequest) -> Self {
         let model = req.model.clone().filter(|m| !m.trim().is_empty()).or_else(|| cfg.default_model.clone());
         let web = bus.holds(molt_api::web::FETCH);
+        let tools = Arc::new(Registry::new(&cfg.tools, |target| bus.holds(target)));
         let budget_usd = req.budget_usd.unwrap_or(cfg.budget_usd);
         // The request was validated, which resolved its workflow.
         let workflow = crate::runner::workflow(&cfg, req.workflow.as_deref()).unwrap_or_else(|_| Workflow::verify());
@@ -231,6 +236,7 @@ impl Ctx {
             interactive: req.interactive,
             memory: Memory::default(),
             web,
+            tools,
             web_health: Arc::default(),
             instructions: None,
             files: req.files.clone(),
@@ -326,7 +332,9 @@ impl Ctx {
                 message: "attempt stopped before starting a new action".into(),
             });
         }
-        let reply = if matches!(target, model::COMPLETE | molt_api::shell::RUN) {
+        // A provided tool may take as long as a command, and stops with the attempt as one does.
+        let reply = if matches!(target, model::COMPLETE | molt_api::shell::RUN) || self.tools.is_provided_target(target)
+        {
             self.bus.call_cancellable(target, payload, budget, &self.trace, &self.cancel).await?
         } else {
             self.bus.call(target, payload, budget, &self.trace).await?

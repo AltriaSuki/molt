@@ -204,6 +204,7 @@ mod tests {
                 .map(|(t, tokens)| CapRequest { target: t.parse().unwrap(), budget: Budget::new(*tokens, 0, 0) })
                 .collect(),
             exec: None,
+            tools: Vec::new(),
         }
     }
 

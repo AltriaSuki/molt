@@ -10,10 +10,18 @@
 //! name = "echo"
 //! tier = "mutable"
 //! exec = { command = "molt-echo" }
+//! provides = ["echo.*"]
 //! requests = [{ target = "topic:builds", budget = { calls = 100 } }]
 //! memory_mb = 512
 //! env = { GREETING = "hi" }           # set for the process
 //! pass_env = ["ECHO_PREFIX"]          # copied from molt's environment when set
+//!
+//! [[service.tools]]                   # a tool the planner's model may be offered (RFC 0002)
+//! name = "echo_back"
+//! description = "Repeat the input back."
+//! target = "echo.echo"                # a method the service provides
+//! read_only = true
+//! input_schema = { type = "object", properties = { text = { type = "string" } } }
 //!
 //! [confirm]                           # when the interface's confirm mode stops
 //! max_lines = 300
@@ -31,6 +39,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use molt_proto::tool::{ProvidedTool, ToolDecl};
 use molt_proto::{Budget, CapRequest, Exec, Manifest, ServiceId, Target, Tier};
 use molt_transport::Secret;
 use serde::{Deserialize, Serialize};
@@ -104,6 +113,11 @@ pub struct ServiceSection {
     /// Variables copied from the molt process's environment when it has them.
     #[serde(default)]
     pub pass_env: Vec<String>,
+    /// Tools the service offers the planner's model, each on a method it
+    /// provides. Declaring one grants nothing: the planner offers it only
+    /// when it holds a capability for the method (RFC 0002).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDecl>,
 }
 
 fn mutable() -> Tier {
@@ -124,6 +138,7 @@ impl ServiceSection {
             max_restarts: five(),
             env: BTreeMap::new(),
             pass_env: Vec::new(),
+            tools: Vec::new(),
         }
     }
 
@@ -135,6 +150,7 @@ impl ServiceSection {
             provides: self.provides.clone(),
             requests: self.requests.clone(),
             exec: self.exec.clone(),
+            tools: self.tools.clone(),
         })
     }
 
@@ -309,6 +325,26 @@ const MEMORY_ENV: &[&str] = &[
     "MOLT_MODEL",
 ];
 
+/// Refuse a key a tool declaration does not have: declarations ignore
+/// unknown fields so that older readers keep working, but in the user's own
+/// file a misspelt `read_only` must not go unnoticed.
+fn unknown_tool_keys(doc: &toml::Value) -> anyhow::Result<()> {
+    let services = doc.get("service").and_then(toml::Value::as_array).into_iter().flatten();
+    for svc in services {
+        let name = svc.get("name").and_then(toml::Value::as_str).unwrap_or("?");
+        for tool in svc.get("tools").and_then(toml::Value::as_array).into_iter().flatten() {
+            let Some(keys) = tool.as_table() else { continue };
+            if let Some(key) = keys.keys().find(|k| !ToolDecl::FIELDS.contains(&k.as_str())) {
+                anyhow::bail!(
+                    "service {name}: a tool has the unknown key {key:?}; a tool takes {}",
+                    ToolDecl::FIELDS.join(", ")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Whether a variable of this name likely holds a credential.
 pub(crate) fn secret_name(name: &str) -> bool {
     ["API_KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|marker| name.to_ascii_uppercase().contains(marker))
@@ -329,12 +365,27 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> anyhow::Result<Self> {
+        unknown_tool_keys(&toml::from_str(text)?)?;
         let config: Self = toml::from_str(text)?;
+        config.provided_tools()?;
         config.tui.validate()?;
         for (name, profile) in &config.profiles {
             profile.validate().with_context(|| format!("in profile {name}"))?;
         }
         Ok(config)
+    }
+
+    /// Every tool the services declare, for the planner, once each
+    /// service's declarations are checked against what it provides and
+    /// against each other's names.
+    pub fn provided_tools(&self) -> anyhow::Result<Vec<ProvidedTool>> {
+        let mut tools = Vec::new();
+        for svc in &self.services {
+            svc.manifest()?.validate_tools().map_err(anyhow::Error::msg)?;
+            tools.extend(svc.tools.iter().map(|decl| ProvidedTool { service: svc.name.clone(), decl: decl.clone() }));
+        }
+        molt_planner::validate_tools(&tools)?;
+        Ok(tools)
     }
 
     /// The default agent setup: the model gateway, file and shell services
@@ -613,6 +664,45 @@ mod tests {
         ] {
             assert!(Config::parse(&format!("[tui]\n{field}")).is_err(), "{field}");
         }
+    }
+
+    #[test]
+    fn a_service_declares_tools_on_methods_it_provides_and_they_reach_its_manifest() {
+        let service = |tool: &str| {
+            format!(
+                "[[service]]\nname = \"lint\"\nexec = {{ command = \"molt-lint\" }}\nprovides = [\"lint.*\"]\n\
+                 [[service.tools]]\nname = \"lint\"\ndescription = \"Lint a file.\"\n\
+                 input_schema = {{ type = \"object\", properties = {{ path = {{ type = \"string\" }} }} }}\n{tool}"
+            )
+        };
+        let cfg =
+            Config::parse(&service("target = \"lint.check\"\nread_only = true\nroles = [\"attempt\", \"reviewer\"]\n"))
+                .unwrap();
+        let manifest = cfg.service("lint").unwrap().manifest().unwrap();
+        assert_eq!(manifest.tools.len(), 1);
+        assert!(manifest.tools[0].read_only);
+        let provided = cfg.provided_tools().unwrap();
+        assert_eq!(
+            (provided[0].service.as_str(), provided[0].decl.target.to_string().as_str()),
+            ("lint", "lint.check")
+        );
+        // A manifest without tools serializes as it did before they existed, so its version id is unchanged.
+        let mut plain = cfg.service("lint").unwrap().clone();
+        plain.tools.clear();
+        assert!(!serde_json::to_value(plain.manifest().unwrap()).unwrap().as_object().unwrap().contains_key("tools"));
+
+        for (tool, says) in [
+            ("target = \"fs.write\"\n", "does not provide"),
+            ("target = \"lint.check\"\nreadonly = true\n", "unknown key \"readonly\""),
+            ("target = \"lint.check\"\nroles = [\"reviewer\"]\n", "only reads"),
+            ("name = \"x\"\n", "duplicate key"),
+        ] {
+            let err = format!("{:#}", Config::parse(&service(tool)).unwrap_err());
+            assert!(err.contains(says), "{tool}: {err}");
+        }
+        let taken = service("target = \"lint.check\"\n")
+            .replace("name = \"lint\"\ndescription", "name = \"read_file\"\ndescription");
+        assert!(format!("{:#}", Config::parse(&taken).unwrap_err()).contains("planner's own tools"));
     }
 
     #[test]

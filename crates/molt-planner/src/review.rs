@@ -11,6 +11,7 @@ use molt_api::fs::{Change, ChangeKind};
 use molt_api::model::{tool_result, user_blocks, user_text, Role, ToolUse, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{SubmitReview, SUBMIT_REVIEW};
 use molt_api::planner::{CheckSpec, Requirement, Review, ReviewDetails, Verdict};
+use molt_proto::tool::ToolRole;
 use serde_json::Value;
 
 use crate::agent::{self, Meter, Stop};
@@ -190,8 +191,13 @@ async fn model(ctx: &Arc<Ctx>, winner: &Winner<'_>, rules: &[String]) -> Result<
         truncated,
         winner.requirements,
     );
-    let mut conv =
-        Conversation::new(prompts::REVIEWER_SYSTEM, Arc::new(prompts::reviewer_tools()), first, Role::Reviewer, None);
+    let mut conv = Conversation::new(
+        prompts::REVIEWER_SYSTEM,
+        Arc::new(prompts::reviewer_tools(&ctx.tools)),
+        first,
+        Role::Reviewer,
+        None,
+    );
     let mut meter = Meter::default();
     // The winner is decided; only the run's own end stops its review.
     let cancel = ctx.run_cancel.clone();
@@ -230,12 +236,12 @@ async fn model(ctx: &Arc<Ctx>, winner: &Winner<'_>, rules: &[String]) -> Result<
 /// anything else is refused without running.
 async fn answers(ctx: &Arc<Ctx>, fork: &str, calls: &[ToolUse], cut_off: Option<&str>) -> Vec<Value> {
     let reads: Vec<ToolUse> =
-        calls.iter().filter(|c| prompts::REVIEWER_READS.contains(&c.name.as_str())).cloned().collect();
+        calls.iter().filter(|c| ctx.tools.offers(ToolRole::Reviewer, true, &c.name)).cloned().collect();
     let mut read_results = tools::execute(ctx, fork, &reads, cut_off, Actor::Reviewer).await.into_iter();
     calls
         .iter()
         .map(|call| {
-            if prompts::REVIEWER_READS.contains(&call.name.as_str()) {
+            if ctx.tools.offers(ToolRole::Reviewer, true, &call.name) {
                 read_results.next().unwrap_or_else(|| tool_result(&call.id, "The tool failed unexpectedly.", true))
             } else if call.name == SUBMIT_REVIEW {
                 let msg = "Invalid input for submit_review: give verdict (approve, concern or reject) and findings.";
