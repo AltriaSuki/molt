@@ -3,6 +3,12 @@
 //! Commands run under `bash -c` (or `sh -c`) with the workspace as working
 //! directory, no stdin, their own process group (killed whole on timeout),
 //! and an environment without Molt or API secrets.
+//!
+//! A request that sets [`RunRequest::stream`] also has the command's output
+//! published as it comes, on `topic:progress` as
+//! [`crate::progress::Progress::Output`] events traced with the request, when
+//! the service may publish there. Those events are best effort and bounded;
+//! the reply holds the output as always.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +22,9 @@ pub struct RunRequest {
     /// Default and maximum are set by the service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Publish the output while the command runs (see the module docs).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

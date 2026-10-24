@@ -56,6 +56,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         };
         draw_viewer(frame, area, &mut viewer, " ↑/↓ select · d diff · enter apply · n discard · esc back ");
     }
+    if let Some(view) = &app.changes {
+        let mut viewer = super::app::Viewer {
+            title: "changes against HEAD".into(),
+            lines: app.changes_lines(),
+            scroll: view.selected.saturating_sub(5),
+        };
+        draw_viewer(frame, area, &mut viewer, " ↑/↓ select · enter diff · r again · esc back ");
+    }
     if let Some(viewer) = &mut app.viewer {
         draw_viewer(frame, area, viewer, " j/k scroll · g/G ends · esc close ");
     }

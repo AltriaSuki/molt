@@ -27,8 +27,12 @@ async fn main() -> anyhow::Result<()> {
     let fork =
         fs.handle(fs::FORK, serde_json::json!({"workspace": root})).await.map_err(|e| anyhow::anyhow!(e.message))?;
     let fork: fs::ForkResponse = serde_json::from_value(fork)?;
-    let req =
-        shell::RunRequest { workspace: fork.fork.clone(), command: args.command, timeout_ms: Some(args.timeout_ms) };
+    let req = shell::RunRequest {
+        workspace: fork.fork.clone(),
+        command: args.command,
+        timeout_ms: Some(args.timeout_ms),
+        stream: false,
+    };
     let result = shell.handle(shell::RUN, serde_json::to_value(req)?).await;
     shell.shutdown().await;
     let _ = fs.handle(fs::DROP, serde_json::json!({"fork": fork.fork})).await;

@@ -102,6 +102,26 @@ The log keeps everything a task reports, in full; PgUp and PgDn scroll it,
 and Ctrl+Home and Ctrl+End (or Home and End with an empty input) jump to its
 start and end.
 
+A line that starts with `!` is a shell command, not a task: `!cargo test`
+runs through the shell service in a fresh fork of the workspace as it is
+now, in the same sandbox as the attempts' commands, and its output streams
+into the log (stderr dimmed) as it comes. No model is called and nothing is
+spent; the request and its reply are in the audit log like every other
+message. The fork is dropped afterwards, so whatever the command writes is
+not kept in the workspace. The log says how it ran (`in the sandbox`, or
+`unconfined (--no-sandbox)` when you chose that), and its last line gives
+the exit code and how long it took. Esc stops it. One command runs at a
+time, for at most an hour; live output stops after 1 MiB, and the end of
+the output then comes from the reply.
+
+`/diff` lists what the workspace has changed against git's `HEAD`: each
+file with its added and removed lines, untracked files git does not ignore
+marked `new`. Enter opens the selected file's diff in the diff viewer, `r`
+lists again, and Esc goes back. Outside a git work tree, or before the
+first commit, it says it cannot compare. Git runs on your side, as it does
+for `/commit`, with the repository's external diff programs, filters and
+hooks turned off.
+
 `/memory [words]` lists the notes about the project, strongest first, with
 where each came from: the run, the service version that wrote it and the
 messages in the audit log it rests on. `f` forgets one, with a reason, as

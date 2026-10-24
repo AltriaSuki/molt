@@ -15,6 +15,7 @@ impl App {
         if !matches!(self.screen, Screen::Main)
             || self.queue_view.is_some()
             || self.kept_view.is_some()
+            || self.changes.is_some()
             || self.prompt.is_some()
             || self.viewer.is_some()
             || self.transcript.is_some()

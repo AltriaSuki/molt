@@ -159,6 +159,11 @@ async fn event_loop(
             .map(|(_, value)| value.clone()),
     );
     app.rules = cfg.confirm.clone();
+    app.sandbox = match agent::shell_sandboxed(&cfg) {
+        Some(true) => app::Sandbox::Isolated,
+        Some(false) => app::Sandbox::Unconfined,
+        None => app::Sandbox::Unknown,
+    };
     app.load_commands(Path::new(&workspace));
     let store = match state::Store::new(&cfg.kernel.data_dir, Path::new(&workspace)) {
         Ok(store) => {
@@ -302,6 +307,21 @@ async fn event_loop(
                         let _ = tx.send(Msg::Audit { trace, result });
                     });
                 }
+                Action::Changes => {
+                    let (tx, root) = (lister.clone(), root.clone());
+                    tokio::task::spawn_blocking(move || {
+                        let result = crate::git::Repo::open(&root).and_then(|repo| repo.changes());
+                        let _ = tx.send(Msg::Changes(result.map_err(|e| format!("{e:#}"))));
+                    });
+                }
+                Action::FileDiff { change } => {
+                    let (tx, root) = (lister.clone(), root.clone());
+                    tokio::task::spawn_blocking(move || {
+                        let result = crate::git::Repo::open(&root).and_then(|repo| repo.file_diff(&change));
+                        let _ =
+                            tx.send(Msg::FileDiff { path: change.path, result: result.map_err(|e| format!("{e:#}")) });
+                    });
+                }
                 Action::Export { text } => {
                     if let Err(e) = edit_outside(terminal, &pause, &data_dir, "transcript", &text) {
                         app.flash = Some(format!("the editor failed: {}", text::clean_line(&e)));
@@ -440,6 +460,8 @@ struct Runtime {
     starting: bool,
     /// Calls in flight, stopped on an interrupt.
     work: Vec<JoinHandle<()>>,
+    /// The user's commands running, by trace: what stops each.
+    commands: std::collections::HashMap<String, tokio_util::sync::CancellationToken>,
     /// The work tree as it was when the task `.0` started, for `/commit on`.
     before: Option<(String, anyhow::Result<crate::git::Before>)>,
 }
@@ -580,6 +602,20 @@ impl Runtime {
                 Msg::UsedNotes { run, result }
             }),
 
+            Action::Command { command, trace } => {
+                let stop = tokio_util::sync::CancellationToken::new();
+                self.commands.retain(|_, stop| !stop.is_cancelled());
+                self.commands.insert(trace.to_string(), stop.clone());
+                self.call(move |s| async move {
+                    let result = s.command(&command, &trace, stop).await.map_err(|e| format!("{e:#}"));
+                    Msg::CommandRan { trace, result }
+                })
+            }
+            Action::StopCommand { trace } => {
+                if let Some(stop) = self.commands.remove(trace.as_str()) {
+                    stop.cancel();
+                }
+            }
             Action::DropRun { run } => self.call(move |s| async move {
                 let result = s.drop_run(&run).await.map_err(|e| format!("{e:#}"));
                 Msg::RunDropped { run, result }
@@ -654,6 +690,8 @@ impl Runtime {
             | Action::ListRuns
             | Action::ReadAudit { .. }
             | Action::Export { .. }
+            | Action::Changes
+            | Action::FileDiff { .. }
             | Action::EditFork { .. } => {}
         }
     }
@@ -955,6 +993,7 @@ mod tests {
             session: None,
             starting: false,
             work: Vec::new(),
+            commands: Default::default(),
             before: None,
         };
         let resp = |path: &str| RunResponse {

@@ -4,6 +4,7 @@
 //! tested with plain values.
 
 mod apply;
+mod changes;
 mod check;
 mod command;
 mod completion;
@@ -15,6 +16,7 @@ mod queue;
 mod retry;
 mod runs;
 mod settings;
+mod shell;
 mod status;
 mod task;
 #[cfg(test)]
@@ -26,6 +28,7 @@ pub use input::{HistorySearch, Input};
 pub use memory::{memory_lines, ChangeStep, MemoryEdit, MemoryView};
 pub use runs::Stopped;
 pub use settings::Settings;
+pub use shell::Sandbox;
 pub use viewer::{TranscriptView, Viewer};
 
 use apply::apply_stops;
@@ -275,6 +278,23 @@ pub enum Action {
     Export {
         text: String,
     },
+    /// Run the user's `command` through the shell service (`!cmd`); its
+    /// output comes as [`Progress::Output`] events of `trace`, and its end
+    /// as [`Msg::CommandRan`].
+    Command {
+        command: String,
+        trace: TraceId,
+    },
+    /// Ask the shell to stop the command `trace`.
+    StopCommand {
+        trace: TraceId,
+    },
+    /// List what the workspace changed against `HEAD`; it comes back as [`Msg::Changes`].
+    Changes,
+    /// Read one changed file's diff against `HEAD`; it comes back as [`Msg::FileDiff`].
+    FileDiff {
+        change: crate::git::Changed,
+    },
 }
 
 /// A stretch of a run's messages in the audit log.
@@ -389,6 +409,17 @@ pub enum Msg {
     RunDropped {
         run: String,
         result: Result<(), String>,
+    },
+    /// How the user's command `trace` ended.
+    CommandRan {
+        trace: TraceId,
+        result: Result<molt_api::shell::RunResponse, String>,
+    },
+    /// What the workspace changed against `HEAD`, or why that cannot be said.
+    Changes(Result<Vec<crate::git::Changed>, String>),
+    FileDiff {
+        path: String,
+        result: Result<crate::git::FileDiff, String>,
     },
 }
 
@@ -679,6 +710,12 @@ pub struct App {
     kept_entries: Vec<super::kept::Entry>,
     kept_changes: Vec<super::kept::Change>,
     pub kept_view: Option<usize>,
+    /// `/diff`: the workspace's changes against `HEAD`.
+    pub changes: Option<changes::ChangesView>,
+    /// The user's command (`!cmd`) running now, or ending.
+    pub shell: Option<shell::ShellRun>,
+    /// How the shell service runs commands, as the config says.
+    pub sandbox: Sandbox,
     kept_pending: Option<String>,
     pending_result: Option<super::kept::Entry>,
     interrupted_task: Option<String>,
@@ -795,6 +832,9 @@ impl App {
             kept_entries: Vec::new(),
             kept_changes: Vec::new(),
             kept_view: None,
+            changes: None,
+            shell: None,
+            sandbox: Sandbox::Unknown,
             kept_pending: None,
             pending_result: None,
             interrupted_task: None,
@@ -1000,6 +1040,7 @@ impl App {
             }
             Msg::Tick => {
                 self.tick = self.tick.wrapping_add(1);
+                self.command_settle();
                 if self.retry_at.is_some_and(|at| self.tick >= at) {
                     self.retry_at = None;
                     if matches!(self.session, SessionState::Down(_)) && self.task.is_none() && self.learning.is_empty()
@@ -1050,6 +1091,7 @@ impl App {
             }
             Msg::BackendFailed(error) => {
                 self.retry_at = None;
+                self.command_lost();
                 let error = scrub(&error, &self.secrets);
                 self.error("the interface backend stopped", &error);
                 self.session = SessionState::Down(clean_line(&error));
@@ -1081,6 +1123,7 @@ impl App {
             }
             Msg::Stopped { kept, notes } => {
                 self.fork_operations = 0;
+                self.command_lost();
                 for note in &notes {
                     self.push(Line::from(span(format!("  {}", clean_line(note)), Tone::Warn)));
                 }
@@ -1097,8 +1140,24 @@ impl App {
                 self.session = SessionState::Starting;
                 vec![Action::StartSession]
             }
+            Msg::Progress(event @ Progress::Output { .. }) => {
+                self.command_output(event);
+                Vec::new()
+            }
             Msg::Progress(event) => {
                 self.progress(event);
+                Vec::new()
+            }
+            Msg::CommandRan { trace, result } => {
+                self.command_ran(trace, result);
+                Vec::new()
+            }
+            Msg::Changes(result) => {
+                self.listed_changes(result);
+                Vec::new()
+            }
+            Msg::FileDiff { path, result } => {
+                self.file_diff(path, result);
                 Vec::new()
             }
             Msg::Designed { trace, result, existing } => self.designed(trace, result, &existing),

@@ -265,6 +265,13 @@ fn standard_shell(exec: &molt_proto::Exec) -> bool {
     Path::new(&exec.command).file_name().is_some_and(|name| name == "molt-tools")
 }
 
+/// Whether the shell service runs commands in the sandbox: `None` for a
+/// shell service other than the standard one, which says nothing about it.
+pub fn shell_sandboxed(cfg: &Config) -> Option<bool> {
+    let exec = cfg.service("shell")?.exec.as_ref().filter(|exec| standard_shell(exec))?;
+    Some(!exec.args.iter().any(|arg| arg == "--no-sandbox"))
+}
+
 /// Have the standard shell's commands build offline from this user's
 /// dependency cache (`--deps-cache KIND`; `cargo` so far).
 pub fn deps_cache(cfg: &mut Config, kinds: &[String]) -> anyhow::Result<()> {
@@ -995,6 +1002,12 @@ pub(crate) fn progress_event(msg: &Envelope) -> Option<Progress> {
     {
         return None;
     }
+    // Likewise a command's output comes from the shell, in the trace of the command.
+    if matches!(event, Progress::Output { .. })
+        && (msg.from.as_ref().map(ServiceId::as_str) != Some("shell") || msg.trace_id.as_str() != event.run())
+    {
+        return None;
+    }
     Some(event)
 }
 
@@ -1117,6 +1130,7 @@ pub fn describe(event: &Progress) -> String {
             }
             line
         }
+        Progress::Output { text, .. } => text.trim_end().to_owned(),
     })
 }
 

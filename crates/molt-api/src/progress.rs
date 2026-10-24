@@ -1,7 +1,8 @@
 //! Progress events the planner publishes on `topic:progress` while a run is
 //! going. `run` is the trace id of the `planner.run` request, so a caller
 //! can pick out its own run. Events are best effort: a slow subscriber may
-//! miss some.
+//! miss some. The gateway publishes the model events, and the shell the
+//! output of a command run with [`crate::shell::RunRequest::stream`].
 
 use serde::{Deserialize, Serialize};
 
@@ -154,6 +155,19 @@ pub enum Progress {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         reason: String,
     },
+    /// Output of a streamed `shell.run`, whose trace id `run` is: whole
+    /// lines where it can, in the order read, numbered from 0 so a gap
+    /// shows. `cut` is the last event of a command whose output went past
+    /// what the shell streams; the reply still has its end.
+    Output {
+        run: String,
+        seq: u64,
+        text: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stderr: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cut: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -181,7 +195,8 @@ impl Progress {
             | Self::Adopted { run, .. }
             | Self::State { run, .. }
             | Self::Recalled { run, .. }
-            | Self::Routed { run, .. } => run,
+            | Self::Routed { run, .. }
+            | Self::Output { run, .. } => run,
         }
     }
 

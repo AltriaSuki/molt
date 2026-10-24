@@ -2224,3 +2224,87 @@ async fn the_ui_backend_finishes_without_terminal_reads_and_exits_when_the_pipe_
     assert!(tokio::time::timeout(Duration::from_secs(15), child.wait()).await.unwrap().unwrap().success());
     assert!(Path::new(&fork).is_dir(), "the fork outlives the interface that died");
 }
+
+/// `!cmd` in the interface: the session runs it through the shell service in
+/// a fork of the workspace, in the sandbox the attempts get, streams its
+/// output, stops it when asked, calls no model, and the audit log has it.
+#[tokio::test]
+async fn a_session_command_streams_its_output_from_the_sandbox_and_is_audited() {
+    use molt::session::Session;
+    use tokio_util::sync::CancellationToken;
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let workspace = setup.workspace.path().canonicalize().unwrap();
+    let (events, mut progress) = tokio::sync::mpsc::unbounded_channel();
+    let session = Session::start(&setup.cfg, workspace.to_str().unwrap(), events).await.unwrap();
+    let trace = molt_proto::TraceId::random();
+    // As the shell's own sandbox tests check it: the sandbox's home, and no host secret in reach.
+    let secret = setup.data.path().join("host-secret");
+    std::fs::write(&secret, "outside").unwrap();
+    let command = format!(
+        "echo hi && test \"$HOME\" = /home/molt && ! cat '{}' && echo kept-not > written.txt && echo oops >&2",
+        secret.display()
+    );
+    let ran = session.command(&command, &trace, CancellationToken::new()).await.unwrap();
+    assert!(ran.success(), "{ran:?}");
+    assert_eq!(ran.stdout, "hi\n");
+    let mut streamed = Vec::new();
+    // Published before the reply, the events may still be on their way to this channel.
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(1), progress.recv()).await {
+        if let Progress::Output { run, text, stderr, .. } = event {
+            assert_eq!(run, trace.as_str());
+            streamed.push((text, stderr));
+        }
+    }
+    assert!(streamed.contains(&("hi\n".to_owned(), false)), "{streamed:?}");
+    assert!(streamed.contains(&("oops\n".to_owned(), true)), "{streamed:?}");
+    assert!(!workspace.join("written.txt").exists(), "the command ran in a fork that was dropped");
+    assert_eq!(setup.files(), ["README.txt"]);
+
+    // Stopped while it runs, the shell says it stopped it.
+    let stop = CancellationToken::new();
+    let stopping = stop.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        stopping.cancel();
+    });
+    let started = Instant::now();
+    let ran = session.command("sleep 30", &molt_proto::TraceId::random(), stop).await.unwrap();
+    assert!(ran.cancelled && !ran.success(), "{ran:?}");
+    assert!(started.elapsed() < Duration::from_secs(20));
+    session.shutdown(&[]).await;
+
+    assert!(bodies(&server).await.is_empty(), "no model was called");
+    let audit = molt_kernel::audit::read_all(&setup.data.path().join("audit.jsonl")).await.unwrap();
+    let audited = audit.iter().any(|e| match &e.event {
+        AuditEvent::Message { envelope } => {
+            envelope.trace_id == trace
+                && matches!(&envelope.to, molt_proto::Target::Method { .. })
+                && envelope.to.to_string() == RUN_CHECK
+                && envelope.payload["command"] == command.as_str()
+        }
+        _ => false,
+    });
+    assert!(audited, "the command's shell.run is in the audit log");
+}
+
+/// `/diff` after a result is applied lists the files it changed.
+#[tokio::test]
+async fn changes_against_head_list_what_an_applied_result_changed() {
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let w = setup.workspace.path();
+    git(w, &["init", "-q", "-b", "main"]);
+    for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")] {
+        git(w, &["config", key, value]);
+    }
+    git(w, &["add", "."]);
+    git(w, &["commit", "-q", "-m", "start"]);
+    let (response, _) = setup.run(setup.request(Some(CHECK), 1)).await;
+    assert!(response.applied, "{response:#?}");
+    let repo = molt::git::Repo::open(w).unwrap();
+    let changes = repo.changes().unwrap();
+    assert_eq!(changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), ["greeting.txt"]);
+    assert!(changes[0].untracked && changes[0].lines == Some((1, 0)), "{changes:?}");
+    assert!(repo.file_diff(&changes[0]).unwrap().patch.contains("+hello"));
+}

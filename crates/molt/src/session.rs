@@ -8,8 +8,9 @@
 //! going, `fs.merge` and `fs.drop` to apply or discard a result the user has
 //! looked at, `fs.narrow` and `shell.run` to check part of a result, or one
 //! the user edited, again before it is applied, `memory.recall`, `memory.forget`, `memory.review`,
-//! `memory.correct` and `memory.promote` for the memory screen, and
-//! `memory.remember` for notes the user writes down.
+//! `memory.correct` and `memory.promote` for the memory screen,
+//! `memory.remember` for notes the user writes down, and `fs.fork` with
+//! `shell.run` for the commands the user runs (`!cmd`).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -54,6 +55,8 @@ const CONTROL_MS: u64 = 10_000;
 const CHECK_MS: u64 = 900_000;
 /// Reply deadline for memory's notes.
 const NOTES_MS: u64 = 60_000;
+/// How long a command the user runs may take: the shell's own maximum.
+pub const COMMAND_MS: u64 = 3_600_000;
 
 pub struct Session {
     running: Mutex<Option<Running>>,
@@ -149,11 +152,9 @@ impl Session {
             fs::MERGE,
             fs::DROP,
             fs::NARROW,
+            fs::FORK,
             molt_api::shell::RUN,
         ];
-        if !cfg.hooks.is_empty() {
-            targets.push(fs::FORK);
-        }
         if memory.is_some() {
             targets.extend([
                 memory::CONSOLIDATE,
@@ -285,6 +286,7 @@ impl Session {
                     workspace: narrowed.fork.clone(),
                     command: check.command.clone(),
                     timeout_ms: Some(CHECK_MS),
+                    stream: false,
                 };
                 let ran: anyhow::Result<molt_api::shell::RunResponse> =
                     self.call(molt_api::shell::RUN, req, CHECK_MS.saturating_add(5000), None).await;
@@ -312,6 +314,7 @@ impl Session {
                 workspace: fork.fork.clone(),
                 command: hook.command.clone(),
                 timeout_ms: Some(hook.timeout_ms),
+                stream: false,
             };
             let result: anyhow::Result<molt_api::shell::RunResponse> =
                 self.call(molt_api::shell::RUN, req, hook.timeout_ms.saturating_add(5000), None).await;
@@ -321,6 +324,53 @@ impl Session {
         }
         let _: anyhow::Result<fs::DropResponse> =
             self.call(fs::DROP, fs::DropRequest { fork: fork.fork }, TREE_MS, None).await;
+    }
+
+    /// Run `command` for the user, as the attempts' commands run: in a
+    /// fork of the workspace as it is now, through the shell service and
+    /// its sandbox, which is dropped after, so what the command writes is
+    /// not kept. Its output is published as it comes, as
+    /// [`Progress::Output`] events of `trace`. `stop` asks the shell to
+    /// stop it; the reply then says whether it did.
+    pub async fn command(
+        &self,
+        command: &str,
+        trace: &TraceId,
+        stop: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<molt_api::shell::RunResponse> {
+        let forked: fs::ForkResponse = tokio::select! {
+            forked = self.call(fs::FORK, fs::ForkRequest { workspace: self.workspace.clone() }, TREE_MS, Some(trace)) => forked?,
+            _ = stop.cancelled() => anyhow::bail!("stopped before it started"),
+        };
+        let req = molt_api::shell::RunRequest {
+            workspace: forked.fork.clone(),
+            command: command.to_owned(),
+            timeout_ms: Some(COMMAND_MS),
+            stream: true,
+        };
+        let ran = async {
+            let opts = CallOpts { cap: None, budget: Budget::new(0, COMMAND_MS + 5000, 0), trace: Some(trace.clone()) };
+            let pending = self.cli.request(molt_api::shell::RUN, serde_json::to_value(req)?, opts).await?;
+            let canceller = pending.canceller();
+            let reply = pending.wait();
+            tokio::pin!(reply);
+            let reply = tokio::select! {
+                reply = &mut reply => reply,
+                _ = stop.cancelled() => {
+                    canceller.cancel().await?;
+                    reply.await
+                }
+            };
+            let reply = reply.with_context(|| format!("{} failed", molt_api::shell::RUN))?;
+            serde_json::from_value(reply).context("the answer to shell.run is not what it should be")
+        }
+        .await;
+        let dropped: anyhow::Result<DropResponse> =
+            self.call(fs::DROP, DropRequest { fork: forked.fork.clone() }, TREE_MS, None).await;
+        if let Err(e) = dropped {
+            tracing::warn!("could not drop {}: {e:#}", forked.fork);
+        }
+        ran
     }
 
     /// The paths `fork` changed.
