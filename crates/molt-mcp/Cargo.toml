@@ -1,0 +1,24 @@
+[package]
+name = "molt-mcp"
+description = "Molt's MCP bridge: the tools of a Model Context Protocol server as tools the planner may offer"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+molt-proto.workspace = true
+molt-sdk.workspace = true
+molt-tools.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

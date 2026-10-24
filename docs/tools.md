@@ -72,6 +72,9 @@ call has the tool's deadline and nothing to spend on further calls. The
 model gets the content, cut to `max_result_bytes`, marked as data it must
 not take instructions from. Every call and its answer is in the audit log.
 
+For the tools of an MCP server, configure the server in `[mcp.NAME]`
+instead: see [MCP servers](mcp.md).
+
 A project cannot add tools: its `.molt/config.toml` may not have
 `[[service]]`, and tool declarations in a `--config` file inside the
 project are ignored, as its hooks are.

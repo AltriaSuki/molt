@@ -1497,6 +1497,7 @@ dependencies = [
  "molt-bench",
  "molt-gateway",
  "molt-kernel",
+ "molt-mcp",
  "molt-memory",
  "molt-planner",
  "molt-proto",
@@ -1587,6 +1588,25 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "molt-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "libc",
+ "molt-proto",
+ "molt-sdk",
+ "molt-tools",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
