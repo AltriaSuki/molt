@@ -30,13 +30,8 @@ pub(crate) async fn vet(
     files: &[(String, String)],
 ) -> Result<Vec<Conflict>, String> {
     let first = prompts::vetter_first_message(&ctx.task, &ctx.preamble(), command, files);
-    let mut conv = Conversation::new(
-        prompts::VETTER_SYSTEM,
-        Arc::new(prompts::vetter_tools(&ctx.tools)),
-        first,
-        Role::Vetter,
-        None,
-    );
+    let seat = ctx.seats().vetter;
+    let mut conv = Conversation::seated(&seat, "", prompts::vetter_tools(&ctx.tools), first, Role::Vetter, None);
     let mut meter = Meter::default();
     let mut nudged = false;
     loop {

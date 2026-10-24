@@ -8,6 +8,7 @@ use molt_api::fs;
 use molt_api::model::{self, CompleteRequest, CompleteResponse, Effort, Role, Usage};
 use molt_api::planner::RunRequest;
 use molt_api::progress::{self, Progress};
+use molt_api::role::PromptUse;
 use molt_api::workflow::Workflow;
 use molt_proto::{Budget, ErrorCode, RemoteError, TraceId};
 use serde::de::DeserializeOwned;
@@ -20,6 +21,7 @@ use crate::checkpoint::{Saved, SavedSpend, Store};
 use crate::control::Control;
 use crate::fit::Limits;
 use crate::memory::Memory;
+use crate::pack::{Seat, Seats};
 use crate::registry::Registry;
 use crate::{Bus, Config};
 
@@ -140,13 +142,16 @@ pub(crate) struct Ctx {
     pub workflow: Arc<Workflow>,
     /// The task before this one that the run goes on from.
     pub continues: Option<Arc<molt_api::planner::Continuation>>,
+    /// Each role that has made a model call and its prompt, in the order
+    /// they first did.
+    spoke: Arc<Mutex<Vec<PromptUse>>>,
 }
 
 /// A conversation that grows until it no longer fits a model call (see
 /// [`crate::fit`]). `system` and `tools` stay the same for its whole life:
 /// an unchanged prefix keeps the prompt cache warm.
 pub(crate) struct Conversation {
-    pub(crate) system: &'static str,
+    pub(crate) system: Arc<str>,
     pub(crate) tools: Arc<Vec<Value>>,
     pub(crate) messages: Vec<Value>,
     pub(crate) attempt: Option<u32>,
@@ -154,14 +159,45 @@ pub(crate) struct Conversation {
     pub(crate) role: Role,
     /// The model for this conversation, in place of the run's.
     pub(crate) model: Option<String>,
+    /// The effort for this conversation, in place of the run's.
+    pub(crate) effort: Option<Effort>,
+    /// The role it speaks as and its prompt's version, for the audit log.
+    pub(crate) prompt: Option<PromptUse>,
     /// How many messages the model last measured, and the tokens it counted
     /// for them, its reply included.
     pub(crate) known: Option<(usize, u64)>,
 }
 
 impl Conversation {
-    pub fn new(system: &'static str, tools: Arc<Vec<Value>>, first: Value, role: Role, attempt: Option<u32>) -> Self {
-        Self { system, tools, messages: vec![first], attempt, role, model: None, known: None }
+    pub fn new(
+        system: impl Into<Arc<str>>,
+        tools: Arc<Vec<Value>>,
+        first: Value,
+        role: Role,
+        attempt: Option<u32>,
+    ) -> Self {
+        let system = system.into();
+        Self {
+            system,
+            tools,
+            messages: vec![first],
+            attempt,
+            role,
+            model: None,
+            effort: None,
+            prompt: None,
+            known: None,
+        }
+    }
+
+    /// A conversation `seat` holds: its system prompt (with `part` after the
+    /// pack's text), the tools of `tools` it may have, its model and effort.
+    pub fn seated(seat: &Seat, part: &str, tools: Vec<Value>, first: Value, role: Role, attempt: Option<u32>) -> Self {
+        let mut conv = Self::new(seat.system(part), Arc::new(seat.offer(tools)), first, role, attempt);
+        conv.model = seat.model.clone();
+        conv.effort = seat.effort;
+        conv.prompt = Some(seat.prompt.clone());
+        conv
     }
 
     /// Who holds it, as a person reads it: `attempt 1`, `reviewer`.
@@ -217,7 +253,9 @@ impl Ctx {
         let budget_usd = req.budget_usd.unwrap_or(cfg.budget_usd);
         // The request was validated, which resolved its workflow.
         let workflow = crate::runner::workflow(&cfg, req.workflow.as_deref()).unwrap_or_else(|_| Workflow::verify());
-        let share = workflow.stages.design.and_then(|d| d.budget_share).unwrap_or(cfg.design_share);
+        // The designer role's share, else the workflow's, else the planner's.
+        let role_share = cfg.pack.seats(&workflow).ok().and_then(|s| s.designer.budget_share);
+        let share = role_share.or(workflow.stages.design.and_then(|d| d.budget_share)).unwrap_or(cfg.design_share);
         Self {
             bus,
             trace,
@@ -252,7 +290,22 @@ impl Ctx {
             earlier: crate::prompts::earlier_tasks(&req.earlier),
             workflow: Arc::new(workflow),
             continues: req.continues.clone().map(Arc::new),
+            spoke: Arc::default(),
         }
+    }
+
+    /// Who speaks in each part of the run, as its workflow seats them.
+    pub fn seats(&self) -> Seats {
+        // The request was validated, which checked the workflow's roles.
+        self.cfg.pack.seats(&self.workflow).unwrap_or_else(|why| {
+            tracing::warn!(run = %self.trace, %why, "the workflow's roles do not resolve; using the built-in ones");
+            crate::pack::Pack::default().seats(&Workflow::verify()).expect("the built-in roles resolve")
+        })
+    }
+
+    /// Each role that spoke in the run and its prompt, in the order they first spoke.
+    pub fn spoke(&self) -> Vec<PromptUse> {
+        self.spoke.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// Change the run's checkpoint and save it, when it keeps one. A save
@@ -408,15 +461,22 @@ impl Ctx {
     pub async fn complete(self: &Arc<Self>, conv: &Conversation, turn: u32) -> Result<CompleteResponse, RemoteError> {
         let req = CompleteRequest {
             model: conv.model.clone().or_else(|| self.model.clone()),
-            system: Some(conv.system.to_owned()),
+            system: Some(conv.system.to_string()),
             messages: conv.messages.clone(),
             tools: conv.tools.as_ref().clone(),
             max_tokens: Some(self.cfg.max_tokens),
-            effort: self.effort,
+            effort: conv.effort.or(self.effort),
             output_schema: None,
             stream: self.stream.then_some(model::StreamContext { attempt: conv.attempt, turn }),
             role: Some(conv.role),
+            prompt: conv.prompt.clone(),
         };
+        if let Some(prompt) = &conv.prompt {
+            let mut spoke = self.spoke.lock().unwrap_or_else(PoisonError::into_inner);
+            if !spoke.contains(prompt) {
+                spoke.push(prompt.clone());
+            }
+        }
         let ms = u64::try_from(self.cfg.model_timeout.as_millis()).unwrap_or(u64::MAX);
         let budget = Budget::new(self.cfg.max_tokens.into(), ms, 0);
         self.tally.send_modify(|t| t.pending += 1);

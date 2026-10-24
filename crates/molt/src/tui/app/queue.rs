@@ -245,7 +245,7 @@ mod tests {
         app.settings.model = Some("opus".into());
         app.take_preference_changes();
         let trace = app.task.as_ref().unwrap().trace.clone();
-        let actions = app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/first"))) });
+        let actions = app.update(Msg::Ran { trace, result: Box::new(Ok(passed(false, Some("/fork/first")))) });
         let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
         assert_eq!(
             (req.task.as_str(), req.model.as_deref(), req.check.as_deref()),
@@ -260,7 +260,7 @@ mod tests {
         assert_eq!(app.settings.model.as_deref(), Some("opus"));
         assert!(app.take_preference_changes().is_empty());
         let trace = app.task.as_ref().unwrap().trace.clone();
-        let actions = app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/second"))) });
+        let actions = app.update(Msg::Ran { trace, result: Box::new(Ok(passed(false, Some("/fork/second")))) });
         assert!(
             matches!(actions.as_slice(), [Action::Run { req, .. }] if req.task == "third" && req.model.as_deref() == Some("sonnet") && !req.apply)
         );
@@ -278,7 +278,7 @@ mod tests {
         type_in(&mut app, "/queue add second");
         type_in(&mut app, "/queue add third");
         let trace = app.task.as_ref().unwrap().trace.clone();
-        assert!(app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/first"))) }).is_empty());
+        assert!(app.update(Msg::Ran { trace, result: Box::new(Ok(passed(false, Some("/fork/first")))) }).is_empty());
         assert_eq!(app.queue.len(), 2);
         assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
         assert_eq!(app.update(key(KeyCode::Enter)), [Action::Apply { fork: "/fork/first".into() }]);
@@ -290,7 +290,7 @@ mod tests {
         assert!(matches!(actions.as_slice(), [Action::PrepareCommit { .. }, Action::Run { req, .. }]
             if req.task == "second" && req.earlier.last().unwrap().applied));
         let trace = app.task.as_ref().unwrap().trace.clone();
-        app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/second"))) });
+        app.update(Msg::Ran { trace, result: Box::new(Ok(passed(false, Some("/fork/second")))) });
         assert_eq!(app.update(key(KeyCode::Char('n'))), [Action::Discard { fork: "/fork/second".into() }]);
         assert_eq!(app.queue.len(), 1);
         let actions = app.update(Msg::Discarded(Ok(())));
@@ -311,7 +311,7 @@ mod tests {
         app.mode = Mode::Auto;
         app.settings.check = Some("false".into());
         let trace = app.task.as_ref().unwrap().trace.clone();
-        let actions = app.update(Msg::Ran { trace, result: Ok(passed(false, Some("/fork/first"))) });
+        let actions = app.update(Msg::Ran { trace, result: Box::new(Ok(passed(false, Some("/fork/first")))) });
         let [Action::Design { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
         assert_eq!(req.task, "second");
         assert!(!req.apply && req.check.is_none());
@@ -421,7 +421,7 @@ mod tests {
         type_in(&mut app, "/queue add update @../outside");
         app.input = Input::with("my unsent draft");
         let trace = app.task.as_ref().unwrap().trace.clone();
-        assert!(app.update(Msg::Ran { trace, result: Err("failed".into()) }).is_empty());
+        assert!(app.update(Msg::Ran { trace, result: Box::new(Err("failed".into())) }).is_empty());
         assert!(app.queue_paused && app.queue.len() == 1 && app.task.is_none());
         assert_eq!(app.input.full(), "my unsent draft");
         std::fs::write(tmp.path().join("later.txt"), "added by the preceding task").unwrap();
@@ -442,7 +442,7 @@ mod tests {
         let trace = app.task.as_ref().unwrap().trace.clone();
         let mut response = passed(false, None);
         response.outcome = Outcome::Failed;
-        let actions = app.update(Msg::Ran { trace, result: Ok(response) });
+        let actions = app.update(Msg::Ran { trace, result: Box::new(Ok(response)) });
         assert!(matches!(actions.as_slice(), [Action::Run { req, .. }] if req.task == "second"));
         assert!(app.prompt.is_none());
     }

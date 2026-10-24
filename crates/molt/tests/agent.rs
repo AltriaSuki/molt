@@ -2318,6 +2318,55 @@ async fn changes_against_head_list_what_an_applied_result_changed() {
     assert!(repo.file_diff(&changes[0]).unwrap().patch.contains("+hello"));
 }
 
+/// A prompt pack the planner is pointed at: its override is what the model
+/// is told, and the kernel's audit log has each call's role and prompt hash.
+#[tokio::test]
+async fn an_override_in_the_prompt_pack_reaches_the_model_and_its_hash_the_audit_log() {
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    let pack = tempfile::tempdir().unwrap();
+    let text = "You greet. Write greeting.txt and stop.";
+    std::fs::write(pack.path().join("attempt.md"), format!("{text}\n")).unwrap();
+    let planner = setup.cfg.service_mut("planner").unwrap();
+    planner.env.insert(molt_planner::pack::PROMPTS_ENV.into(), pack.path().to_str().unwrap().into());
+    let before = bodies(&server).await.len();
+    let (resp, _) = setup.run(setup.request(Some(CHECK), 1)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    let hash = molt_planner::pack::sha256(text);
+    let used = resp.prompts.iter().find(|p| p.role == "attempt").expect("the attempt's prompt is in the reply");
+    assert_eq!((used.prompt.sha256.as_str(), used.prompt.source), (hash.as_str(), molt_api::role::Source::User));
+
+    let sent = bodies(&server).await;
+    let attempts: Vec<&Value> = sent[before..]
+        .iter()
+        .filter(|b| b["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == WRITE_FILE)))
+        .collect();
+    assert!(!attempts.is_empty());
+    for body in &attempts {
+        let system = body["system"][0]["text"].as_str().unwrap();
+        assert!(system.starts_with(&format!("{text}\n\nThe done-check:")), "{system}");
+        assert!(body.get("prompt").is_none(), "the version is for the audit log, not the model API");
+    }
+    let audit = molt_kernel::audit::read_all(&setup.data.path().join("audit.jsonl")).await.unwrap();
+    let audited: Vec<&Value> = audit
+        .iter()
+        .filter_map(|e| match &e.event {
+            AuditEvent::Message { envelope }
+                if envelope.kind == Kind::Request && envelope.to.to_string() == COMPLETE =>
+            {
+                Some(&envelope.payload)
+            }
+            _ => None,
+        })
+        .filter(|p| p["prompt"]["role"] == "attempt")
+        .collect();
+    assert!(!audited.is_empty());
+    for payload in audited {
+        assert_eq!(payload["prompt"]["prompt"], json!({ "name": "attempt", "sha256": hash, "source": "user" }));
+    }
+    assert_requests_valid(&server).await;
+}
+
 /// A service of the user's config that declares a tool: the planner offers
 /// it when the config grants the planner its method, and the call goes
 /// through the kernel, which writes it to the audit log.

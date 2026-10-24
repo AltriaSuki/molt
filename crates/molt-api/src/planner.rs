@@ -664,6 +664,11 @@ pub struct RunResponse {
     /// left out to keep it within a model call. Empty without a winner.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conversation: Vec<serde_json::Value>,
+    /// Each role that spoke in the run and the version of the prompt it
+    /// spoke with, in the order they first spoke. Empty in a reply from an
+    /// older planner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompts: Vec<crate::role::PromptUse>,
 }
 
 /// What a result was held to: the level of evidence behind it.

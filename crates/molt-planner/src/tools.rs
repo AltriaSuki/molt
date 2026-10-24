@@ -366,9 +366,21 @@ pub(crate) async fn execute(
         _ => None,
     };
     let no_ask = format!("There is no tool named {:?}.", t::ASK_USER);
+    let seats = ctx.seats();
+    let seat = match actor {
+        Actor::Designer => Some(seats.designer),
+        Actor::Attempt { .. } if ctx.workflow.read_only() => Some(seats.explorer),
+        Actor::Attempt { .. } => Some(seats.attempt),
+        Actor::Reviewer => Some(seats.reviewer),
+        Actor::Judge => Some(seats.judge),
+        Actor::Vetter => None,
+    };
     for (i, call) in calls.iter().enumerate() {
         let tool = if cut_off == Some(call.id.as_str()) {
             Err(prompts::CUT_OFF.to_owned())
+        } else if !seat.as_ref().is_none_or(|seat| seat.allows(&call.name)) {
+            // Its role was not offered the tool: to it there is no such tool.
+            Err(format!("There is no tool named {:?}.", call.name))
         } else {
             Tool::parse(call, &ctx.tools, actor.role())
         };

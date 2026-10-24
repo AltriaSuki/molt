@@ -524,7 +524,7 @@ impl Runtime {
             }),
             Action::Run { req, trace } => self.call(move |s| async move {
                 let result = s.run(&req, &trace).await.map_err(|e| format!("{e:#}"));
-                Msg::Ran { trace, result }
+                Msg::Ran { trace, result: Box::new(result) }
             }),
             Action::Control { trace, action } => self.call(move |s| async move {
                 let result = s.control(&trace, action.clone()).await.map_err(|e| format!("{e:#}"));
@@ -1068,6 +1068,7 @@ mod tests {
             verification: None,
             workflow: None,
             conversation: Vec::new(),
+            prompts: Vec::new(),
         };
         let trace = TraceId::random();
         rt.exec(Action::PrepareCommit { trace: trace.clone() });

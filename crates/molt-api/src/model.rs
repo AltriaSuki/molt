@@ -139,6 +139,11 @@ pub struct CompleteRequest {
     /// progress events it publishes. New: an older caller leaves it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<Role>,
+    /// The role the call speaks as and the version of its system prompt,
+    /// for the audit log; the gateway does not send it to the model. New:
+    /// an older caller leaves it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<crate::role::PromptUse>,
 }
 
 /// Token counts as the Messages API reports them. A count the API sends as

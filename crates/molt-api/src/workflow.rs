@@ -36,6 +36,13 @@ pub struct Workflow {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
     pub stages: Stages,
+    /// The role seated in each slot it names, by slot (`designer`,
+    /// `attempt`, `explorer`, `reviewer`, `judge`) and role name; a slot
+    /// not named keeps its built-in role. The roles are the planner's own
+    /// (see [`crate::role`]). New in #164: optional, so every document
+    /// written before it reads the same.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub roles: std::collections::BTreeMap<String, String>,
 }
 
 /// Each stage, with its parameters when enabled; `None` leaves it out.
@@ -126,6 +133,7 @@ impl Workflow {
                 deliver: on,
                 learn: on,
             },
+            roles: Default::default(),
         }
     }
 
@@ -141,6 +149,7 @@ impl Workflow {
                 deliver: Some(Stage {}),
                 ..Stages::default()
             },
+            roles: Default::default(),
         }
     }
 
@@ -158,6 +167,7 @@ impl Workflow {
                 deliver: Some(Stage {}),
                 ..Stages::default()
             },
+            roles: Default::default(),
         }
     }
 
@@ -191,6 +201,24 @@ impl Workflow {
                 "workflow {name:?} only reads, so it has nothing to design a check for, compare or review: leave out \
                  design, compare and review"
             ));
+        }
+        for slot in self.roles.keys() {
+            let Some(base) = crate::role::Base::from_name(slot) else {
+                return Some(format!(
+                    "workflow {name:?} seats a role in {slot:?}, which is no slot: use designer, attempt, explorer, \
+                     reviewer or judge"
+                ));
+            };
+            let unused = match base {
+                crate::role::Base::Designer => s.design.is_none(),
+                crate::role::Base::Attempt => self.read_only(),
+                crate::role::Base::Explorer => !self.read_only(),
+                crate::role::Base::Reviewer => s.review.is_none_or(|r| r.rules_only),
+                crate::role::Base::Judge => self.read_only(),
+            };
+            if unused {
+                return Some(format!("workflow {name:?} seats a role in {slot:?}, which none of its stages uses"));
+            }
         }
         if let Some(share) = self.stages.design.and_then(|d| d.budget_share) {
             if !(share > 0.0 && share <= 1.0) {
@@ -292,5 +320,30 @@ mod tests {
         let mut many = Workflow::quick();
         many.stages.attempts = Some(Attempts { count: Some(9), read_only: false });
         assert!(many.problem().is_some_and(|p| p.contains("attempts.count")));
+    }
+
+    #[test]
+    fn a_workflow_seats_roles_only_in_slots_its_stages_use() {
+        let seat = |mut w: Workflow, slot: &str| {
+            w.roles.insert(slot.into(), "mine".into());
+            w.problem()
+        };
+        for slot in ["designer", "attempt", "reviewer", "judge"] {
+            assert_eq!(seat(Workflow::verify(), slot), None, "{slot}");
+        }
+        assert_eq!(seat(Workflow::ask(), "explorer"), None);
+        assert!(seat(Workflow::verify(), "explorer").is_some_and(|p| p.contains("none of its stages")));
+        assert!(seat(Workflow::ask(), "attempt").is_some());
+        assert!(seat(Workflow::quick(), "reviewer").is_some(), "quick's review asks no model");
+        assert!(seat(Workflow::quick(), "designer").is_some());
+        assert!(seat(Workflow::verify(), "vetter").is_some_and(|p| p.contains("no slot")));
+        let wire = serde_json::json!({
+            "schema": 1, "name": "careful", "roles": { "attempt": "terse" },
+            "stages": { "attempts": {}, "deliver": {} }
+        });
+        let careful: Workflow = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(careful.roles["attempt"], "terse");
+        assert_eq!(serde_json::to_value(&careful).unwrap(), wire);
+        assert!(serde_json::to_value(Workflow::verify()).unwrap().get("roles").is_none());
     }
 }

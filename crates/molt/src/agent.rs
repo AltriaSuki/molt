@@ -78,6 +78,11 @@ pub fn resolve_config(
     if let Some(path) = path {
         let mut cfg = Layered::file(path, profile)?.config;
         let trusted = !path.canonicalize()?.starts_with(workspace);
+        let pack = molt_planner::pack::PROMPTS_ENV;
+        if let Some(planner) = cfg.service_mut("planner").filter(|p| !trusted && p.env.contains_key(pack)) {
+            eprintln!("a prompt pack named in a project configuration is ignored; keep it in ~/.config/molt/prompts/");
+            planner.env.remove(pack);
+        }
         if !trusted && !cfg.hooks.is_empty() {
             eprintln!("lifecycle hooks in a project configuration are ignored; keep trusted hook configuration outside the project");
             cfg.hooks.clear();
@@ -1453,6 +1458,30 @@ mod tests {
     }
 
     #[test]
+    fn only_configuration_outside_the_project_can_name_a_prompt_pack() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        std::fs::create_dir(&workspace).unwrap();
+        let services = SERVICES
+            .iter()
+            .map(|name| match *name {
+                "planner" => "[[service]]\nname = \"planner\"\nexec = { command = \"/bin/true\" }\n\
+                              env = { MOLT_PROMPTS_DIR = \"/somewhere\" }\n"
+                    .to_owned(),
+                name => format!("[[service]]\nname = \"{name}\"\nexec = {{ command = \"/bin/true\" }}\n"),
+            })
+            .collect::<String>();
+        let pack = |cfg: &Config| cfg.service("planner").unwrap().env.get(molt_planner::pack::PROMPTS_ENV).cloned();
+        let outside = root.path().join("config.toml");
+        std::fs::write(&outside, &services).unwrap();
+        let trusted = resolve_config(Some(&outside), &workspace, None, None, None).unwrap();
+        assert_eq!(pack(&trusted).as_deref(), Some("/somewhere"));
+        let inside = workspace.join("config.toml");
+        std::fs::write(&inside, services).unwrap();
+        assert_eq!(pack(&resolve_config(Some(&inside), &workspace, None, None, None).unwrap()), None);
+    }
+
+    #[test]
     fn only_configuration_outside_the_project_can_install_hooks() {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("project");
@@ -1887,6 +1916,7 @@ mod tests {
             verification: None,
             workflow: None,
             conversation: Vec::new(),
+            prompts: Vec::new(),
         };
         // A rejected key or a wrong URL: every call refused, nothing to learn from.
         let refused = resp(Outcome::Failed, 0, 0.0, 0);
@@ -1984,6 +2014,7 @@ mod tests {
             verification: None,
             workflow: None,
             conversation: Vec::new(),
+            prompts: Vec::new(),
         };
         assert_eq!(
             report(&resp),

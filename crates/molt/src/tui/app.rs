@@ -354,7 +354,8 @@ pub enum Msg {
     },
     Ran {
         trace: TraceId,
-        result: Result<RunResponse, String>,
+        // Boxed: a run's reply is much larger than any other message.
+        result: Box<Result<RunResponse, String>>,
     },
     Learned {
         trace: TraceId,
@@ -1184,7 +1185,7 @@ impl App {
                 Vec::new()
             }
             Msg::Designed { trace, result, existing } => self.designed(trace, result, &existing),
-            Msg::Ran { trace, result } => self.ran(trace, result),
+            Msg::Ran { trace, result } => self.ran(trace, *result),
             Msg::Runs(runs) => {
                 self.listed_runs(runs);
                 Vec::new()

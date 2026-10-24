@@ -521,7 +521,7 @@ mod tests {
         assert!(text.starts_with(&format!("molt transcript · run {trace}")));
         assert!(text.contains("    command: cargo test") && text.contains("    path: src/lexer.rs"), "{text}");
         // The end of the run is read once more.
-        let ended = app.update(Msg::Ran { trace: trace.clone(), result: Err("stopped".into()) });
+        let ended = app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Err("stopped".into())) });
         assert_eq!(reads(&ended), [(trace, Some(200))]);
         app.update(key(KeyCode::Esc));
         assert!(app.transcript.is_none() && app.task.is_none());
@@ -535,7 +535,7 @@ mod tests {
         type_in(&mut app, "implement it");
         let trace = app.task.as_ref().unwrap().trace.clone();
         attempt_with_tool_call(&mut app, &trace, "cargo build");
-        app.update(Msg::Ran { trace: trace.clone(), result: Err("stopped".into()) });
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Err("stopped".into())) });
         assert!(app.task.is_none());
         assert_eq!(reads(&app.update(ctrl_key('o'))), [(trace.clone(), None)]);
         app.update(Msg::Audit { trace, result: Err("audit.jsonl: permission denied".into()) });
@@ -574,7 +574,7 @@ mod tests {
         for end in [KeyCode::Char('y'), KeyCode::Char('k'), KeyCode::Char('n')] {
             let actions = type_in(&mut app, "task");
             let [Action::Run { trace, .. }] = actions.as_slice() else { panic!() };
-            app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-5"))) });
+            app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(passed(false, Some("/d/work/fork-5")))) });
             app.update(key(end));
             if end == KeyCode::Char('y') {
                 app.update(Msg::Applied(Ok(())));

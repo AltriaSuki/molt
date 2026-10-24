@@ -185,6 +185,7 @@ pub(super) fn passed(apply: bool, fork: Option<&str>) -> RunResponse {
         verification: None,
         workflow: None,
         conversation: Vec::new(),
+        prompts: Vec::new(),
     }
 }
 
@@ -251,7 +252,7 @@ pub(super) fn apply_stop(resp: RunResponse) -> Vec<String> {
     type_in(&mut app, "/check true");
     let actions = type_in(&mut app, "task");
     let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
-    let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+    let actions = app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(resp)) });
     assert!(!actions.iter().any(|a| matches!(a, Action::Apply { .. })), "{actions:?}");
     assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
     app.task.as_ref().unwrap().stops.clone()

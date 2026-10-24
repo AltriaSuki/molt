@@ -690,6 +690,7 @@ pub(crate) async fn consolidate(
         tools: vec![submit_notes()],
         max_tokens: Some(cfg.max_tokens),
         output_schema: None,
+        prompt: None,
     };
     let (answer, spent) = match ask(bus, cfg, request, trace, deadline).await? {
         Ok(answered) => answered,
