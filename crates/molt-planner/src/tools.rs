@@ -40,7 +40,14 @@ const FETCH_MS: u64 = 90_000;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Actor {
     Designer,
-    Attempt { index: u32, turn: u32 },
+    Attempt {
+        index: u32,
+        turn: u32,
+    },
+    /// The sub-agent attempt `index` asked with `explore`.
+    Explorer {
+        index: u32,
+    },
     Reviewer,
     Judge,
     Vetter,
@@ -52,6 +59,7 @@ impl Actor {
         match self {
             Self::Designer => "designer",
             Self::Attempt { .. } => "attempt",
+            Self::Explorer { .. } => "explorer",
             Self::Reviewer => "reviewer",
             Self::Judge => "judge",
             Self::Vetter => "vetter",
@@ -60,7 +68,7 @@ impl Actor {
 
     fn attempt(self) -> Option<u32> {
         match self {
-            Self::Attempt { index, .. } => Some(index),
+            Self::Attempt { index, .. } | Self::Explorer { index, .. } => Some(index),
             _ => None,
         }
     }
@@ -69,7 +77,8 @@ impl Actor {
     fn role(self) -> ToolRole {
         match self {
             Self::Designer => ToolRole::Designer,
-            Self::Attempt { .. } => ToolRole::Attempt,
+            // Its calls are held to the attempt's reads before they get here (see crate::explore).
+            Self::Attempt { .. } | Self::Explorer { .. } => ToolRole::Attempt,
             Self::Reviewer => ToolRole::Reviewer,
             Self::Judge => ToolRole::Judge,
             Self::Vetter => ToolRole::Vetter,
@@ -390,6 +399,7 @@ pub(crate) async fn execute(
         Actor::Designer => Some(seats.designer),
         Actor::Attempt { .. } if ctx.workflow.read_only() => Some(seats.explorer),
         Actor::Attempt { .. } => Some(seats.attempt),
+        Actor::Explorer { .. } => Some(seats.explorer),
         Actor::Reviewer => Some(seats.reviewer),
         Actor::Judge => Some(seats.judge),
         Actor::Vetter => None,
@@ -512,6 +522,9 @@ async fn report(ctx: &Ctx, actor: Actor, tool: &str, detail: &str) {
                 .await
         }
         // Named as their model calls are, so a tool line and a preview agree.
+        Actor::Explorer { index, .. } => {
+            ctx.note(format!("{}: {detail}", molt_api::model::speaker(Some(Role::Explorer), Some(index)))).await
+        }
         Actor::Designer => ctx.note(format!("{}: {detail}", Role::Designer.name())).await,
         Actor::Reviewer => ctx.note(format!("{}: {detail}", Role::Reviewer.name())).await,
         Actor::Judge => ctx.note(format!("{}: {detail}", Role::Judge.name())).await,

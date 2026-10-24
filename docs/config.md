@@ -111,6 +111,7 @@ Defaults come from the environment:
 | `MOLT_MODEL_PRICES`, `MOLT_PRICES_FILE` | gateway | unset, `~/.local/share/molt/prices.json` (see [Model prices](providers-and-prices.md#model-prices)) |
 | `MOLT_PLANNER_MODEL`, `MOLT_MAX_TURNS`, `MOLT_BUDGET_USD` | planner | the gateway's model, `50`, `10` |
 | `MOLT_DESIGN_BUDGET_SHARE` | planner | `0.25`: the share of a run's budget designing its check may spend, more than 0 and at most 1 (see [Designing has a budget](do.md#designing-has-a-budget)) |
+| `MOLT_EXPLORE`, `MOLT_EXPLORE_MODEL` | planner | `off`: `on` offers attempts `explore` in every workflow whose attempts change files; the model of its sub-agent, by default the explorer role's, else the run's (see [Explore](explore.md)) |
 | `MOLT_MAX_CHECK_ROUNDS`, `MOLT_CHECK_TIMEOUT_S` | planner | `3` check runs per attempt, `900` |
 | `MOLT_MAP_TOKENS` | planner | `3000` (the project map a run starts with; at most `32000`) |
 | `MOLT_CONTEXT_TOKENS` | planner | the model's context window: `200000` for Claude models, `128000` for others |

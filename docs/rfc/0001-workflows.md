@@ -87,6 +87,11 @@ document written before them still reads the same; a planner that does not
 know them refuses a document that uses them, as it refuses any unknown
 parameter.
 
+`attempts.explore: true` (#42), optional in the same way, offers the
+attempts `explore`: a question to a sub-agent, seated as the `explorer`
+role, that only reads their fork and returns its conclusion alone (see
+[explore.md](../explore.md)). It cannot be combined with `read_only`.
+
 Stage parameters that today live on the request (`attempts`, `select`,
 `max_turns`, ...) stay there in version 1; a later version can move a
 parameter into the workflow when a workflow needs to fix it.

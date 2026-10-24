@@ -266,7 +266,8 @@ server in the trusted config grants the planner `mcp-NAME.call`; see
 
 ## Deferred
 
-- The MCP bridge itself (#43), and sub-agents as tools (#42).
+- The MCP bridge itself (#43), and sub-agents as tools (#42). Both have
+  landed since: see [mcp.md](../mcp.md) and [explore.md](../explore.md).
 - `tools.list`, for providers whose tools change while they run.
 - An easier way to give the planner a provider's capability than restating
   the planner's `requests` in the user config (for example a `planner_calls`
