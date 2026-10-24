@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context};
 use molt_api::fs::ChangeKind;
 use molt_api::memory::{self, ConsolidateRequest, ConsolidateResponse};
+use molt_api::model::{attempt_name, speaker};
 use molt_api::planner::{
     self, AttemptStatus, Candidate, Outcome, Requirement, RunRequest, RunResponse, RunState, Verdict,
 };
@@ -728,8 +729,8 @@ pub fn stopped_run(saved: &molt_planner::checkpoint::Saved) -> String {
         .attempts
         .iter()
         .map(|a| match &a.end {
-            Some(end) => format!("{}: {:?} after {} turns", a.index, end.status, a.turns).to_lowercase(),
-            None => format!("{}: stopped after {} turns", a.index, a.turns),
+            Some(end) => format!("{}: {:?} after {} turns", a.index + 1, end.status, a.turns).to_lowercase(),
+            None => format!("{}: stopped after {} turns", a.index + 1, a.turns),
         })
         .collect();
     let task: String = saved.request.task.lines().next().unwrap_or_default().chars().take(60).collect();
@@ -1052,8 +1053,8 @@ pub fn describe(event: &Progress) -> String {
             let result = error.as_ref().map_or_else(|| "model finished".into(), |e| format!("model failed: {e}"));
             format!("{}: {result} ({cost}{tokens})", model_label(context))
         }
-        Progress::ModelRetry { attempt, call, failure, delay_ms, retry, retries, .. } => {
-            let actor = attempt.map_or_else(|| "designer".into(), |a| format!("attempt {a}"));
+        Progress::ModelRetry { attempt, role, call, failure, delay_ms, retry, retries, .. } => {
+            let actor = speaker(*role, *attempt);
             let line = molt_api::progress::retry_line(failure, Duration::from_millis(*delay_ms), *retry, *retries);
             format!("{actor}, call {call}: {line}")
         }
@@ -1078,27 +1079,29 @@ pub fn describe(event: &Progress) -> String {
         Progress::CheckReady { command: None, designed: false, .. } => {
             "running without a done-check, as asked; the result will be unverified".to_owned()
         }
-        Progress::AttemptStarted { attempt, .. } => format!("attempt {attempt}: started"),
-        Progress::ToolCall { attempt, detail, .. } => format!("attempt {attempt}: {detail}"),
+        Progress::AttemptStarted { attempt, .. } => format!("{}: started", attempt_name(*attempt)),
+        Progress::ToolCall { attempt, detail, .. } => format!("{}: {detail}", attempt_name(*attempt)),
         Progress::CheckRan { attempt, passed: true, judged: true, .. } => {
-            format!("attempt {attempt}: the judge found every criterion met")
+            format!("{}: the judge found every criterion met", attempt_name(*attempt))
         }
         Progress::CheckRan { attempt, passed: false, judged: true, tail, .. } => {
-            format!("attempt {attempt}: judged: {tail}")
+            format!("{}: judged: {tail}", attempt_name(*attempt))
         }
-        Progress::CheckRan { attempt, passed: true, .. } => format!("attempt {attempt}: check passed"),
+        Progress::CheckRan { attempt, passed: true, .. } => format!("{}: check passed", attempt_name(*attempt)),
         Progress::CheckRan { attempt, passed: false, exit_code: Some(code), .. } => {
-            format!("attempt {attempt}: check failed (exit code {code})")
+            format!("{}: check failed (exit code {code})", attempt_name(*attempt))
         }
         Progress::CheckRan { attempt, passed: false, exit_code: None, .. } => {
-            format!("attempt {attempt}: check failed (killed or timed out)")
+            format!("{}: check failed (killed or timed out)", attempt_name(*attempt))
         }
-        Progress::AttemptFinished { attempt, status, .. } => format!("attempt {attempt}: {}", status_name(*status)),
+        Progress::AttemptFinished { attempt, status, .. } => {
+            format!("{}: {}", attempt_name(*attempt), status_name(*status))
+        }
         Progress::Note { message, .. } => message.clone(),
         Progress::Routed { workflow, reason, .. } => routed_line(workflow, reason, "--workflow verify"),
         Progress::Required { requirement, .. } => requirement_line(requirement),
         Progress::Adopted { attempt, version, turn, .. } => {
-            format!("attempt {attempt}: follows requirements v{version} from turn {turn}")
+            format!("{}: follows requirements v{version} from turn {turn}", attempt_name(*attempt))
         }
         Progress::State { state: RunState::Running, .. } => "going on".to_owned(),
         Progress::State { state: RunState::Paused, .. } => "paused".to_owned(),
@@ -1106,7 +1109,7 @@ pub fn describe(event: &Progress) -> String {
             format!("pausing; waiting for {}", waiting.join(", "))
         }
         Progress::Asked { attempt, question, text, options, .. } => {
-            let mut line = format!("attempt {attempt} asks (question {question}): {text}");
+            let mut line = format!("{} asks (question {question}): {text}", attempt_name(*attempt));
             if !options.is_empty() {
                 let numbered: Vec<String> =
                     options.iter().enumerate().map(|(i, o)| format!("{}. {o}", i + 1)).collect();
@@ -1156,7 +1159,7 @@ pub fn requirement_line(requirement: &Requirement) -> String {
 }
 
 fn model_label(context: &molt_api::progress::ModelCall) -> String {
-    let actor = context.attempt.map_or_else(|| "designer".into(), |a| format!("attempt {a}"));
+    let actor = speaker(context.role, context.attempt);
     format!("{actor}, turn {}, call {}", context.turn, context.call)
 }
 
@@ -1261,7 +1264,7 @@ pub fn selection_lines(resp: &RunResponse) -> Vec<String> {
     let mut lines = vec![format!("picked among {} passing attempts:", selection.candidates.len())];
     for c in &selection.candidates {
         let mark = if resp.winner == Some(c.attempt) { "*" } else { " " };
-        lines.push(format!(" {mark} attempt {}: {}", c.attempt, candidate_scores(c)));
+        lines.push(format!(" {mark} {}: {}", attempt_name(c.attempt), candidate_scores(c)));
     }
     lines
 }
@@ -1385,7 +1388,7 @@ fn change_name(kind: ChangeKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use molt_api::fs::Change;
-    use molt_api::model::Usage;
+    use molt_api::model::{Role, Usage};
     use molt_api::planner::{CheckSpec, Constraint, Review};
     use serde_json::json;
 
@@ -1587,7 +1590,7 @@ mod tests {
             text: "Tabs or spaces?".into(),
             options: vec!["tabs".into(), "spaces".into()],
         };
-        assert_eq!(describe(&asked), "attempt 1 asks (question 2): Tabs or spaces? [1. tabs 2. spaces]");
+        assert_eq!(describe(&asked), "attempt 2 asks (question 2): Tabs or spaces? [1. tabs 2. spaces]");
         let constraint = Constraint { text: "tabs".into(), answers: Some(2), ..Default::default() };
         let answer = Requirement { version: 3, constraint, at_ms: 0 };
         assert_eq!(requirement_line(&answer), "requirements v3: answer to question 2: tabs");
@@ -1607,7 +1610,7 @@ mod tests {
             tool: "run".into(),
             detail: "run echo \x1b[2Khi".into(),
         };
-        assert_eq!(describe(&call), "attempt 0: run echo \\u{1b}[2Khi");
+        assert_eq!(describe(&call), "attempt 1: run echo \\u{1b}[2Khi");
     }
 
     #[test]
@@ -1679,6 +1682,7 @@ mod tests {
             context: molt_api::progress::ModelCall {
                 run: trace.to_string(),
                 attempt: Some(1),
+                role: None,
                 turn: 2,
                 call: "call-a".into(),
                 seq: 1,
@@ -1703,6 +1707,7 @@ mod tests {
             context: molt_api::progress::ModelCall {
                 run: "run".into(),
                 attempt: Some(1),
+                role: None,
                 turn: 2,
                 call: call.into(),
                 seq,
@@ -1735,12 +1740,13 @@ mod tests {
         let context = molt_api::progress::ModelCall {
             run: "run".into(),
             attempt: Some(1),
+            role: None,
             turn: 2,
             call: "call-a".into(),
             seq: 1,
         };
         let preview = describe(&Progress::ModelText { context: context.clone(), text: "\x1b[2Khi".into() });
-        assert_eq!(preview, "attempt 1, turn 2, call call-a preview: \\u{1b}[2Khi");
+        assert_eq!(preview, "attempt 2, turn 2, call call-a preview: \\u{1b}[2Khi");
         let finished = describe(&Progress::ModelFinished {
             context,
             usage: None,
@@ -1790,9 +1796,9 @@ mod tests {
                 "check: sh check.sh (designed by the planner; uses check.sh)",
                 "no automated check fits this task; the result will be unverified",
                 "running without a done-check, as asked; the result will be unverified",
-                "attempt 1: read a.rs",
-                "attempt 0: check failed (exit code 1)",
-                "attempt 1: cancelled",
+                "attempt 2: read a.rs",
+                "attempt 1: check failed (exit code 1)",
+                "attempt 2: cancelled",
             ]
         );
     }
@@ -1877,13 +1883,48 @@ mod tests {
         let retry = Progress::ModelRetry {
             run: String::new(),
             attempt: Some(1),
+            role: None,
             call: "c1".into(),
             failure: "model API 502".into(),
             delay_ms: 60_000,
             retry: 2,
             retries: 4,
         };
-        assert_eq!(describe(&retry), "attempt 1, call c1: model API 502, retrying in 60s (2/4)");
+        assert_eq!(describe(&retry), "attempt 2, call c1: model API 502, retrying in 60s (2/4)");
+        let reviewer = Progress::ModelRetry {
+            run: String::new(),
+            attempt: None,
+            role: Some(Role::Reviewer),
+            call: "c1".into(),
+            failure: "model API 502".into(),
+            delay_ms: 60_000,
+            retry: 2,
+            retries: 4,
+        };
+        assert_eq!(describe(&reviewer), "reviewer, call c1: model API 502, retrying in 60s (2/4)");
+    }
+
+    #[test]
+    fn stream_lines_name_the_reviewer_and_the_judge_not_the_designer() {
+        let context = |role, attempt| molt_api::progress::ModelCall {
+            run: "run".into(),
+            attempt,
+            role,
+            turn: 3,
+            call: "msg_1".into(),
+            seq: 1,
+        };
+        let text =
+            |role, attempt| describe(&Progress::ModelText { context: context(role, attempt), text: "hi".into() });
+        assert_eq!(text(Some(Role::Reviewer), None), "reviewer, turn 3, call msg_1 preview: hi");
+        assert_eq!(text(Some(Role::Judge), None), "judge, turn 3, call msg_1 preview: hi");
+        assert_eq!(text(Some(Role::Designer), None), "designer, turn 3, call msg_1 preview: hi");
+        assert_eq!(text(Some(Role::Attempt), Some(0)), "attempt 1, turn 3, call msg_1 preview: hi");
+        // From an older gateway that names no role.
+        assert_eq!(text(None, Some(0)), "attempt 1, turn 3, call msg_1 preview: hi");
+        assert_eq!(text(None, None), "planner, turn 3, call msg_1 preview: hi");
+        let started = describe(&Progress::ModelStarted { context: context(Some(Role::Reviewer), None) });
+        assert_eq!(started, "reviewer, turn 3, call msg_1: model started (cost pending)");
     }
 
     #[test]
@@ -1961,8 +2002,8 @@ mod tests {
         }));
         assert!(
             report(&resp).contains(
-                "picked among 2 passing attempts:\n * attempt 0: suite passed, 3 lines in 1 files, review: approve\n   \
-                 attempt 1: suite failed, 1 lines in 1 files\nnot applied"
+                "picked among 2 passing attempts:\n * attempt 1: suite passed, 3 lines in 1 files, review: approve\n   \
+                 attempt 2: suite failed, 1 lines in 1 files\nnot applied"
             ),
             "{}",
             report(&resp)

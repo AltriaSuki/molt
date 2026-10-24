@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 
+use molt_api::model::Role;
 use molt_api::progress::{ModelCall, Progress};
 use ratatui::text::Line;
 
@@ -12,6 +13,9 @@ const CLOSED_CALLS: usize = 16;
 
 struct Active {
     call: String,
+    /// Whose call it is: a role, or `model` for an attempt's, whose box
+    /// already says which it is.
+    who: &'static str,
     turn: u32,
     seq: u64,
     text: String,
@@ -88,7 +92,7 @@ impl Preview {
             _ => "",
         };
         let text = if active.text.is_empty() { "no text received".into() } else { short(&active.text, 90) };
-        Some(Line::from(span(format!("   model preview {reason}{flags}: {text}"), Tone::Dim)))
+        Some(Line::from(span(format!("   {} preview {reason}{flags}: {text}", active.who), Tone::Dim)))
     }
 
     pub fn lines(&self, width: u16, max_lines: usize) -> Vec<Line<'static>> {
@@ -103,7 +107,8 @@ impl Preview {
         if active.cut {
             flags.push_str(" · truncated");
         }
-        let label = super::text::fit(&format!("model preview{flags} · turn {}", active.turn), usize::from(width));
+        let label =
+            super::text::fit(&format!("{} preview{flags} · turn {}", active.who, active.turn), usize::from(width));
         let mut lines = vec![Line::from(span(label, Tone::Dim))];
         let body: Vec<_> = super::text::block(&active.text, "   ", Tone::Plain)
             .iter()
@@ -119,6 +124,10 @@ impl Active {
     fn new(c: &ModelCall, gap: bool) -> Self {
         Self {
             call: c.call.clone(),
+            who: match c.role {
+                Some(role) if role != Role::Attempt => role.name(),
+                _ => "model",
+            },
             turn: c.turn,
             seq: if gap { c.seq.saturating_sub(1) } else { c.seq },
             text: String::new(),
@@ -161,7 +170,7 @@ mod tests {
     use molt_api::model::Usage;
 
     fn call(id: &str, turn: u32, seq: u64) -> ModelCall {
-        ModelCall { run: "run".into(), attempt: Some(0), turn, call: id.into(), seq }
+        ModelCall { run: "run".into(), attempt: Some(0), role: None, turn, call: id.into(), seq }
     }
 
     #[test]

@@ -57,6 +57,7 @@ pub(super) fn model_context(app: &App, attempt: Option<u32>, seq: u64) -> molt_a
     molt_api::progress::ModelCall {
         run: app.task.as_ref().unwrap().trace.to_string(),
         attempt,
+        role: None,
         turn: 1,
         call: "fake-stream".into(),
         seq,

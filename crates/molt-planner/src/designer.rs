@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use molt_api::fs::{Change, ChangeKind};
-use molt_api::model::{tool_result, user_blocks, user_text, ToolUse, STOP_MAX_TOKENS};
+use molt_api::model::{tool_result, user_blocks, user_text, Role, ToolUse, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{Conflict, SubmitCheck, SUBMIT_CHECK};
 use molt_api::planner::{Baseline, Criterion};
 use molt_proto::RemoteError;
@@ -94,7 +94,7 @@ async fn run_baseline(ctx: &Arc<Ctx>, fork: &str, command: &str, files: &[(Strin
 async fn work(ctx: &Arc<Ctx>, fork: &str) -> Design {
     let tools = Arc::new(prompts::designer_tools(ctx.memory.up, ctx.web));
     let first = prompts::designer_first_message(&ctx.task, &ctx.preamble());
-    let mut conv = Conversation::new(prompts::DESIGNER_SYSTEM, tools, first, None);
+    let mut conv = Conversation::new(prompts::DESIGNER_SYSTEM, tools, first, Role::Designer, None);
     let mut meter = Meter::default();
     let mut nudged = false;
     let mut conflicted = 0;
@@ -244,16 +244,16 @@ async fn vetted(ctx: &Arc<Ctx>, fork: &str, design: Design) -> Vetted {
         return Vetted::Accepted(Design::Check { command, files, suite, rationale, baseline });
     }
     match vet::vet(ctx, fork, &command, &files).await {
-        Ok(conflicts) if conflicts.is_empty() => ctx.note("check vetter: the check fits the task").await,
+        Ok(conflicts) if conflicts.is_empty() => ctx.note("vetter: the check fits the task").await,
         Ok(conflicts) => {
             let n = conflicts.len();
-            ctx.note(format!("check vetter: {n} conflict{} with the task; back to the designer", plural(n))).await;
+            ctx.note(format!("vetter: {n} conflict{} with the task; back to the designer", plural(n))).await;
             tracing::info!(run = %ctx.trace, conflicts = n, "the vetter sent the check back");
             return Vetted::Conflicts(conflicts);
         }
         Err(why) => {
             tracing::warn!(run = %ctx.trace, %why, "the check vetter did not finish; the check is used unvetted");
-            ctx.note(format!("check vetter: did not finish ({why}); the check is used without vetting")).await;
+            ctx.note(format!("vetter: did not finish ({why}); the check is used without vetting")).await;
             rationale =
                 format!("{}\n\nNot vetted against the task: the vetter did not finish ({why}).", rationale.trim_end());
         }

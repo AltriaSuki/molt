@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use molt_api::model::attempt_name;
 use molt_api::planner::{
     AttemptStatus, Candidate, CheckDispute, CheckFile, CheckSpec, Criterion, DesignResponse, Outcome, Resume, Review,
     RunRequest, RunResponse, Select, Selection, Verdict, Verification,
@@ -764,9 +765,10 @@ async fn stop_after_first(ctx: &Ctx, select: Select, first: &Finished) -> Option
     let left = ctx.budget_usd - ctx.tally().spend.cost_usd;
     if left < first.report.cost_usd {
         ctx.note(format!(
-            "attempt {} passed; ${left:.2} of the budget is left, less than it cost (${:.2}), so the others are \
+            "{} passed; ${left:.2} of the budget is left, less than it cost (${:.2}), so the others are \
              cancelled rather than waited for",
-            first.report.index, first.report.cost_usd
+            attempt_name(first.report.index),
+            first.report.cost_usd
         ))
         .await;
         return None;
@@ -1032,8 +1034,9 @@ async fn compare(
             }
             Err(e) => {
                 ctx.note(format!(
-                    "attempt {} is left out of the comparison: its changes could not be listed: {}",
-                    done.report.index, e.message
+                    "{} is left out of the comparison: its changes could not be listed: {}",
+                    attempt_name(done.report.index),
+                    e.message
                 ))
                 .await
             }
@@ -1115,7 +1118,7 @@ fn failure_summary(spec: Option<&CheckSpec>, rubric: &[Criterion], finished: &[F
     };
     for f in finished {
         let status = if f.report.dispute.is_some() { "disputed" } else { status_name(f.report.status) };
-        summary.push_str(&format!("\n- attempt {}: {status}", f.report.index));
+        summary.push_str(&format!("\n- {}: {status}", attempt_name(f.report.index)));
         if !f.report.note.is_empty() {
             summary.push_str(&format!(": {}", f.report.note));
         }
@@ -1126,10 +1129,13 @@ fn failure_summary(spec: Option<&CheckSpec>, rubric: &[Criterion], finished: &[F
 /// What a dispute says, for the run's summary.
 fn dispute_summary(d: &CheckDispute) -> String {
     format!(
-        "The done-check was disputed: attempt {} found that it contradicts the task.\n\
+        "The done-check was disputed: {} found that it contradicts the task.\n\
          The check asserts: {}\nThe task says: \"{}\"\nTo reproduce: `{}`\n\
          Look at the check, change it if it is wrong, and run the task again.",
-        d.attempt, d.assertion, d.task_quote, d.reproduce
+        attempt_name(d.attempt),
+        d.assertion,
+        d.task_quote,
+        d.reproduce
     )
 }
 

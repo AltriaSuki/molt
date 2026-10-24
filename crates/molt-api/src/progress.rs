@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::Usage;
+use crate::model::{Role, Usage};
 use crate::planner::{AttemptStatus, Requirement, RunState};
 
 /// Identity and ordering of one model call's preview events. Sequence 0 is
@@ -16,6 +16,9 @@ use crate::planner::{AttemptStatus, Requirement, RunState};
 pub struct ModelCall {
     pub run: String,
     pub attempt: Option<u32>,
+    /// Who makes the call; absent from an older gateway or caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
     pub turn: u32,
     pub call: String,
     pub seq: u64,
@@ -52,6 +55,9 @@ pub enum Progress {
         /// The attempt the call belongs to, when the caller said.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attempt: Option<u32>,
+        /// Who makes the call, when the caller said.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<Role>,
         call: String,
         failure: String,
         delay_ms: u64,
@@ -200,6 +206,15 @@ impl Progress {
         }
     }
 
+    /// Who makes the model call of a model or retry event, as a person
+    /// reads it ([`crate::model::speaker`]).
+    pub fn speaker(&self) -> Option<String> {
+        match self {
+            Self::ModelRetry { role, attempt, .. } => Some(crate::model::speaker(*role, *attempt)),
+            _ => self.model_call().map(|c| crate::model::speaker(c.role, c.attempt)),
+        }
+    }
+
     pub fn model_call(&self) -> Option<&ModelCall> {
         match self {
             Self::ModelStarted { context } | Self::ModelText { context, .. } | Self::ModelFinished { context, .. } => {
@@ -255,5 +270,37 @@ mod tests {
         let event: Progress = serde_json::from_str(old).unwrap();
         assert_eq!(event, Progress::AttemptStarted { run: "r".into(), attempt: 0, fork: None });
         assert_eq!(serde_json::to_string(&event).unwrap(), old);
+    }
+
+    #[test]
+    fn model_events_name_their_role_and_older_ones_still_parse() {
+        let old = r#"{"event":"model_started","run":"r","attempt":null,"turn":1,"call":"c","seq":0}"#;
+        let event: Progress = serde_json::from_str(old).unwrap();
+        assert_eq!(event.model_call().unwrap().role, None);
+        assert_eq!(serde_json::to_string(&event).unwrap(), old, "no role is left out, as before");
+        assert_eq!(event.speaker().as_deref(), Some("planner"));
+
+        let new = r#"{"event":"model_started","run":"r","attempt":null,"role":"reviewer","turn":1,"call":"c","seq":0}"#;
+        let event: Progress = serde_json::from_str(new).unwrap();
+        assert_eq!(event.speaker().as_deref(), Some("reviewer"));
+        assert_eq!(serde_json::to_string(&event).unwrap(), new);
+
+        let retry = r#"{"event":"model_retry","run":"r","role":"judge","call":"c","failure":"model API 502","delay_ms":1,"retry":1,"retries":4}"#;
+        assert_eq!(serde_json::from_str::<Progress>(retry).unwrap().speaker().as_deref(), Some("judge"));
+        // A role from a newer peer does not make the event unreadable.
+        let later = new.replace("reviewer", "auditor");
+        assert_eq!(serde_json::from_str::<Progress>(&later).unwrap().model_call().unwrap().role, Some(Role::Other));
+    }
+
+    #[test]
+    fn attempts_are_counted_from_one_and_other_calls_by_their_role() {
+        use crate::model::speaker;
+        assert_eq!(speaker(Some(Role::Attempt), Some(0)), "attempt 1");
+        assert_eq!(speaker(None, Some(2)), "attempt 3", "an older caller names only the attempt");
+        assert_eq!(speaker(Some(Role::Designer), None), "designer");
+        assert_eq!(speaker(Some(Role::Reviewer), None), "reviewer");
+        assert_eq!(speaker(Some(Role::Judge), None), "judge");
+        assert_eq!(speaker(Some(Role::Memory), None), "memory");
+        assert_eq!(speaker(None, None), "planner");
     }
 }

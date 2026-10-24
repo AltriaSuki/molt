@@ -398,7 +398,7 @@ mod tests {
             options: vec!["tabs".into(), "four spaces".into()],
         }));
         let shown = log(&app);
-        assert!(shown.contains("? attempt 0 asks  Tabs or spaces?"), "{shown}");
+        assert!(shown.contains("? attempt 1 asks  Tabs or spaces?"), "{shown}");
         assert!(shown.contains("  2. four spaces") && shown.contains("type an option's number"), "{shown}");
 
         // An option by its number.

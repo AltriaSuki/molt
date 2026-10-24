@@ -682,6 +682,7 @@ pub(crate) async fn consolidate(
     let known = blocking(db, move |db| known(db, &task, &w, now)).await?;
     let request = CompleteRequest {
         stream: None,
+        role: Some(model::Role::Memory),
         effort: model.as_deref().is_none_or(takes_effort).then_some(cfg.effort),
         model,
         system: Some(SYSTEM.to_owned()),
@@ -1029,6 +1030,7 @@ mod tests {
         assert!(text.contains("[2] [workspace] run `pytest -q`"), "{text}");
         assert_eq!(payload["tools"][0]["name"], SUBMIT_NOTES);
         assert_eq!(payload["tools"][0]["input_schema"], answer_schema());
+        assert_eq!(payload["role"], "memory", "the call says it is memory's, for its progress and transcript");
         assert!(payload.get("output_schema").is_none(), "the answer's shape does not rest on the server");
         assert!(payload.get("model").is_none(), "no model named anywhere: the gateway's default, as for the attempts");
         let reads: Vec<_> = calls.iter().filter(|(t, ..)| t == audit::READ).collect();

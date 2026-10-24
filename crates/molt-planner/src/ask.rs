@@ -5,6 +5,7 @@
 //! every attempt follows it. Without an answer in time the attempt is told
 //! to decide itself.
 
+use molt_api::model::attempt_name;
 use molt_api::planner::tools::AskUser;
 use molt_api::progress::Progress;
 
@@ -36,7 +37,7 @@ pub(crate) async fn ask(ctx: &Ctx, attempt: u32, ask: AskUser) -> Result<String,
     let id = match ctx.control.ask(ctx.cfg.max_questions) {
         Ok(id) => id,
         Err(why) => {
-            ctx.note(format!("attempt {attempt} could not ask: {why}")).await;
+            ctx.note(format!("{} could not ask: {why}", attempt_name(attempt))).await;
             return Ok(format!("Your question was not asked: {why}. {NO_ANSWER}"));
         }
     };
@@ -53,7 +54,11 @@ pub(crate) async fn ask(ctx: &Ctx, attempt: u32, ask: AskUser) -> Result<String,
         }
         None => {
             let secs = ctx.cfg.ask_timeout.as_secs();
-            ctx.note(format!("attempt {attempt}: no answer to question {id} within {secs}s; it decides itself")).await;
+            ctx.note(format!(
+                "{}: no answer to question {id} within {secs}s; it decides itself",
+                attempt_name(attempt)
+            ))
+            .await;
             Ok(NO_ANSWER.to_owned())
         }
     }

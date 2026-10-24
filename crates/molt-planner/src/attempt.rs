@@ -4,7 +4,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use molt_api::model::{tool_result, user_blocks, user_text, ToolUse, STOP_MAX_TOKENS};
+use molt_api::model::{attempt_name, tool_result, user_blocks, user_text, Role, ToolUse, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{DisputeCheck, DISPUTE_CHECK};
 use molt_api::planner::{AttemptReport, AttemptStatus, CheckDispute, Criterion, Finding};
 use molt_api::progress::Progress;
@@ -328,7 +328,7 @@ impl Attempt {
                 ctx.track_fork(&fork);
                 let started = Some(fork.clone());
                 ctx.progress(Progress::AttemptStarted { run: ctx.run_id(), attempt: self.index, fork: started }).await;
-                let mut conv = Conversation::new(system, tools, Value::Null, Some(self.index));
+                let mut conv = Conversation::new(system, tools, Value::Null, Role::Attempt, Some(self.index));
                 conv.messages = saved.messages;
                 conv.known = saved.known;
                 given = self.resume_point(&mut conv).await;
@@ -370,7 +370,7 @@ impl Attempt {
                     &ctx.preamble(),
                     &ctx.control.upto(self.version),
                 );
-                let mut conv = Conversation::new(system, tools, first, Some(self.index));
+                let mut conv = Conversation::new(system, tools, first, Role::Attempt, Some(self.index));
                 if let Some(earlier) =
                     ctx.continues.as_ref().map(|c| continued(&c.conversation)).filter(|c| !c.is_empty())
                 {
@@ -410,7 +410,8 @@ impl Attempt {
                         self.go().await?;
                         let cut_off = agent::cut_off(&resp);
                         if let Some(dispute) = self.dispute(&calls, cut_off) {
-                            ctx.note(format!("attempt {} disputed the check: {}", self.index, dispute.assertion)).await;
+                            ctx.note(format!("{} disputed the check: {}", attempt_name(self.index), dispute.assertion))
+                                .await;
                             return Err(End::disputed(dispute));
                         }
                         let actor = Actor::Attempt { index: self.index, turn: self.meter.turns };
@@ -448,8 +449,8 @@ impl Attempt {
             let changed = self.changed_protected(&fork, self.version).await;
             if !changed.is_empty() {
                 ctx.note(format!(
-                    "attempt {}: its result changes {}, which must stay as they are",
-                    self.index,
+                    "{}: its result changes {}, which must stay as they are",
+                    attempt_name(self.index),
                     changed.join(", ")
                 ))
                 .await;
@@ -537,7 +538,7 @@ impl Attempt {
     /// call can take and to a quarter of a frame, so a reply and the request
     /// that goes on from it both carry it.
     fn keep(&mut self, conv: &Conversation) {
-        let mut kept = Conversation::new(conv.system, conv.tools.clone(), Value::Null, conv.attempt);
+        let mut kept = Conversation::new(conv.system, conv.tools.clone(), Value::Null, conv.role, conv.attempt);
         kept.messages = conv.messages.clone();
         kept.known = conv.known;
         let limits = self.ctx.limits();
@@ -627,8 +628,8 @@ impl Attempt {
         let names: Vec<&str> = calls.iter().filter_map(|c| c["name"].as_str()).collect();
         self.ctx
             .note(format!(
-                "attempt {}: the run stopped while {} ran; the model is told their effect is unknown",
-                self.index,
+                "{}: the run stopped while {} ran; the model is told their effect is unknown",
+                attempt_name(self.index),
                 names.join(", ")
             ))
             .await;

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use molt_api::model::{tool_result, user_blocks, user_text, STOP_MAX_TOKENS};
+use molt_api::model::{tool_result, user_blocks, user_text, Role, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{SubmitRoute, SUBMIT_ROUTE};
 
 use crate::agent::{self, Meter};
@@ -30,7 +30,8 @@ pub(crate) async fn route(ctx: &Arc<Ctx>, candidates: &[&'static str], check: Op
         return Routed { workflow: heaviest, reason: String::new() };
     }
     let first = prompts::route_first_message(&ctx.task, candidates, check);
-    let mut conv = Conversation::new(prompts::ROUTE_SYSTEM, Arc::new(prompts::route_tools()), first, None);
+    let mut conv =
+        Conversation::new(prompts::ROUTE_SYSTEM, Arc::new(prompts::route_tools()), first, Role::Router, None);
     conv.model = ctx.cfg.route_model.clone();
     let mut meter = Meter::default();
     let cancel = ctx.run_cancel.clone();

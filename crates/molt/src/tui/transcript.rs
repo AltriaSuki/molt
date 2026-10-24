@@ -6,11 +6,13 @@
 //! message holds the results of the tools the turn before called. The reply
 //! holds the turn's text and tool calls. A run that did not stream is told
 //! apart by conversation instead: a request that answers a turn's tool calls
-//! continues that turn's conversation.
+//! continues that turn's conversation. A request names its caller's role
+//! (designer, reviewer, judge...) whether or not the run streams; one from
+//! an older planner does not.
 
 use std::collections::HashMap;
 
-use molt_api::model;
+use molt_api::model::{self, Role};
 use molt_proto::audit::Logged;
 use molt_proto::Kind;
 use ratatui::text::Line;
@@ -25,7 +27,10 @@ const FOLD: usize = 12;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Speaker {
     Attempt(u32),
-    /// The check designer, the reviewer and the planner's other calls.
+    /// A call that names its role: the check designer, the reviewer, the judge.
+    Role(Role),
+    /// A call of the planner's other than an attempt's, from a planner that
+    /// did not name its role.
     Planner,
     /// A run that did not stream does not say; its `n`th conversation.
     Unknown(usize),
@@ -112,11 +117,19 @@ impl Reader {
             }
         }
         let stream = &payload["stream"];
+        let role = serde_json::from_value::<Role>(payload["role"].clone()).ok();
         let call = if let Some(turn) = stream["turn"].as_u64() {
-            let speaker = stream["attempt"].as_u64().map_or(Speaker::Planner, |a| Speaker::Attempt(a as u32));
+            let speaker = match (stream["attempt"].as_u64(), role) {
+                (Some(a), None | Some(Role::Attempt)) => Speaker::Attempt(a as u32),
+                (_, Some(role)) => Speaker::Role(role),
+                (None, None) => Speaker::Planner,
+            };
             Call { speaker, turn: turn as u32 }
         } else if let Some(t) = asked {
             Call { speaker: self.turns[t].speaker, turn: self.turns[t].turn + 1 }
+        } else if let Some(role) = role.filter(|r| *r != Role::Attempt) {
+            // Not streamed, but named: its conversation needs no number.
+            Call { speaker: Speaker::Role(role), turn: 1 }
         } else {
             self.conversations += 1;
             Call { speaker: Speaker::Unknown(self.conversations), turn: 1 }
@@ -170,7 +183,11 @@ pub fn slim(entry: &mut Logged) {
     let env = &mut entry.envelope;
     if env.kind == Kind::Request && env.to.to_string() == model::COMPLETE {
         let last = env.payload["messages"].as_array().and_then(|m| m.last()).cloned();
-        env.payload = json!({ "stream": env.payload["stream"], "messages": last.into_iter().collect::<Vec<_>>() });
+        env.payload = json!({
+            "stream": env.payload["stream"],
+            "role": env.payload["role"],
+            "messages": last.into_iter().collect::<Vec<_>>(),
+        });
     } else if env.kind == Kind::Request {
         env.payload = Value::Null;
     }
@@ -207,7 +224,8 @@ pub fn render(
     for turn in turns.iter().filter(|t| only.is_none_or(|a| t.speaker == Speaker::Attempt(a))) {
         starts.push(lines.len());
         let who = match turn.speaker {
-            Speaker::Attempt(a) => format!("attempt {}", a + 1),
+            Speaker::Attempt(a) => model::attempt_name(a),
+            Speaker::Role(role) => role.name().to_owned(),
             Speaker::Planner => "planner".to_owned(),
             Speaker::Unknown(n) => format!("conversation {n}"),
         };
@@ -374,6 +392,59 @@ pub(crate) mod tests {
         let (lines, starts) = render(&reader.turns, Some(0), false, &|s| s.to_owned());
         assert_eq!(starts.len(), 2, "every turn is shown");
         assert!(plain(&lines)[0].contains("did not stream"));
+    }
+
+    /// A reviewer's turn and a judge's, each answered, as a planner that
+    /// names roles logs them; `stream` says whether the run streamed.
+    fn reviewer_and_judge(trace: &TraceId, stream: bool) -> Vec<Logged> {
+        let mut log = Vec::new();
+        for (i, role) in ["reviewer", "judge"].into_iter().enumerate() {
+            let mut payload = json!({ "role": role, "messages": [{ "role": "user", "content": "look" }] });
+            if stream {
+                payload["stream"] = json!({ "attempt": null, "turn": 1 });
+            }
+            let call = request(trace, payload);
+            let reply = call.reply(
+                json!({ "model": "m", "content": [{ "type": "text", "text": "the exit flag is a false positive" }] }),
+            );
+            log.push(logged(2 * i as u64 + 1, call));
+            log.push(logged(2 * i as u64 + 2, reply));
+        }
+        log
+    }
+
+    #[test]
+    fn reviewer_and_judge_turns_are_headed_by_their_role() {
+        for stream in [true, false] {
+            let trace = TraceId::random();
+            let mut log = reviewer_and_judge(&trace, stream);
+            log.iter_mut().for_each(slim);
+            let mut reader = Reader::default();
+            reader.add(log);
+            let speakers: Vec<_> = reader.turns.iter().map(|t| t.speaker).collect();
+            assert_eq!(speakers, [Speaker::Role(Role::Reviewer), Speaker::Role(Role::Judge)], "stream: {stream}");
+            let (lines, starts) = render(&reader.turns, None, false, &|s| s.to_owned());
+            let shown = plain(&lines);
+            assert!(shown[starts[0]].starts_with("reviewer · turn 1 · "), "{shown:?}");
+            assert!(shown[starts[1]].starts_with("judge · turn 1 · "), "{shown:?}");
+            assert!(!shown.iter().any(|l| l.starts_with("planner") || l.starts_with("designer")), "{shown:?}");
+        }
+    }
+
+    #[test]
+    fn an_attempt_that_names_its_role_is_still_numbered_from_one() {
+        let trace = TraceId::random();
+        let mut log = two_turns(&trace);
+        for entry in &mut log {
+            if let Some(payload) = entry.envelope.payload.as_object_mut().filter(|p| p.contains_key("stream")) {
+                payload.insert("role".into(), json!("attempt"));
+            }
+        }
+        let mut reader = Reader::default();
+        reader.add(log);
+        assert_eq!(reader.turns[0].speaker, Speaker::Attempt(0));
+        let (lines, starts) = render(&reader.turns, Some(0), false, &|s| s.to_owned());
+        assert!(plain(&lines)[starts[0]].starts_with("attempt 1 · turn 1"), "{:?}", plain(&lines));
     }
 
     #[test]

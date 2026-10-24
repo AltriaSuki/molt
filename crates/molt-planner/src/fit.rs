@@ -311,7 +311,7 @@ fn record(earlier: &str, dropped: &[Value]) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use molt_api::model::{tool_result, user_blocks, user_text};
+    use molt_api::model::{tool_result, user_blocks, user_text, Role};
     use serde_json::json;
 
     use super::*;
@@ -325,7 +325,13 @@ mod tests {
     }
 
     fn conversation(turns: usize, result: &str) -> Conversation {
-        let mut conv = Conversation::new("system", Arc::new(Vec::new()), user_text("<task>\nDo it.\n</task>"), None);
+        let mut conv = Conversation::new(
+            "system",
+            Arc::new(Vec::new()),
+            user_text("<task>\nDo it.\n</task>"),
+            Role::Attempt,
+            None,
+        );
         for n in 0..turns {
             conv.push(assistant(&format!("t{n}"), &format!("turn {n}")));
             conv.push(user_blocks(vec![tool_result(&format!("t{n}"), result, false)]));
@@ -421,10 +427,10 @@ mod tests {
     #[test]
     fn what_cannot_fit_says_which_limit() {
         let big = user_text("x".repeat(200_000));
-        let mut conv = Conversation::new("system", Arc::new(Vec::new()), big.clone(), None);
+        let mut conv = Conversation::new("system", Arc::new(Vec::new()), big.clone(), Role::Attempt, None);
         let err = conv.fit(Limits { tokens: 10_000, bytes: 1 << 30 }).unwrap_err();
         assert!(err.contains("input tokens") && err.contains("MOLT_CONTEXT_TOKENS"), "{err}");
-        let mut conv = Conversation::new("system", Arc::new(Vec::new()), big, None);
+        let mut conv = Conversation::new("system", Arc::new(Vec::new()), big, Role::Attempt, None);
         let err = conv.fit(Limits { tokens: 1 << 30, bytes: 100_000 }).unwrap_err();
         assert!(err.contains("transport frame limit"), "{err}");
     }

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use molt_api::fs;
-use molt_api::model::{self, CompleteRequest, CompleteResponse, Effort, Usage};
+use molt_api::model::{self, CompleteRequest, CompleteResponse, Effort, Role, Usage};
 use molt_api::planner::RunRequest;
 use molt_api::progress::{self, Progress};
 use molt_api::workflow::Workflow;
@@ -146,6 +146,8 @@ pub(crate) struct Conversation {
     pub(crate) tools: Arc<Vec<Value>>,
     pub(crate) messages: Vec<Value>,
     pub(crate) attempt: Option<u32>,
+    /// Who holds it, named in its model calls.
+    pub(crate) role: Role,
     /// The model for this conversation, in place of the run's.
     pub(crate) model: Option<String>,
     /// How many messages the model last measured, and the tokens it counted
@@ -154,8 +156,13 @@ pub(crate) struct Conversation {
 }
 
 impl Conversation {
-    pub fn new(system: &'static str, tools: Arc<Vec<Value>>, first: Value, attempt: Option<u32>) -> Self {
-        Self { system, tools, messages: vec![first], attempt, model: None, known: None }
+    pub fn new(system: &'static str, tools: Arc<Vec<Value>>, first: Value, role: Role, attempt: Option<u32>) -> Self {
+        Self { system, tools, messages: vec![first], attempt, role, model: None, known: None }
+    }
+
+    /// Who holds it, as a person reads it: `attempt 1`, `reviewer`.
+    pub fn speaker(&self) -> String {
+        model::speaker(Some(self.role), self.attempt)
     }
 
     pub fn push(&mut self, message: Value) {
@@ -400,19 +407,13 @@ impl Ctx {
             effort: self.effort,
             output_schema: None,
             stream: self.stream.then_some(model::StreamContext { attempt: conv.attempt, turn }),
+            role: Some(conv.role),
         };
         let ms = u64::try_from(self.cfg.model_timeout.as_millis()).unwrap_or(u64::MAX);
         let budget = Budget::new(self.cfg.max_tokens.into(), ms, 0);
         self.tally.send_modify(|t| t.pending += 1);
         self.save(|s| s.open_calls += 1);
-        let who = match conv.attempt {
-            Some(n) => format!("attempt {n}"),
-            None if conv.system == crate::prompts::REVIEWER_SYSTEM => "the reviewer".to_owned(),
-            None if conv.system == crate::prompts::JUDGE_SYSTEM => "the judge".to_owned(),
-            None if conv.system == crate::prompts::ROUTE_SYSTEM => "picking a workflow".to_owned(),
-            None => "the check's designer".to_owned(),
-        };
-        let busy = self.control.busy(format!("{who}: a model call"));
+        let busy = self.control.busy(format!("{}: a model call", conv.speaker()));
         let ctx = self.clone();
         let call = tokio::spawn(async move {
             let resp = ctx.call::<CompleteResponse>(model::COMPLETE, req, budget).await;

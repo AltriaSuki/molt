@@ -38,12 +38,12 @@ use progress::{bounded, lane_lines};
 use settings::task_budget;
 use viewer::{diff_viewer, review_viewer, viewer_key};
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
 use molt_api::fs::ChangeKind;
 use molt_api::memory::{ConsolidateResponse, Layer, RecallSnapshot, Recalled, ReviewRequest, ReviewResponse};
-use molt_api::model::Effort;
+use molt_api::model::{attempt_name, Effort, Role};
 use molt_api::planner::{
     AttemptReport, AttemptStatus, Constraint, Continuation, Control, ControlResponse, DesignResponse, Earlier, Outcome,
     RunRequest, RunResponse, RunState, Verdict,
@@ -517,6 +517,9 @@ pub struct Task {
     settings: Settings,
     pub lanes: Vec<Lane>,
     pub designer_preview: Preview,
+    /// Previews of the other calls of no attempt, one per role (the
+    /// reviewer's, the judge's), so one role's turns do not hide another's.
+    pub role_previews: BTreeMap<Role, Preview>,
     /// The gateway is about to try a model call of the check's design (or
     /// another call of no attempt) again.
     pub designer_retry: Option<Retrying>,
@@ -575,6 +578,7 @@ impl Task {
             notes_seen: HashSet::new(),
             stops: Vec::new(),
             designer_preview: Preview::default(),
+            role_previews: BTreeMap::new(),
             designer_retry: None,
             version: 0,
             state: RunState::Running,

@@ -16,6 +16,62 @@ use serde_json::{json, Value};
 /// the call's cost unknown.
 pub const COMPLETE: &str = "model.complete";
 
+/// Who in a run makes a model call, so previews, retries and transcripts can
+/// say whose turn it was. An attempt's index is given apart, where there is
+/// one. A role this build does not know reads as [`Role::Other`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// The check designer.
+    Designer,
+    /// The vetter, which looks over the designer's check.
+    Vetter,
+    Attempt,
+    /// The reviewer, which looks at a passing result before it is applied.
+    Reviewer,
+    /// The judge of a result against the run's rubric.
+    Judge,
+    /// The planner picking a workflow for `auto`.
+    Router,
+    /// Memory learning from a finished run.
+    Memory,
+    #[serde(other)]
+    Other,
+}
+
+impl Role {
+    /// The role's name as a person reads it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Designer => "designer",
+            Self::Vetter => "vetter",
+            Self::Attempt => "attempt",
+            Self::Reviewer => "reviewer",
+            Self::Judge => "judge",
+            Self::Router => "router",
+            Self::Memory => "memory",
+            Self::Other => "planner",
+        }
+    }
+}
+
+/// Attempt `index` (counted from 0 on the wire) as a person reads it,
+/// counted from 1: `attempt 1` is the first.
+pub fn attempt_name(index: u32) -> String {
+    format!("attempt {}", u64::from(index) + 1)
+}
+
+/// Who made a model call, as a person reads it: [`attempt_name`] for an
+/// attempt, else the role's name. A call that names neither, from an
+/// older caller, is the planner's.
+pub fn speaker(role: Option<Role>, attempt: Option<u32>) -> String {
+    match (role, attempt) {
+        (None | Some(Role::Attempt), Some(a)) => attempt_name(a),
+        (Some(role), _) => role.name().to_owned(),
+        (None, None) => Role::Other.name().to_owned(),
+    }
+}
+
 /// Display context for an opt-in streaming call. The run and call ids come
 /// from the authenticated request envelope, not from this payload.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -79,6 +135,10 @@ pub struct CompleteRequest {
     /// authoritative. Thinking and partial tool inputs are never published.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<StreamContext>,
+    /// Who makes the call, for display only; the gateway copies it into the
+    /// progress events it publishes. New: an older caller leaves it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
 }
 
 /// Token counts as the Messages API reports them. A count the API sends as
