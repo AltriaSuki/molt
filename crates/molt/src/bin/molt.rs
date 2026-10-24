@@ -81,6 +81,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ProjectCmd,
     },
+    /// The environment a workspace's commands get in the sandbox.
+    Env {
+        #[command(subcommand)]
+        cmd: EnvCmd,
+    },
     /// Benchmark Molt against a plain agent loop on coding tasks graded by hidden tests.
     Bench {
         #[command(subcommand)]
@@ -386,6 +391,20 @@ struct SkillArgs {
     at: MemoryAt,
     #[command(subcommand)]
     cmd: SkillCmd,
+}
+
+#[derive(Subcommand)]
+enum EnvCmd {
+    /// Say which environment profiles apply to the workspace, run their
+    /// probes in the sandbox as a run's commands would, and give a fix for
+    /// each that fails. Exits 1 when one fails.
+    Doctor {
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        /// The trusted shell sandbox JSON policy runs use, if any.
+        #[arg(long)]
+        sandbox_policy: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -721,6 +740,29 @@ async fn main() -> anyhow::Result<ExitCode> {
         Cmd::Apply(args) => return apply_cmd(cli.config.as_deref(), args).await,
         Cmd::Memory { cmd } => memory_cmd(cli.config.as_deref(), cmd).await?,
         Cmd::Project { cmd } => project_cmd(cmd)?,
+        Cmd::Env { cmd: EnvCmd::Doctor { workspace, sandbox_policy } } => {
+            let workspace = workspace.canonicalize().with_context(|| format!("workspace {}", workspace.display()))?;
+            // The profiles of the --config file if one is given, else the user config's.
+            let user = match cli.config.as_deref() {
+                Some(path) => Config::load(path)?.environments,
+                None => match molt::layers::user_path(&|name| std::env::var(name).ok()) {
+                    Some(path) if path.is_file() => Config::load(&path)?.environments,
+                    _ => Default::default(),
+                },
+            };
+            let policy = match sandbox_policy {
+                Some(path) => {
+                    let scratch = std::env::temp_dir().join("molt-env-doctor");
+                    molt_tools::SandboxPolicy::load(&path, &molt_tools::Roots { root: workspace.clone(), scratch })?
+                }
+                None => molt_tools::SandboxPolicy::default(),
+            };
+            let (report, ok) = molt::doctor::run(&workspace, &user, policy).await?;
+            print!("{report}");
+            if !ok {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
         Cmd::Bench { cmd } => return molt_bench::cli::main(cmd).await,
         Cmd::Prices { cmd } => return prices_cmd(cmd).await,
         Cmd::Audit { cmd: AuditCmd::Verify { path } } => {
@@ -902,6 +944,7 @@ fn prepare(config: Option<&Path>, profile: Option<&str>, args: &RunArgs) -> anyh
         shell.pass_env.extend(args.pass_env.iter().cloned());
     }
     agent::deps_cache(&mut cfg, &args.deps_cache)?;
+    agent::environments(&mut cfg)?;
     if args.no_memory {
         cfg.services.retain(|s| s.name.as_str() != agent::MEMORY);
     }
@@ -1020,7 +1063,8 @@ async fn execute(
     for warning in agent::web_warnings(cfg).await? {
         eprintln!("{}", agent::printable(&format!("web DNS preflight: {warning}")));
     }
-    for missing in agent::dependency_warnings(cfg, Path::new(&workspace)) {
+    for missing in agent::dependency_warnings(cfg, Path::new(&workspace), molt_tools::host_cargo_home().ok().as_deref())
+    {
         eprintln!("{}", agent::printable(&format!("dependency preflight: {missing}")));
     }
     let checkpointed = req.checkpoint;

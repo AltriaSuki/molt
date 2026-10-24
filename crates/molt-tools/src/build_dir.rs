@@ -37,6 +37,8 @@ const MAX_FORK_DEPTH: usize = 8;
 
 /// The private build directories one command uses, held until it is dropped.
 pub(crate) struct BuildDir {
+    /// The workspace's directory, which holds the others.
+    dir: PathBuf,
     cargo: PathBuf,
     go: PathBuf,
     /// The private Cargo home and the host cache it reads.
@@ -45,6 +47,10 @@ pub(crate) struct BuildDir {
 }
 
 impl BuildDir {
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// The directories to make writable, each mounted at its own path.
     pub(crate) fn mounts(&self) -> Vec<&Path> {
         let mut mounts = vec![self.cargo.as_path(), self.go.as_path()];
@@ -117,7 +123,7 @@ pub(crate) fn acquire(roots: &Roots, ws: &Path, cargo: Option<&Arc<CargoCache>>)
         }
         let cargo = dir.join(format!("cargo-{n}"));
         private_dir(&cargo).map_err(error)?;
-        return Ok(BuildDir { cargo, go, cargo_home, _slot: lock });
+        return Ok(BuildDir { dir, cargo, go, cargo_home, _slot: lock });
     }
     Err(failed(format!(
         "every private build directory of this workspace is in use ({SLOTS} commands are building); retry when one finishes"

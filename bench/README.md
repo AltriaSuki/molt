@@ -109,7 +109,8 @@ results recorded before the change are not mixed with results after it.
 `smoke/` holds the smoke suite: small real projects that a real model works
 on in Molt's default configuration, to catch what tests with a fake model
 do not (a Go command that adds `os.Exit`, a crate with a crates.io
-dependency, a task and notes in Chinese, a task only a rubric can judge).
+dependency, a Python package whose pytest is only in `.venv`, a task and
+notes in Chinese, a task only a rubric can judge).
 They use the task format above, and each has a `[smoke]` table saying what
 is checked about a run beyond its hidden tests:
 
@@ -133,9 +134,11 @@ free. Each assertion is recorded with what it found, and `molt bench report`
 lists every one a run failed, by project.
 
 The smoke projects may break the rules above where that is what they test:
-`rs-smoke-deps` depends on a crate from crates.io, so its check fetches it.
-`cargo test -p molt-bench --test tasks` validates the others, and that one
-too with `MOLT_BENCH_NETWORK=1`.
+`rs-smoke-deps` depends on a crate from crates.io, so its check fetches it,
+and `py-smoke-venv`'s setup installs pytest from PyPI into `.venv`.
+`cargo test -p molt-bench --test tasks` validates the others, and those two
+too with `MOLT_BENCH_NETWORK=1`; validation runs a task's `setup` first, as
+a run does.
 
 Run them with:
 

@@ -1,0 +1,49 @@
+# Molt's built-in environment profiles (see `env_profile.rs`). A profile
+# applies to a project that has any of its `detect` paths. A profile of the
+# same name in the user's config replaces one of these.
+#
+# Built-in profiles never turn the network on, and mount only what the host
+# itself points at: the installation of each of `tools` found on PATH, and,
+# with `cargo_cache`, the registry and git caches of the user's Cargo home.
+# `env` values may use $WORKSPACE (the command's workspace), $BUILD (the
+# workspace's private build directory) and $PATH (the PATH commands get).
+
+[rust]
+detect = ["Cargo.toml"]
+tools = ["cargo", "rustc"]
+cargo_cache = true
+probes = [
+  { command = "cargo --version", fix = "Rust is not visible in the sandbox: install it with rustup or under /usr, or mount its directory with --sandbox-policy." },
+  { command = "cargo tree --offline > /dev/null", fix = "Commands build offline from your Cargo cache, which lacks this project's crates: run `cargo fetch` in the project on this machine." },
+]
+
+[python]
+detect = ["pyproject.toml", "setup.py", "requirements.txt"]
+tools = ["python3"]
+probes = [
+  { command = "python3 --version", fix = "Python is not visible in the sandbox: install python3 under /usr, or mount its directory with --sandbox-policy." },
+]
+
+[python-venv]
+detect = [".venv/pyvenv.cfg"]
+env = { VIRTUAL_ENV = "$WORKSPACE/.venv", PATH = "$WORKSPACE/.venv/bin:$PATH" }
+probes = [
+  { command = "python -c 'import sys; sys.exit(sys.prefix == sys.base_prefix)'", fix = "The interpreter of .venv does not run in the sandbox: recreate it from a Python under /usr (`python3 -m venv .venv`), or mount its base with --sandbox-policy." },
+]
+
+[go]
+detect = ["go.mod"]
+tools = ["go", "gofmt"]
+env = { GOTOOLCHAIN = "local", GOPROXY = "off" }
+probes = [
+  { command = "go version", fix = "Go is not visible in the sandbox: install it under /usr or /usr/local, or mount its directory with --sandbox-policy." },
+  { command = "go list -deps ./... > /dev/null", fix = "Commands cannot download modules: run `go mod vendor` in the project." },
+]
+
+[node]
+detect = ["package.json"]
+tools = ["node", "npm", "npx"]
+probes = [
+  { command = "node --version", fix = "Node is not visible in the sandbox: install it under /usr, or mount its directory with --sandbox-policy." },
+  { command = "npm ls --depth=0 > /dev/null", fix = "Commands cannot install packages: run `npm install` in the project on this machine (commands see node_modules read-only)." },
+]

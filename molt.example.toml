@@ -61,6 +61,8 @@ name = "shell"
 tier = "protected"
 exec = { command = "molt-tools", args = ["shell", "--root", ".", "--scratch", "/home/you/.cache/molt/work"] }
 provides = ["shell.*"]
+# Where the environment profiles find rustup and your Cargo cache.
+pass_env = ["CARGO_HOME", "RUSTUP_HOME"]
 
 # Memory: notes learned from finished runs, and a model of the project's code
 # (definitions and references) the planner maps and searches. It reads runs
@@ -121,3 +123,13 @@ requests = [
 # max_files = 10
 # ask_paths = [".github/", "Cargo.toml", "Cargo.lock", "package.json", "go.mod", "migrations/"]
 # always_ask = false
+
+# Environment profiles of your own, for the sandboxed shell: each adds one or
+# replaces the built-in profile of its name (rust, python, python-venv, go,
+# node); `detect = []` turns one off. `molt env doctor` runs their probes.
+# [environment.node]
+# detect = ["package.json"]
+# tools = ["node", "npm", "npx"]
+# read_only = ["/opt/corepack"]
+# env = { NODE_OPTIONS = "--max-old-space-size=2048" }
+# probes = [{ command = "npm ls --depth=0", fix = "run `npm install` in the project" }]

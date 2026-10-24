@@ -83,6 +83,7 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
         shell.pass_env.extend(opts.pass_env);
     }
     agent::deps_cache(&mut cfg, &opts.deps_cache)?;
+    agent::environments(&mut cfg)?;
     agent::allow_web(&mut cfg, &opts.allow_web)?;
     if let Some(resolver) = &opts.web_resolver {
         cfg.web_resolver(resolver)?;
@@ -207,7 +208,9 @@ async fn event_loop(
             text::Tone::Warn,
         ));
     }
-    for missing in agent::dependency_warnings(&cfg, Path::new(&workspace)) {
+    for missing in
+        agent::dependency_warnings(&cfg, Path::new(&workspace), molt_tools::host_cargo_home().ok().as_deref())
+    {
         app.log.extend(text::block(&format!("dependency preflight: {missing}"), "", text::Tone::Warn));
     }
     let data_dir = cfg.kernel.data_dir.clone();

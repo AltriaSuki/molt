@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod doctor;
 pub mod git;
 pub mod layers;
 mod lock;
