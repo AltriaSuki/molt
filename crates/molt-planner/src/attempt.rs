@@ -9,6 +9,7 @@ use molt_api::planner::tools::{DisputeCheck, DISPUTE_CHECK};
 use molt_api::planner::{AttemptReport, AttemptStatus, CheckDispute, Criterion, Finding};
 use molt_api::progress::Progress;
 use molt_api::shell;
+use molt_proto::tool::ToolRole;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -312,9 +313,9 @@ impl Attempt {
             (None, true) => prompts::UNVERIFIED_SYSTEM,
         };
         let tools = Arc::new(match self.check {
-            _ if self.read_only => prompts::ask_tools(self.memory_tools, self.web_tools),
-            Some(_) => prompts::checked_attempt_tools(self.memory_tools, self.web_tools),
-            None => prompts::attempt_tools(self.memory_tools, self.web_tools),
+            _ if self.read_only => prompts::ask_tools(&ctx.tools, self.memory_tools, self.web_tools),
+            Some(_) => prompts::checked_attempt_tools(&ctx.tools, self.memory_tools, self.web_tools),
+            None => prompts::attempt_tools(&ctx.tools, self.memory_tools, self.web_tools),
         });
         // A read-only `ask` attempt may only read, so it is not offered the question either.
         let tools = if ctx.interactive && !self.read_only { Arc::new(prompts::with_ask_user(&tools)) } else { tools };
@@ -555,7 +556,7 @@ impl Attempt {
     /// that only reads runs nothing else: the calls are refused unrun.
     async fn execute(&self, fork: &str, calls: &[ToolUse], cut_off: Option<&str>, actor: Actor) -> Vec<Value> {
         let is_dispute = |c: &ToolUse| self.check.is_some() && c.name == DISPUTE_CHECK;
-        let refused = |c: &ToolUse| self.read_only && !prompts::ASK_READS.contains(&c.name.as_str());
+        let refused = |c: &ToolUse| self.read_only && !self.ctx.tools.offers(ToolRole::Attempt, true, &c.name);
         let others: Vec<ToolUse> = calls.iter().filter(|c| !is_dispute(c) && !refused(c)).cloned().collect();
         let mut results = tools::execute(&self.ctx, fork, &others, cut_off, actor).await.into_iter();
         calls

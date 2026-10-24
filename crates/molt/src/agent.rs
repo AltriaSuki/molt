@@ -82,6 +82,12 @@ pub fn resolve_config(
             eprintln!("lifecycle hooks in a project configuration are ignored; keep trusted hook configuration outside the project");
             cfg.hooks.clear();
         }
+        if !trusted && cfg.services.iter().any(|s| !s.tools.is_empty()) {
+            eprintln!(
+                "tool declarations in a project configuration are ignored; declare tools in your user configuration"
+            );
+            cfg.services.iter_mut().for_each(|s| s.tools.clear());
+        }
         install_hooks(&mut cfg)?;
         require_services(&cfg).with_context(|| format!("{} cannot run tasks", path.display()))?;
         if let Some(dir) = data_dir {
@@ -1466,6 +1472,30 @@ mod tests {
         let ignored = resolve_config(Some(&inside), &workspace, None, None, None).unwrap();
         assert!(ignored.hooks.is_empty());
         assert_eq!(ignored.service("planner").unwrap().env["MOLT_HOOKS_JSON"], "[]");
+    }
+
+    #[test]
+    fn only_configuration_outside_the_project_can_declare_tools() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        std::fs::create_dir(&workspace).unwrap();
+        let services = SERVICES
+            .iter()
+            .map(|name| format!("[[service]]\nname = \"{name}\"\nexec = {{ command = \"/bin/true\" }}\n"))
+            .collect::<String>();
+        let config = format!(
+            "{services}\n[[service]]\nname = \"lint\"\nexec = {{ command = \"/bin/true\" }}\nprovides = [\"lint.*\"]\n\
+             [[service.tools]]\nname = \"lint\"\ndescription = \"Lint.\"\ntarget = \"lint.check\"\n\
+             input_schema = {{ type = \"object\" }}\n"
+        );
+        let outside = root.path().join("config.toml");
+        std::fs::write(&outside, &config).unwrap();
+        let trusted = resolve_config(Some(&outside), &workspace, None, None, None).unwrap();
+        assert_eq!(trusted.provided_tools().unwrap().len(), 1);
+        let inside = workspace.join("config.toml");
+        std::fs::write(&inside, config).unwrap();
+        let ignored = resolve_config(Some(&inside), &workspace, None, None, None).unwrap();
+        assert!(ignored.provided_tools().unwrap().is_empty());
     }
 
     #[test]

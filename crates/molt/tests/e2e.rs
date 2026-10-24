@@ -24,6 +24,7 @@ fn echo_manifest() -> Manifest {
         provides: vec!["echo.*".parse().unwrap()],
         requests: vec![],
         exec: Some(Exec { command: env!("CARGO_BIN_EXE_molt-echo").into(), args: vec![] }),
+        tools: Vec::new(),
     }
 }
 

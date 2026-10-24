@@ -8,6 +8,7 @@ pub mod audit;
 mod envelope;
 mod ids;
 mod manifest;
+pub mod tool;
 
 pub use envelope::{depth, nesting, Budget, Envelope, ErrorCode, Kind, RemoteError, MAX_DEPTH, MAX_ID};
 pub use ids::{CapId, IdError, MsgId, ServiceId, Target, TraceId};

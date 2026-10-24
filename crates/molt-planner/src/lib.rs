@@ -18,6 +18,7 @@ mod judge;
 mod memory;
 mod prompts;
 mod referenced;
+mod registry;
 mod review;
 mod route;
 mod runner;
@@ -88,6 +89,10 @@ pub struct Config {
     /// Model for the one call that picks a workflow for a run that names
     /// `auto`; `None` uses the run's model.
     pub route_model: Option<String>,
+    /// Tools services declared in their manifests (RFC 0002). They come
+    /// from whoever starts the planner, never from a request or a project;
+    /// a run offers only those whose method the planner holds a capability for.
+    pub tools: Vec<molt_proto::tool::ProvidedTool>,
 }
 
 impl Default for Config {
@@ -114,6 +119,7 @@ impl Default for Config {
             syntax_check: molt_api::fs::SyntaxCheck::Report,
             workflows: Vec::new(),
             route_model: None,
+            tools: Vec::new(),
         }
     }
 }
@@ -184,6 +190,12 @@ impl Config {
             .transpose()?
             .unwrap_or_default();
         hooks::validate(&hooks)?;
+        let tools = get(TOOLS_ENV)
+            .map(|s| serde_json::from_str::<Vec<molt_proto::tool::ProvidedTool>>(&s))
+            .transpose()
+            .context("MOLT_TOOLS_JSON is not a list of tool declarations")?
+            .unwrap_or_default();
+        validate_tools(&tools)?;
         Ok(Self {
             hooks,
             default_model: get("MOLT_PLANNER_MODEL"),
@@ -223,8 +235,35 @@ impl Config {
             },
             workflows: d.workflows,
             route_model: get("MOLT_ROUTE_MODEL"),
+            tools,
         })
     }
+}
+
+/// The variable that carries [`Config::tools`] to a planner started as a
+/// process, as a JSON list of [`molt_proto::tool::ProvidedTool`].
+pub const TOOLS_ENV: &str = "MOLT_TOOLS_JSON";
+
+/// What is wrong with the tools services declared for the planner, if
+/// anything: each must be well formed, on a method of the service that
+/// declares it, and have a name no other tool has, the planner's own
+/// included.
+pub fn validate_tools(tools: &[molt_proto::tool::ProvidedTool]) -> anyhow::Result<()> {
+    let mut names = std::collections::BTreeMap::new();
+    for tool in tools {
+        let (service, name) = (&tool.service, &tool.decl.name);
+        tool.decl.validate().map_err(|e| anyhow::anyhow!("service {service}: {e}"))?;
+        ensure!(
+            tool.decl.target.service() == Some(service),
+            "service {service}: tool {name:?} targets {}, a method of another service",
+            tool.decl.target
+        );
+        ensure!(!registry::reserved(name), "service {service}: {name:?} is the name of one of the planner's own tools");
+        if let Some(other) = names.insert(name.as_str(), service) {
+            anyhow::bail!("services {other} and {service} both declare a tool named {name:?}: rename one");
+        }
+    }
+    Ok(())
 }
 
 /// What the review's fixed rules find in `changes` and their `patch`:
@@ -453,6 +492,27 @@ mod tests {
     fn from(vars: &[(&str, &str)]) -> anyhow::Result<Config> {
         let vars: HashMap<String, String> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         Config::from_vars(|name| vars.get(name).cloned())
+    }
+
+    #[test]
+    fn declared_tools_come_from_the_environment_and_are_checked() {
+        assert!(from(&[]).unwrap().tools.is_empty());
+        let tool = |service: &str, name: &str, target: &str| {
+            serde_json::json!({ "service": service, "name": name, "description": "d",
+                "input_schema": { "type": "object" }, "target": target })
+        };
+        let vars = |tools: Vec<Value>| serde_json::to_string(&tools).unwrap();
+        let cfg = from(&[(TOOLS_ENV, &vars(vec![tool("lint", "lint", "lint.check")]))]).unwrap();
+        assert_eq!(cfg.tools[0].decl.name, "lint");
+        for (tools, says) in [
+            (vec![tool("lint", "run", "lint.check")], "planner's own tools"),
+            (vec![tool("lint", "lint", "fs.write")], "a method of another service"),
+            (vec![tool("lint", "lint", "lint.check"), tool("fmt", "lint", "fmt.run")], "both declare"),
+        ] {
+            let err = format!("{:#}", from(&[(TOOLS_ENV, &vars(tools))]).unwrap_err());
+            assert!(err.contains(says), "{err}");
+        }
+        assert!(from(&[(TOOLS_ENV, "{")]).is_err());
     }
 
     #[test]

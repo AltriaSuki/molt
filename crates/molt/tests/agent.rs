@@ -66,6 +66,8 @@ enum Fake {
     /// Attempts run a command that starts a long `sleep`, writes its pid to
     /// this file and waits for it.
     Hangs(PathBuf),
+    /// Attempts greet and, when they are offered this tool, call it too.
+    GreetsWithTool(&'static str),
 }
 
 #[derive(Debug, PartialEq)]
@@ -163,6 +165,11 @@ impl Respond for FakeApi {
                 let mut notes = write("notes.txt", "scratch\n");
                 notes["id"] = json!(format!("toolu_{n:03}_notes"));
                 (vec![write("greeting.txt", "hello\n"), notes], "tool_use")
+            }
+            (Fake::GreetsWithTool(tool), false, Turn::First)
+                if body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == *tool)) =>
+            {
+                (vec![write("greeting.txt", "hello\n"), tool_use(n, tool, json!({ "text": "hi" }))], "tool_use")
             }
             (_, false, Turn::First | Turn::Feedback) => (vec![write("greeting.txt", "hello\n")], "tool_use"),
             (_, false, Turn::AfterTools) => {
@@ -2309,4 +2316,78 @@ async fn changes_against_head_list_what_an_applied_result_changed() {
     assert_eq!(changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), ["greeting.txt"]);
     assert!(changes[0].untracked && changes[0].lines == Some((1, 0)), "{changes:?}");
     assert!(repo.file_diff(&changes[0]).unwrap().patch.contains("+hello"));
+}
+
+/// A service of the user's config that declares a tool: the planner offers
+/// it when the config grants the planner its method, and the call goes
+/// through the kernel, which writes it to the audit log.
+#[tokio::test]
+async fn a_tool_a_configured_service_declares_is_offered_called_and_audited() {
+    use molt_proto::tool::ToolDecl;
+    let server = fake_api(Fake::GreetsWithTool("echo_back")).await;
+    for granted in [false, true] {
+        let mut setup = Setup::new(&server);
+        let echo = molt_proto::Exec { command: env!("CARGO_BIN_EXE_molt-echo").into(), args: vec![] };
+        let mut svc = molt::config::ServiceSection::new(
+            ServiceId::new("echo").unwrap(),
+            molt_proto::Tier::Mutable,
+            echo,
+            vec!["echo.*".parse().unwrap()],
+        );
+        svc.tools = vec![serde_json::from_value::<ToolDecl>(json!({
+            "name": "echo_back",
+            "description": "Repeat the input back.",
+            "input_schema": { "type": "object", "properties": { "text": { "type": "string" } } },
+            "target": "echo.echo",
+            "read_only": true,
+        }))
+        .unwrap()];
+        setup.cfg.services.push(svc);
+        if granted {
+            let planner = setup.cfg.service_mut("planner").unwrap();
+            let grant = molt_proto::CapRequest {
+                target: "echo.echo".parse().unwrap(),
+                budget: molt_proto::Budget::new(0, 0, 100),
+            };
+            planner.requests.push(grant);
+        }
+        let before = bodies(&server).await.len();
+        let (resp, _) = setup.run(setup.request(Some(CHECK), 1)).await;
+        assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+        let sent = bodies(&server).await;
+        let offered = |b: &Value| b["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == "echo_back"));
+        // Attempts are offered it; the reviewer, for whom it is not declared, is not.
+        let attempt = |b: &&Value| {
+            b["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == WRITE_FILE) && !offers_submit_check(b))
+        };
+        let attempts: Vec<&Value> = sent[before..].iter().filter(attempt).collect();
+        assert!(!attempts.is_empty());
+        assert!(attempts.iter().all(|b| offered(b) == granted), "granted: {granted}");
+        assert!(sent[before..].iter().filter(|b| !attempt(b)).all(|b| !offered(b)));
+        let audit = molt_kernel::audit::read_all(&setup.data.path().join("audit.jsonl")).await.unwrap();
+        let calls: Vec<&molt_proto::Envelope> = audit
+            .iter()
+            .filter_map(|e| match &e.event {
+                AuditEvent::Message { envelope } if envelope.to.to_string() == "echo.echo" => Some(envelope),
+                _ => None,
+            })
+            .collect();
+        if !granted {
+            assert!(calls.is_empty());
+            continue;
+        }
+        let request = calls.iter().find(|e| e.kind == Kind::Request).expect("the tool call is in the audit log");
+        assert_eq!(request.from.as_ref().map(|f| f.as_str()), Some("planner"));
+        assert_eq!(request.payload["tool"], "echo_back");
+        assert_eq!(request.payload["input"], json!({ "text": "hi" }));
+        // The attempt got the service's answer back, marked as data.
+        let result = sent[before..]
+            .iter()
+            .flat_map(|b| b["messages"].as_array().cloned().unwrap_or_default())
+            .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+            .find(|c| c["type"] == "tool_result" && c["content"].as_str().is_some_and(|t| t.contains("echo_back")))
+            .expect("the tool's result went back to the model");
+        assert!(result["content"].as_str().unwrap().contains("<tool_output tool=\"echo_back\">"), "{result}");
+    }
+    assert_requests_valid(&server).await;
 }
