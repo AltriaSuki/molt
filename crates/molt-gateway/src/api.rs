@@ -95,7 +95,11 @@ enum Failure {
         detail: String,
     },
     Timeout,
-    Transport(String),
+    /// `connect`: the connection itself failed, so nothing was sent.
+    Transport {
+        message: String,
+        connect: bool,
+    },
     /// A success status with a body that is not a Messages API response.
     BadBody(String),
     /// Once a successful streaming response begins, never retry it: some
@@ -107,8 +111,29 @@ impl Failure {
     fn retryable(&self) -> bool {
         match self {
             Failure::Status { status, .. } => matches!(status.as_u16(), 408 | 409 | 429) || status.is_server_error(),
-            Failure::Timeout | Failure::Transport(_) => true,
+            Failure::Timeout | Failure::Transport { .. } => true,
             Failure::BadBody(_) | Failure::Stream(_) => false,
+        }
+    }
+
+    /// The API may have done (and billed) the work. An error status comes
+    /// with no usage and a refused connection sent nothing; a timeout, a cut
+    /// connection or a broken body leave it unknown.
+    fn may_have_billed(&self) -> bool {
+        match self {
+            Failure::Status { .. } => false,
+            Failure::Transport { connect, .. } => !connect,
+            Failure::Timeout | Failure::BadBody(_) | Failure::Stream(_) => true,
+        }
+    }
+
+    /// What failed, in a few words, for a progress event.
+    fn short(&self) -> String {
+        match self {
+            Failure::Status { status, .. } => format!("model API {}", status.as_u16()),
+            Failure::Timeout => "model API timed out".into(),
+            Failure::Transport { .. } => "could not reach the model API".into(),
+            Failure::BadBody(_) | Failure::Stream(_) => "model API sent a bad response".into(),
         }
     }
 
@@ -134,16 +159,47 @@ impl Failure {
             Failure::Timeout => {
                 (ErrorCode::Timeout, format!("the Messages API did not answer within {timeout:?}{tries}"))
             }
-            Failure::Transport(e) => (ErrorCode::Unavailable, format!("could not reach the Messages API: {e}{tries}")),
+            Failure::Transport { message, .. } => {
+                (ErrorCode::Unavailable, format!("could not reach the Messages API: {message}{tries}"))
+            }
             Failure::BadBody(e) => (ErrorCode::Failed, format!("the Messages API sent an unreadable response: {e}")),
         };
         RemoteError { code, message }
     }
 }
 
+/// A retry the gateway is about to make, for progress.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Retry {
+    /// What failed, in a few words: `model API 502`.
+    pub failure: String,
+    pub delay: Duration,
+    /// This retry's number, from 1, and the most retries there will be.
+    pub retry: u32,
+    pub retries: u32,
+}
+
+/// Who hears about a call while it is under way: streamed text, and each
+/// retry before its wait. Neither may block.
+#[derive(Default)]
+pub(crate) struct Observer<'a> {
+    pub text: Option<&'a mut (dyn FnMut(String) + Send)>,
+    pub retry: Option<&'a mut (dyn FnMut(Retry) + Send)>,
+}
+
+/// The settings an error message names, so it can say what to fix.
+struct Names {
+    base_url: &'static str,
+    path: &'static str,
+    credential: &'static str,
+}
+
 /// A client for `POST {base_url}/v1/messages`.
 pub(crate) struct Api {
     provider: Provider,
+    names: Names,
+    /// The base URL ends in `/v1`, which a 404 most likely comes from.
+    doubled_v1: bool,
     http: reqwest::Client,
     url: Url,
     headers: HeaderMap,
@@ -189,6 +245,12 @@ impl Api {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         Ok(Self {
             provider: Provider::Anthropic,
+            names: Names {
+                base_url: "ANTHROPIC_BASE_URL",
+                path: "/v1/messages",
+                credential: "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN",
+            },
+            doubled_v1: ends_in_v1(&cfg.base_url),
             http,
             url,
             headers,
@@ -225,6 +287,8 @@ impl Api {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         Ok(Self {
             provider: Provider::Openai,
+            names: Names { base_url: "OPENAI_BASE_URL", path: "/v1/chat/completions", credential: "OPENAI_API_KEY" },
+            doubled_v1: ends_in_v1(&cfg.providers.openai_base_url),
             http,
             url,
             headers,
@@ -243,35 +307,29 @@ impl Api {
         body: &Value,
         fallbacks: bool,
         deadline: Option<Instant>,
-    ) -> Result<Message, RemoteError> {
-        self.create_observed(body, fallbacks, deadline, None).await
-    }
-
-    pub async fn create_observed(
-        &self,
-        body: &Value,
-        fallbacks: bool,
-        deadline: Option<Instant>,
-        mut on_text: Option<&mut (dyn FnMut(String) + Send)>,
+        mut observer: Observer<'_>,
     ) -> Result<Message, RemoteError> {
         let streaming = body["stream"] == true;
         let bytes = serde_json::to_vec(body)
             .map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("encoding the request: {e}") })?;
         let left = || deadline.map(|d| d.saturating_duration_since(Instant::now()));
         let mut retries = 0;
+        // An earlier attempt the API may have billed, which the last one's
+        // refusal does not make free.
+        let mut billed_before = false;
         loop {
             let timeout = left().map_or(self.timeout, |left| left.min(self.timeout));
             if timeout.is_zero() {
                 let message = "the caller's deadline passed before the Messages API was called".to_owned();
                 return Err(RemoteError { code: ErrorCode::Timeout, message });
             }
-            let failure = match self.attempt(bytes.clone(), fallbacks, timeout, streaming, &mut on_text).await {
+            let failure = match self.attempt(bytes.clone(), fallbacks, timeout, streaming, &mut observer.text).await {
                 Ok(msg) => return Ok(msg),
                 Err(f) => f,
             };
             let cut = timeout < self.timeout;
             if !failure.retryable() || retries >= self.max_retries {
-                return Err(self.error(failure.into_error(retries + 1, timeout, cut)));
+                return Err(self.give_up(failure, retries + 1, timeout, cut, billed_before));
             }
             let delay = match &failure {
                 Failure::Status { retry_after: Some(d), .. } => *d,
@@ -283,12 +341,49 @@ impl Api {
                     ?delay,
                     "Messages API call failed; no time to retry before the caller's deadline"
                 );
-                return Err(self.error(failure.into_error(retries + 1, timeout, cut)));
+                return Err(self.give_up(failure, retries + 1, timeout, cut, billed_before));
             }
             tracing::warn!(?failure, retry = retries + 1, ?delay, "Messages API call failed; retrying");
+            if let Some(on_retry) = observer.retry.as_mut() {
+                on_retry(Retry { failure: failure.short(), delay, retry: retries + 1, retries: self.max_retries });
+            }
+            billed_before |= failure.may_have_billed();
             tokio::time::sleep(delay).await;
             retries += 1;
         }
+    }
+
+    /// The error for the call's last failure, saying what to fix where the
+    /// status points at a setting. A refusal (`denied`, `invalid`) means
+    /// nothing was billed, which callers count on, so it is reported as
+    /// `failed` when an earlier attempt may have been.
+    fn give_up(
+        &self,
+        failure: Failure,
+        attempts: u32,
+        timeout: Duration,
+        cut: bool,
+        billed_before: bool,
+    ) -> RemoteError {
+        let status = match &failure {
+            Failure::Status { status, .. } => Some(status.as_u16()),
+            _ => None,
+        };
+        let mut error = self.error(failure.into_error(attempts, timeout, cut));
+        let names = &self.names;
+        match status {
+            Some(404) if self.doubled_v1 => error.message.push_str(&format!(
+                "; {} ends in /v1 and molt adds {} itself: remove the trailing /v1",
+                names.base_url, names.path
+            )),
+            Some(401) => error.message.push_str(&format!("; the credential was rejected: check {}", names.credential)),
+            _ => {}
+        }
+        if billed_before && matches!(error.code, ErrorCode::Denied | ErrorCode::Invalid) {
+            error.code = ErrorCode::Failed;
+            error.message.push_str("; an earlier attempt may have been billed, so the cost is unknown");
+        }
+        error
     }
 
     fn error(&self, mut error: RemoteError) -> RemoteError {
@@ -442,7 +537,12 @@ fn transport(e: reqwest::Error) -> Failure {
         message.push_str(&s.to_string());
         source = s.source();
     }
-    Failure::Transport(message)
+    Failure::Transport { message, connect: e.is_connect() }
+}
+
+/// A base URL whose path already ends in `/v1`, to which `/v1/...` is added.
+fn ends_in_v1(base_url: &str) -> bool {
+    base_url.trim_end_matches('/').to_ascii_lowercase().ends_with("/v1")
 }
 
 /// A `retry-after` given in seconds, capped.

@@ -1735,6 +1735,27 @@ async fn the_projects_instruction_files_open_every_conversation_as_data() {
 }
 
 #[tokio::test]
+async fn a_model_call_the_api_refused_is_settled_at_no_cost_and_any_other_failure_stays_unknown() {
+    let refusal = |code, message: &str| {
+        let resp = Err(RemoteError { code, message: message.into() });
+        move |_: &CompleteRequest| Reply { resp: resp.clone(), delay: Duration::ZERO }
+    };
+    for (code, message, uncounted) in [
+        (ErrorCode::Denied, "the Messages API returned 401: authentication_error: invalid x-api-key", 0),
+        (ErrorCode::Invalid, "the Messages API returned 404: 404 page not found", 0),
+        (ErrorCode::Unavailable, "the Messages API returned 502 (5 attempts)", 1),
+        (ErrorCode::Failed, "the Messages API returned 400; an earlier attempt may have been billed", 1),
+    ] {
+        let fake = Fake::new(refusal(code, message), hello_check);
+        let resp = run(&fake, request(Some("check"), 1)).await;
+        assert_eq!(resp.outcome, Outcome::Failed, "{code:?}");
+        assert_eq!(resp.attempts[0].status, AttemptStatus::Error, "{code:?}");
+        assert_eq!(resp.uncounted_calls, uncounted, "{code:?}: {message}");
+        assert_eq!(resp.cost_usd, 0.0);
+    }
+}
+
+#[tokio::test]
 async fn unknown_model_prices_are_reported_and_stop_further_actions() {
     let fake = Fake::new(
         |req| {

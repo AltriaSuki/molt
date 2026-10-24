@@ -569,6 +569,25 @@ pub fn memory_model(asked: Option<&str>, attempts: Option<&str>) -> Option<Strin
     }
 }
 
+/// Why memory does not learn from a finished run, if it does not: the run
+/// failed before any model call was answered (a wrong key or URL, say), so
+/// there is nothing to learn from; or, since learning is a model call too
+/// and the run's budget covers it, the budget is spent or what the run
+/// spent is not all known.
+fn skip_learning(resp: &RunResponse, budget_usd: Option<f64>) -> Option<String> {
+    if resp.outcome == molt_api::planner::Outcome::Failed && resp.usage == molt_api::model::Usage::default() {
+        return Some("skipped: the run failed before any model call was answered".to_owned());
+    }
+    if budget_usd.is_some_and(|b| resp.cost_usd >= b) {
+        return Some("skipped: the budget is exhausted".to_owned());
+    }
+    match resp.uncounted_calls {
+        0 => None,
+        1 => Some("skipped: model settlement is incomplete (1 call with unknown cost)".to_owned()),
+        n => Some(format!("skipped: model settlement is incomplete ({n} calls with unknown cost)")),
+    }
+}
+
 /// Asks memory to learn with the model the attempts used.
 pub const SAME_MODEL: &str = "same";
 
@@ -645,11 +664,8 @@ pub async fn run_task_as(
             let learned = match (learn, ran.memory) {
                 (None, _) | (Some(_), None) => None,
                 (Some(_), Some(Err(e))) => Some(Err(e)),
-                // Learning is a model call too: the run's budget covers it.
-                (Some(_), Some(Ok(())))
-                    if (ran.resp.uncounted_calls > 0 || budget_usd.is_some_and(|b| ran.resp.cost_usd >= b)) =>
-                {
-                    Some(Err("skipped: the budget is exhausted or model settlement is incomplete".to_owned()))
+                (Some(_), Some(Ok(()))) if skip_learning(&ran.resp, budget_usd).is_some() => {
+                    skip_learning(&ran.resp, budget_usd).map(Err)
                 }
                 (Some(learn), Some(Ok(()))) => {
                     on_progress(&Progress::Note {
@@ -1035,6 +1051,11 @@ pub fn describe(event: &Progress) -> String {
             let tokens = usage.map_or_else(String::new, |u| format!(", {} tokens", u.total()));
             let result = error.as_ref().map_or_else(|| "model finished".into(), |e| format!("model failed: {e}"));
             format!("{}: {result} ({cost}{tokens})", model_label(context))
+        }
+        Progress::ModelRetry { attempt, call, failure, delay_ms, retry, retries, .. } => {
+            let actor = attempt.map_or_else(|| "designer".into(), |a| format!("attempt {a}"));
+            let line = molt_api::progress::retry_line(failure, Duration::from_millis(*delay_ms), *retry, *retries);
+            format!("{actor}, call {call}: {line}")
         }
         Progress::CheckReady { command: Some(command), files, designed, .. } => {
             let mut line = format!("check: {command}");
@@ -1801,6 +1822,68 @@ mod tests {
         assert!(report(&resp).starts_with("outcome: unverified\nverification: none\n"), "{}", report(&resp));
         let older = RunResponse { verification: None, ..resp };
         assert!(!report(&older).contains("verification"), "{}", report(&older));
+    }
+
+    #[test]
+    fn learning_is_skipped_with_the_reason_that_applies() {
+        let resp = |outcome, input_tokens, cost_usd, uncounted_calls| RunResponse {
+            outcome,
+            check: None,
+            winner: None,
+            summary: String::new(),
+            changes: vec![],
+            left_out: None,
+            patch: String::new(),
+            patch_truncated: false,
+            applied: false,
+            fork: None,
+            review: None,
+            attempts: vec![],
+            usage: Usage { input_tokens, ..Usage::default() },
+            cost_usd,
+            uncounted_calls,
+            checkpoint: None,
+            requirements: vec![],
+            selection: None,
+            rubric: vec![],
+            judgement: vec![],
+            dispute: None,
+            verification: None,
+            workflow: None,
+            conversation: Vec::new(),
+        };
+        // A rejected key or a wrong URL: every call refused, nothing to learn from.
+        let refused = resp(Outcome::Failed, 0, 0.0, 0);
+        assert_eq!(
+            skip_learning(&refused, None).unwrap(),
+            "skipped: the run failed before any model call was answered"
+        );
+        // A host that cannot be reached leaves the calls' cost unknown, but the run's failure is the reason.
+        let unreachable = resp(Outcome::Failed, 0, 0.0, 1);
+        assert!(skip_learning(&unreachable, None).unwrap().contains("the run failed"));
+        let spent = resp(Outcome::Failed, 100, 0.5, 0);
+        assert_eq!(skip_learning(&spent, Some(0.5)).unwrap(), "skipped: the budget is exhausted");
+        let unsettled = resp(Outcome::Passed, 100, 0.1, 2);
+        assert_eq!(
+            skip_learning(&unsettled, Some(1.0)).unwrap(),
+            "skipped: model settlement is incomplete (2 calls with unknown cost)"
+        );
+        assert_eq!(skip_learning(&resp(Outcome::Failed, 100, 0.1, 0), Some(1.0)), None, "a failed run is learned from");
+        assert_eq!(skip_learning(&resp(Outcome::Passed, 100, 0.1, 0), None), None);
+    }
+
+    #[test]
+    fn a_retry_is_one_line_naming_its_attempt() {
+        let retry = Progress::ModelRetry {
+            run: String::new(),
+            attempt: Some(1),
+            call: "c1".into(),
+            failure: "model API 502".into(),
+            delay_ms: 60_000,
+            retry: 2,
+            retries: 4,
+        };
+        assert_eq!(describe(&retry), "attempt 1, call c1: model API 502, retrying in 60s (2/4)");
     }
 
     #[test]

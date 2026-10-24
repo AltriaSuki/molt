@@ -71,6 +71,12 @@ impl Tally {
     }
 }
 
+/// A `model.complete` error that says the call was refused before anything
+/// was billed: a bad key, a wrong URL, a model that does not exist.
+pub(crate) fn refused(error: &RemoteError) -> bool {
+    matches!(error.code, ErrorCode::Denied | ErrorCode::Invalid)
+}
+
 #[derive(Default)]
 struct WebHealth {
     failures: u32,
@@ -415,6 +421,8 @@ impl Ctx {
                 t.pending -= 1;
                 match &resp {
                     Ok(resp) => t.spend.add(resp),
+                    // Refused before anything was billed (see model::COMPLETE): settled, at no cost.
+                    Err(e) if refused(e) => {}
                     Err(_) if ctx.cancel.is_cancelled() && !ctx.run_cancel.is_cancelled() => t.abandoned += 1,
                     Err(_) => t.unsettled += 1,
                 }
