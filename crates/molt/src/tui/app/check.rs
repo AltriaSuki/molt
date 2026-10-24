@@ -305,7 +305,8 @@ mod tests {
         assert_eq!(task.lanes.iter().map(|l| l.index).collect::<Vec<_>>(), [0, 1]);
         assert_eq!(plain(&task.lanes[1].lines), [" 3 edit src/parser.rs", "   check passed"]);
 
-        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-1"))) });
+        let actions =
+            app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(passed(false, Some("/d/work/fork-1")))) });
         assert_eq!(actions, [Action::Learn { trace: trace.clone(), model: None }]);
         assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
         assert!(
@@ -486,7 +487,7 @@ mod tests {
             dispute: Some(Box::new(dispute)),
             ..failed(vec![disputed, attempt(1, AttemptStatus::Failed, "x")])
         };
-        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(resp)) });
         assert!(actions.iter().all(|a| matches!(a, Action::Learn { .. })), "nothing runs: {actions:?}");
         assert!(log(&app).contains("  – attempt 1 disputed the check · 3 turns"), "{}", log(&app));
         // It stops at the check card, with the dispute, instead of offering a retry.
@@ -525,7 +526,8 @@ mod tests {
         let [Action::Run { req, .. }] = actions.as_slice() else { panic!("no stop for the check: {actions:?}") };
         assert_eq!(req.check.as_deref(), Some("cargo test --test commas"));
         assert!(app.prompt.is_none());
-        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/work/fork-1"))) });
+        let actions =
+            app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(passed(false, Some("/d/work/fork-1")))) });
         assert_eq!(actions, [Action::Apply { fork: "/d/work/fork-1".into() }, Action::Learn { trace, model: None }]);
         assert!(app.prompt.is_none());
         app.update(Msg::Applied(Ok(())));

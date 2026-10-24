@@ -306,19 +306,23 @@ impl Attempt {
     /// The final reply once the attempt is done (and, when there is a check, passed it).
     async fn work(&mut self, resume: Option<SavedAttempt>) -> Result<String, End> {
         let ctx = self.ctx.clone();
-        let system = match (&self.check, self.rubric.is_empty()) {
-            _ if self.read_only => prompts::ASK_SYSTEM,
-            (Some(_), _) => prompts::ATTEMPT_SYSTEM,
-            (None, false) => prompts::RUBRIC_SYSTEM,
-            (None, true) => prompts::UNVERIFIED_SYSTEM,
+        let seats = ctx.seats();
+        let seat = if self.read_only { &seats.explorer } else { &seats.attempt };
+        // The pack's text, then what holds for the way this attempt's result is verified.
+        let part = match (&self.check, self.rubric.is_empty()) {
+            _ if self.read_only => "",
+            (Some(_), _) => prompts::CHECK_PART,
+            (None, false) => prompts::RUBRIC_PART,
+            (None, true) => "",
         };
-        let tools = Arc::new(match self.check {
+        let tools = match self.check {
             _ if self.read_only => prompts::ask_tools(&ctx.tools, self.memory_tools, self.web_tools),
             Some(_) => prompts::checked_attempt_tools(&ctx.tools, self.memory_tools, self.web_tools),
             None => prompts::attempt_tools(&ctx.tools, self.memory_tools, self.web_tools),
-        });
+        };
         // A read-only `ask` attempt may only read, so it is not offered the question either.
-        let tools = if ctx.interactive && !self.read_only { Arc::new(prompts::with_ask_user(&tools)) } else { tools };
+        let tools = if ctx.interactive && !self.read_only { prompts::with_ask_user(&tools) } else { tools };
+        let max_turns = seat.max_turns.unwrap_or(ctx.max_turns);
         // A final reply the model gave before the run stopped, still to be checked.
         let mut given = None;
         let (fork, mut conv) = match resume {
@@ -329,7 +333,7 @@ impl Attempt {
                 ctx.track_fork(&fork);
                 let started = Some(fork.clone());
                 ctx.progress(Progress::AttemptStarted { run: ctx.run_id(), attempt: self.index, fork: started }).await;
-                let mut conv = Conversation::new(system, tools, Value::Null, Role::Attempt, Some(self.index));
+                let mut conv = Conversation::seated(seat, part, tools, Value::Null, Role::Attempt, Some(self.index));
                 conv.messages = saved.messages;
                 conv.known = saved.known;
                 given = self.resume_point(&mut conv).await;
@@ -371,7 +375,7 @@ impl Attempt {
                     &ctx.preamble(),
                     &ctx.control.upto(self.version),
                 );
-                let mut conv = Conversation::new(system, tools, first, Role::Attempt, Some(self.index));
+                let mut conv = Conversation::seated(seat, part, tools, first, Role::Attempt, Some(self.index));
                 if let Some(earlier) =
                     ctx.continues.as_ref().map(|c| continued(&c.conversation)).filter(|c| !c.is_empty())
                 {
@@ -401,7 +405,7 @@ impl Attempt {
                 None => {
                     // A clear step: what the user added since takes effect here.
                     self.adopt(&fork, &mut conv, false).await;
-                    let resp = agent::turn(&ctx, &mut conv, ctx.max_turns, &mut self.meter, &self.cancel).await?;
+                    let resp = agent::turn(&ctx, &mut conv, max_turns, &mut self.meter, &self.cancel).await?;
                     let calls = resp.tool_uses();
                     if !calls.is_empty() {
                         reply.clear();
@@ -554,7 +558,7 @@ impl Attempt {
     /// call can take and to a quarter of a frame, so a reply and the request
     /// that goes on from it both carry it.
     fn keep(&mut self, conv: &Conversation) {
-        let mut kept = Conversation::new(conv.system, conv.tools.clone(), Value::Null, conv.role, conv.attempt);
+        let mut kept = Conversation::new(conv.system.clone(), conv.tools.clone(), Value::Null, conv.role, conv.attempt);
         kept.messages = conv.messages.clone();
         kept.known = conv.known;
         let limits = self.ctx.limits();

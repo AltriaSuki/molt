@@ -9,6 +9,7 @@ pub mod git;
 pub mod layers;
 mod lock;
 pub mod project;
+pub mod prompts;
 pub mod session;
 pub mod tui;
 
@@ -123,6 +124,9 @@ fn check_socket_paths(cfg: &Config) -> anyhow::Result<()> {
 }
 
 async fn launch_all(kernel: &Kernel, cfg: &Config, secrets: Option<&Secrets>) -> anyhow::Result<()> {
+    let mut cfg = cfg.clone();
+    mcp_tools(&mut cfg.services).await;
+    let cfg = &cfg;
     // The planner learns the services' tools from the same manifests the kernel installs.
     let tools = cfg.provided_tools()?;
     for svc in &cfg.services {
@@ -146,6 +150,56 @@ async fn launch_all(kernel: &Kernel, cfg: &Config, secrets: Option<&Secrets>) ->
         tracing::info!(service = %svc.name, "launched");
     }
     Ok(())
+}
+
+/// How long an MCP bridge gets to list its server's tools.
+const MCP_LIST: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Give each MCP bridge service (`molt-mcp serve`) the declarations of its
+/// server's tools, which `molt-mcp list` prints with the same arguments and
+/// environment. A server that cannot list them is started without tools,
+/// with a warning: one broken server does not stop the run.
+async fn mcp_tools(services: &mut [ServiceSection]) {
+    for svc in services.iter_mut().filter(|s| s.tools.is_empty()) {
+        let Some(exec) = svc.exec.as_ref().filter(|e| {
+            std::path::Path::new(&e.command).file_name().is_some_and(|n| n == "molt-mcp")
+                && e.args.first().is_some_and(|a| a == "serve")
+        }) else {
+            continue;
+        };
+        let mut command = tokio::process::Command::new(&exec.command);
+        command.env_clear();
+        for key in molt_kernel::supervisor::BASELINE_ENV {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command
+            .arg("list")
+            .args(&exec.args[1..])
+            .envs(svc.launch_env())
+            .env("RUST_LOG", "warn")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let listed = match tokio::time::timeout(MCP_LIST, command.output()).await {
+            Err(_) => Err(format!("it did not list its tools within {} s", MCP_LIST.as_secs())),
+            Ok(Err(e)) => Err(format!("molt-mcp did not start: {e}")),
+            Ok(Ok(out)) if !out.status.success() => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
+            Ok(Ok(out)) => serde_json::from_slice::<serde_json::Value>(&out.stdout).map_err(|e| e.to_string()),
+        };
+        match listed {
+            Ok(listing) => {
+                for why in listing["left_out"].as_array().into_iter().flatten().filter_map(|w| w.as_str()) {
+                    tracing::warn!(service = %svc.name, "an MCP tool is left out: {why}");
+                }
+                match serde_json::from_value(listing["tools"].clone()) {
+                    Ok(tools) => svc.tools = tools,
+                    Err(e) => tracing::warn!(service = %svc.name, "its tool list is malformed: {e}"),
+                }
+            }
+            Err(why) => tracing::warn!(service = %svc.name, "its MCP server offers no tools in this run: {why}"),
+        }
+    }
 }
 
 #[cfg(test)]

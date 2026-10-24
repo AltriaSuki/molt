@@ -30,8 +30,8 @@ pub(crate) async fn route(ctx: &Arc<Ctx>, candidates: &[&'static str], check: Op
         return Routed { workflow: heaviest, reason: String::new() };
     }
     let first = prompts::route_first_message(&ctx.task, candidates, check);
-    let mut conv =
-        Conversation::new(prompts::ROUTE_SYSTEM, Arc::new(prompts::route_tools()), first, Role::Router, None);
+    let seat = ctx.seats().router;
+    let mut conv = Conversation::seated(&seat, "", prompts::route_tools(), first, Role::Router, None);
     conv.model = ctx.cfg.route_model.clone();
     let mut meter = Meter::default();
     let cancel = ctx.run_cancel.clone();

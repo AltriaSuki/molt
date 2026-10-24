@@ -72,6 +72,7 @@ pub(crate) async fn run_cancellable(
         let store = Store::create(dir, Saved::new(ctx.trace.as_str(), req.clone())).map_err(failed)?;
         ctx.checkpoint = Some(Arc::new(store));
     }
+    announce_prompts(&ctx).await;
     gather_context(&mut ctx).await;
     let ctx = Arc::new(ctx);
     let _steer = steer(&ctx);
@@ -125,6 +126,7 @@ async fn resume_run(
     let mut ctx = Ctx::new(bus, cfg, trace, &run_req);
     ctx.cancel = cancel.clone();
     ctx.run_cancel = cancel;
+    announce_prompts(&ctx).await;
     gather_context(&mut ctx).await;
     ctx.restore(&saved.spend, saved.open_calls);
     ctx.control = Control::new(saved.requirements.clone());
@@ -292,6 +294,14 @@ async fn pick(ctx: &mut Ctx, req: &RunRequest, candidates: &[&'static str]) -> &
     routed.workflow
 }
 
+/// Say which roles of the run speak with a prompt of the pack, by its
+/// hash, and which pack prompt is not used for want of a promotion.
+async fn announce_prompts(ctx: &Ctx) {
+    for note in ctx.seats().notes(&ctx.workflow) {
+        ctx.note(note).await;
+    }
+}
+
 /// The workflow `name` names: a built-in, or one of the planner's own
 /// configuration. `None` is [`workflow::VERIFY`].
 pub(crate) fn workflow(cfg: &Config, name: Option<&str>) -> Result<Workflow, String> {
@@ -302,21 +312,24 @@ pub(crate) fn workflow(cfg: &Config, name: Option<&str>) -> Result<Workflow, Str
             let known = || {
                 [workflow::VERIFY, workflow::ASK, workflow::QUICK]
                     .into_iter()
-                    .chain(cfg.workflows.iter().map(|w| w.name.as_str()))
+                    .chain(cfg.workflows.iter().chain(&cfg.pack.workflows).map(|w| w.name.as_str()))
                     .collect::<Vec<_>>()
                     .join(", ")
             };
             cfg.workflows
                 .iter()
+                .chain(&cfg.pack.workflows)
                 .find(|w| w.name == name)
                 .cloned()
                 .ok_or_else(|| format!("no workflow is named {name:?}: this planner has {}", known()))?
         }
     };
-    match found.problem() {
-        Some(problem) => Err(problem),
-        None => Ok(found),
+    if let Some(problem) = found.problem() {
+        return Err(problem);
     }
+    // A workflow an embedder configured may seat roles its pack does not declare.
+    cfg.pack.seats(&found)?;
+    Ok(found)
 }
 
 /// The context stage: what the model is given besides the task. A workflow
@@ -459,6 +472,7 @@ async fn finish(ctx: &Arc<Ctx>, req: &RunRequest, settled: Settled, designed: bo
     resp.usage = tally.spend.usage;
     resp.cost_usd = tally.spend.cost_usd;
     resp.uncounted_calls = tally.uncounted_calls() + ctx.carried_uncounted;
+    resp.prompts = ctx.spoke();
     crate::hooks::notify(ctx, crate::hooks::Event::RunFinished).await;
     if stopped {
         let spend = SavedSpend { usage: resp.usage, cost_usd: resp.cost_usd, uncounted_calls: resp.uncounted_calls };
@@ -487,6 +501,7 @@ async fn finish(ctx: &Arc<Ctx>, req: &RunRequest, settled: Settled, designed: bo
 /// A run that ended before any attempt: a stopped one keeps its checkpoint,
 /// to design the check again when resumed; otherwise nothing is left.
 async fn finish_early(ctx: &Arc<Ctx>, mut resp: RunResponse) -> RunResponse {
+    resp.prompts = ctx.spoke();
     if let Some(store) = &ctx.checkpoint {
         if ctx.run_cancel.is_cancelled() {
             resp.checkpoint = Some(ctx.run_id());
@@ -553,6 +568,7 @@ pub(crate) async fn design_cancellable(
         let message = format!("workflow {:?} has no design stage: planner.design has nothing to do", ctx.workflow.name);
         return Err(RemoteError { code: ErrorCode::Invalid, message });
     }
+    announce_prompts(&ctx).await;
     gather_context(&mut ctx).await;
     let ctx = Arc::new(ctx);
     let design = designer::design(&ctx, true).await;
@@ -835,6 +851,7 @@ async fn conclude(
         verification: Some(verification(spec.as_ref(), rubric, reviews_by_rules(ctx, req))),
         workflow: Some(ctx.workflow.name.clone()),
         conversation: Vec::new(),
+        prompts: Vec::new(),
     };
     let outcome = match (&spec, rubric.is_empty()) {
         (Some(_), _) => Outcome::Passed,
@@ -1203,6 +1220,7 @@ fn not_designed(ctx: &Ctx, reason: &str) -> RunResponse {
         verification: Some(Verification::None),
         workflow: Some(ctx.workflow.name.clone()),
         conversation: Vec::new(),
+        prompts: Vec::new(),
     }
 }
 

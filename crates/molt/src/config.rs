@@ -191,6 +191,11 @@ pub struct Config {
     /// Sets of `[tui]` defaults, one picked with `--profile NAME`.
     #[serde(default, rename = "profile", skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, TuiSection>,
+    /// MCP servers by name, each bridged as service `mcp-NAME` (see
+    /// [`Config::install_mcp`] and `docs/mcp.md`). Only trusted
+    /// configuration has them: never a project's.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, molt_mcp::McpServer>,
 }
 
 /// Defaults for the terminal interface; `model`, `effort`, `attempts`,
@@ -368,6 +373,9 @@ impl Config {
         unknown_tool_keys(&toml::from_str(text)?)?;
         let config: Self = toml::from_str(text)?;
         config.provided_tools()?;
+        for (name, server) in &config.mcp {
+            server.validate(name).map_err(anyhow::Error::msg)?;
+        }
         config.tui.validate()?;
         for (name, profile) in &config.profiles {
             profile.validate().with_context(|| format!("in profile {name}"))?;
@@ -480,7 +488,93 @@ impl Config {
             tui: TuiSection::default(),
             hooks: Vec::new(),
             profiles: BTreeMap::new(),
+            mcp: BTreeMap::new(),
         })
+    }
+
+    /// Add a bridge service, `mcp-NAME`, for each MCP server of `[mcp]`,
+    /// with its executable in `bin_dir`, and let the planner call each one
+    /// as many times as its `calls` say. A server runs in the sandbox the
+    /// standard shell's commands get (with the shell's `--sandbox-policy`,
+    /// if any, and the network only when the server's `network` says so),
+    /// or unconfined when the shell is `--no-sandbox`. Call it once the
+    /// shell's sandbox options are set.
+    pub fn install_mcp(&mut self, bin_dir: &Path) -> anyhow::Result<()> {
+        if self.mcp.is_empty() {
+            return Ok(());
+        }
+        let sandbox = self.mcp_sandbox()?;
+        let command = bin_dir.join("molt-mcp").to_str().context("the molt-mcp path is not UTF-8")?.to_owned();
+        let servers: Vec<(String, molt_mcp::McpServer)> =
+            self.mcp.iter().map(|(name, server)| (name.clone(), server.clone())).collect();
+        for (name, server) in servers {
+            server.validate(&name).map_err(anyhow::Error::msg)?;
+            let id = molt_mcp::service_name(&name);
+            anyhow::ensure!(
+                self.service(&id).is_none(),
+                "the config has both a service {id} and [mcp.{name}], which is bridged as service {id}: rename one"
+            );
+            // The bridge gets the variables' names; their values reach it as the service's environment.
+            let named = molt_mcp::McpServer { env: BTreeMap::new(), pass_env: server.variables(), ..server.clone() };
+            let cache = self.kernel.data_dir.join("mcp").join(format!("{name}.json"));
+            let cache = cache.to_str().context("the data dir path is not UTF-8")?.to_owned();
+            let mut args = vec![
+                "serve".to_owned(),
+                "--name".into(),
+                name.clone(),
+                "--server".into(),
+                serde_json::to_string(&named)?,
+                "--cache".into(),
+                cache,
+            ];
+            match &sandbox {
+                Some(policy) => args.extend(["--policy".into(), serde_json::to_string(policy)?]),
+                None => args.push("--no-sandbox".into()),
+            }
+            let mut bridge = ServiceSection::new(
+                ServiceId::new(&id)?,
+                Tier::Protected,
+                Exec { command: command.clone(), args },
+                vec![format!("{id}.*").parse()?],
+            );
+            bridge.env = server.env.clone();
+            bridge.pass_env = server.pass_env.clone();
+            self.services.push(bridge);
+            if server.calls > 0 {
+                let target: Target = molt_mcp::target(&name).parse()?;
+                if let Some(planner) =
+                    self.service_mut("planner").filter(|p| !p.requests.iter().any(|r| r.target == target))
+                {
+                    planner.requests.push(CapRequest { target, budget: Budget::new(0, 0, server.calls) });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The sandbox MCP servers run in: the standard shell's, or none when
+    /// its commands run unconfined.
+    fn mcp_sandbox(&self) -> anyhow::Result<Option<molt_tools::SandboxPolicy>> {
+        let Some(exec) = self
+            .service("shell")
+            .and_then(|s| s.exec.as_ref())
+            .filter(|e| Path::new(&e.command).file_name().is_some_and(|n| n == "molt-tools"))
+        else {
+            return Ok(Some(molt_tools::SandboxPolicy::default()));
+        };
+        let arg = |flag: &str| exec.args.windows(2).find(|w| w[0] == flag).map(|w| PathBuf::from(&w[1]));
+        if exec.args.iter().any(|a| a == "--no-sandbox") {
+            return Ok(None);
+        }
+        let Some(path) = arg("--sandbox-policy") else { return Ok(Some(molt_tools::SandboxPolicy::default())) };
+        let roots = molt_tools::Roots {
+            root: arg("--root").context("the shell service has no --root")?,
+            scratch: arg("--scratch").context("the shell service has no --scratch")?,
+        };
+        let mut policy = molt_tools::SandboxPolicy::load(&path, &roots)?;
+        // What the policy passes is for commands; a server gets only its own variables.
+        policy.environment.clear();
+        Ok(Some(policy))
     }
 
     /// Have the memory service keep the notes about `paths` under the
@@ -703,6 +797,45 @@ mod tests {
         let taken = service("target = \"lint.check\"\n")
             .replace("name = \"lint\"\ndescription", "name = \"read_file\"\ndescription");
         assert!(format!("{:#}", Config::parse(&taken).unwrap_err()).contains("planner's own tools"));
+    }
+
+    #[test]
+    fn each_mcp_server_is_a_protected_bridge_service_the_planner_may_call_as_often_as_it_says() {
+        let bin = Path::new("/opt/molt/bin");
+        let mut cfg = Config::agent(Path::new("/w"), Path::new("/d"), bin).unwrap();
+        let servers = Config::parse(
+            "[mcp.issues]\ncommand = \"issues-mcp\"\nargs = [\"--stdio\"]\nnetwork = true\ncalls = 50\n\
+             env = { TRACKER_TOKEN = \"tok\" }\npass_env = [\"TRACKER_URL\"]\n\
+             [mcp.quiet]\ncommand = \"/opt/quiet\"\ncalls = 0\n",
+        )
+        .unwrap();
+        cfg.mcp = servers.mcp;
+        cfg.install_mcp(bin).unwrap();
+        let bridge = cfg.service("mcp-issues").unwrap();
+        assert_eq!(bridge.tier, Tier::Protected);
+        assert_eq!(bridge.provides, ["mcp-issues.*".parse::<Target>().unwrap()]);
+        assert!(bridge.requests.is_empty(), "it holds no capability");
+        assert_eq!(bridge.env["TRACKER_TOKEN"], "tok");
+        assert_eq!(bridge.pass_env, ["TRACKER_URL"]);
+        let exec = bridge.exec.as_ref().unwrap();
+        assert_eq!(exec.command, "/opt/molt/bin/molt-mcp");
+        assert_eq!(&exec.args[..3], ["serve", "--name", "issues"]);
+        assert!(!exec.args.iter().any(|a| a.contains("tok")), "variable values stay out of the manifest");
+        assert!(exec.args.iter().any(|a| a == "--policy"), "it runs in the shell's sandbox");
+        assert!(exec.args.iter().any(|a| a == "/d/mcp/issues.json"));
+        let planner = cfg.service("planner").unwrap();
+        let grant = planner.requests.iter().find(|r| r.target.to_string() == "mcp-issues.call").unwrap();
+        assert_eq!(grant.budget.calls, 50);
+        assert!(!planner.requests.iter().any(|r| r.target.to_string() == "mcp-quiet.call"), "calls = 0 grants none");
+
+        let mut unconfined = Config::agent(Path::new("/w"), Path::new("/d"), bin).unwrap();
+        unconfined.service_mut("shell").unwrap().exec.as_mut().unwrap().args.push("--no-sandbox".into());
+        unconfined.mcp = cfg.mcp.clone();
+        unconfined.install_mcp(bin).unwrap();
+        let args = &unconfined.service("mcp-issues").unwrap().exec.as_ref().unwrap().args;
+        assert!(args.iter().any(|a| a == "--no-sandbox") && !args.iter().any(|a| a == "--policy"));
+        let err = unconfined.install_mcp(bin).unwrap_err().to_string();
+        assert!(err.contains("rename one"), "{err}");
     }
 
     #[test]

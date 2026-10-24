@@ -272,7 +272,7 @@ mod tests {
                         ..Default::default()
                     }),
                 });
-                app.update(Msg::Ran { trace: trace.clone(), result: Ok(resp) });
+                app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(resp)) });
                 let reason = app.task.as_ref().unwrap().stops.join("; ");
                 assert!(reason.contains("rule: src/parser.rs") && reason.contains("reviewer approved"), "{reason}");
             }
@@ -310,7 +310,7 @@ mod tests {
         let mut resp = passed(false, Some("/d/work/fork-1"));
         resp.changes.push(Change { path: "target/out.bin".into(), kind: ChangeKind::Added });
         let all = resp.changes.clone();
-        app.update(Msg::Ran { trace, result: Ok(resp) });
+        app.update(Msg::Ran { trace, result: Box::new(Ok(resp)) });
         assert!(matches!(app.prompt, Some(Prompt::Apply { .. })));
         assert!(frame_text(&mut app).contains("s choose files"));
 
@@ -373,7 +373,7 @@ mod tests {
         // Off by default: nothing about git.
         let actions = type_in(&mut app, "implement it");
         let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
-        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(true, None)) });
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(passed(true, None))) });
         assert!(!actions.iter().any(|a| matches!(a, Action::Commit { .. })), "{actions:?}");
 
         type_in(&mut app, "/commit on");
@@ -385,7 +385,7 @@ mod tests {
         };
         assert_eq!(trace, run);
         let trace = trace.clone();
-        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(true, None)) });
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(passed(true, None))) });
         let Some(Action::Commit { trace: committed, task, resp }) = actions.first() else { panic!("{actions:?}") };
         assert_eq!((committed, task.as_str(), resp.changes.len()), (&trace, "implement more", 1));
         let made = crate::git::Committed {
@@ -404,7 +404,8 @@ mod tests {
         let actions = type_in(&mut app, "and more");
         let [Action::PrepareCommit { trace }, Action::Run { .. }] = actions.as_slice() else { panic!("{actions:?}") };
         let trace = trace.clone();
-        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/fork-3"))) });
+        let actions =
+            app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(passed(false, Some("/d/fork-3")))) });
         assert!(!actions.iter().any(|a| matches!(a, Action::Commit { .. })), "{actions:?}");
         assert_eq!(app.update(key(KeyCode::Enter)), [Action::Apply { fork: "/d/fork-3".into() }]);
         let actions = app.update(Msg::Applied(Ok(())));
@@ -414,7 +415,7 @@ mod tests {
         // A result the user keeps in its fork, or that fails to apply, is not committed.
         let actions = type_in(&mut app, "once more");
         let [Action::PrepareCommit { trace }, ..] = actions.as_slice() else { panic!("{actions:?}") };
-        app.update(Msg::Ran { trace: trace.clone(), result: Ok(passed(false, Some("/d/fork-4"))) });
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(passed(false, Some("/d/fork-4")))) });
         app.update(key(KeyCode::Enter));
         assert!(app.update(Msg::Applied(Err("conflict".into()))).is_empty());
         type_in(&mut app, "/commit off");

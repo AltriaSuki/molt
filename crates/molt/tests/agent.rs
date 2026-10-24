@@ -68,6 +68,9 @@ enum Fake {
     Hangs(PathBuf),
     /// Attempts greet and, when they are offered this tool, call it too.
     GreetsWithTool(&'static str),
+    /// Attempts greet and, when they are offered the first of these tools,
+    /// make each call in turn, in the same turn.
+    GreetsWithCalls(Vec<(&'static str, Value)>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -170,6 +173,17 @@ impl Respond for FakeApi {
                 if body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == *tool)) =>
             {
                 (vec![write("greeting.txt", "hello\n"), tool_use(n, tool, json!({ "text": "hi" }))], "tool_use")
+            }
+            (Fake::GreetsWithCalls(calls), false, Turn::First)
+                if body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == calls[0].0)) =>
+            {
+                let mut content = vec![write("greeting.txt", "hello\n")];
+                for (i, (tool, input)) in calls.iter().enumerate() {
+                    let mut call = tool_use(n, tool, input.clone());
+                    call["id"] = json!(format!("toolu_{n:03}_{i}"));
+                    content.push(call);
+                }
+                (content, "tool_use")
             }
             (_, false, Turn::First | Turn::Feedback) => (vec![write("greeting.txt", "hello\n")], "tool_use"),
             (_, false, Turn::AfterTools) => {
@@ -2413,6 +2427,55 @@ async fn changes_against_head_list_what_an_applied_result_changed() {
     assert!(repo.file_diff(&changes[0]).unwrap().patch.contains("+hello"));
 }
 
+/// A prompt pack the planner is pointed at: its override is what the model
+/// is told, and the kernel's audit log has each call's role and prompt hash.
+#[tokio::test]
+async fn an_override_in_the_prompt_pack_reaches_the_model_and_its_hash_the_audit_log() {
+    let server = fake_api(Fake::Greets).await;
+    let mut setup = Setup::new(&server);
+    let pack = tempfile::tempdir().unwrap();
+    let text = "You greet. Write greeting.txt and stop.";
+    std::fs::write(pack.path().join("attempt.md"), format!("{text}\n")).unwrap();
+    let planner = setup.cfg.service_mut("planner").unwrap();
+    planner.env.insert(molt_planner::pack::PROMPTS_ENV.into(), pack.path().to_str().unwrap().into());
+    let before = bodies(&server).await.len();
+    let (resp, _) = setup.run(setup.request(Some(CHECK), 1)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    let hash = molt_planner::pack::sha256(text);
+    let used = resp.prompts.iter().find(|p| p.role == "attempt").expect("the attempt's prompt is in the reply");
+    assert_eq!((used.prompt.sha256.as_str(), used.prompt.source), (hash.as_str(), molt_api::role::Source::User));
+
+    let sent = bodies(&server).await;
+    let attempts: Vec<&Value> = sent[before..]
+        .iter()
+        .filter(|b| b["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == WRITE_FILE)))
+        .collect();
+    assert!(!attempts.is_empty());
+    for body in &attempts {
+        let system = body["system"][0]["text"].as_str().unwrap();
+        assert!(system.starts_with(&format!("{text}\n\nThe done-check:")), "{system}");
+        assert!(body.get("prompt").is_none(), "the version is for the audit log, not the model API");
+    }
+    let audit = molt_kernel::audit::read_all(&setup.data.path().join("audit.jsonl")).await.unwrap();
+    let audited: Vec<&Value> = audit
+        .iter()
+        .filter_map(|e| match &e.event {
+            AuditEvent::Message { envelope }
+                if envelope.kind == Kind::Request && envelope.to.to_string() == COMPLETE =>
+            {
+                Some(&envelope.payload)
+            }
+            _ => None,
+        })
+        .filter(|p| p["prompt"]["role"] == "attempt")
+        .collect();
+    assert!(!audited.is_empty());
+    for payload in audited {
+        assert_eq!(payload["prompt"]["prompt"], json!({ "name": "attempt", "sha256": hash, "source": "user" }));
+    }
+    assert_requests_valid(&server).await;
+}
+
 /// A service of the user's config that declares a tool: the planner offers
 /// it when the config grants the planner its method, and the call goes
 /// through the kernel, which writes it to the audit log.
@@ -2483,6 +2546,88 @@ async fn a_tool_a_configured_service_declares_is_offered_called_and_audited() {
             .find(|c| c["type"] == "tool_result" && c["content"].as_str().is_some_and(|t| t.contains("echo_back")))
             .expect("the tool's result went back to the model");
         assert!(result["content"].as_str().unwrap().contains("<tool_output tool=\"echo_back\">"), "{result}");
+    }
+    assert_requests_valid(&server).await;
+}
+
+/// An MCP server of the user's config, bridged as service `mcp-fake`: its
+/// tools are offered to attempts as `mcp__fake__*`, every call goes through
+/// the kernel into the audit log, a call beyond the planner's budget for it
+/// is refused by the kernel, and a server that crashes gives its call an
+/// error result while the run goes on. With `calls = 0` nothing is offered.
+#[tokio::test]
+async fn an_mcp_servers_tools_are_called_through_the_kernel_within_their_budget_and_survive_a_crash() {
+    let calls = vec![
+        ("mcp__fake__echo", json!({ "text": "hi" })),
+        ("mcp__fake__crash", json!({})),
+        ("mcp__fake__echo", json!({ "text": "again" })),
+    ];
+    let server = fake_api(Fake::GreetsWithCalls(calls)).await;
+    for budget in [0, 2] {
+        let mut setup = Setup::new(&server);
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().canonicalize().unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../molt-mcp/tests/fake_mcp_server.py");
+        std::fs::copy(script, dir_path.join("server.py")).unwrap();
+        let text = format!(
+            "[mcp.fake]\ncommand = \"/usr/bin/python3\"\nargs = [\"{0}/server.py\", \"{0}\"]\nmounts = [\"{0}\"]\n\
+             calls = {budget}\n[mcp.fake.tools.echo]\nread_only = true\n",
+            dir_path.display()
+        );
+        setup.cfg.mcp = Config::parse(&text).unwrap().mcp;
+        setup.cfg.install_mcp(&bin_dir()).unwrap();
+        let before = bodies(&server).await.len();
+        let (resp, _) = setup.run(setup.request(Some(CHECK), 1)).await;
+        assert_eq!(resp.outcome, Outcome::Passed, "the run goes on: {}", resp.summary);
+        let sent = bodies(&server).await;
+        let offered =
+            |b: &Value| b["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == "mcp__fake__echo"));
+        let audit = molt_kernel::audit::read_all(&setup.data.path().join("audit.jsonl")).await.unwrap();
+        let to_bridge = |e: &&AuditEvent| match e {
+            AuditEvent::Message { envelope } => envelope.to.to_string() == "mcp-fake.call",
+            AuditEvent::Denied { to, .. } => to.to_string() == "mcp-fake.call",
+            _ => false,
+        };
+        let events: Vec<&AuditEvent> = audit.iter().map(|e| &e.event).filter(to_bridge).collect();
+        if budget == 0 {
+            assert!(sent[before..].iter().all(|b| !offered(b)), "a server with calls = 0 offers nothing");
+            assert!(events.is_empty());
+            continue;
+        }
+        assert!(sent[before..].iter().any(offered));
+        let requests: Vec<&molt_proto::Envelope> = events
+            .iter()
+            .filter_map(|e| match e {
+                AuditEvent::Message { envelope } if envelope.kind == Kind::Request => Some(envelope),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requests.len(), 2, "the third call is refused before delivery");
+        assert!(requests.iter().all(|r| r.from.as_ref().map(|f| f.as_str()) == Some("planner")));
+        assert_eq!(requests[0].payload["tool"], "mcp__fake__echo");
+        assert_eq!(requests[0].payload["input"], json!({ "text": "hi" }));
+        let denied = events.iter().find_map(|e| match e {
+            AuditEvent::Denied { from, code, .. } => Some((from.as_str().to_owned(), *code)),
+            _ => None,
+        });
+        assert_eq!(denied, Some(("planner".to_owned(), molt_proto::ErrorCode::OverBudget)), "{events:?}");
+        let results: Vec<Value> = sent[before..]
+            .iter()
+            .flat_map(|b| b["messages"].as_array().cloned().unwrap_or_default())
+            .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+            .filter(|c| c["type"] == "tool_result" && c["content"].as_str().is_some_and(|t| t.contains("mcp")))
+            .collect();
+        let result = |needle: &str| {
+            results
+                .iter()
+                .find(|r| r["content"].as_str().unwrap().contains(needle))
+                .unwrap_or_else(|| panic!("no tool result with {needle:?} in {results:#?}"))
+        };
+        let echo = result("echo: hi");
+        assert!(echo["content"].as_str().unwrap().contains("<tool_output tool=\"mcp__fake__echo\">"));
+        assert!(echo["content"].as_str().unwrap().contains("data from outside the workspace"), "{echo}");
+        assert_eq!(result("crashing on purpose")["is_error"], true);
+        assert_eq!(results.iter().filter(|r| r["is_error"] == true).count(), 2, "{results:#?}");
     }
     assert_requests_valid(&server).await;
 }

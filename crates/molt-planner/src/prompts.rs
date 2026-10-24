@@ -14,10 +14,10 @@ use serde_json::{json, Value};
 use crate::memory::note_lines;
 use crate::registry::{self, Builtin, Registry};
 
-/// The part of an attempt's system prompt that holds with or without a done-check.
-macro_rules! attempt_system {
-    () => {
-        "\
+/// The part of an attempt's system prompt that holds with or without a
+/// done-check: the system prompt of the one attempt of a run without one,
+/// and the built-in `attempt` prompt of the pack (see [`crate::pack`]).
+pub(crate) const ATTEMPT_BASE: &str = "\
 You are a software engineer carrying out one task in a project, working on your own without anyone to ask. \
 Make reasonable decisions where the task leaves room and mention them in your final reply.
 
@@ -34,13 +34,11 @@ How to work:
 - Read a file before you edit it, and change existing files with edit_file rather than rewriting them.
 - Keep tool output small: read large files in windows with offset and limit, find code with search \
 instead of reading whole trees, and filter long command output (for example with tail or grep).
-- When you are done, stop calling tools and reply with a short summary of what you changed."
-    };
-}
+- When you are done, stop calling tools and reply with a short summary of what you changed.";
 
-pub(crate) const ATTEMPT_SYSTEM: &str = concat!(
-    attempt_system!(),
-    "
+/// What an attempt's system prompt says after [`ATTEMPT_BASE`] when a
+/// done-check decides its result.
+pub(crate) const CHECK_PART: &str = "
 
 The done-check:
 - When you stop calling tools, the task's done-check command runs in your workspace. If it fails, \
@@ -51,23 +49,17 @@ Fix the code, not the check.
 the task (it expects a value, message or format that the task's own words rule out), do not bend the code to it: \
 call dispute_check with that assertion, the words of the task it contradicts, and a command that shows the \
 contradiction. That ends your work, and a person looks at the check. Dispute only a real contradiction with the \
-task, never a check that is merely hard to pass."
-);
+task, never a check that is merely hard to pass.";
 
-/// The system prompt of the one attempt of a run without a done-check.
-pub(crate) const UNVERIFIED_SYSTEM: &str = attempt_system!();
-
-/// The system prompt of an attempt judged by a rubric.
-pub(crate) const RUBRIC_SYSTEM: &str = concat!(
-    attempt_system!(),
-    "
+/// What an attempt's system prompt says after [`ATTEMPT_BASE`] when it is
+/// judged by a rubric.
+pub(crate) const RUBRIC_PART: &str = "
 
 The criteria:
 - When you stop calling tools, an independent judge checks your result against the task's criteria, one by one. \
 It sees the task, your final reply and the files you changed, nothing else of your work: put everything the result \
 needs in them.
-- If some criteria are not met, you get the judge's findings and continue."
-);
+- If some criteria are not met, you get the judge's findings and continue.";
 
 /// The system prompt of an attempt that answers with tools that only read.
 pub(crate) const ASK_SYSTEM: &str = "\
@@ -994,6 +986,32 @@ mod tests {
         for ((name, tools), (pinned_name, pinned_json)) in lists.iter().zip(pinned) {
             assert_eq!(name, pinned_name);
             assert_eq!(serde_json::to_string(tools).unwrap(), pinned_json, "{name}");
+        }
+    }
+
+    /// Every system prompt as the model API got it before prompts became a
+    /// pack (RFC 0003), one `name<TAB>json` line each.
+    const SYSTEM_PROMPTS: &str = include_str!("testdata/system_prompts.txt");
+
+    #[test]
+    fn the_built_in_system_prompts_the_model_gets_are_byte_for_byte_what_they_were() {
+        let seats = crate::pack::Pack::default().seats(&molt_api::workflow::Workflow::verify()).unwrap();
+        let prompts = [
+            ("attempt", seats.attempt.system(CHECK_PART)),
+            ("attempt-rubric", seats.attempt.system(RUBRIC_PART)),
+            ("attempt-unverified", seats.attempt.system("")),
+            ("explorer", seats.explorer.system("")),
+            ("designer", seats.designer.system("")),
+            ("vetter", seats.vetter.system("")),
+            ("reviewer", seats.reviewer.system("")),
+            ("judge", seats.judge.system("")),
+            ("router", seats.router.system("")),
+        ];
+        let pinned: Vec<(&str, &str)> = SYSTEM_PROMPTS.lines().map(|l| l.split_once('\t').unwrap()).collect();
+        assert_eq!(pinned.len(), prompts.len());
+        for ((name, text), (pinned_name, pinned_json)) in prompts.iter().zip(pinned) {
+            assert_eq!(*name, pinned_name);
+            assert_eq!(serde_json::to_string(&**text).unwrap(), pinned_json, "{name}");
         }
     }
 

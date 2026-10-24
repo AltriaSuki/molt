@@ -191,19 +191,15 @@ async fn model(ctx: &Arc<Ctx>, winner: &Winner<'_>, rules: &[String]) -> Result<
         truncated,
         winner.requirements,
     );
-    let mut conv = Conversation::new(
-        prompts::REVIEWER_SYSTEM,
-        Arc::new(prompts::reviewer_tools(&ctx.tools)),
-        first,
-        Role::Reviewer,
-        None,
-    );
+    let seat = ctx.seats().reviewer;
+    let mut conv = Conversation::seated(&seat, "", prompts::reviewer_tools(&ctx.tools), first, Role::Reviewer, None);
+    let max_turns = seat.max_turns.unwrap_or(MAX_TURNS);
     let mut meter = Meter::default();
     // The winner is decided; only the run's own end stops its review.
     let cancel = ctx.run_cancel.clone();
     let mut nudged = false;
     loop {
-        let resp = agent::turn(ctx, &mut conv, MAX_TURNS, &mut meter, &cancel).await.map_err(|stop| match stop {
+        let resp = agent::turn(ctx, &mut conv, max_turns, &mut meter, &cancel).await.map_err(|stop| match stop {
             Stop::OutOfTurns => "it ran out of turns".to_owned(),
             Stop::Budget => "the budget ran out".to_owned(),
             Stop::Model(e) => format!("the model call failed: {}", e.message),

@@ -84,6 +84,7 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
     }
     agent::deps_cache(&mut cfg, &opts.deps_cache)?;
     agent::environments(&mut cfg)?;
+    agent::mcp(&mut cfg)?;
     agent::allow_web(&mut cfg, &opts.allow_web)?;
     if let Some(resolver) = &opts.web_resolver {
         cfg.web_resolver(resolver)?;
@@ -524,7 +525,7 @@ impl Runtime {
             }),
             Action::Run { req, trace } => self.call(move |s| async move {
                 let result = s.run(&req, &trace).await.map_err(|e| format!("{e:#}"));
-                Msg::Ran { trace, result }
+                Msg::Ran { trace, result: Box::new(result) }
             }),
             Action::Control { trace, action } => self.call(move |s| async move {
                 let result = s.control(&trace, action.clone()).await.map_err(|e| format!("{e:#}"));
@@ -1068,6 +1069,7 @@ mod tests {
             verification: None,
             workflow: None,
             conversation: Vec::new(),
+            prompts: Vec::new(),
         };
         let trace = TraceId::random();
         rt.exec(Action::PrepareCommit { trace: trace.clone() });
