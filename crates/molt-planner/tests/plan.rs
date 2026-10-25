@@ -222,6 +222,7 @@ fn response(content: Vec<Value>, stop: &str) -> CompleteResponse {
         // A binary fraction, so sums are exact.
         cost_usd: Some(0.125),
         price_source: None,
+        context_tokens: None,
     }
 }
 

@@ -553,6 +553,7 @@ mod tests {
                 usage: Usage::default(),
                 cost_usd: None,
                 price_source: None,
+                context_tokens: None,
             };
             self.push(req.reply(serde_json::to_value(resp).unwrap()));
         }

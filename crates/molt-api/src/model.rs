@@ -3,8 +3,10 @@
 //! The gateway is the only process that holds the API key. Callers send
 //! messages and tool definitions in the Messages API's own JSON shape, and
 //! get Anthropic response content back verbatim, so thinking blocks can be passed
-//! back unmodified on the next turn. The OpenAI adapter translates unsigned
-//! text and function tools to this shared shape and rejects native blocks.
+//! back unmodified on the next turn. The OpenAI adapters translate unsigned
+//! text and function tools to this shared shape and reject native blocks;
+//! OpenAI Responses reasoning comes back as `openai_reasoning` blocks, to be
+//! passed back the same way.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -263,6 +265,11 @@ pub struct CompleteResponse {
     /// Where the prices behind `cost_usd` came from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_source: Option<PriceSource>,
+    /// The model's context window in tokens, the reply included, when the
+    /// gateway's trusted configuration declares it; the planner fits its
+    /// conversations to it. New: an older gateway leaves it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
 }
 
 /// Which price a cost was worked out with, so that any charge can be checked later.

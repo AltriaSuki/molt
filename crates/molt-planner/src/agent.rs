@@ -168,6 +168,7 @@ mod tests {
             usage: Usage::default(),
             cost_usd: None,
             price_source: None,
+            context_tokens: None,
         };
         let a = json!({ "type": "tool_use", "id": "a", "name": "run", "input": {} });
         let b = json!({ "type": "tool_use", "id": "b", "name": "write_file", "input": { "path": "x" } });

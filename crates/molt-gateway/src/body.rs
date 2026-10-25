@@ -9,6 +9,7 @@ use crate::profile::profile;
 use crate::Config;
 
 /// A request body ready to send.
+#[derive(Default)]
 pub(crate) struct Call {
     pub body: Value,
     /// Send the server-side fallback beta header with it.

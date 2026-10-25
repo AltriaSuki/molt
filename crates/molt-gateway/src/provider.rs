@@ -26,6 +26,18 @@ impl fmt::Display for Provider {
     }
 }
 
+/// The wire protocol an OpenAI model is called with. It comes only from a
+/// trusted declaration; an endpoint's errors never switch it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Protocol {
+    /// `POST /v1/chat/completions`.
+    #[default]
+    ChatCompletions,
+    /// `POST /v1/responses`, always with `store: false` (see `responses.rs`).
+    Responses,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capabilities {
@@ -35,6 +47,12 @@ pub struct Capabilities {
     #[serde(default)]
     pub efforts: Vec<Effort>,
     pub max_output: u32,
+    #[serde(default)]
+    pub protocol: Protocol,
+    /// The context window in tokens, the reply included, which the planner
+    /// is told so it fits conversations to it. `None`: not declared.
+    #[serde(default)]
+    pub context: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -102,6 +120,10 @@ impl Providers {
                 p.openai_models.iter().all(|(id, c)| !id.trim().is_empty() && c.max_output > 0),
                 "OpenAI model declarations need an id and positive max_output"
             );
+            ensure!(
+                p.openai_models.values().all(|c| c.context.is_none_or(|n| n > c.max_output)),
+                "an OpenAI model's context must be larger than its max_output"
+            );
         }
         Ok(p)
     }
@@ -134,6 +156,8 @@ impl Providers {
                 output_schema: true,
                 efforts: Vec::new(),
                 max_output: 32_768,
+                protocol: Protocol::ChatCompletions,
+                context: Some(1_047_576),
             });
         }
         Err(invalid("unknown OpenAI model capabilities: declare it in MOLT_OPENAI_MODELS"))
@@ -158,8 +182,27 @@ mod tests {
                 "MOLT_OPENAI_MODELS",
                 r#"{"x":{"tools":true,"streaming":true,"output_schema":true,"max_output":1,"typo":true}}"#,
             ),
+            (
+                "MOLT_OPENAI_MODELS",
+                r#"{"x":{"tools":true,"streaming":true,"output_schema":true,"max_output":1,"protocol":"realtime"}}"#,
+            ),
+            (
+                "MOLT_OPENAI_MODELS",
+                r#"{"x":{"tools":true,"streaming":true,"output_schema":true,"max_output":10,"context":10}}"#,
+            ),
         ] {
             assert!(Providers::from_vars(&|n| (n == name).then(|| value.into())).is_err(), "{name}: {value}");
         }
+    }
+
+    #[test]
+    fn the_protocol_is_chat_completions_unless_a_declaration_names_responses() {
+        let models = r#"{"r":{"tools":true,"streaming":true,"output_schema":true,"max_output":8,"protocol":"responses","context":400000},
+            "c":{"tools":true,"streaming":true,"output_schema":true,"max_output":8}}"#;
+        let p = Providers::from_vars(&|n| (n == "MOLT_OPENAI_MODELS").then(|| models.into())).unwrap();
+        let r = p.capabilities("r").unwrap();
+        assert_eq!((r.protocol, r.context), (Protocol::Responses, Some(400_000)));
+        assert_eq!(p.capabilities("c").unwrap().protocol, Protocol::ChatCompletions);
+        assert_eq!(p.capabilities("gpt-4.1").unwrap().protocol, Protocol::ChatCompletions);
     }
 }
