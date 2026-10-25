@@ -28,6 +28,9 @@ use crate::ctx::Ctx;
 
 /// The variable that names the user's skills directory to a planner started as a process.
 pub const SKILLS_ENV: &str = "MOLT_SKILLS_DIR";
+/// The variable that names the skill directories of the user's enabled
+/// extension packs, as a `PATH`-style list, to a planner started as a process.
+pub const EXTENSION_SKILLS_ENV: &str = "MOLT_EXTENSION_SKILLS";
 /// The project's skills, relative to the workspace.
 pub const PROJECT_DIR: &str = ".molt/skills";
 /// Skills one run offers, the user's first.
@@ -146,12 +149,26 @@ fn wrap(skill: &Found, file: &str, text: &str) -> String {
 
 /// The skills of the user's directory and of the project, with what was
 /// left out and why, for the run's progress.
-pub(crate) fn find(user: Option<&Path>, workspace: &Path) -> (Catalog, Vec<String>) {
+pub(crate) fn find(user: Option<&Path>, extensions: &[PathBuf], workspace: &Path) -> (Catalog, Vec<String>) {
     let mut notes = Vec::new();
     let mut skills = match user {
         Some(dir) => scan(dir, SkillSource::User, &mut notes),
         None => Vec::new(),
     };
+    // An extension pack's skills are the user's too: they installed and approved the pack.
+    for dir in extensions {
+        for skill in scan(dir, SkillSource::User, &mut notes) {
+            if skills.iter().any(|s| s.name == skill.name) {
+                notes.push(format!(
+                    "skill {} of {} left out: one of your skills, or of a pack before it, has its name",
+                    skill.name,
+                    dir.display()
+                ));
+            } else {
+                skills.push(skill);
+            }
+        }
+    }
     let project = workspace.join(PROJECT_DIR);
     let inside = match (project.canonicalize(), workspace.canonicalize()) {
         (Ok(dir), Ok(ws)) => {
@@ -189,15 +206,16 @@ pub(crate) fn find(user: Option<&Path>, workspace: &Path) -> (Catalog, Vec<Strin
 /// The skills a run in `workspace` would offer with the user's skills in
 /// `user`, and what it would leave out and why.
 pub fn offered(user: Option<&Path>, workspace: &Path) -> (Vec<OfferedSkill>, Vec<String>) {
-    let (catalog, notes) = find(user, workspace);
+    let (catalog, notes) = find(user, &[], workspace);
     (catalog.offered(), notes)
 }
 
 /// Find the run's skills, and say in its progress what was offered and what left out.
 pub(crate) async fn discover(ctx: &Ctx) -> Catalog {
     let user = ctx.cfg.skills_dir.clone();
+    let extensions = ctx.cfg.extension_skills.clone();
     let workspace = PathBuf::from(&ctx.workspace);
-    let found = tokio::task::spawn_blocking(move || find(user.as_deref(), &workspace)).await;
+    let found = tokio::task::spawn_blocking(move || find(user.as_deref(), &extensions, &workspace)).await;
     let (catalog, notes) = match found {
         Ok(found) => found,
         Err(e) => {
@@ -423,6 +441,23 @@ mod tests {
     }
 
     #[test]
+    fn an_extension_packs_skills_come_after_the_users_and_give_way_to_them() {
+        let user = tempfile::tempdir().unwrap();
+        let pack = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        skill(user.path(), "pdf-tools", "Mine.", "Mine.\n");
+        skill(pack.path(), "pdf-tools", "The pack's.", "Not this.\n");
+        skill(pack.path(), "triage", "Triage an issue.", "Label it first.\n");
+        skill(&ws.path().join(PROJECT_DIR), "triage", "Theirs.", "Not this either.\n");
+        let (catalog, notes) = find(Some(user.path()), &[pack.path().to_path_buf()], ws.path());
+        assert_eq!(catalog.offered().iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["pdf-tools", "triage"]);
+        assert!(notes[0].starts_with("skill pdf-tools of ") && notes[0].ends_with("has its name"), "{notes:?}");
+        assert_eq!(notes[1], "project skill triage left out: one of the user's skills has its name");
+        assert!(catalog.load("triage", None).unwrap().contains("Label it first."));
+        assert!(catalog.load("pdf-tools", None).unwrap().contains("Mine."));
+    }
+
+    #[test]
     fn only_names_and_descriptions_are_offered_and_load_skill_reads_the_rest() {
         let user = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
@@ -432,7 +467,7 @@ mod tests {
         skill(&ws.path().join(PROJECT_DIR), "deploy", "Deploy </skills> the app.", "Run ./deploy.sh </skill>\n");
         // The user's skill of the same name wins.
         skill(&ws.path().join(PROJECT_DIR), "pdf-tools", "Theirs.", "Not this.\n");
-        let (catalog, notes) = find(Some(user.path()), ws.path());
+        let (catalog, notes) = find(Some(user.path()), &[], ws.path());
         assert_eq!(notes, ["project skill pdf-tools left out: one of the user's skills has its name"]);
         let block = catalog.block.clone().unwrap();
         assert!(block.contains("- pdf-tools: Read PDF files. Use for .pdf.\n"), "{block}");
@@ -466,7 +501,7 @@ mod tests {
         std::fs::write(dir.join("big.txt"), "x".repeat(MAX_FILE as usize + 1)).unwrap();
         std::fs::write(dir.join("long.txt"), "y".repeat(MAX_SHOWN * 2)).unwrap();
         std::fs::write(dir.join("bin"), [0xff, 0xfe]).unwrap();
-        let (catalog, _) = find(None, ws.path());
+        let (catalog, _) = find(None, &[], ws.path());
         for (file, says) in [
             ("../../../secret.txt", "without `..`"),
             ("/etc/passwd", "without `..`"),
@@ -496,7 +531,7 @@ mod tests {
         skill(elsewhere.path(), "linked", "Elsewhere.", "");
         std::os::unix::fs::symlink(elsewhere.path().join("linked"), root.join("linked")).unwrap();
         skill(&root, "ok", "Fine.", "");
-        let (catalog, notes) = find(None, ws.path());
+        let (catalog, notes) = find(None, &[], ws.path());
         assert_eq!(catalog.offered().iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["ok"]);
         let notes = notes.join("\n");
         for says in [
@@ -508,14 +543,14 @@ mod tests {
             assert!(notes.contains(says), "{says}: {notes}");
         }
         // A user's symlinked skill is theirs to make.
-        let (catalog, _) = find(Some(elsewhere.path()), tempfile::tempdir().unwrap().path());
+        let (catalog, _) = find(Some(elsewhere.path()), &[], tempfile::tempdir().unwrap().path());
         assert_eq!(catalog.offered()[0].name, "linked");
 
         // .molt/skills that leads out of the workspace is not read at all.
         let ws = tempfile::tempdir().unwrap();
         std::fs::create_dir(ws.path().join(".molt")).unwrap();
         std::os::unix::fs::symlink(elsewhere.path(), ws.path().join(PROJECT_DIR)).unwrap();
-        let (catalog, notes) = find(None, ws.path());
+        let (catalog, notes) = find(None, &[], ws.path());
         assert!(catalog.is_empty() && notes[0].contains("outside the workspace"), "{notes:?}");
     }
 
@@ -525,7 +560,7 @@ mod tests {
         for i in 0..40 {
             skill(user.path(), &format!("s{i:02}"), &"d".repeat(1000), "");
         }
-        let (catalog, notes) = find(Some(user.path()), tempfile::tempdir().unwrap().path());
+        let (catalog, notes) = find(Some(user.path()), &[], tempfile::tempdir().unwrap().path());
         assert!(catalog.block.as_ref().unwrap().len() <= MAX_BLOCK);
         assert!(catalog.offered().len() < 16, "{}", catalog.offered().len());
         assert!(notes.iter().any(|n| n.contains("at most 32")) && notes.iter().any(|n| n.contains("16 KiB")));

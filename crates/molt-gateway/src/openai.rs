@@ -9,11 +9,26 @@ use serde_json::{json, Value};
 
 use crate::api::Message;
 use crate::body::Call;
+use crate::probe::Probed;
 use crate::provider::invalid;
 use crate::Config;
 
-pub(crate) fn build(cfg: &Config, model: &str, req: CompleteRequest) -> Result<Call, RemoteError> {
-    let caps = cfg.providers.capabilities(model)?;
+/// `probed` is what `molt models probe` found on this endpoint: a feature
+/// it found missing is refused as an undeclared one is.
+pub(crate) fn build(
+    cfg: &Config,
+    model: &str,
+    req: CompleteRequest,
+    probed: Option<&Probed>,
+) -> Result<Call, RemoteError> {
+    let mut caps = cfg.providers.capabilities(model)?;
+    if let Some(p) = probed {
+        caps.tools &= p.tools != Some(false);
+        caps.output_schema &= p.output_schema != Some(false);
+        if p.effort == Some(false) {
+            caps.efforts.clear();
+        }
+    }
     if req.messages.is_empty() {
         return Err(invalid("messages is empty"));
     }
@@ -147,7 +162,7 @@ pub(crate) fn build(cfg: &Config, model: &str, req: CompleteRequest) -> Result<C
         body["stream"] = json!(true);
         body["stream_options"] = json!({"include_usage":true});
     }
-    Ok(Call { body, fallbacks: false, max_tokens })
+    Ok(Call { body, fallbacks: false, max_tokens, schema_tool: false })
 }
 
 pub(crate) fn decode(value: Value) -> Result<Message, String> {

@@ -124,10 +124,21 @@ pub struct Config {
     /// planner, never from a request or a project; a project's own skills,
     /// in its `.molt/skills`, are read as data.
     pub skills_dir: Option<std::path::PathBuf>,
+    /// The `skills/` directories of the extension packs the user installed,
+    /// approved and enabled (`MOLT_EXTENSION_SKILLS`), read after
+    /// `skills_dir` and as the user's: like it, they come from whoever
+    /// starts the planner, never from a request or a project.
+    pub extension_skills: Vec<std::path::PathBuf>,
     /// Have a model write an attempt's notes on the turns its conversation
     /// leaves out to fit, beside Molt's own record of them (#108). Off by
     /// default: each fit then costs one more model call.
     pub compact_model: bool,
+    /// The model each role's calls go to when its declaration names none
+    /// (`MOLT_ROLE_MODELS`, #169): the reviewer on a cheaper model, say,
+    /// while the attempts keep the run's. A request's `judge_model`, the
+    /// explorer's `MOLT_EXPLORE_MODEL` and the router's `MOLT_ROUTE_MODEL`
+    /// still win for their roles.
+    pub role_models: std::collections::BTreeMap<molt_api::model::Role, String>,
 }
 
 impl Default for Config {
@@ -160,8 +171,10 @@ impl Default for Config {
             route_model: None,
             tools: Vec::new(),
             pack: Arc::default(),
+            extension_skills: Vec::new(),
             skills_dir: None,
             compact_model: false,
+            role_models: Default::default(),
         }
     }
 }
@@ -172,7 +185,8 @@ impl Config {
     /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_EXPLORE`, `MOLT_EXPLORE_MODEL`, `MOLT_PROCESSES`, `MOLT_GIT`, `MOLT_MAX_TOKENS`,
     /// `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
     /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES`,
-    /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL`, `MOLT_PROMPTS_DIR`, `MOLT_SKILLS_DIR` and `MOLT_COMPACT`.
+    /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL`, `MOLT_PROMPTS_DIR`, `MOLT_SKILLS_DIR`, `MOLT_COMPACT` and
+    /// `MOLT_ROLE_MODELS`.
     ///
     /// | Variable | Default |
     /// |---|---|
@@ -195,7 +209,9 @@ impl Config {
     /// | `MOLT_ROUTE_MODEL` | unset: the run's model picks the workflow of a run that names `auto` |
     /// | `MOLT_PROMPTS_DIR` | unset: the built-in prompts; else the prompt pack to read ([`pack::Pack::load`]) |
     /// | `MOLT_SKILLS_DIR` | unset: no user skills; else the directory of the user's skills ([`skills`]) |
+    /// | `MOLT_EXTENSION_SKILLS` | unset: none; else the extension packs' skill directories, as a `PATH`-style list ([`skills`]) |
     /// | `MOLT_COMPACT` | `record`: Molt's own record of the turns a conversation leaves out; `model` also has the `compactor` write notes on them ([`compact`]) |
+    /// | `MOLT_ROLE_MODELS` | unset: every role but the judge's uses the run's model; else a JSON object of role to model ([`molt_api::model::role_models`]) |
     ///
     /// An empty variable counts as unset. A value that does not parse is an
     /// error, and so is a zero: none of these limits has a "no limit" value.
@@ -252,6 +268,9 @@ impl Config {
         };
         Ok(Self {
             hooks,
+            extension_skills: get(skills::EXTENSION_SKILLS_ENV)
+                .map(|v| std::env::split_paths(&v).filter(|p| p.is_absolute()).collect())
+                .unwrap_or_default(),
             default_model: get("MOLT_PLANNER_MODEL"),
             max_turns: small("MOLT_MAX_TURNS", d.max_turns)?,
             max_check_rounds: small("MOLT_MAX_CHECK_ROUNDS", d.max_check_rounds)?,
@@ -313,6 +332,10 @@ impl Config {
             tools,
             pack: Arc::new(pack),
             skills_dir: get(skills::SKILLS_ENV).filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from),
+            role_models: match get(molt_api::model::ROLE_MODELS_ENV) {
+                Some(text) => molt_api::model::role_models(&text).map_err(anyhow::Error::msg)?,
+                None => d.role_models,
+            },
         })
     }
 }
@@ -772,6 +795,10 @@ mod tests {
         assert!(!cfg.explore && cfg.explore_model.is_none());
         let cfg = from(&[("MOLT_EXPLORE", "on"), ("MOLT_EXPLORE_MODEL", "haiku")]).unwrap();
         assert!(cfg.explore && cfg.explore_model.as_deref() == Some("haiku"));
+        let cfg = from(&[("MOLT_ROLE_MODELS", r#"{"reviewer":"haiku"}"#)]).unwrap();
+        assert_eq!(cfg.role_models.get(&molt_api::model::Role::Reviewer).map(String::as_str), Some("haiku"));
+        assert!(from(&[]).unwrap().role_models.is_empty());
+        assert!(from(&[("MOLT_ROLE_MODELS", r#"{"attempt":"opus"}"#)]).is_err());
         assert!(!from(&[("MOLT_EXPLORE", "off")]).unwrap().explore);
         assert!(format!("{:#}", from(&[("MOLT_EXPLORE", "yes")]).unwrap_err()).contains("use on or off"));
         // On, it is every workflow whose attempts change files, and never ask's.

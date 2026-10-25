@@ -9,8 +9,10 @@
 
 mod api;
 mod body;
+pub mod catalog;
 mod openai;
 pub mod prices;
+pub mod probe;
 mod profile;
 pub mod provider;
 mod responses;
@@ -66,6 +68,8 @@ pub struct Config {
     pub retry_base: Duration,
     /// What each model costs; see [`prices`].
     pub prices: Arc<PriceTable>,
+    /// What `molt models probe` found each model does on its endpoint; see [`probe`].
+    pub probed: Arc<probe::Records>,
 }
 
 // Written out so that logging a config never prints credentials.
@@ -85,6 +89,7 @@ impl fmt::Debug for Config {
             .field("fallbacks", &self.fallbacks)
             .field("retry_base", &self.retry_base)
             .field("prices", &self.prices.sources())
+            .field("probed", &self.probed.models.len())
             .finish()
     }
 }
@@ -105,6 +110,7 @@ impl Config {
     /// | `MOLT_MODEL_CONCURRENCY` | `16` |
     /// | `MOLT_FALLBACKS` | `1` (`0` turns them off) |
     /// | `MOLT_MODEL_PRICES`, `MOLT_PRICES_FILE` | see [`prices`] |
+    /// | `MOLT_MODELS_FILE` | see [`probe::records_path`] |
     ///
     /// An empty variable counts as unset. `MOLT_MAX_TOKENS`,
     /// `MOLT_MODEL_TIMEOUT_S` and `MOLT_MODEL_CONCURRENCY` must be above 0:
@@ -155,6 +161,7 @@ impl Config {
             fallbacks,
             retry_base: Duration::from_secs(1),
             prices: Arc::new(PriceTable::from_vars(&var)?),
+            probed: Arc::new(probe::Records::from_vars(&var)?),
         })
     }
 }
@@ -267,18 +274,21 @@ impl Gateway {
         let deadline = within.and_then(|d| Instant::now().checked_add(d));
         let named = req.model.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or(&self.cfg.default_model).to_owned();
         let (provider, model) = self.cfg.providers.resolve(&named)?;
-        let api = match provider {
-            provider::Provider::Anthropic => self.anthropic.as_ref(),
-            provider::Provider::Openai => self.openai.as_ref(),
-        }
-        .ok_or_else(|| RemoteError {
+        let api = self.api(provider).ok_or_else(|| RemoteError {
             code: ErrorCode::Invalid,
             message: format!("no credential configured for {provider}"),
         })?;
         let messages = req.messages.len();
+        let probed = self.cfg.probed.lookup(provider, self.base_url(provider), &model);
+        let mut req = req;
+        if req.stream.is_some() && probed.is_some_and(|p| p.streaming == Some(false)) {
+            // The reply stays whole; only its previews are lost.
+            tracing::debug!(%model, "not streaming: `molt models probe` found the endpoint does not stream");
+            req.stream = None;
+        }
         let call = match provider {
-            provider::Provider::Anthropic => body::build(&self.cfg, &model, req)?,
-            provider::Provider::Openai => openai::build(&self.cfg, &model, req)?,
+            provider::Provider::Anthropic => body::build(&self.cfg, &model, req, probed)?,
+            provider::Provider::Openai => openai::build(&self.cfg, &model, req, probed)?,
         };
         tracing::debug!(
             %provider,
@@ -289,7 +299,7 @@ impl Gateway {
             "calling the Messages API"
         );
 
-        let msg = api.create(&call.body, call.fallbacks, deadline, observer).await.map_err(|mut e| {
+        let mut msg = api.create(&call.body, call.fallbacks, deadline, observer).await.map_err(|mut e| {
             if let Some(hint) = self.alias_hint(&named, &e) {
                 e.message.push_str(&hint);
             }
@@ -300,6 +310,9 @@ impl Gateway {
                 code: ErrorCode::Failed,
                 message: "model finished without token usage; usage and cost are unknown".into(),
             });
+        }
+        if call.schema_tool {
+            probe::tool_as_answer(&mut msg.content, &mut msg.stop_reason);
         }
         let usage = Usage::from(msg.usage);
         // After a fallback or a router's choice another model answered, and its prices apply.
@@ -354,6 +367,13 @@ impl Gateway {
 }
 
 impl Gateway {
+    fn api(&self, provider: provider::Provider) -> Option<&api::Api> {
+        match provider {
+            provider::Provider::Anthropic => self.anthropic.as_ref(),
+            provider::Provider::Openai => self.openai.as_ref(),
+        }
+    }
+
     /// For a refused call that names a model which is no alias but is one
     /// typo from one, such as `sonet`: which alias was likely meant.
     fn alias_hint(&self, named: &str, error: &RemoteError) -> Option<String> {
