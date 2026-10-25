@@ -373,7 +373,8 @@ Ctrl+L clears and redraws the interface. On Unix, Ctrl+Z restores the terminal
 and suspends just the interface process; use the shell's `fg` to return. Its
 kernel and services run in an independent backend process group, so bus
 dispatch and later tool/model turns continue while the interface is stopped.
-Private pipes carry bounded frames; service stdout goes to the log, and output
+A private pipe carries the client protocol ([serve.md](serve.md)), a line of at
+most 16 MiB per message; service stdout goes to the log, and output
 backpressure can drop progress previews while preserving final RPC settlement.
 Queued results are shown after resuming. This requires a shell with job control and a foreground
 process group (an orphaned process group can ignore SIGTSTP). Background color

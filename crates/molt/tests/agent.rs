@@ -2272,22 +2272,87 @@ async fn a_kept_result_the_user_applies_passes_the_apply_hooks_too() {
     assert!(audit.contains(r#"\"changes\":[\"greeting.txt\"]"#));
 }
 
+/// One side of the client protocol (docs/serve.md): JSON-RPC, a message a line.
+struct Rpc<R, W> {
+    input: tokio::io::BufReader<R>,
+    out: W,
+    next: u64,
+    /// Progress events read while waiting for an answer.
+    events: Vec<Value>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> Rpc<R, W> {
+    fn new(input: R, out: W) -> Self {
+        Self { input: tokio::io::BufReader::new(input), out, next: 0, events: Vec::new() }
+    }
+
+    async fn line(&mut self, value: &Value) {
+        use tokio::io::AsyncWriteExt;
+        self.out.write_all(format!("{value}\n").as_bytes()).await.unwrap();
+        self.out.flush().await.unwrap();
+    }
+
+    /// Send a request without waiting; its id.
+    async fn send(&mut self, method: &str, params: Value) -> u64 {
+        self.next += 1;
+        self.line(&json!({"jsonrpc": "2.0", "id": self.next, "method": method, "params": params})).await;
+        self.next
+    }
+
+    /// The answer to request `id`, keeping the events that come before it.
+    async fn answer(&mut self, id: u64) -> Value {
+        use tokio::io::AsyncBufReadExt;
+        tokio::time::timeout(RUN_LIMIT, async {
+            loop {
+                let mut line = String::new();
+                assert!(self.input.read_line(&mut line).await.unwrap() > 0, "the server hung up");
+                let msg: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(msg["jsonrpc"], "2.0", "{msg}");
+                if msg["method"] == "progress" {
+                    self.events.push(msg["params"].clone());
+                } else if msg["id"] == id {
+                    return msg;
+                }
+            }
+        })
+        .await
+        .expect("no answer")
+    }
+
+    /// The first progress event `pred` takes, read from what comes.
+    async fn event(&mut self, pred: impl Fn(&Value) -> bool) -> Value {
+        use tokio::io::AsyncBufReadExt;
+        if let Some(event) = self.events.iter().find(|e| pred(e)) {
+            return event.clone();
+        }
+        tokio::time::timeout(RUN_LIMIT, async {
+            loop {
+                let mut line = String::new();
+                assert!(self.input.read_line(&mut line).await.unwrap() > 0, "the server hung up");
+                let msg: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(msg["method"], "progress", "an answer came first: {msg}");
+                self.events.push(msg["params"].clone());
+                if pred(&msg["params"]) {
+                    return msg["params"].clone();
+                }
+            }
+        })
+        .await
+        .expect("no such event")
+    }
+
+    async fn call(&mut self, method: &str, params: Value) -> Value {
+        let id = self.send(method, params).await;
+        let answer = self.answer(id).await;
+        assert!(answer.get("error").is_none(), "{method}: {answer}");
+        answer["result"].clone()
+    }
+}
+
+/// The interface's own server: the config it resolved comes first on the
+/// pipe, then the client protocol, as the interface speaks it.
 #[tokio::test]
 async fn the_ui_backend_finishes_without_terminal_reads_and_exits_when_the_pipe_closes() {
-    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-    async fn send(out: &mut (impl AsyncWrite + Unpin), value: Value) {
-        let bytes = serde_json::to_vec(&value).unwrap();
-        out.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
-        out.write_all(&bytes).await.unwrap();
-        out.flush().await.unwrap();
-    }
-    async fn recv(input: &mut (impl AsyncRead + Unpin)) -> Value {
-        let mut size = [0; 4];
-        input.read_exact(&mut size).await.unwrap();
-        let mut bytes = vec![0; u32::from_be_bytes(size) as usize];
-        input.read_exact(&mut bytes).await.unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    }
     let server = fake_api(Fake::Greets).await;
     let mut setup = Setup::new(&server);
     let mut noise = molt::ServiceSection::new(
@@ -2309,18 +2374,15 @@ async fn the_ui_backend_finishes_without_terminal_reads_and_exits_when_the_pipe_
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let mut input = child.stdin.take().unwrap();
-    let mut output = child.stdout.take().unwrap();
-    send(
-        &mut input,
-        json!({"cfg":setup.cfg,"workspace":setup.workspace.path().canonicalize().unwrap().to_str().unwrap()}),
-    )
-    .await;
-    send(&mut input, json!("StartSession")).await;
-    let up = tokio::time::timeout(Duration::from_secs(20), recv(&mut output)).await.unwrap();
-    assert!(up.get("SessionUp").is_some(), "{up}");
+    let workspace = setup.workspace.path().canonicalize().unwrap();
+    let mut rpc = Rpc::new(child.stdout.take().unwrap(), child.stdin.take().unwrap());
+    rpc.line(&json!({"cfg": setup.cfg, "workspace": workspace.to_str().unwrap()})).await;
+    let hello = rpc.call("initialize", json!({"protocol": 1, "client": {"name": "molt-tui"}})).await;
+    assert_eq!(hello["workspace"], workspace.to_str().unwrap());
+    let up = rpc.call("session.open", json!({})).await;
+    assert!(up["versions"].as_array().is_some_and(|v| !v.is_empty()), "{up}");
     let req = setup.request(Some(CHECK), 1);
-    send(&mut input, json!({"Run":{"req":req,"trace":molt_proto::TraceId::random()}})).await;
+    let id = rpc.send("task.submit", json!({"trace": molt_proto::TraceId::random(), "request": req})).await;
     // With no frontend reading messages, both model turns and review still run.
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -2332,37 +2394,138 @@ async fn the_ui_backend_finishes_without_terminal_reads_and_exits_when_the_pipe_
     })
     .await
     .unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let msg = recv(&mut output).await;
-            if msg.get("Ran").is_some() {
-                break msg;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(result["Ran"]["result"]["Ok"]["applied"], true, "{result}");
+    let result = rpc.answer(id).await;
+    assert_eq!(result["result"]["applied"], true, "{result}");
     assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    // Only protocol messages came on the pipe: a service's stdout is not among them.
+    assert!(rpc.events.iter().all(|e| e["event"].is_string()), "{:?}", rpc.events);
     // A result waits for the interface's decision when the interface dies: its fork stays, to be picked up.
     std::fs::remove_file(setup.workspace.path().join("greeting.txt")).unwrap();
     let mut req = setup.request(Some(CHECK), 1);
     req.apply = false;
-    send(&mut input, json!({"Run":{"req":req,"trace":molt_proto::TraceId::random()}})).await;
-    let result = tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let msg = recv(&mut output).await;
-            if msg.get("Ran").is_some() {
-                break msg;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    let fork = result["Ran"]["result"]["Ok"]["fork"].as_str().expect("kept in its fork").to_owned();
-    drop(input);
+    let kept = rpc.call("task.submit", json!({"trace": molt_proto::TraceId::random(), "request": req})).await;
+    let fork = kept["fork"].as_str().expect("kept in its fork").to_owned();
+    drop(rpc);
     assert!(tokio::time::timeout(Duration::from_secs(15), child.wait()).await.unwrap().unwrap().success());
     assert!(Path::new(&fork).is_dir(), "the fork outlives the interface that died");
+}
+
+/// A script as a client of `molt serve`: over the socket in the data dir,
+/// it runs a task to a result kept in its fork, sees its progress, reads
+/// its diff, applies it, and closes; the server stops on SIGTERM.
+#[tokio::test]
+async fn a_script_runs_a_task_through_molt_serve_and_applies_the_result() {
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let workspace = setup.workspace.path().canonicalize().unwrap();
+    let mut serve = molt(&server, &workspace, setup.data.path(), &["serve"]).spawn().unwrap();
+    let socket = setup.data.path().join("serve.sock");
+    let started = Instant::now();
+    let stream = loop {
+        match tokio::net::UnixStream::connect(&socket).await {
+            Ok(stream) => break stream,
+            Err(_) if started.elapsed() < Duration::from_secs(20) => {
+                tokio::time::sleep(Duration::from_millis(20)).await
+            }
+            Err(e) => {
+                serve.start_kill().unwrap();
+                let out = serve.wait_with_output().await.unwrap();
+                panic!(
+                    "molt serve did not listen on {}: {e}\n{}",
+                    socket.display(),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            }
+        }
+    };
+    assert_eq!(std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777, 0o600, "only its user opens it");
+    let (input, out) = stream.into_split();
+    let mut rpc = Rpc::new(input, out);
+    let hello = rpc.call("initialize", json!({"protocol": 1, "client": {"name": "script"}})).await;
+    assert_eq!(hello["workspace"], workspace.to_str().unwrap());
+    let missing = rpc.send("result.diff", json!({"fork": "/nowhere"})).await;
+    assert_eq!(rpc.answer(missing).await["error"]["code"], -32001, "no session yet");
+    rpc.call("session.open", json!({})).await;
+
+    // The request names no workspace: the server's own is the one.
+    let trace = molt_proto::TraceId::random();
+    let mut req = RunRequest::new("Write a greeting into greeting.txt.", "");
+    (req.check, req.attempts, req.apply, req.stream) = (Some(CHECK.into()), 1, false, true);
+    let result = rpc.call("task.submit", json!({"trace": trace, "request": req})).await;
+    assert_eq!(result["outcome"], "passed", "{result}");
+    assert!(setup.file("greeting.txt").is_none(), "a result kept is not applied");
+    let fork = result["fork"].as_str().expect("kept in its fork").to_owned();
+    let of_run: Vec<&Value> = rpc.events.iter().filter(|e| e["run"] == trace.as_str()).collect();
+    let saw = |kind: &str| of_run.iter().any(|e| e["event"] == kind);
+    assert!(saw("attempt_started") && saw("tool_call") && saw("check_ran") && saw("attempt_finished"), "{of_run:?}");
+    let costed = |e: &&&Value| e["event"] == "model_finished" && e["role"] == "attempt" && e["cost_usd"].is_number();
+    assert!(of_run.iter().any(|e| costed(&e)), "who made each call, and what it cost: {of_run:?}");
+
+    let diff = rpc.call("result.diff", json!({"fork": fork})).await;
+    assert_eq!(diff["changes"][0]["path"], "greeting.txt", "{diff}");
+    assert!(diff["patch"].as_str().unwrap().contains("+hello"), "{diff}");
+    let applied = rpc.call("result.apply", json!({"fork": fork})).await;
+    assert_eq!(applied["changes"][0]["path"], "greeting.txt", "{applied}");
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    assert_eq!(rpc.call("session.close", json!({"keep": []})).await, json!({}));
+    drop(rpc);
+
+    // SAFETY: plain syscall.
+    unsafe { libc::kill(serve.id().unwrap() as i32, libc::SIGTERM) };
+    let status = tokio::time::timeout(Duration::from_secs(15), serve.wait()).await.unwrap().unwrap();
+    assert!(status.success(), "{status}");
+    assert!(!socket.exists(), "the socket goes with the server");
+    setup.assert_forks_dropped();
+    assert_requests_valid(&server).await;
+}
+
+/// The interface's Esc, through the protocol: `task.stop` cuts the run off,
+/// its call answers that it was stopped, the command the attempt started
+/// ends, and the attempt's fork is kept for the work in it.
+#[tokio::test]
+async fn a_task_stopped_through_the_protocol_keeps_the_attempts_work_and_its_commands_end() {
+    let pids = tempfile::tempdir().unwrap();
+    let pidfile = pids.path().join("sleep.pid");
+    let hang = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
+    let server = fake_api(Fake::GreetsWithCalls(vec![(RUN, json!({ "command": hang }))])).await;
+    let mut setup = Setup::new(&server);
+    // The pid marker is outside the fork, as in `stopping_a_run_kills_the_commands_it_started`.
+    setup.cfg.service_mut("shell").unwrap().exec.as_mut().unwrap().args.push("--no-sandbox".into());
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+        .arg("ui-backend")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let workspace = setup.workspace.path().canonicalize().unwrap();
+    let mut rpc = Rpc::new(child.stdout.take().unwrap(), child.stdin.take().unwrap());
+    rpc.line(&json!({"cfg": setup.cfg, "workspace": workspace.to_str().unwrap()})).await;
+    rpc.call("initialize", json!({"protocol": 1})).await;
+    rpc.call("session.open", json!({})).await;
+    let mut req = setup.request(Some(CHECK), 1);
+    req.keep_cancelled_forks = true;
+    let trace = molt_proto::TraceId::random();
+    let submitted = rpc.send("task.submit", json!({"trace": trace, "request": req})).await;
+    let started = rpc.event(|e| e["event"] == "attempt_started" && e["run"] == trace.as_str()).await;
+    let fork = started["fork"].as_str().expect("the attempt's fork").to_owned();
+    let pid = wait_for_pid(&pidfile).await;
+
+    let stop = rpc.send("task.stop", json!({"attempts": [fork], "check_files": []})).await;
+    let cut = rpc.answer(submitted).await;
+    assert_eq!(cut["error"]["code"], -32003, "the run's call answers that it was stopped: {cut}");
+    let stopped = rpc.answer(stop).await;
+    assert_eq!(stopped["result"], json!({"kept": [fork], "notes": []}), "{stopped}");
+    assert!(exits(pid).await, "the command's child {pid} outlived the stop");
+    assert_eq!(std::fs::read_to_string(Path::new(&fork).join("greeting.txt")).unwrap(), "hello\n");
+    assert!(setup.file("greeting.txt").is_none());
+    // The next session opens, as the interface's does after a stop.
+    rpc.call("session.open", json!({})).await;
+    rpc.call("session.close", json!({"keep": [fork]})).await;
+    drop(rpc);
+    assert!(tokio::time::timeout(Duration::from_secs(15), child.wait()).await.unwrap().unwrap().success());
+    assert!(Path::new(&fork).is_dir(), "kept as the client asked");
 }
 
 /// `!cmd` in the interface: the session runs it through the shell service in

@@ -2,8 +2,11 @@
 //! agent services up and takes one task after another.
 //!
 //! [`app`] holds the state and the rules, [`view`] draws it, and the loop
-//! here carries the [`app::Action`]s out on a [`Session`] and feeds what
-//! comes back, with the keys, to the app.
+//! here carries the [`app::Action`]s out and feeds what comes back, with the
+//! keys, to the app. What needs the services goes to the interface's own
+//! server ([`crate::serve`]) through the client protocol, as any client's
+//! would ([`backend`]); the terminal, the editor, and reading the workspace,
+//! git and the logs stay here.
 
 mod app;
 mod backend;
@@ -36,32 +39,16 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen};
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::{self, UnboundedSender};
-use tokio::task::JoinHandle;
 
 use self::app::{Action, App, Msg};
 use self::notice::Notice;
 use crate::config::secret_name;
-use crate::session::Session;
 use crate::{agent, Config};
 
 /// How often the spinners turn.
 const TICK: Duration = Duration::from_millis(app::TICK_MS);
 
-pub struct Options {
-    pub config: Option<PathBuf>,
-    pub workspace: PathBuf,
-    /// A project of the registry, by id or name, in place of `workspace`.
-    pub project: Option<String>,
-    pub data_dir: Option<PathBuf>,
-    pub pass_env: Vec<String>,
-    /// Dependency caches commands build from offline (`--deps-cache`).
-    pub deps_cache: Vec<String>,
-    /// Hosts the agent may read web pages from.
-    pub allow_web: Vec<String>,
-    pub web_resolver: Option<String>,
-    /// The `[profile.NAME]` of the config to take defaults from.
-    pub profile: Option<String>,
-}
+pub use crate::serve::Options;
 
 /// Run the interface until the user quits. Returns the forks the user kept.
 pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
@@ -70,30 +57,7 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
         "molt needs a terminal for its interface; in scripts, use `molt do TASK`"
     );
     let stop = crate::stop_signal()?;
-    let (workspace, project) = agent::locate(opts.project.as_deref(), &opts.workspace, opts.config.is_some())?;
-    let path = workspace.to_str().context("the workspace path is not UTF-8")?.to_owned();
-    let mut cfg = agent::resolve_config(
-        opts.config.as_deref(),
-        &workspace,
-        opts.data_dir.as_deref(),
-        project.as_ref(),
-        opts.profile.as_deref(),
-    )?;
-    if let Some(shell) = cfg.service_mut("shell") {
-        shell.pass_env.extend(opts.pass_env);
-    }
-    agent::deps_cache(&mut cfg, &opts.deps_cache)?;
-    agent::environments(&mut cfg)?;
-    agent::mcp(&mut cfg)?;
-    agent::allow_web(&mut cfg, &opts.allow_web)?;
-    if let Some(resolver) = &opts.web_resolver {
-        cfg.web_resolver(resolver)?;
-    }
-    if std::env::var_os("RUST_LOG").is_none() {
-        for svc in &mut cfg.services {
-            svc.env.entry("RUST_LOG".into()).or_insert_with(|| "warn".into());
-        }
-    }
+    let (cfg, path, project) = crate::serve::configure(opts)?;
     std::fs::create_dir_all(&cfg.kernel.data_dir)
         .with_context(|| format!("data dir {}", cfg.kernel.data_dir.display()))?;
     // The services write their logs to stderr, which they share with molt;
@@ -221,12 +185,11 @@ async fn event_loop(
     }
     let data_dir = cfg.kernel.data_dir.clone();
     let (lister, root) = (tx.clone(), PathBuf::from(&workspace));
-    let checkpoints = agent::checkpoint_dir(&cfg);
-    // What stopped runs there are to go on with: read from their checkpoints, with no model call.
-    list_runs_later(&lister, checkpoints.clone(), &workspace);
     let mut saved_session = None;
     let mut backend = backend::Backend::start(cfg.clone(), workspace.clone(), tx, app.backend_generation).await?;
-    backend.send(&Action::StartSession).await?;
+    // What stopped runs there are to go on with: read from their checkpoints, with no model call.
+    backend.send(Action::ListRuns).await?;
+    backend.send(Action::StartSession).await?;
     let notice = Notice::from_env(|name| std::env::var(name).ok());
     let mut keep = Vec::new();
     let mut title = String::new();
@@ -285,7 +248,7 @@ async fn event_loop(
                     backend =
                         backend::Backend::start(cfg.clone(), workspace.clone(), lister.clone(), app.backend_generation)
                             .await?;
-                    backend.send(&Action::StartSession).await?;
+                    backend.send(Action::StartSession).await?;
                 }
                 Action::ShowLog => {
                     let (tx, path) = (lister.clone(), data_dir.join("tui.log"));
@@ -294,7 +257,6 @@ async fn event_loop(
                         let _ = tx.send(Msg::ServiceLog(result));
                     });
                 }
-                Action::ListRuns => list_runs_later(&lister, checkpoints.clone(), &workspace),
                 Action::ListFiles => {
                     let (tx, root) = (lister.clone(), root.clone());
                     tokio::task::spawn_blocking(move || {
@@ -348,7 +310,7 @@ async fn event_loop(
                     let result = step_aside(terminal, &pause, Path::new(&fork));
                     let _ = lister.send(Msg::ForkEdited { fork, result });
                 }
-                action => backend.send(&action).await?,
+                action => backend.send(action).await?,
             }
         }
         if app.quit {
@@ -368,8 +330,8 @@ async fn event_loop(
     Ok(keep)
 }
 
-/// Internal child entry point. Standard input/output are private framed pipes,
-/// not a terminal or the capability bus.
+/// The interface's own server (`molt ui-backend`): the config the interface
+/// resolved comes on its private pipe first, then the client protocol.
 pub async fn serve_backend() -> anyhow::Result<()> {
     backend::serve().await
 }
@@ -422,303 +384,6 @@ fn read_terminal(tx: UnboundedSender<Msg>, pause: Arc<Pause>) {
 /// hides them in what commands print.
 fn secrets_in_env() -> Vec<String> {
     std::env::vars().filter(|(name, value)| value.len() >= 8 && secret_name(name)).map(|(_, value)| value).collect()
-}
-
-/// How long an interrupt waits before it lists a fork's changes again,
-/// after the shell's grace for a stopped command (TERM, then KILL 500 ms on).
-const RELIST_AFTER: Duration = Duration::from_secs(1);
-
-/// What an interrupted attempt left in its fork.
-#[derive(Debug, PartialEq)]
-enum Leftover {
-    /// Changes beyond the check's own files: the attempt's work, to keep.
-    Work,
-    /// Nothing but the check's files.
-    Empty,
-    /// Its changes could not be listed, and the fork is still there: kept,
-    /// since it may hold work.
-    Unlisted(String),
-    /// Its changes could not be listed because the fork is gone.
-    Gone(String),
-}
-
-fn leftover(fork: &str, listed: anyhow::Result<Vec<String>>, check_files: &[String]) -> Leftover {
-    match listed {
-        Ok(paths) if paths.iter().any(|p| !check_files.contains(p)) => Leftover::Work,
-        Ok(_) => Leftover::Empty,
-        Err(e) if Path::new(fork).exists() => Leftover::Unlisted(format!("{e:#}")),
-        Err(e) => Leftover::Gone(format!("{e:#}")),
-    }
-}
-
-struct Runtime {
-    cfg: Arc<Config>,
-    workspace: String,
-    tx: UnboundedSender<Msg>,
-    sessions: UnboundedSender<Result<Arc<Session>, String>>,
-    session: Option<Arc<Session>>,
-    /// A session is starting; its result comes on `sessions`.
-    starting: bool,
-    /// Calls in flight, stopped on an interrupt.
-    work: Vec<JoinHandle<()>>,
-    /// The user's commands running, by trace: what stops each.
-    commands: std::collections::HashMap<String, tokio_util::sync::CancellationToken>,
-    /// The work tree as it was when the task `.0` started, for `/commit on`.
-    before: Option<(String, anyhow::Result<crate::git::Before>)>,
-}
-
-impl Runtime {
-    fn started(&mut self, session: Result<Arc<Session>, String>) -> Msg {
-        self.starting = false;
-        match session {
-            Ok(session) => {
-                let msg = Msg::SessionUp {
-                    versions: session.versions().to_vec(),
-                    memory_problem: session.memory_problem(),
-                    default_model: session.default_model().map(str::to_owned),
-                };
-                self.session = Some(session);
-                msg
-            }
-            Err(e) => Msg::SessionFailed(e),
-        }
-    }
-
-    fn exec(&mut self, action: Action) {
-        self.work.retain(|w| !w.is_finished());
-        match action {
-            Action::StartSession => {
-                if self.starting || self.session.is_some() {
-                    return;
-                }
-                self.starting = true;
-                let (cfg, workspace, tx, sessions) =
-                    (self.cfg.clone(), self.workspace.clone(), self.tx.clone(), self.sessions.clone());
-                tokio::spawn(async move {
-                    let (events, mut progress) = mpsc::unbounded_channel();
-                    tokio::spawn(async move {
-                        while let Some(event) = progress.recv().await {
-                            if tx.send(Msg::Progress(event)).is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    let session = Session::start(&cfg, &workspace, events).await;
-                    let _ = sessions.send(session.map(Arc::new).map_err(|e| format!("{e:#}")));
-                });
-            }
-            Action::Design { req, trace } => self.call(move |s| async move {
-                let result = s.design(&req, &trace).await.map_err(|e| format!("{e:#}"));
-                // Which check files would replace the workspace's own, for confirm mode to stop on.
-                let existing = match &result {
-                    Ok(d) => {
-                        let root = Path::new(s.workspace());
-                        d.files
-                            .iter()
-                            .filter(|f| root.join(&f.path).symlink_metadata().is_ok())
-                            .map(|f| f.path.clone())
-                            .collect()
-                    }
-                    Err(_) => Vec::new(),
-                };
-                Msg::Designed { trace, result, existing }
-            }),
-            Action::Run { req, trace } => self.call(move |s| async move {
-                let result = s.run(&req, &trace).await.map_err(|e| format!("{e:#}"));
-                Msg::Ran { trace, result: Box::new(result) }
-            }),
-            Action::Plan { req, trace } => self.call(move |s| async move {
-                let result = s.plan(&req, &trace).await.map_err(|e| format!("{e:#}"));
-                Msg::Planned { trace, result: Box::new(result) }
-            }),
-            Action::Control { trace, action } => self.call(move |s| async move {
-                let result = s.control(&trace, action.clone()).await.map_err(|e| format!("{e:#}"));
-                Msg::Controlled { trace, action, result }
-            }),
-            Action::Learn { trace, model } => self.call(move |s| async move {
-                let result = s.learn(&trace, model).await;
-                Msg::Learned { trace, result }
-            }),
-            Action::Diff { fork } => self.call(move |s| async move {
-                let result = s.diff(&fork).await.map_err(|e| format!("{e:#}"));
-                Msg::Diff { fork, result }
-            }),
-            Action::Apply { fork } => self.call(move |s| async move {
-                Msg::Applied(s.apply(&fork).await.map(|_| ()).map_err(|e| format!("{e:#}")))
-            }),
-            Action::ApplyOnly { fork, paths } => self.call(move |s| async move {
-                Msg::Applied(s.apply_only(&fork, &paths).await.map(|_| ()).map_err(|e| format!("{e:#}")))
-            }),
-            Action::Recheck { fork, only, check } => self.call(move |s| async move {
-                let result = s.recheck(&fork, only.as_deref(), check.as_ref()).await.map_err(|e| format!("{e:#}"));
-                Msg::Rechecked { fork, only, result }
-            }),
-            Action::Undo { run } => {
-                let (session, tx) = (self.session.clone(), self.tx.clone());
-                // The interface waits for both Git and memory before quitting.
-                // Like commits, this is not among the interruptible attempt work.
-                tokio::spawn(async move {
-                    let result = match session {
-                        Some(session) => session.undo(run).await.map_err(|e| format!("{e:#}")),
-                        None => Err("the services are not up".into()),
-                    };
-                    let _ = tx.send(Msg::Undone(result));
-                });
-            }
-            Action::PrepareCommit { trace } => {
-                self.before = Some((trace.to_string(), crate::git::Before::look(Path::new(&self.workspace))));
-            }
-            Action::Commit { trace, task, resp } => {
-                let before = match self.before.take() {
-                    Some((run, before)) if run == trace.as_str() => before,
-                    other => {
-                        self.before = other;
-                        Err(anyhow::anyhow!("/commit was turned on after the task started"))
-                    }
-                };
-                let tx = self.tx.clone();
-                // Not among the interruptible work: a commit half made would leave the index behind.
-                tokio::spawn(async move {
-                    let made = tokio::task::spawn_blocking(move || before?.commit(&resp, trace.as_str(), &task, None))
-                        .await
-                        .map_err(anyhow::Error::from)
-                        .and_then(|made| made);
-                    let _ = tx.send(Msg::Committed(made.map_err(|e| format!("{e:#}"))));
-                });
-            }
-            Action::Discard { fork } => {
-                self.call(move |s| async move { Msg::Discarded(s.discard(&fork).await.map_err(|e| format!("{e:#}"))) })
-            }
-            Action::LoadNotes { query } => self
-                .call(move |s| async move { Msg::Notes(s.inspect_notes(&query).await.map_err(|e| format!("{e:#}"))) }),
-            Action::Forget { id, reason } => self.call(move |s| async move {
-                let result = s.forget(&id, &reason).await.map_err(|e| format!("{e:#}"));
-                Msg::Forgot { id, result }
-            }),
-            Action::Remember { text } => self.call(move |s| async move {
-                Msg::Remembered(s.remember(&text).await.map(|r| r.note.id).map_err(|e| format!("{e:#}")))
-            }),
-            Action::Promote { id, reason } => self.call(move |s| async move {
-                let result = s.promote(&id, &reason).await.map(|n| n.id).map_err(|e| format!("{e:#}"));
-                Msg::Promoted { id, result }
-            }),
-            Action::ChangeNote { review, text } => self.call(move |s| async move {
-                Msg::ChangedNote(s.change_note(review, text).await.map_err(|e| format!("{e:#}")))
-            }),
-            Action::UsedNotes { run } => self.call(move |s| async move {
-                let result = s.used_notes(&run).await.map_err(|e| format!("{e:#}"));
-                Msg::UsedNotes { run, result }
-            }),
-
-            Action::Command { command, trace } => {
-                let stop = tokio_util::sync::CancellationToken::new();
-                self.commands.retain(|_, stop| !stop.is_cancelled());
-                self.commands.insert(trace.to_string(), stop.clone());
-                self.call(move |s| async move {
-                    let result = s.command(&command, &trace, stop).await.map_err(|e| format!("{e:#}"));
-                    Msg::CommandRan { trace, result }
-                })
-            }
-            Action::StopCommand { trace } => {
-                if let Some(stop) = self.commands.remove(trace.as_str()) {
-                    stop.cancel();
-                }
-            }
-            Action::DropRun { run } => self.call(move |s| async move {
-                let result = s.drop_run(&run).await.map_err(|e| format!("{e:#}"));
-                Msg::RunDropped { run, result }
-            }),
-            Action::Interrupt { keep, attempts, check_files, drop_run } => {
-                for work in self.work.drain(..) {
-                    work.abort();
-                }
-                let tx = self.tx.clone();
-                match self.session.take() {
-                    Some(session) => {
-                        tokio::spawn(async move {
-                            let mut listed = Vec::new();
-                            for fork in &attempts {
-                                listed.push(session.changes(fork).await);
-                            }
-                            if listed.iter().any(Result::is_err) {
-                                // A command the attempt started may still be writing in its fork until the
-                                // shell has stopped it: look once more after that.
-                                tokio::time::sleep(RELIST_AFTER).await;
-                                for (fork, result) in attempts.iter().zip(listed.iter_mut()) {
-                                    if result.is_err() {
-                                        *result = session.changes(fork).await;
-                                    }
-                                }
-                            }
-                            let (mut kept, mut notes) = (Vec::new(), Vec::new());
-                            for (fork, result) in attempts.into_iter().zip(listed) {
-                                match leftover(&fork, result, &check_files) {
-                                    Leftover::Work => kept.push(fork),
-                                    Leftover::Empty => {
-                                        // The planner left it to us; a scratch dir outside the data dir is not
-                                        // cleaned up at shutdown.
-                                        if let Err(e) = session.discard(&fork).await {
-                                            tracing::warn!("could not drop {fork}: {e:#}");
-                                        }
-                                    }
-                                    Leftover::Unlisted(e) => {
-                                        tracing::warn!("could not list the changes in {fork}: {e}");
-                                        notes.push(format!(
-                                            "the changes in {fork} could not be listed, so it is kept in case it holds work: {e}"
-                                        ));
-                                        kept.push(fork);
-                                    }
-                                    Leftover::Gone(e) => {
-                                        tracing::warn!("could not list the changes in {fork}: {e}");
-                                        notes.push(format!("{fork} is gone, with whatever it held: {e}"));
-                                    }
-                                }
-                            }
-                            let all: Vec<String> = keep.into_iter().chain(kept.iter().cloned()).collect();
-                            session.shutdown_dropping(&all, drop_run.as_deref()).await;
-                            let _ = tx.send(Msg::Stopped { kept, notes });
-                        });
-                    }
-                    None if self.starting => {}
-                    None => {
-                        let _ = tx.send(Msg::Stopped { kept: Vec::new(), notes: Vec::new() });
-                    }
-                }
-            }
-            // The loop handles these: they need the terminal.
-            Action::Quit { .. }
-            | Action::RestartSession { .. }
-            | Action::ShowLog
-            | Action::Edit { .. }
-            | Action::Redraw
-            | Action::Suspend
-            | Action::SaveTheme(_)
-            | Action::Alert { .. }
-            | Action::ListFiles
-            | Action::ListRuns
-            | Action::ReadAudit { .. }
-            | Action::Export { .. }
-            | Action::Changes
-            | Action::FileDiff { .. }
-            | Action::EditFork { .. } => {}
-        }
-    }
-
-    /// Make a call on the session in a task of its own; its message goes to the app.
-    fn call<F, Fut>(&mut self, work: F)
-    where
-        F: FnOnce(Arc<Session>) -> Fut + Send + 'static,
-        Fut: Future<Output = Msg> + Send + 'static,
-    {
-        let tx = self.tx.clone();
-        let Some(session) = self.session.clone() else {
-            let _ = tx.send(Msg::SessionFailed("the services are not up".into()));
-            return;
-        };
-        self.work.push(tokio::spawn(async move {
-            let _ = tx.send(work(session).await);
-        }));
-    }
 }
 
 /// `text` as the user leaves it in `$VISUAL` or `$EDITOR` (see
@@ -859,40 +524,6 @@ fn suspend(terminal: &mut DefaultTerminal, pause: &Pause) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// List the stopped runs of `workspace` in `dir` off the loop; they come as [`Msg::Runs`].
-fn list_runs_later(tx: &UnboundedSender<Msg>, dir: Option<PathBuf>, workspace: &str) {
-    let (tx, workspace) = (tx.clone(), workspace.to_owned());
-    tokio::task::spawn_blocking(move || {
-        let _ = tx.send(Msg::Runs(dir.map_or_else(Vec::new, |dir| list_runs(&dir, &workspace))));
-    });
-}
-
-/// The runs of `workspace` that stopped with a checkpoint in `dir`, newest
-/// first, without their conversations; one whose checkpoint cannot be read
-/// comes with why.
-fn list_runs(dir: &Path, workspace: &str) -> Vec<app::Stopped> {
-    molt_planner::checkpoint::list(dir)
-        .into_iter()
-        .filter_map(|(run, saved)| match saved {
-            Ok(mut saved) if saved.request.workspace == workspace => {
-                let gone = saved
-                    .attempts
-                    .iter()
-                    .filter(|a| a.end.is_none())
-                    .filter_map(|a| a.fork.clone())
-                    .filter(|fork| !Path::new(fork).is_dir())
-                    .collect();
-                for attempt in &mut saved.attempts {
-                    attempt.messages = Vec::new();
-                }
-                Some(app::Stopped { run, saved: Ok(saved), gone })
-            }
-            Ok(_) => None,
-            Err(e) => Some(app::Stopped { run, saved: Err(e), gone: Vec::new() }),
-        })
-        .collect()
-}
-
 /// The workspace's files for `@` completion, as the services see them:
 /// `.gitignore` applies, and `.git` and `.molt` are left out.
 fn list_files(root: &Path) -> Msg {
@@ -998,119 +629,6 @@ mod tests {
         let both = |v: &str| Some(if v == "VISUAL" { " " } else { "hx" }.to_owned());
         assert_eq!(pick_editor(both, |_| true).as_deref(), Ok("hx"), "a blank $VISUAL counts as unset");
         assert!(on_path("sh") && !on_path("molt-no-such-editor"));
-    }
-
-    #[test]
-    fn an_interrupted_fork_whose_changes_cannot_be_listed_is_kept_while_it_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let fork = dir.path().to_str().unwrap();
-        let check = vec!["tests/check.rs".to_owned()];
-        let unreadable = || Err(anyhow::anyhow!("fs.diff failed: reading the fork: No such file or directory"));
-        assert_eq!(
-            leftover(fork, unreadable(), &check),
-            Leftover::Unlisted("fs.diff failed: reading the fork: No such file or directory".into())
-        );
-        assert!(matches!(leftover("/nowhere/fork-gone", unreadable(), &check), Leftover::Gone(_)));
-        assert_eq!(leftover(fork, Ok(vec!["src/lib.rs".into()]), &check), Leftover::Work);
-        assert_eq!(leftover(fork, Ok(check.clone()), &check), Leftover::Empty, "the check's own files are no work");
-    }
-
-    #[tokio::test]
-    async fn the_runtime_commits_what_the_task_merged_against_the_tree_it_started_from() {
-        use molt_api::fs::{Change, ChangeKind};
-        use molt_api::planner::{Outcome, RunResponse};
-        use molt_proto::TraceId;
-        let git = |dir: &Path, args: &[&str]| {
-            let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-            String::from_utf8(out.stdout).unwrap()
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        git(d, &["init", "-q", "-b", "main"]);
-        for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")] {
-            git(d, &["config", key, value]);
-        }
-        std::fs::write(d.join("a.txt"), "a\n").unwrap();
-        git(d, &["add", "."]);
-        git(d, &["commit", "-q", "-m", "start"]);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let (sessions, _started) = mpsc::unbounded_channel();
-        let workspace = d.to_str().unwrap().to_owned();
-        let mut rt = Runtime {
-            cfg: Arc::new(Config::default()),
-            workspace,
-            tx,
-            sessions,
-            session: None,
-            starting: false,
-            work: Vec::new(),
-            commands: Default::default(),
-            before: None,
-        };
-        let resp = |path: &str| RunResponse {
-            outcome: Outcome::Unverified,
-            check: None,
-            winner: Some(0),
-            summary: "Write b".into(),
-            changes: vec![Change { path: path.into(), kind: ChangeKind::Added }],
-            left_out: None,
-            patch: String::new(),
-            patch_truncated: false,
-            applied: true,
-            fork: None,
-            review: None,
-            attempts: vec![],
-            usage: Default::default(),
-            cost_usd: 0.0,
-            uncounted_calls: 0,
-            checkpoint: None,
-            requirements: vec![],
-            selection: Default::default(),
-            rubric: vec![],
-            judgement: vec![],
-            dispute: None,
-            verification: None,
-            workflow: None,
-            conversation: Vec::new(),
-            prompts: Vec::new(),
-        };
-        let trace = TraceId::random();
-        rt.exec(Action::PrepareCommit { trace: trace.clone() });
-        std::fs::write(d.join("b.txt"), "b\n").unwrap();
-        rt.exec(Action::Commit { trace: trace.clone(), task: "write b".into(), resp: Box::new(resp("b.txt")) });
-        let Some(Msg::Committed(Ok(Some(made)))) = rx.recv().await else { panic!("not committed") };
-        assert_eq!((made.subject.as_str(), made.branch.as_deref()), ("Write b", Some("main")));
-        assert_eq!(git(d, &["show", "--name-only", "--format=", "HEAD"]), "b.txt\n");
-        let trailer = git(d, &["log", "-1", "--format=%(trailers:key=Molt-Run,valueonly)"]);
-        assert_eq!(trailer.trim(), trace.as_str());
-        // Turned on after the task started: nothing was looked at for it.
-        rt.exec(Action::Commit { trace: TraceId::random(), task: "late".into(), resp: Box::new(resp("b.txt")) });
-        let Some(Msg::Committed(Err(e))) = rx.recv().await else { panic!("committed") };
-        assert!(e.contains("turned on after the task started"), "{e}");
-    }
-    #[test]
-    fn stopped_runs_are_this_workspaces_say_which_forks_are_gone_and_name_damage() {
-        use molt_api::planner::RunRequest;
-        use molt_planner::checkpoint::Saved;
-        let dir = tempfile::tempdir().unwrap();
-        let fork = dir.path().join("fork-kept");
-        std::fs::create_dir(&fork).unwrap();
-        let mut here = Saved::new("trace_here", RunRequest::new("t", "/w"));
-        here.attempt(0).fork = Some(fork.to_str().unwrap().into());
-        here.attempt(0).messages = vec![serde_json::json!({"role": "user", "content": "long"})];
-        here.attempt(1).fork = Some("/nowhere/fork-gone".into());
-        let other = Saved::new("trace_other", RunRequest::new("t", "/elsewhere"));
-        for saved in [&here, &other] {
-            std::fs::write(dir.path().join(format!("{}.json", saved.run)), serde_json::to_vec(saved).unwrap()).unwrap();
-        }
-        std::fs::write(dir.path().join("trace_bad.json"), "{\"format\":1,").unwrap();
-        let mut runs = list_runs(dir.path(), "/w");
-        runs.sort_by(|a, b| a.run.cmp(&b.run));
-        assert_eq!(runs.iter().map(|r| r.run.as_str()).collect::<Vec<_>>(), ["trace_bad", "trace_here"]);
-        assert!(runs[0].saved.as_ref().unwrap_err().contains("damaged"));
-        assert_eq!(runs[1].gone, ["/nowhere/fork-gone"]);
-        assert!(runs[1].saved.as_ref().unwrap().attempts[0].messages.is_empty(), "conversations stay on disk");
     }
 
     #[test]

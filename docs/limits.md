@@ -59,3 +59,4 @@ the confirmation screen and session total, and starts no attempts when design
 cost is unknown or the remainder is exhausted. The new fields have serde
 defaults for reading older replies; older consumers should be updated to
 handle failed design replies explicitly and honor the remaining limit.
+- `molt serve` ([serve.md](serve.md)) serves one workspace and one session at a time, on a Unix socket or a pipe only, and clients cannot share a session. Its progress events name a tool call in one line and do not carry the call's result or an attempt's diff as it goes; ask `result.diff` for that. No JSON Schema or client library is generated from the protocol's types yet, and the interface always starts a server of its own rather than attaching to a running one.
