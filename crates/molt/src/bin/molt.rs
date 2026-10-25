@@ -46,6 +46,10 @@ enum Cmd {
     /// protocol (docs/serve.md): on a Unix socket only you can open, or on
     /// standard input and output with --stdio. The interface is one such client.
     Serve(ServeArgs),
+    /// Work for an editor that speaks the Agent Client Protocol, such as Zed
+    /// or a JetBrains IDE (docs/acp.md): the editor starts it and talks to it
+    /// on standard input and output. A result is applied only when you allow it there.
+    Acp(AcpArgs),
     /// Start the kernel and the configured services; stop on Ctrl-C, SIGTERM or SIGHUP.
     Run,
     /// Carry out a task in a workspace with the agent services, verified by a done-check.
@@ -387,6 +391,26 @@ struct ServeArgs {
     /// Serve one client on standard input and output instead of a socket.
     #[arg(long)]
     stdio: bool,
+}
+
+#[derive(Args)]
+struct AcpArgs {
+    /// Pass this variable from your environment to the commands the agent
+    /// runs (repeatable).
+    #[arg(long, value_name = "NAME", value_parser = env_name)]
+    pass_env: Vec<String>,
+    /// Let commands build offline from your dependency cache: `cargo` mounts
+    /// $CARGO_HOME/registry and git (default ~/.cargo) read-only.
+    #[arg(long, value_name = "KIND", value_parser = ["cargo"])]
+    deps_cache: Vec<String>,
+    /// Let the agent read web pages from this host (repeatable): `docs.rs`,
+    /// or `*.python.org` for the hosts below it.
+    #[arg(long, value_name = "HOST")]
+    allow_web: Vec<String>,
+    /// DNS for web pages: system (default), or doh:https://PUBLIC_IP/dns-query
+    /// using a DNS JSON HTTPS endpoint such as Cloudflare's 1.1.1.1.
+    #[arg(long, value_name = "RESOLVER")]
+    web_resolver: Option<String>,
 }
 
 #[derive(Args)]
@@ -746,6 +770,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                 | Cmd::Prices { .. }
                 | Cmd::Ui(_)
                 | Cmd::Serve(_)
+                | Cmd::Acp(_)
         ) {
             "warn"
         } else {
@@ -815,6 +840,18 @@ async fn main() -> anyhow::Result<ExitCode> {
             } else {
                 molt::serve::listen(server, &socket, stop).await?;
             }
+        }
+        Cmd::Acp(args) => {
+            let stop = molt::stop_signal()?;
+            let opts = molt::acp::Options {
+                config: cli.config,
+                profile: cli.profile,
+                pass_env: args.pass_env,
+                deps_cache: args.deps_cache,
+                allow_web: args.allow_web,
+                web_resolver: args.web_resolver,
+            };
+            molt::acp::stdio(opts, stop).await?;
         }
         Cmd::Run => {
             let stop = molt::stop_signal()?;

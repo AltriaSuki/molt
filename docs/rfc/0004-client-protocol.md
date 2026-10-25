@@ -196,6 +196,30 @@ process speaking ACP on one side and this protocol on the other, to a
 | `session/request_permission` | asked before `result.apply`, and for each `asked` event, whose answer goes to `question.answer` |
 | `session/cancel` | `task.stop` with the run's attempt forks, which keeps their work |
 
+`molt acp` (#168, [acp.md](../acp.md)) is this adapter. Where it settles
+what the table leaves open:
+
+- **One server per folder, not per session.** The data dir allows one
+  kernel, so ACP sessions in the same `cwd` share its server and its
+  protocol session, one task at a time. The server runs in the adapter's
+  process, on an in-memory pipe, with the config resolved for that folder;
+  the adapter reaches it only through this protocol.
+- **`model_text` goes out as thought chunks**, `agent_thought_chunk`, each
+  speaker's text under its name, since the attempts' calls run side by
+  side. The agent's message is the result's summary and outcome.
+- **The result is shown as ACP diffs** (the workspace's text and the
+  fork's, read by the adapter as any local program could), with the patch
+  for what it cannot show, in a pending tool call that the permission
+  prompt names. Its options are `apply` (`allow_once`), `keep` and
+  `discard` (`reject_once`): only `apply` leads to `result.apply`.
+- **An `asked` event** is a permission prompt with the question's options
+  and one that lets the attempt decide; ACP version 1 has no free-text
+  answer.
+- **The run's steps** go out as an ACP plan, from the workflow `routed`
+  names; `check_ran` is a tool call of its own.
+- **After `session/cancel`** the next prompt opens a new protocol session,
+  since `task.stop` closes it.
+
 ## Compatibility
 
 - The parameters and results here follow the repository's rule for wire

@@ -601,7 +601,7 @@ pub fn memory_model(asked: Option<&str>, attempts: Option<&str>) -> Option<Strin
 /// there is nothing to learn from; or, since learning is a model call too
 /// and the run's budget covers it, the budget is spent or what the run
 /// spent is not all known.
-fn skip_learning(resp: &RunResponse, budget_usd: Option<f64>) -> Option<String> {
+pub(crate) fn skip_learning(resp: &RunResponse, budget_usd: Option<f64>) -> Option<String> {
     if resp.outcome == molt_api::planner::Outcome::Failed && resp.usage == molt_api::model::Usage::default() {
         return Some("skipped: the run failed before any model call was answered".to_owned());
     }

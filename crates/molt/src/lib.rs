@@ -2,6 +2,7 @@
 //! transport, installs the configured services and supervises them. The
 //! [`agent`] module runs one task through them for `molt do`.
 
+pub mod acp;
 pub mod agent;
 pub mod agent_skills;
 pub mod config;
