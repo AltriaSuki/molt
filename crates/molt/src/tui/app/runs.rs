@@ -7,6 +7,11 @@ use molt_api::planner::Resume;
 /// A stopped run of the workspace, as `runs.list` answers.
 pub use crate::protocol::StoppedRun as Stopped;
 
+/// Marks the runs of this interface's session in `/runs`.
+const HISTORY_MARK: &str = "•";
+/// The most runs `/runs` shows.
+pub const HISTORY: usize = 10;
+
 /// Whether a task run with `workflow` keeps a checkpoint: every one that
 /// changes things does. Under `auto`, the planner keeps none when it picks
 /// one that only reads.
@@ -118,9 +123,10 @@ impl App {
     pub(super) fn runs_command(&mut self, arg: &str) -> Vec<Action> {
         let (command, run) = arg.split_once(' ').map_or((arg, ""), |(c, r)| (c, r.trim()));
         match command {
+            // The project's latest runs, then the ones that can go on.
             "" => {
                 self.runs_asked = true;
-                vec![Action::ListRuns]
+                vec![Action::RunHistory]
             }
             "resume" => self.resume_run(run),
             "discard" => self.discard_run(run),
@@ -238,6 +244,44 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// The latest runs of the project, as `molt runs` has them; then the
+    /// stopped ones are asked for.
+    pub(super) fn listed_history(&mut self, listed: Result<Vec<crate::runs::Run>, String>) -> Vec<Action> {
+        use crate::runs as history;
+        match listed {
+            Err(e) => self.error("the runs could not be listed", &scrub(&e, &self.secrets)),
+            Ok(listed) if listed.is_empty() => self.push(Line::from(span("no runs in this project yet", Tone::Dim))),
+            Ok(listed) => {
+                let heading = format!(
+                    "the project's latest runs, oldest first ({} this session's; `molt runs` lists them all):",
+                    HISTORY_MARK
+                );
+                self.push(Line::from(span(heading, Tone::Dim)));
+                for run in &listed {
+                    let mark =
+                        if run.session.as_deref() == Some(self.run_session.as_str()) { HISTORY_MARK } else { " " };
+                    let id: String = run.run.chars().take(14).collect();
+                    let line = format!(
+                        "  {mark} {id}  {}  {:<11}  {:<9}  {:<7}  {:<9}  {}",
+                        history::when(run.started_ms),
+                        run.result.name(),
+                        history::cost(run.cost_usd, run.uncounted_calls),
+                        history::learned(run.learning.as_ref()),
+                        history::applied_name(run),
+                        history::first_line(&run.task, 50),
+                    );
+                    let tone = match run.result {
+                        history::Status::Passed | history::Status::Judged => Tone::Plain,
+                        history::Status::Running | history::Status::Unverified => Tone::Dim,
+                        _ => Tone::Warn,
+                    };
+                    self.push(Line::from(span(clean_line(&scrub(&line, &self.secrets)), tone)));
+                }
+            }
+        }
+        vec![Action::ListRuns]
     }
 
     pub(super) fn listed_runs(&mut self, runs: Vec<Stopped>) {
@@ -387,7 +431,8 @@ mod tests {
         let listed = || vec![stopped_run("trace_cli", req, 0.5, 2)];
         app.update(Msg::Runs(listed()));
         assert!(log(&app).contains("1 stopped runs in this workspace can go on"), "{}", log(&app));
-        assert_eq!(type_in(&mut app, "/runs"), [Action::ListRuns]);
+        assert_eq!(type_in(&mut app, "/runs"), [Action::RunHistory]);
+        assert_eq!(app.update(Msg::RunHistory(Ok(Vec::new()))), [Action::ListRuns], "then the stopped ones");
         app.update(Msg::Runs(listed()));
         assert!(log(&app).contains("  trace_cli  "), "{}", log(&app));
         assert_eq!(type_in(&mut app, "/runs discard trace_cli"), [Action::DropRun { run: "trace_cli".into() }]);
@@ -397,6 +442,54 @@ mod tests {
         assert_eq!(app.uncounted_calls, 2, "calls unanswered when it stopped are not free");
         assert!(type_in(&mut app, "/runs resume trace_cli").is_empty());
         assert!(app.flash.as_deref().is_some_and(|f| f.contains("no stopped run trace_cli")), "{:?}", app.flash);
+    }
+
+    #[test]
+    fn the_interfaces_runs_carry_its_session_and_runs_lists_the_projects_latest_with_this_sessions_marked() {
+        let mut app = App::new("/w", None);
+        app.run_session = "sess_here".into();
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "first task");
+        let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.session.as_deref(), Some("sess_here"));
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(passed(true, None))) });
+
+        let listed = |id: &str, session: &str, result: crate::runs::Status| crate::runs::Run {
+            run: id.into(),
+            started_ms: 0,
+            task: format!("task of {id}\nmore"),
+            workspace: "/w".into(),
+            session: Some(session.into()),
+            workflow: None,
+            plan: false,
+            result,
+            verification: None,
+            cost_usd: None,
+            uncounted_calls: 0,
+            duration_ms: None,
+            applied: crate::runs::Applied::Unknown,
+            fork: None,
+            changed: 0,
+            learning: None,
+            resumable: false,
+            summary: String::new(),
+            at: 0,
+        };
+        assert_eq!(type_in(&mut app, "/runs"), [Action::RunHistory]);
+        let history = vec![
+            listed("trace_before", "sess_other", crate::runs::Status::Interrupted),
+            listed(trace.as_str(), "sess_here", crate::runs::Status::Passed),
+        ];
+        assert_eq!(app.update(Msg::RunHistory(Ok(history))), [Action::ListRuns]);
+        let shown = log(&app);
+        let line = |id: &str| shown.lines().find(|l| l.contains(id)).unwrap_or_default().to_owned();
+        assert!(line("trace_before").contains("interrupted") && line("trace_before").contains("?"), "{shown}");
+        assert!(!line("trace_before").contains(HISTORY_MARK), "{shown}");
+        let here: String = trace.as_str().chars().take(14).collect();
+        assert!(line(&here).contains(HISTORY_MARK) && line(&here).contains("task of"), "{shown}");
+        app.update(Msg::RunHistory(Err("audit.jsonl: denied".into())));
+        assert!(log(&app).contains("the runs could not be listed"), "{}", log(&app));
     }
 
     #[test]

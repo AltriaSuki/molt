@@ -16,6 +16,7 @@ mod progress;
 mod queue;
 mod retry;
 mod runs;
+pub(super) use runs::HISTORY;
 mod settings;
 mod shell;
 mod status;
@@ -255,6 +256,9 @@ pub enum Action {
     /// List the stopped runs of the workspace, from their checkpoints; they
     /// come back as [`Msg::Runs`]. Nothing is started.
     ListRuns,
+    /// List the project's runs from its audit log (`molt runs`); they come
+    /// back as [`Msg::RunHistory`].
+    RunHistory,
     /// Drop the stopped run `run`, its forks and its checkpoint; the answer
     /// comes back as [`Msg::RunDropped`].
     DropRun {
@@ -421,6 +425,8 @@ pub enum Msg {
     },
     /// The stopped runs of the workspace, newest first.
     Runs(Vec<runs::Stopped>),
+    /// The project's latest runs, oldest first, as `molt runs` lists them.
+    RunHistory(Result<Vec<crate::runs::Run>, String>),
     RunDropped {
         run: String,
         result: Result<(), String>,
@@ -788,6 +794,9 @@ pub struct App {
     stopped_runs: Vec<runs::Stopped>,
     /// `/runs` asked for the list, to show in full.
     runs_asked: bool,
+    /// The session this interface's runs belong to: one each time it is
+    /// opened, unless `--session` names one.
+    pub run_session: String,
     /// The run the last interface stopped in, until it is resumed or dropped.
     restored: Option<super::saved::Active>,
     /// Of the runs that stopped with a checkpoint, what the session total
@@ -898,6 +907,7 @@ impl App {
             earlier: Vec::new(),
             continuation: None,
             stopped_runs: Vec::new(),
+            run_session: crate::runs::new_session(),
             runs_asked: false,
             restored: None,
             settled_runs: Default::default(),
@@ -1222,6 +1232,7 @@ impl App {
                 self.listed_runs(runs);
                 Vec::new()
             }
+            Msg::RunHistory(result) => self.listed_history(result),
             Msg::RunDropped { run, result } => self.run_dropped(run, result),
             Msg::Learned { trace, result } => {
                 self.learning.remove(trace.as_str());

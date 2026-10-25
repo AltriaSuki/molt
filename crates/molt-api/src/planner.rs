@@ -175,6 +175,11 @@ pub struct RunRequest {
     /// result, when there is one, is where the attempt works.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continues: Option<Continuation>,
+    /// The session the run belongs to: a name that groups the runs of one
+    /// piece of work (`molt runs --session`). The planner does not read it;
+    /// it is on the request so that the audit log has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// What a task goes on from (see [`RunRequest::continues`]).
@@ -298,6 +303,7 @@ impl RunRequest {
             files: Vec::new(),
             workflow: None,
             continues: None,
+            session: None,
         }
     }
 }

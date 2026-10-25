@@ -138,6 +138,22 @@ fn install_hooks(cfg: &mut Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The data dir `molt do` keeps its state in for `workspace`: the one of
+/// the config file at `path` when one is given, else `project`'s, else the
+/// default one; `data_dir` in place of either, when given. Nothing is created.
+pub fn data_dir_for(
+    path: Option<&Path>,
+    workspace: &Path,
+    data_dir: Option<&Path>,
+    project: Option<&Project>,
+) -> anyhow::Result<PathBuf> {
+    match (path, data_dir) {
+        (_, Some(dir)) => Ok(dir.to_path_buf()),
+        (Some(path), None) => Ok(Config::load(path)?.kernel.data_dir),
+        (None, None) => chosen_data_dir(workspace, None, project),
+    }
+}
+
 /// `data_dir`, else `project`'s, else the default one of `workspace`.
 fn chosen_data_dir(workspace: &Path, data_dir: Option<&Path>, project: Option<&Project>) -> anyhow::Result<PathBuf> {
     match (data_dir, project) {
@@ -1502,7 +1518,7 @@ pub fn outcome_name(outcome: Outcome) -> &'static str {
     }
 }
 
-fn status_name(status: AttemptStatus) -> &'static str {
+pub fn status_name(status: AttemptStatus) -> &'static str {
     match status {
         AttemptStatus::Passed => "passed",
         AttemptStatus::Failed => "failed",
@@ -1511,7 +1527,7 @@ fn status_name(status: AttemptStatus) -> &'static str {
     }
 }
 
-fn change_name(kind: ChangeKind) -> &'static str {
+pub fn change_name(kind: ChangeKind) -> &'static str {
     match kind {
         ChangeKind::Added => "added",
         ChangeKind::Modified => "modified",

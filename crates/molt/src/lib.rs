@@ -14,6 +14,7 @@ mod lock;
 pub mod project;
 pub mod prompts;
 pub mod protocol;
+pub mod runs;
 pub mod serve;
 pub mod session;
 pub mod tui;

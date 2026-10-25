@@ -103,6 +103,8 @@ impl Options {
             allow_web: self.allow_web.clone(),
             web_resolver: self.web_resolver.clone(),
             profile: self.profile.clone(),
+            // Each ACP session names its own runs' session.
+            session: None,
         }
     }
 }
@@ -1212,6 +1214,8 @@ impl Turn<'_> {
         req.keep_cancelled_forks = true;
         req.workflow = Some(workflow::AUTO.to_owned());
         req.earlier = earlier;
+        // The editor's session is the runs' session.
+        req.session = Some(self.session.id.clone());
         req.stream = defaults.stream.unwrap_or(true);
         if let Some(n) = defaults.attempts {
             req.attempts = n;
