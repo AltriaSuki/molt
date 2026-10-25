@@ -64,6 +64,50 @@ impl Role {
     }
 }
 
+/// The variable that names a model for each role ([`role_models`]), read
+/// by the planner and by memory.
+pub const ROLE_MODELS_ENV: &str = "MOLT_ROLE_MODELS";
+
+/// The roles [`role_models`] may name. The attempts are not one of them:
+/// their model is the run's (`--model`).
+pub const ROUTED_ROLES: [Role; 8] = [
+    Role::Designer,
+    Role::Vetter,
+    Role::Reviewer,
+    Role::Judge,
+    Role::Router,
+    Role::Explorer,
+    Role::Compactor,
+    Role::Memory,
+];
+
+/// A JSON object of role name to model, such as
+/// `{"reviewer":"haiku","explorer":"haiku"}`: the model a role's calls go
+/// to when its declaration names none. Refused: a role not of
+/// [`ROUTED_ROLES`], and an empty model.
+pub fn role_models(text: &str) -> Result<std::collections::BTreeMap<Role, String>, String> {
+    let named: std::collections::BTreeMap<String, String> = serde_json::from_str(text)
+        .map_err(|e| format!("{ROLE_MODELS_ENV} must be a JSON object of role names to models: {e}"))?;
+    let mut models = std::collections::BTreeMap::new();
+    for (name, model) in named {
+        if name == Role::Attempt.name() {
+            return Err(format!(
+                "{ROLE_MODELS_ENV}: the attempts' model is the run's; set it with --model or [tui] model"
+            ));
+        }
+        let Some(role) = ROUTED_ROLES.into_iter().find(|r| r.name() == name) else {
+            let names: Vec<&str> = ROUTED_ROLES.iter().map(|r| r.name()).collect();
+            return Err(format!("{ROLE_MODELS_ENV}: no role {name:?}; the roles are {}", names.join(", ")));
+        };
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(format!("{ROLE_MODELS_ENV}: the model of {name} is empty"));
+        }
+        models.insert(role, model.to_owned());
+    }
+    Ok(models)
+}
+
 /// Attempt `index` (counted from 0 on the wire) as a person reads it,
 /// counted from 1: `attempt 1` is the first.
 pub fn attempt_name(index: u32) -> String {
@@ -312,6 +356,20 @@ pub fn tool_result(tool_use_id: &str, content: impl Into<String>, is_error: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn role_models_name_routed_roles_only_and_never_the_attempts() {
+        let models = role_models(r#"{"reviewer":"haiku","explorer":" openai/gpt-4.1-mini ","memory":"sonnet"}"#);
+        let models = models.unwrap();
+        assert_eq!(models.get(&Role::Reviewer).map(String::as_str), Some("haiku"));
+        assert_eq!(models.get(&Role::Explorer).map(String::as_str), Some("openai/gpt-4.1-mini"));
+        assert_eq!(models.len(), 3);
+        assert!(role_models(r#"{"attempt":"opus"}"#).unwrap_err().contains("--model"));
+        assert!(role_models(r#"{"reviewr":"haiku"}"#).unwrap_err().contains("reviewer"));
+        assert!(role_models(r#"{"planner":"haiku"}"#).is_err());
+        assert!(role_models(r#"{"judge":" "}"#).is_err());
+        assert!(role_models("[]").is_err());
+    }
 
     #[test]
     fn request_omits_unset_fields() {

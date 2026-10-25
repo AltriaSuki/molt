@@ -7,9 +7,9 @@ use std::fmt;
 use anyhow::{ensure, Context};
 use molt_api::model::Effort;
 use molt_proto::{ErrorCode, RemoteError};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     #[default]

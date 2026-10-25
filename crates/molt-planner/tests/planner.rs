@@ -5118,6 +5118,54 @@ async fn a_reviewer_override_reaches_the_model_only_once_a_person_has_promoted_i
 }
 
 #[tokio::test]
+async fn role_models_send_the_reviewers_calls_to_its_model_while_the_attempts_keep_the_runs() {
+    let review = |req: &CompleteRequest| submit_review(req, "approve", &[]);
+    let routed = Config {
+        role_models: molt_api::model::role_models(r#"{"reviewer":"haiku","judge":"sonnet"}"#).unwrap(),
+        ..config()
+    };
+    let req = RunRequest { review: true, model: Some("opus".into()), ..request(Some("check"), 1) };
+    let fake = reviewed(review);
+    let resp = run_with(&fake, routed.clone(), req.clone()).await;
+    assert!(resp.applied, "{}", resp.summary);
+    let requests = fake.requests();
+    let reviewer: Vec<_> = requests.iter().filter(|r| is_reviewer(r)).collect();
+    assert!(!reviewer.is_empty());
+    assert!(reviewer.iter().all(|r| r.model.as_deref() == Some("haiku") && r.role == Some(Role::Reviewer)));
+    let attempts = attempt_requests(&fake);
+    assert!(!attempts.is_empty() && attempts.iter().all(|r| r.model.as_deref() == Some("opus")));
+
+    // Without the table every role takes the run's model, as before.
+    let fake = reviewed(review);
+    run_with(&fake, config(), req.clone()).await;
+    assert!(fake.requests().iter().filter(|r| is_reviewer(r)).all(|r| r.model.as_deref() == Some("opus")));
+
+    // A role declaration that names a model still wins over the table.
+    const STRICT: &str = r#"
+[[role]]
+name = "strict"
+base = "reviewer"
+model = "deep"
+
+[[workflow]]
+schema = 1
+name = "strict-review"
+roles = { reviewer = "strict" }
+[workflow.stages]
+context = {}
+attempts = {}
+review = {}
+deliver = {}
+"#;
+    let (_dir, pack) = pack_of(&[], STRICT, "");
+    let fake = reviewed(review);
+    let cfg = Config { pack: Arc::new(pack), ..routed };
+    run_with(&fake, cfg, RunRequest { workflow: Some("strict-review".into()), ..req }).await;
+    let reviewer: Vec<_> = fake.requests().into_iter().filter(is_reviewer).collect();
+    assert!(!reviewer.is_empty() && reviewer.iter().all(|r| r.model.as_deref() == Some("deep")));
+}
+
+#[tokio::test]
 async fn the_projects_instruction_files_add_to_the_system_prompt_and_never_replace_it() {
     let model = |req: &CompleteRequest| match turn(req) {
         1 if is_designer(req) => use_tools(

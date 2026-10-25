@@ -32,6 +32,7 @@ fn config(server: &MockServer) -> Config {
         prices: PriceTable::from_vars(|name| (name == "MOLT_MODEL_PRICES").then(|| "gpt-4.1=2,8,2,0.5".into()))
             .unwrap()
             .into(),
+        probed: Default::default(),
     }
 }
 fn request() -> CompleteRequest {
@@ -294,5 +295,6 @@ fn config_for_test() -> Config {
         fallbacks: false,
         retry_base: Duration::from_millis(1),
         prices: Default::default(),
+        probed: Default::default(),
     }
 }

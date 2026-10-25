@@ -196,6 +196,25 @@ pub struct Config {
     /// configuration has them: never a project's.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, molt_mcp::McpServer>,
+    #[serde(default, skip_serializing_if = "ModelsSection::is_empty")]
+    pub models: ModelsSection,
+}
+
+/// `[models]`: which model each role's calls go to (#169).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelsSection {
+    /// Role name to model, such as `reviewer = "haiku"`: the model for a
+    /// role whose declaration names none. The planner and memory get it as
+    /// `MOLT_ROLE_MODELS` (see `molt_api::model::role_models`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub roles: BTreeMap<String, String>,
+}
+
+impl ModelsSection {
+    fn is_empty(&self) -> bool {
+        self.roles.is_empty()
+    }
 }
 
 /// Defaults for the terminal interface; `model`, `effort`, `attempts`,
@@ -300,6 +319,7 @@ const GATEWAY_ENV: &[&str] = &[
     "MOLT_FALLBACKS",
     "MOLT_MODEL_PRICES",
     "MOLT_PRICES_FILE",
+    "MOLT_MODELS_FILE",
     "XDG_DATA_HOME",
 ];
 
@@ -321,6 +341,7 @@ const PLANNER_ENV: &[&str] = &[
     "MOLT_SYNTAX_CHECK",
     "MOLT_PROCESSES",
     "MOLT_GIT",
+    "MOLT_ROLE_MODELS",
 ];
 
 /// What the memory service reads from its environment (see `molt_memory::Config::from_env`).
@@ -333,6 +354,7 @@ const MEMORY_ENV: &[&str] = &[
     "MOLT_MEMORY_MODEL_TIMEOUT_S",
     "MOLT_PLANNER_MODEL",
     "MOLT_MODEL",
+    "MOLT_ROLE_MODELS",
 ];
 
 /// Refuse a key a tool declaration does not have: declarations ignore
@@ -371,7 +393,9 @@ pub const RUNS: &str = "runs";
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("parsing {}", path.display()))
+        let mut config = Self::parse(&text).with_context(|| format!("parsing {}", path.display()))?;
+        config.route_roles(&|name| std::env::var(name).ok())?;
+        Ok(config)
     }
 
     pub fn parse(text: &str) -> anyhow::Result<Self> {
@@ -382,6 +406,10 @@ impl Config {
             server.validate(name).map_err(anyhow::Error::msg)?;
         }
         config.tui.validate()?;
+        if !config.models.roles.is_empty() {
+            molt_api::model::role_models(&serde_json::to_string(&config.models.roles)?)
+                .map_err(|e| anyhow::anyhow!("[models.roles]: {e}"))?;
+        }
         for (name, profile) in &config.profiles {
             profile.validate().with_context(|| format!("in profile {name}"))?;
         }
@@ -498,6 +526,7 @@ impl Config {
             hooks: Vec::new(),
             profiles: BTreeMap::new(),
             mcp: BTreeMap::new(),
+            models: ModelsSection::default(),
         })
     }
 
@@ -673,6 +702,22 @@ impl Config {
 
     pub fn service_mut(&mut self, name: &str) -> Option<&mut ServiceSection> {
         self.services.iter_mut().find(|s| s.name.as_str() == name)
+    }
+
+    /// Give the planner and memory `[models.roles]` as `MOLT_ROLE_MODELS`,
+    /// unless the environment (`var`) or the service's own `env` sets it.
+    pub fn route_roles(&mut self, var: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<()> {
+        let env = molt_api::model::ROLE_MODELS_ENV;
+        if self.models.roles.is_empty() || var(env).is_some_and(|v| !v.trim().is_empty()) {
+            return Ok(());
+        }
+        let routed = serde_json::to_string(&self.models.roles)?;
+        for name in ["planner", "memory"] {
+            if let Some(service) = self.service_mut(name) {
+                service.env.entry(env.into()).or_insert_with(|| routed.clone());
+            }
+        }
+        Ok(())
     }
 
     pub fn socket_dir(&self) -> PathBuf {
@@ -984,7 +1029,11 @@ mod tests {
         );
         assert_eq!(memory.tier, Tier::Mutable);
         assert_eq!(targets("memory"), ["model.complete", "kernel.audit.read", "topic:subscribe:fs.changed", "fs.view"]);
-        assert!(memory.pass_env.iter().all(|v| v.starts_with("MOLT_MEMORY_") || v.ends_with("_MODEL")), "no secrets");
+        let routed = |v: &String| v == molt_api::model::ROLE_MODELS_ENV;
+        assert!(
+            memory.pass_env.iter().all(|v| v.starts_with("MOLT_MEMORY_") || v.ends_with("_MODEL") || routed(v)),
+            "no secrets"
+        );
         // Memory learns with the attempts' model unless told otherwise, so it reads which that is.
         assert!(["MOLT_PLANNER_MODEL", "MOLT_MODEL"].iter().all(|v| memory.pass_env.iter().any(|p| p == v)));
 
