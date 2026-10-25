@@ -42,6 +42,10 @@ enum Cmd {
     Ui(UiArgs),
     #[command(hide = true)]
     UiBackend,
+    /// Keep the services of a workspace up for clients of the client
+    /// protocol (docs/serve.md): on a Unix socket only you can open, or on
+    /// standard input and output with --stdio. The interface is one such client.
+    Serve(ServeArgs),
     /// Start the kernel and the configured services; stop on Ctrl-C, SIGTERM or SIGHUP.
     Run,
     /// Carry out a task in a workspace with the agent services, verified by a done-check.
@@ -374,6 +378,18 @@ struct UiArgs {
 }
 
 #[derive(Args)]
+struct ServeArgs {
+    #[command(flatten)]
+    at: UiArgs,
+    /// The socket to listen on. Default: serve.sock in the data dir.
+    #[arg(long, conflicts_with = "stdio")]
+    socket: Option<PathBuf>,
+    /// Serve one client on standard input and output instead of a socket.
+    #[arg(long)]
+    stdio: bool,
+}
+
+#[derive(Args)]
 struct UndoArgs {
     /// The run to take back, as its commit's `Molt-Run:` trailer names it.
     /// Default: the newest run on the current branch not taken back yet.
@@ -698,6 +714,20 @@ enum AuditCmd {
     },
 }
 
+fn serve_options(config: Option<PathBuf>, profile: Option<String>, args: UiArgs) -> molt::serve::Options {
+    molt::serve::Options {
+        config,
+        workspace: args.workspace,
+        project: args.project,
+        data_dir: args.data_dir,
+        pass_env: args.pass_env,
+        deps_cache: args.deps_cache,
+        allow_web: args.allow_web,
+        web_resolver: args.web_resolver,
+        profile,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
@@ -715,6 +745,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                 | Cmd::Bench { .. }
                 | Cmd::Prices { .. }
                 | Cmd::Ui(_)
+                | Cmd::Serve(_)
         ) {
             "warn"
         } else {
@@ -730,18 +761,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     };
     match cmd {
         Cmd::Ui(args) => {
-            let opts = molt::tui::Options {
-                config: cli.config,
-                workspace: args.workspace,
-                project: args.project,
-                data_dir: args.data_dir,
-                pass_env: args.pass_env,
-                deps_cache: args.deps_cache,
-                allow_web: args.allow_web,
-                web_resolver: args.web_resolver,
-                profile: cli.profile,
-            };
-            for fork in molt::tui::run(opts).await? {
+            for fork in molt::tui::run(serve_options(cli.config, cli.profile, args)).await? {
                 eprintln!("kept: {}", agent::printable(&fork));
             }
         }
@@ -785,6 +805,17 @@ async fn main() -> anyhow::Result<ExitCode> {
             }
         }
         Cmd::UiBackend => molt::tui::serve_backend().await?,
+        Cmd::Serve(args) => {
+            let stop = molt::stop_signal()?;
+            let (cfg, workspace, _) = molt::serve::configure(serve_options(cli.config, cli.profile, args.at))?;
+            let socket = args.socket.unwrap_or_else(|| cfg.kernel.data_dir.join(molt::protocol::SOCKET));
+            let server = molt::serve::Server::new(cfg, workspace);
+            if args.stdio {
+                molt::serve::stdio(server, stop).await?;
+            } else {
+                molt::serve::listen(server, &socket, stop).await?;
+            }
+        }
         Cmd::Run => {
             let stop = molt::stop_signal()?;
             let mut cfg = config()?;

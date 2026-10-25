@@ -3,17 +3,9 @@
 use super::*;
 use crate::tui::saved;
 use molt_api::planner::Resume;
-use molt_planner::checkpoint;
 
-/// A stopped run of the workspace, as its checkpoint has it.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct Stopped {
-    pub run: String,
-    /// The checkpoint, its conversations left out; or why it cannot be used.
-    pub saved: Result<checkpoint::Saved, String>,
-    /// Forks of attempts that would go on, and are gone.
-    pub gone: Vec<String>,
-}
+/// A stopped run of the workspace, as `runs.list` answers.
+pub use crate::protocol::StoppedRun as Stopped;
 
 /// Whether a task run with `workflow` keeps a checkpoint: every one that
 /// changes things does. Under `auto`, the planner keeps none when it picks

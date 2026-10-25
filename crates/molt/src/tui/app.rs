@@ -27,7 +27,6 @@ mod viewer;
 pub(crate) use check::DISPUTED;
 pub use input::{HistorySearch, Input};
 pub use memory::{memory_lines, ChangeStep, MemoryEdit, MemoryView};
-pub use runs::Stopped;
 pub use settings::Settings;
 pub use shell::Sandbox;
 pub use viewer::{TranscriptView, Viewer};

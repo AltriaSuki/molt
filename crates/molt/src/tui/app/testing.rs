@@ -270,7 +270,7 @@ pub(super) fn conversation() -> Vec<serde_json::Value> {
 }
 
 /// The checkpoint of run `run` of `req`, as `/runs` lists it, having spent `usd` with `open` calls unanswered.
-pub(super) fn stopped_run(run: &str, req: &RunRequest, usd: f64, open: u32) -> Stopped {
+pub(super) fn stopped_run(run: &str, req: &RunRequest, usd: f64, open: u32) -> runs::Stopped {
     let mut saved = molt_planner::checkpoint::Saved::new(run, req.clone());
     saved.spend.cost_usd = usd;
     saved.open_calls = open;
@@ -279,5 +279,5 @@ pub(super) fn stopped_run(run: &str, req: &RunRequest, usd: f64, open: u32) -> S
         constraint: Constraint { text: "keep the API".into(), ..Default::default() },
         at_ms: 0,
     }];
-    Stopped { run: run.into(), saved: Ok(saved), gone: Vec::new() }
+    runs::Stopped { run: run.into(), saved: Ok(saved), gone: Vec::new() }
 }
