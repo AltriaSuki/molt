@@ -14,6 +14,7 @@ mod ctx;
 mod designer;
 mod explore;
 mod fit;
+mod git;
 pub mod hooks;
 mod instructions;
 mod judge;
@@ -66,6 +67,9 @@ pub struct Config {
     /// Offer attempts the process tools, to run a command in the background
     /// while they work (#110), when the planner may call `shell.start`.
     pub processes: bool,
+    /// Offer attempts `git`, to read the history of the user's repository
+    /// (#111), when the planner may call `fs.git`.
+    pub git: bool,
     /// `max_tokens` for each model call.
     pub max_tokens: u32,
     /// Deadline for one model call.
@@ -137,6 +141,7 @@ impl Default for Config {
             explore: false,
             explore_model: None,
             processes: false,
+            git: false,
             max_tokens: 32_000,
             model_timeout: Duration::from_secs(1200),
             check_timeout: Duration::from_secs(900),
@@ -163,7 +168,7 @@ impl Default for Config {
 impl Config {
     /// [`Config::default`] overridden by `MOLT_PLANNER_MODEL`,
     /// `MOLT_MAX_TURNS`, `MOLT_MAX_CHECK_ROUNDS`, `MOLT_BUDGET_USD`,
-    /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_EXPLORE`, `MOLT_EXPLORE_MODEL`, `MOLT_PROCESSES`, `MOLT_MAX_TOKENS`,
+    /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_EXPLORE`, `MOLT_EXPLORE_MODEL`, `MOLT_PROCESSES`, `MOLT_GIT`, `MOLT_MAX_TOKENS`,
     /// `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
     /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES`,
     /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL`, `MOLT_PROMPTS_DIR`, `MOLT_SKILLS_DIR` and `MOLT_COMPACT`.
@@ -178,6 +183,7 @@ impl Config {
     /// | `MOLT_EXPLORE` | `off`: only workflows that set `attempts.explore` offer `explore`; `on` for every one whose attempts change files |
     /// | `MOLT_EXPLORE_MODEL` | unset: `explore`'s sub-agent uses the explorer role's model, else the run's |
     /// | `MOLT_PROCESSES` | `off`: `on` offers attempts `start_process`, `read_process`, `write_process` and `stop_process`, to run commands in the background |
+    /// | `MOLT_GIT` | `off`: `on` offers attempts `git`, to read the history of the user's repository |
     /// | `MOLT_MAX_TOKENS` | `32000` |
     /// | `MOLT_MODEL_TIMEOUT_S` | `1200` |
     /// | `MOLT_CHECK_TIMEOUT_S` | `900` |
@@ -254,6 +260,11 @@ impl Config {
                 None | Some("off" | "0" | "false") => false,
                 Some("on" | "1" | "true") => true,
                 Some(v) => anyhow::bail!("MOLT_PROCESSES={v:?}: use on or off"),
+            },
+            git: match get("MOLT_GIT").as_deref() {
+                None | Some("off" | "0" | "false") => false,
+                Some("on" | "1" | "true") => true,
+                Some(v) => anyhow::bail!("MOLT_GIT={v:?}: use on or off"),
             },
             explore: match get("MOLT_EXPLORE").as_deref() {
                 None | Some("off" | "0" | "false") => false,
@@ -744,6 +755,14 @@ mod tests {
         assert!(from(&[("MOLT_PROCESSES", "on")]).unwrap().processes);
         assert!(!from(&[("MOLT_PROCESSES", "off")]).unwrap().processes);
         assert!(format!("{:#}", from(&[("MOLT_PROCESSES", "yes")]).unwrap_err()).contains("use on or off"));
+    }
+
+    #[test]
+    fn git_is_off_unless_the_planners_starter_turns_it_on() {
+        assert!(!from(&[]).unwrap().git);
+        assert!(from(&[("MOLT_GIT", "on")]).unwrap().git);
+        assert!(!from(&[("MOLT_GIT", "off")]).unwrap().git);
+        assert!(format!("{:#}", from(&[("MOLT_GIT", "yes")]).unwrap_err()).contains("MOLT_GIT"));
     }
 
     #[test]

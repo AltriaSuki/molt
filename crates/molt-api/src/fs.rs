@@ -11,6 +11,9 @@
 //! to the original, and `.git` is left out. [`DIFF`] lists what the attempt
 //! changed and [`MERGE`] copies it back, refusing if the original changed
 //! the same files in the meantime.
+//!
+//! [`GIT`] reads the git history of the repository a workspace is in, which
+//! a fork does not have, without changing anything in it.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +30,7 @@ pub const DROP: &str = "fs.drop";
 pub const NARROW: &str = "fs.narrow";
 pub const APPLIES: &str = "fs.applies";
 pub const RECOVER: &str = "fs.recover";
+pub const GIT: &str = "fs.git";
 
 /// The topic the service publishes [`FilesChanged`] on, when it may.
 pub const CHANGED: &str = "fs.changed";
@@ -428,4 +432,91 @@ pub struct DropRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DropResponse {
     pub dropped: bool,
+}
+
+/// Read the git history of the repository a workspace is in (#111). For a
+/// fork it is the repository of the workspace it was copied from, and its
+/// baseline is the commit that workspace's `HEAD` named when the fork was
+/// made, however that `HEAD` moved since; otherwise the baseline is `HEAD`
+/// now. A revision of `HEAD`, `HEAD~2` or `HEAD^` means the baseline.
+///
+/// Nothing in the repository is changed: git only reads its objects and
+/// refs, never its work tree or index, with every configuration that could
+/// run a program, use the network or page turned off. Paths and output are
+/// kept to the workspace's part of the repository. A workspace outside a
+/// repository gets an `invalid` error that says so.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRequest {
+    pub workspace: String,
+    #[serde(flatten)]
+    pub query: GitQuery,
+}
+
+/// What to read. Revisions name commits; paths are relative to the workspace.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "query", rename_all = "snake_case")]
+pub enum GitQuery {
+    /// The baseline, whether the original's `HEAD` moved since, the changes
+    /// not committed that the workspace (for a fork: as it was copied) has
+    /// against the baseline, and, for a fork, what it changed since.
+    Status,
+    /// Commits, newest first.
+    Log {
+        /// A commit or a range `A..B`; default the baseline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rev: Option<String>,
+        /// Only commits that changed this file or directory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        /// Only commits that added or removed this exact text (`git log -S`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        search: Option<String>,
+        /// Most commits. Default and maximum are set by the service.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// One commit: its message and its patch.
+    Show {
+        rev: String,
+        /// Only the patch of this file or directory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// The difference between two commits, or from a commit to the
+    /// workspace's files as they are now.
+    Diff {
+        /// Default the baseline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        /// Default: the files as they are now.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// Who last changed each line of a file, as of a commit.
+    Blame {
+        path: String,
+        /// Default the baseline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rev: Option<String>,
+        /// First line, 1-based.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_line: Option<u64>,
+        /// Last line, included.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_line: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitResponse {
+    /// What the query found, as text.
+    pub output: String,
+    /// `output` was cut to the service's size limit.
+    #[serde(default)]
+    pub truncated: bool,
+    /// The full id of the baseline commit; `None` in a repository without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<String>,
 }

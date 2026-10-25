@@ -89,6 +89,7 @@ const ROLE_TOOLS: &[&str] = &[
     t::READ_PROCESS,
     t::WRITE_PROCESS,
     t::STOP_PROCESS,
+    t::GIT,
 ];
 
 /// Whether `name` is the planner's own.
