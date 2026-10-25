@@ -118,6 +118,31 @@ pub struct ServiceSection {
     /// when it holds a capability for the method (RFC 0002).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDecl>,
+    /// How its process runs (see `docs/services.md`): `native`, as a
+    /// trusted host process, or `sandbox`, as a candidate an agent may
+    /// replace.
+    #[serde(default, skip_serializing_if = "Isolation::is_native")]
+    pub isolation: Isolation,
+}
+
+/// How a service's process runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Isolation {
+    /// A host process with the user's files, network and rights, whatever
+    /// its capabilities on the bus. Trusted code only: a gate can never
+    /// promote a version of it.
+    #[default]
+    Native,
+    /// A candidate in the Linux sandbox, with only its granted capabilities
+    /// and private state. Never run any other way.
+    Sandbox,
+}
+
+impl Isolation {
+    fn is_native(&self) -> bool {
+        *self == Isolation::Native
+    }
 }
 
 fn mutable() -> Tier {
@@ -139,7 +164,28 @@ impl ServiceSection {
             env: BTreeMap::new(),
             pass_env: Vec::new(),
             tools: Vec::new(),
+            isolation: Isolation::Native,
         }
+    }
+
+    /// What is wrong with a sandboxed service's settings, if anything: it
+    /// needs a command, and its variables cannot name Molt's own settings,
+    /// the model credentials or what the sandbox sets.
+    fn validate_isolation(&self) -> anyhow::Result<()> {
+        if self.isolation != Isolation::Sandbox {
+            return Ok(());
+        }
+        anyhow::ensure!(self.exec.is_some(), "service {}: a sandboxed service needs exec", self.name);
+        for name in self.env.keys().chain(&self.pass_env) {
+            anyhow::ensure!(
+                !["MOLT_", "ANTHROPIC_", "OPENAI_"].iter().any(|p| name.starts_with(p))
+                    && !["HOME", "PATH", "TMPDIR"].contains(&name.as_str()),
+                "service {}: a sandboxed service cannot be given {name}: Molt's settings, the model credentials \
+                 and HOME, PATH and TMPDIR stay out of its sandbox",
+                self.name
+            );
+        }
+        Ok(())
     }
 
     pub fn manifest(&self) -> anyhow::Result<Manifest> {
@@ -407,6 +453,9 @@ impl Config {
         unknown_tool_keys(&toml::from_str(text)?)?;
         let config: Self = toml::from_str(text)?;
         config.provided_tools()?;
+        for svc in &config.services {
+            svc.validate_isolation()?;
+        }
         for (name, server) in &config.mcp {
             server.validate(name).map_err(anyhow::Error::msg)?;
         }
@@ -947,7 +996,29 @@ mod tests {
             assert_eq!(got.requests, want.requests, "{}", want.name);
             assert_eq!(got.pass_env, want.pass_env, "{}", want.name);
         }
-        assert!(cfg.service("echo").is_some());
+        assert_eq!(cfg.service("echo").unwrap().isolation, Isolation::Sandbox);
+        assert!(cfg.services.iter().filter(|s| s.name.as_str() != "echo").all(|s| s.isolation == Isolation::Native));
+    }
+
+    #[test]
+    fn a_sandboxed_service_needs_a_command_and_gets_none_of_molts_settings_or_credentials() {
+        let service = |extra: &str| format!("[[service]]\nname = \"c\"\nisolation = \"sandbox\"\n{extra}");
+        let exec = "exec = { command = \"/usr/bin/c\" }\n";
+        assert!(Config::parse(&service(exec)).is_ok());
+        let err = Config::parse(&service("")).unwrap_err().to_string();
+        assert!(err.contains("needs exec"), "{err}");
+        for extra in [
+            "pass_env = [\"ANTHROPIC_API_KEY\"]",
+            "pass_env = [\"OPENAI_API_KEY\"]",
+            "env = { MOLT_SECRET = \"x\" }",
+            "env = { HOME = \"/root\" }",
+        ] {
+            let err = Config::parse(&service(&format!("{exec}{extra}"))).unwrap_err().to_string();
+            assert!(err.contains("cannot be given"), "{extra}: {err}");
+        }
+        // A native service may still be given them: it is trusted.
+        assert!(Config::parse("[[service]]\nname = \"c\"\npass_env = [\"ANTHROPIC_API_KEY\"]\n").is_ok());
+        assert!(Config::parse("[[service]]\nname = \"c\"\nisolation = \"wasm\"\n").is_err());
     }
 
     #[test]

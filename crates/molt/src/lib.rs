@@ -6,6 +6,7 @@ pub mod acp;
 pub mod agent;
 pub mod agent_skills;
 pub mod config;
+pub mod confine;
 pub mod doctor;
 pub mod extensions;
 pub mod git;
@@ -27,7 +28,7 @@ use molt_kernel::{Config as KernelConfig, Kernel};
 use molt_transport::{Secret, Transport};
 use tokio::signal::unix::{signal, SignalKind};
 
-pub use config::{Config, Secrets, ServiceSection, TransportKind};
+pub use config::{Config, Isolation, Secrets, ServiceSection, TransportKind};
 pub use lock::{DataDirLock, LOCK_FILE};
 
 /// The longest path a Unix socket address holds (`sun_path` less its NUL).
@@ -135,7 +136,14 @@ async fn launch_all(kernel: &Kernel, cfg: &Config, secrets: Option<&Secrets>) ->
     // The planner learns the services' tools from the same manifests the kernel installs.
     let tools = cfg.provided_tools()?;
     for svc in &cfg.services {
-        kernel.install(svc.manifest()?).await?;
+        let mut manifest = svc.manifest()?;
+        if svc.isolation == Isolation::Sandbox {
+            // Looked up here, as the user's configuration names it: the sandbox has no PATH to search.
+            if let Some(exec) = manifest.exec.as_mut() {
+                exec.command = resolve(&exec.command)?;
+            }
+        }
+        kernel.install(manifest).await?;
         let secret: Option<Secret> = match secrets {
             Some(s) => Some(
                 s.services
@@ -151,10 +159,35 @@ async fn launch_all(kernel: &Kernel, cfg: &Config, secrets: Option<&Secrets>) ->
         if svc.name.as_str() == "planner" && !tools.is_empty() {
             env.push((molt_planner::TOOLS_ENV.into(), serde_json::to_string(&tools)?));
         }
-        kernel.launch_with_env(&svc.name, secret, limits, restart, env).await?;
-        tracing::info!(service = %svc.name, "launched");
+        match svc.isolation {
+            Isolation::Native => {
+                kernel.launch_with_env(&svc.name, secret, limits, restart, env).await?;
+            }
+            // Never started any other way: an unavailable sandbox stops molt here.
+            Isolation::Sandbox => {
+                let backend = Arc::new(confine::LinuxSandbox::default());
+                kernel.launch_confined(&svc.name, secret, limits, restart, env, backend).await?;
+            }
+        }
+        tracing::info!(service = %svc.name, isolation = ?svc.isolation, "launched");
     }
     Ok(())
+}
+
+/// A command named in the configuration, as an absolute path: itself when
+/// it has a directory, else the first match on PATH.
+fn resolve(command: &str) -> anyhow::Result<String> {
+    let path = std::path::Path::new(command);
+    if path.components().count() > 1 {
+        anyhow::ensure!(path.is_absolute(), "the command {command} of a sandboxed service must be an absolute path");
+        return Ok(command.to_owned());
+    }
+    let dirs = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&dirs)
+        .map(|dir| dir.join(command))
+        .find(|p| p.is_file() && p.is_absolute())
+        .map(|p| p.to_string_lossy().into_owned())
+        .with_context(|| format!("there is no {command} on PATH"))
 }
 
 /// How long an MCP bridge gets to list its server's tools.
