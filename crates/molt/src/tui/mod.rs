@@ -10,7 +10,7 @@
 
 mod app;
 mod backend;
-mod commands;
+pub(crate) mod commands;
 mod kept;
 mod log;
 mod notice;
@@ -129,7 +129,7 @@ async fn event_loop(
         Some(false) => app::Sandbox::Unconfined,
         None => app::Sandbox::Unknown,
     };
-    app.load_commands(Path::new(&workspace));
+    app.load_commands_with(Path::new(&workspace), &cfg.extensions);
     let store = match state::Store::new(&cfg.kernel.data_dir, Path::new(&workspace)) {
         Ok(store) => {
             match store.history(&app.secrets) {

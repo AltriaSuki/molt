@@ -3466,3 +3466,148 @@ async fn an_attempt_reads_the_commit_that_introduced_a_regression_and_the_reposi
     assert_requests_valid(&server).await;
     assert_forks_dropped(setup.data.path());
 }
+
+/// `molt ext ARGS` with the user's config, packs and caches under `home`,
+/// with no terminal.
+fn molt_ext(home: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+        .arg("ext")
+        .args(args)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("user-data"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+/// Extension packs (#170) through the real binary: `molt ext add` lists
+/// what a pack would get and runs nothing; it installs only on approval;
+/// the pack's MCP server is offered to a `molt do` run; once disabled its
+/// tools are not; an update that asks for more is not installed without
+/// another approval; and `molt ext remove` takes everything it added.
+#[tokio::test]
+async fn an_extension_pack_is_shown_approved_offered_disabled_kept_to_its_approval_and_removed() {
+    let calls = vec![("mcp__fakepack__echo", json!({ "text": "hi" }))];
+    let server = fake_api(Fake::GreetsWithCalls(calls)).await;
+    let home = tempfile::tempdir().unwrap();
+    let marker = home.path().join("ran");
+    let src = home.path().join("src");
+    std::fs::create_dir_all(src.join("skills/greet-style")).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../molt-mcp/tests/fake_mcp_server.py");
+    std::fs::copy(script, src.join("server.py")).unwrap();
+    // Were anything of the pack run on install, this would leave the marker.
+    std::fs::write(src.join("install.sh"), format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    std::fs::set_permissions(src.join("install.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        src.join("skills/greet-style/SKILL.md"),
+        "---\nname: greet-style\ndescription: How greetings are written here.\n---\nLowercase.\n",
+    )
+    .unwrap();
+    let manifest = "schema = 1\nname = \"fakepack\"\nversion = \"1.0.0\"\ndescription = \"An echo server.\"\n\
+                    [mcp.fakepack]\ncommand = \"/usr/bin/python3\"\n\
+                    args = [\"${MOLT_EXTENSION_DIR}/server.py\", \"${MOLT_EXTENSION_DIR}\"]\ncalls = 5\n\
+                    [mcp.fakepack.tools.echo]\nread_only = true\n";
+    std::fs::write(src.join("molt-extension.toml"), manifest).unwrap();
+    let src_arg = src.to_str().unwrap();
+    let installed = home.path().join("user-data/molt/extensions/fakepack");
+    let state = home.path().join("config/molt/extensions.toml");
+
+    // No terminal and no --yes: shown, not installed.
+    let out = molt_ext(home.path(), &["add", src_arg]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    for want in [
+        "extension fakepack 1.0.0",
+        "MCP server fakepack runs /usr/bin/python3 ${MOLT_EXTENSION_DIR}/server.py ${MOLT_EXTENSION_DIR}",
+        "the agent may call MCP server fakepack 5 times a run (mcp__fakepack__*)",
+        "MCP server fakepack's tool echo is offered to attempt, as a tool that only reads",
+        "skill greet-style",
+        "Nothing was installed: approve it at a terminal, or pass --yes.",
+    ] {
+        assert!(stderr.contains(want), "{want:?} in\n{stderr}");
+    }
+    assert!(!stderr.contains("network"), "{stderr}");
+    assert!(!installed.exists() && !state.exists());
+
+    let out = molt_ext(home.path(), &["add", src_arg, "--yes"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(installed.join("server.py").is_file());
+    assert!(!marker.exists(), "installing ran nothing of the pack");
+    let list = String::from_utf8_lossy(&molt_ext(home.path(), &["list"]).stdout).into_owned();
+    assert!(list.starts_with("fakepack 1.0.0 enabled sha256 "), "{list}");
+
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |data: &Path| {
+        let mut cmd = molt_do(&server, workspace.path(), data, &["--check", CHECK, "--attempts", "1", "--no-learn"]);
+        cmd.env("XDG_CONFIG_HOME", home.path().join("config")).env("XDG_DATA_HOME", home.path().join("user-data"));
+        cmd.output()
+    };
+    let offered =
+        |b: &Value| b["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == "mcp__fakepack__echo"));
+    let out = tokio::time::timeout(RUN_LIMIT, run(data.path())).await.expect("molt do hung").unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let sent = bodies(&server).await;
+    assert!(sent.iter().any(offered), "the pack's tool is offered");
+    let all = sent.iter().map(|b| b["messages"].to_string()).collect::<String>();
+    assert!(all.contains("echo: hi"), "the call went to the pack's server and came back");
+    assert!(all.contains("greet-style: How greetings are written here."), "the pack's skill is offered");
+    assert!(!marker.exists());
+
+    let out = molt_ext(home.path(), &["disable", "fakepack"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let before = sent.len();
+    let out = tokio::time::timeout(RUN_LIMIT, run(data.path())).await.expect("molt do hung").unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let sent = bodies(&server).await;
+    assert!(sent.len() > before);
+    assert!(sent[before..].iter().all(|b| !offered(b)), "a disabled pack's tools are not offered");
+    assert!(!sent[before..].iter().any(|b| b["messages"].to_string().contains("greet-style")));
+    assert!(molt_ext(home.path(), &["enable", "fakepack"]).status.success());
+
+    // An update that asks for the network is shown as such and not installed without a yes.
+    std::fs::write(
+        src.join("molt-extension.toml"),
+        manifest.replace("1.0.0", "1.1.0").replace("calls = 5", "calls = 5\nnetwork = true"),
+    )
+    .unwrap();
+    let out = molt_ext(home.path(), &["add", src_arg]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("This updates 1.0.0 to 1.1.0. It asks for more than you approved."), "{stderr}");
+    assert!(stderr.contains("  + MCP server fakepack has the network"), "{stderr}");
+    let shown = String::from_utf8_lossy(&molt_ext(home.path(), &["show", "fakepack"]).stdout).into_owned();
+    assert!(shown.starts_with("extension fakepack 1.0.0 (enabled)") && !shown.contains("network"), "{shown}");
+
+    // An archive whose entry leads outside installs nothing.
+    let mut tar = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    let name = b"../../escaped";
+    header.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name);
+    header.set_size(2);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append(&header, &b"hi"[..]).unwrap();
+    let archive = home.path().join("evil.tar");
+    std::fs::write(&archive, tar.into_inner().unwrap()).unwrap();
+    let out = molt_ext(home.path(), &["add", archive.to_str().unwrap(), "--yes"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("leads outside the pack; nothing was installed"), "{stderr}");
+    assert!(!home.path().join("escaped").exists() && !home.path().join("user-data/escaped").exists());
+
+    let cache = home.path().join("cache/molt/proj-0/mcp");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("fakepack.json"), "{}").unwrap();
+    let out = molt_ext(home.path(), &["remove", "fakepack"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!installed.exists() && !cache.join("fakepack.json").exists());
+    assert!(!std::fs::read_to_string(&state).unwrap().contains("fakepack"));
+    let list = String::from_utf8_lossy(&molt_ext(home.path(), &["list"]).stdout).into_owned();
+    assert!(list.starts_with("no extension packs installed"), "{list}");
+    let out = tokio::time::timeout(RUN_LIMIT, run(data.path())).await.expect("molt do hung").unwrap();
+    assert!(out.status.success(), "a run after removal starts: {}", String::from_utf8_lossy(&out.stderr));
+    assert_requests_valid(&server).await;
+}

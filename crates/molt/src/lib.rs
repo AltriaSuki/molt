@@ -7,6 +7,7 @@ pub mod agent;
 pub mod agent_skills;
 pub mod config;
 pub mod doctor;
+pub mod extensions;
 pub mod git;
 pub mod layers;
 mod lock;

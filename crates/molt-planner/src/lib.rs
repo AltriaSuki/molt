@@ -123,6 +123,11 @@ pub struct Config {
     /// planner, never from a request or a project; a project's own skills,
     /// in its `.molt/skills`, are read as data.
     pub skills_dir: Option<std::path::PathBuf>,
+    /// The `skills/` directories of the extension packs the user installed,
+    /// approved and enabled (`MOLT_EXTENSION_SKILLS`), read after
+    /// `skills_dir` and as the user's: like it, they come from whoever
+    /// starts the planner, never from a request or a project.
+    pub extension_skills: Vec<std::path::PathBuf>,
     /// Have a model write an attempt's notes on the turns its conversation
     /// leaves out to fit, beside Molt's own record of them (#108). Off by
     /// default: each fit then costs one more model call.
@@ -159,6 +164,7 @@ impl Default for Config {
             route_model: None,
             tools: Vec::new(),
             pack: Arc::default(),
+            extension_skills: Vec::new(),
             skills_dir: None,
             compact_model: false,
         }
@@ -194,6 +200,7 @@ impl Config {
     /// | `MOLT_ROUTE_MODEL` | unset: the run's model picks the workflow of a run that names `auto` |
     /// | `MOLT_PROMPTS_DIR` | unset: the built-in prompts; else the prompt pack to read ([`pack::Pack::load`]) |
     /// | `MOLT_SKILLS_DIR` | unset: no user skills; else the directory of the user's skills ([`skills`]) |
+    /// | `MOLT_EXTENSION_SKILLS` | unset: none; else the extension packs' skill directories, as a `PATH`-style list ([`skills`]) |
     /// | `MOLT_COMPACT` | `record`: Molt's own record of the turns a conversation leaves out; `model` also has the `compactor` write notes on them ([`compact`]) |
     ///
     /// An empty variable counts as unset. A value that does not parse is an
@@ -251,6 +258,9 @@ impl Config {
         };
         Ok(Self {
             hooks,
+            extension_skills: get(skills::EXTENSION_SKILLS_ENV)
+                .map(|v| std::env::split_paths(&v).filter(|p| p.is_absolute()).collect())
+                .unwrap_or_default(),
             default_model: get("MOLT_PLANNER_MODEL"),
             max_turns: small("MOLT_MAX_TURNS", d.max_turns)?,
             max_check_rounds: small("MOLT_MAX_CHECK_ROUNDS", d.max_check_rounds)?,

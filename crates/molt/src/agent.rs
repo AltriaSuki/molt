@@ -983,6 +983,7 @@ pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::
         confirm: cfg.confirm.clone(),
         tui: cfg.tui.clone(),
         hooks: cfg.hooks.clone(),
+        extensions: Vec::new(),
         profiles: cfg.profiles.clone(),
         mcp: Default::default(),
     };

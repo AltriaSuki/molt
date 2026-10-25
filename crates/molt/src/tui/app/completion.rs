@@ -3,8 +3,14 @@
 use super::*;
 
 impl App {
+    #[cfg(test)]
     pub fn load_commands(&mut self, workspace: &std::path::Path) {
-        let (commands, warnings) = crate::tui::commands::load(workspace);
+        self.load_commands_with(workspace, &[]);
+    }
+
+    /// The extension packs' commands of `packs`, then the project's.
+    pub fn load_commands_with(&mut self, workspace: &std::path::Path, packs: &[(String, std::path::PathBuf)]) {
+        let (commands, warnings) = crate::tui::commands::load_with(workspace, packs);
         self.commands = commands;
         for warning in warnings {
             self.push(Line::from(span(clean_line(&warning), Tone::Warn)));

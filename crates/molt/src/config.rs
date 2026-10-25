@@ -188,6 +188,11 @@ pub struct Config {
     pub tui: TuiSection,
     #[serde(default)]
     pub hooks: Vec<molt_planner::hooks::Hook>,
+    /// The enabled extension packs with command templates for the
+    /// interface, by name and directory. Not a key of a file: only the
+    /// user's layer sets it, from the packs they approved.
+    #[serde(skip)]
+    pub extensions: Vec<(String, PathBuf)>,
     /// Sets of `[tui]` defaults, one picked with `--profile NAME`.
     #[serde(default, rename = "profile", skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, TuiSection>,
@@ -496,6 +501,7 @@ impl Config {
             confirm: ConfirmSection::default(),
             tui: TuiSection::default(),
             hooks: Vec::new(),
+            extensions: Vec::new(),
             profiles: BTreeMap::new(),
             mcp: BTreeMap::new(),
         })

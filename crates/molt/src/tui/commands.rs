@@ -2,7 +2,7 @@
 //! never capabilities or modes.
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context};
 
@@ -171,23 +171,40 @@ pub struct Command {
     pub template: String,
 }
 
+#[cfg(test)]
 pub fn load(workspace: &Path) -> (BTreeMap<String, Command>, Vec<String>) {
+    load_with(workspace, &[])
+}
+
+/// The commands of the enabled extension packs `packs` (name, installed
+/// directory), each from its `commands/`, then the project's: a pack's
+/// command wins over a project's of the same name, as the user installed it.
+pub fn load_with(workspace: &Path, packs: &[(String, PathBuf)]) -> (BTreeMap<String, Command>, Vec<String>) {
     let mut commands = BTreeMap::new();
     let mut warnings = Vec::new();
-    let root = match workspace.canonicalize() {
-        Ok(root) => root,
-        Err(_) => return (commands, warnings),
-    };
-    let dir = root.join(".molt/commands");
-    let entries = match std::fs::read_dir(&dir) {
+    for (name, dir) in packs {
+        let Ok(root) = dir.canonicalize() else { continue };
+        load_dir(&root.join("commands"), &root, &format!("extension {name}"), &mut commands, &mut warnings);
+    }
+    if let Ok(root) = workspace.canonicalize() {
+        load_dir(&root.join(".molt/commands"), &root, "project", &mut commands, &mut warnings);
+    }
+    (commands, warnings)
+}
+
+/// The templates of `dir`, each a file inside `root`, into `commands`
+/// unless one of that name is there already; `from` names where they come
+/// from in warnings.
+fn load_dir(dir: &Path, root: &Path, from: &str, commands: &mut BTreeMap<String, Command>, warnings: &mut Vec<String>) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (commands, warnings),
-        Err(e) => return (commands, vec![format!("project commands: {e}")]),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => return warnings.push(format!("{from} commands: {e}")),
     };
     // Bound discovery too, including directories and invalid entries.
     for (count, entry) in entries.enumerate() {
         if count >= MAX_COMMANDS {
-            warnings.push(format!("project commands: only the first {MAX_COMMANDS} entries are loaded"));
+            warnings.push(format!("{from} commands: only the first {MAX_COMMANDS} entries are loaded"));
             break;
         }
         let result = (|| -> anyhow::Result<Option<(String, Command)>> {
@@ -196,13 +213,11 @@ pub fn load(workspace: &Path) -> (BTreeMap<String, Command>, Vec<String>) {
                 return Ok(None);
             }
             let name = path.file_stem().and_then(|s| s.to_str()).context("command name is not UTF-8")?.to_owned();
-            ensure!(
-                !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-                "invalid command name {name:?}"
-            );
+            ensure!(valid_name(&name), "invalid command name {name:?}");
             ensure!(builtin(&name).is_none(), "/{name} conflicts with a built-in command; keeping the built-in");
+            ensure!(!commands.contains_key(&name), "/{name} is already given by an extension pack; keeping that one");
             let path = path.canonicalize()?;
-            ensure!(path.starts_with(&root) && path.is_file(), "/{name} must be a file inside the workspace");
+            ensure!(path.starts_with(root) && path.is_file(), "/{name} must be a file inside {}", root.display());
             let mut contents = String::new();
             std::fs::File::open(&path)?.take(MAX_BYTES + 1).read_to_string(&mut contents)?;
             ensure!(contents.len() as u64 <= MAX_BYTES, "/{name} exceeds {MAX_BYTES} bytes");
@@ -213,15 +228,19 @@ pub fn load(workspace: &Path) -> (BTreeMap<String, Command>, Vec<String>) {
                 commands.insert(name, command);
             }
             Ok(None) => {}
-            Err(e) => warnings.push(format!("project command skipped: {e:#}")),
+            Err(e) => warnings.push(format!("{from} command skipped: {e:#}")),
         }
     }
-    (commands, warnings)
+}
+
+/// A command's name: ASCII letters, digits, `-` and `_`.
+pub(crate) fn valid_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// A deliberately small frontmatter format: flat, single-line YAML scalars.
 /// Reject unknown fields instead of silently accepting permissions or modes.
-fn parse(text: &str) -> anyhow::Result<Command> {
+pub(crate) fn parse(text: &str) -> anyhow::Result<Command> {
     let text = text.replace("\r\n", "\n");
     let mut command = Command::default();
     let body = if let Some(rest) = text.strip_prefix("---\n") {

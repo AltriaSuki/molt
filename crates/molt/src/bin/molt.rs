@@ -123,6 +123,38 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PromptsCmd,
     },
+    /// Install, approve, disable and remove extension packs (docs/extensions.md):
+    /// MCP servers, hooks, skills and commands bundled in a directory or an
+    /// archive with a molt-extension.toml.
+    Ext {
+        #[command(subcommand)]
+        cmd: ExtCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExtCmd {
+    /// Install a pack from a directory or a .tar, .tar.gz or .tgz archive,
+    /// or update the installed one of its name. It shows what the pack
+    /// would get and installs it only once you approve, at a terminal or
+    /// with --yes; an update that asks for nothing more needs no approval.
+    /// Nothing the pack holds is run. A Claude Code plugin is imported.
+    Add {
+        path: PathBuf,
+        /// Approve what the pack would get without being asked, as from a script.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// List the installed packs.
+    List,
+    /// Show where a pack is and what you approved it for.
+    Show { name: String },
+    /// Stop starting a pack's servers, hooks, skills and commands, and keep it installed.
+    Disable { name: String },
+    /// Start a disabled pack again, as you approved it.
+    Enable { name: String },
+    /// Uninstall a pack: its files, its approval and its servers' cached tool lists.
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -920,6 +952,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             print!("{}", layered.show(origin)?);
         }
         Cmd::Prompts { cmd } => prompts_cmd(cmd)?,
+        Cmd::Ext { cmd } => return ext_cmd(cmd),
         Cmd::NatsConfig => {
             let cfg = config()?;
             let mut ids: Vec<ServiceId> = cfg.services.iter().map(|s| s.name.clone()).collect();
@@ -1714,4 +1747,67 @@ fn prompts_cmd(cmd: PromptsCmd) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn ext_cmd(cmd: ExtCmd) -> anyhow::Result<ExitCode> {
+    use molt::extensions::{self, Added, Approve};
+    use std::io::{BufRead, IsTerminal, Write};
+
+    /// Asks at a terminal, takes --yes, and otherwise refuses.
+    struct Ask {
+        yes: bool,
+    }
+    impl Approve for Ask {
+        fn approve(&mut self, text: &str) -> anyhow::Result<bool> {
+            eprint!("{text}");
+            if self.yes {
+                eprintln!("Approved with --yes.");
+                return Ok(true);
+            }
+            // An approval is a person's word: without a terminal there is no one to give it.
+            if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+                eprintln!("Nothing was installed: approve it at a terminal, or pass --yes.");
+                return Ok(false);
+            }
+            eprint!("Install it? [y/N] ");
+            std::io::stderr().flush()?;
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line)?;
+            let yes = matches!(line.trim(), "y" | "Y" | "yes");
+            if !yes {
+                eprintln!("Nothing was installed.");
+            }
+            Ok(yes)
+        }
+        fn say(&mut self, text: &str) {
+            eprintln!("{text}");
+        }
+    }
+
+    let places = extensions::Places::from_env()?;
+    match cmd {
+        ExtCmd::Add { path, yes } => match extensions::add(&places, &path, &mut Ask { yes })? {
+            Added::Installed => println!("installed; it starts with the next run (molt ext disable NAME turns it off)"),
+            Added::Updated => println!("updated"),
+            Added::Unchanged => {}
+            Added::Refused => return Ok(ExitCode::FAILURE),
+        },
+        ExtCmd::List => print!("{}", extensions::list(&places)?),
+        ExtCmd::Show { name } => print!("{}", extensions::show(&places, &name)?),
+        ExtCmd::Disable { name } => {
+            extensions::set_enabled(&places, &name, false)?;
+            println!("extension {name} is disabled; molt ext enable {name} starts it again");
+        }
+        ExtCmd::Enable { name } => {
+            extensions::set_enabled(&places, &name, true)?;
+            println!("extension {name} is enabled");
+        }
+        ExtCmd::Remove { name } => {
+            for path in extensions::remove(&places, &name)? {
+                println!("removed {}", path.display());
+            }
+            println!("extension {name} is uninstalled");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
