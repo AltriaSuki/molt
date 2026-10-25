@@ -30,16 +30,16 @@ use similar::TextDiff;
 
 use crate::error::{failed, invalid};
 use crate::files::{atomic_write, is_binary};
-use crate::{apply, paths, walk, Roots};
+use crate::{apply, git, paths, walk, Roots};
 
 const MAX_PATCH_BYTES: usize = 1024 * 1024;
-const MAX_DIFF_FILE: u64 = 4 * 1024 * 1024;
-const DIFF_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const MAX_DIFF_FILE: u64 = 4 * 1024 * 1024;
+pub(crate) const DIFF_TIMEOUT: Duration = Duration::from_secs(2);
 /// The state of a path that is a directory, or sits below something that is
 /// not a directory. Never equal to a hash.
-const NOT_A_FILE: &str = "not-a-file";
+pub(crate) const NOT_A_FILE: &str = "not-a-file";
 /// Appended to the hash of a regular file its owner can execute.
-const EXECUTABLE: &str = "+x";
+pub(crate) const EXECUTABLE: &str = "+x";
 /// The metadata format. Version 0 recorded content hashes only.
 const META_VERSION: u32 = 1;
 /// How many left-out paths a reply names.
@@ -63,6 +63,10 @@ struct ForkMeta {
     /// Entries the ignore rules excluded, linked to the original instead of copied.
     #[serde(default)]
     links: BTreeSet<String>,
+    /// The commit the original's git `HEAD` named when the fork was made,
+    /// which its history queries take as their baseline (see [`crate::git`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    git: Option<git::Baseline>,
 }
 
 struct Fork {
@@ -72,10 +76,13 @@ struct Fork {
 
 pub(crate) fn fork(roots: &Roots, req: ForkRequest) -> Result<ForkResponse, RemoteError> {
     let base = roots.workspace(&req.workspace)?;
+    // Before the copy, so the copy holds that commit's files or ones changed after it.
+    let baseline = git::baseline(&base);
     let name = format!("fork-{:012x}", rand::random::<u64>() >> 16);
     let dir = roots.scratch.join(&name);
     DirBuilder::new().mode(0o700).create(&dir).map_err(|e| failed(format!("creating {}: {e}", dir.display())))?;
-    let made = copy_tree(&base, &dir, &roots.scratch).and_then(|meta| {
+    let made = copy_tree(&base, &dir, &roots.scratch).and_then(|mut meta| {
+        meta.git = baseline;
         let json = serde_json::to_vec_pretty(&meta).map_err(|e| failed(e.to_string()))?;
         atomic_write(&meta_path(&dir), &json, Some(Permissions::from_mode(0o600)))
             .map_err(|e| failed(format!("writing fork metadata: {e}")))?;
@@ -144,7 +151,7 @@ fn copy_tree(base: &Path, dest: &Path, scratch: &Path) -> Result<ForkMeta, Remot
         let to = dest.join(dir);
         fs::set_permissions(&to, mode.clone()).map_err(|e| err(&to, e))?;
     }
-    Ok(ForkMeta { version: META_VERSION, base: base.to_path_buf(), files, links })
+    Ok(ForkMeta { version: META_VERSION, base: base.to_path_buf(), files, links, git: None })
 }
 
 /// Copy a regular file with its permission bits; returns its state.
@@ -199,7 +206,7 @@ fn link_hash(target: &Path) -> String {
 /// [`file_state`], its symlink hash or [`NOT_A_FILE`]. Symlinks are never
 /// followed, including in parent directories, so a link swapped in cannot
 /// lead the caller outside `root`.
-fn state(root: &Path, rel: &str) -> io::Result<Option<String>> {
+pub(crate) fn state(root: &Path, rel: &str) -> io::Result<Option<String>> {
     let parts: Vec<&str> = rel.split('/').collect();
     let mut path = root.to_path_buf();
     for (i, part) in parts.iter().enumerate() {
@@ -346,7 +353,7 @@ fn fingerprint_of(dir: &Path, files: &BTreeMap<String, String>) -> Result<String
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
-fn changes(before: &BTreeMap<String, String>, now: &BTreeMap<String, String>) -> Vec<Change> {
+pub(crate) fn changes(before: &BTreeMap<String, String>, now: &BTreeMap<String, String>) -> Vec<Change> {
     let paths: BTreeSet<&String> = before.keys().chain(now.keys()).collect();
     paths
         .into_iter()
@@ -511,6 +518,39 @@ impl Side {
             Err(e) => Side::Unreadable(e),
         }
     }
+}
+
+/// A fork as its history queries see it (see [`crate::git`]).
+pub(crate) struct Snapshot {
+    pub dir: PathBuf,
+    /// The canonical workspace it was copied from.
+    pub base: PathBuf,
+    /// The state of each file when it was made, by path.
+    pub at_fork: BTreeMap<String, String>,
+    /// The state of each file now, without the build output diff leaves out.
+    pub now: BTreeMap<String, String>,
+    /// The entries linked to the original rather than copied.
+    pub links: BTreeSet<String>,
+    /// What it changed, as diff lists it.
+    pub changes: Vec<Change>,
+    pub baseline: Option<git::Baseline>,
+}
+
+/// The fork `name` as it was made and as it is now.
+pub(crate) fn snapshot(roots: &Roots, name: &str) -> Result<Snapshot, RemoteError> {
+    let fork = open(roots, name)?;
+    let now = current(&fork, &roots.scratch)?;
+    let (changes, _) = artifacts(&fork, changes(&fork.meta.files, &now), &now);
+    let changed: HashSet<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+    let now =
+        now.into_iter().filter(|(p, _)| fork.meta.files.contains_key(p) || changed.contains(p.as_str())).collect();
+    let Fork { dir, meta } = fork;
+    Ok(Snapshot { dir, base: meta.base, at_fork: meta.files, now, links: meta.links, changes, baseline: meta.git })
+}
+
+/// True when `path` names a fork: a child of scratch with a fork's name.
+pub(crate) fn names_fork(roots: &Roots, path: &str) -> bool {
+    fork_path(roots, path).is_ok()
 }
 
 /// The canonical workspace `fork` was copied from, if it is a fork.

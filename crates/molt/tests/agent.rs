@@ -563,6 +563,7 @@ fn molt_in(server: &MockServer, workspace: &Path, data: &Path) -> tokio::process
         "MOLT_INSTRUCTION_FILES",
         "MOLT_SYNTAX_CHECK",
         "MOLT_PROCESSES",
+        "MOLT_GIT",
         "MOLT_MEMORY_MODEL",
         "MOLT_MEMORY_EFFORT",
         "MOLT_MEMORY_MAX_TOKENS",
@@ -3395,6 +3396,73 @@ async fn a_process_an_attempt_starts_runs_until_its_final_reply_and_leaves_nothi
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     assert!(alive.is_empty(), "processes left running: {alive:?}");
+    assert_requests_valid(&server).await;
+    assert_forks_dropped(setup.data.path());
+}
+
+/// Git history (#111) through the real kernel and fs service: with
+/// `MOLT_GIT=on` an attempt in a fork finds the commit that broke a
+/// function by its text and reads its patch, the queries are the
+/// planner's `fs.git` requests in the audit log, and the repository is
+/// exactly as it was, its index and the user's change not committed included.
+#[tokio::test]
+async fn an_attempt_reads_the_commit_that_introduced_a_regression_and_the_repository_is_untouched() {
+    use molt_api::planner::tools::GIT;
+    let calls = vec![
+        (GIT, json!({ "query": "log", "search": "a + b" })),
+        (GIT, json!({ "query": "show", "rev": "HEAD~1", "path": "calc.py" })),
+        (GIT, json!({ "query": "status" })),
+    ];
+    let server = fake_api(Fake::GreetsWithCalls(calls)).await;
+    let mut setup = Setup::new(&server);
+    let ws = setup.workspace.path().to_path_buf();
+    let commit = |files: &[(&str, &str)], message: &str| {
+        for (path, content) in files {
+            std::fs::write(ws.join(path), content).unwrap();
+        }
+        git(&ws, &["add", "-A"]);
+        git(&ws, &["-c", "user.name=Ann", "-c", "user.email=ann@example.com", "commit", "-q", "-m", message]);
+    };
+    git(&ws, &["init", "-q", "-b", "main"]);
+    commit(&[("calc.py", "def add(a, b):\n    return a + b\n")], "Add add()");
+    commit(&[("calc.py", "def add(a, b):\n    return a - b\n")], "Tidy up calc");
+    commit(&[("notes.txt", "later\n")], "Add notes");
+    std::fs::write(ws.join("README.txt"), "A test project, edited.\n").unwrap();
+    let state = |ws: &Path| {
+        let index = std::fs::read(ws.join(".git/index")).unwrap();
+        (git(ws, &["status", "--porcelain"]), git(ws, &["rev-parse", "HEAD"]), index)
+    };
+    let before = state(&ws);
+    setup.cfg.service_mut("planner").unwrap().env.insert("MOLT_GIT".into(), "on".into());
+    let (resp, _) = setup.run(setup.request(Some(CHECK), 1)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+
+    let sent = bodies(&server).await;
+    let results: Vec<String> = sent
+        .iter()
+        .flat_map(|b| b["messages"].as_array().cloned().unwrap_or_default())
+        .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+        .filter(|c| c["type"] == "tool_result")
+        .filter_map(|c| c["content"].as_str().map(str::to_owned))
+        .collect();
+    let has = |text: &str| results.iter().any(|r| r.contains(text));
+    assert!(has("Tidy up calc") && has("M\tcalc.py"), "the log found the commit: {results:?}");
+    assert!(has("-    return a + b\n+    return a - b"), "its patch: {results:?}");
+    assert!(has("modified README.txt") && has("added    greeting.txt"), "theirs and the attempt's: {results:?}");
+    let audit = molt_kernel::audit::read_all(&setup.data.path().join("audit.jsonl")).await.unwrap();
+    let queries = audit
+        .iter()
+        .filter(|e| {
+            matches!(&e.event, AuditEvent::Message { envelope }
+            if envelope.kind == Kind::Request && envelope.to.to_string() == molt_api::fs::GIT
+                && envelope.from.as_ref().map(|f| f.as_str()) == Some("planner"))
+        })
+        .count();
+    assert_eq!(queries, 3);
+    // The result was applied; the repository's history, index and the user's own change are as they were.
+    let (status, head, index) = state(&ws);
+    assert_eq!((head, index), (before.1, before.2));
+    assert_eq!(status, format!("{}?? greeting.txt\n", before.0));
     assert_requests_valid(&server).await;
     assert_forks_dropped(setup.data.path());
 }

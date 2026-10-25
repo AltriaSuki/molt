@@ -784,6 +784,10 @@ pub mod tools {
     pub const READ_PROCESS: &str = "read_process";
     pub const WRITE_PROCESS: &str = "write_process";
     pub const STOP_PROCESS: &str = "stop_process";
+    /// Offered to attempts when the planner's starter turns it on (#111):
+    /// read the git history of the user's repository. Its input is a
+    /// [`crate::fs::GitQuery`].
+    pub const GIT: &str = "git";
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ReadFile {
