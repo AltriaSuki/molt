@@ -600,7 +600,8 @@ pub(crate) async fn summarize(ctx: &Arc<Ctx>, conv: &Conversation, from: u32, ca
     );
     let seat = ctx.seats().compactor;
     let mut call = Conversation::seated(&seat, "", vec![notes_tool()], user_text(text), Role::Compactor, conv.attempt);
-    if call.model.is_none() {
+    // The compactor's own model, else the attempt's.
+    if call.model.is_none() && !ctx.cfg.role_models.contains_key(&Role::Compactor) {
         call.model = conv.model.clone();
     }
     if call.effort.is_none() {

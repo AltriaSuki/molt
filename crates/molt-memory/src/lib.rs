@@ -120,7 +120,7 @@ impl Config {
     ///
     /// | Variable | Default |
     /// |---|---|
-    /// | `MOLT_MEMORY_MODEL` | the attempts' model |
+    /// | `MOLT_MEMORY_MODEL` | the `memory` model of `MOLT_ROLE_MODELS`, else the attempts' model |
     /// | `MOLT_MEMORY_EFFORT` | `low` |
     /// | `MOLT_MEMORY_MAX_TOKENS` | `8000` |
     /// | `MOLT_MEMORY_MODEL_TIMEOUT_S` | `300` |
@@ -147,8 +147,14 @@ impl Config {
             Some(v) => v.parse().map_err(|e: String| anyhow::anyhow!("MOLT_MEMORY_EFFORT: {e}"))?,
             None => d.effort,
         };
+        let routed = match get(molt_api::model::ROLE_MODELS_ENV) {
+            Some(text) => {
+                molt_api::model::role_models(&text).map_err(anyhow::Error::msg)?.remove(&molt_api::model::Role::Memory)
+            }
+            None => None,
+        };
         Ok(Self {
-            model: get("MOLT_MEMORY_MODEL"),
+            model: get("MOLT_MEMORY_MODEL").or(routed),
             attempts_model: get("MOLT_PLANNER_MODEL").or_else(|| get("MOLT_MODEL")),
             effort,
             max_tokens: u32::try_from(number("MOLT_MEMORY_MAX_TOKENS", d.max_tokens.into())?)
@@ -703,5 +709,15 @@ mod tests {
         let both = from(&[("MOLT_MODEL", "grok-4.5"), ("MOLT_PLANNER_MODEL", "glm-4.6")]).unwrap();
         assert_eq!(both.attempts_model.as_deref(), Some("glm-4.6"), "the planner's default wins, as in the planner");
         assert_eq!(from(&[("MOLT_PLANNER_MODEL", " ")]).unwrap().attempts_model, None);
+    }
+
+    #[test]
+    fn the_role_models_memory_entry_is_its_model_unless_molt_memory_model_says_otherwise() {
+        let routed = r#"{"memory":"haiku","reviewer":"sonnet"}"#;
+        assert_eq!(from(&[("MOLT_ROLE_MODELS", routed)]).unwrap().model.as_deref(), Some("haiku"));
+        let both = from(&[("MOLT_ROLE_MODELS", routed), ("MOLT_MEMORY_MODEL", "opus")]).unwrap();
+        assert_eq!(both.model.as_deref(), Some("opus"));
+        assert_eq!(from(&[("MOLT_ROLE_MODELS", r#"{"reviewer":"sonnet"}"#)]).unwrap().model, None);
+        assert!(from(&[("MOLT_ROLE_MODELS", "nope")]).is_err());
     }
 }

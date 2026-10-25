@@ -111,7 +111,9 @@ impl Layered {
         let mut table: Table = toml::from_str(&text)?;
         let mut origins = BTreeMap::new();
         use_profile(&mut table, profile, &mut origins)?;
-        Ok(Self { config: into_config(&table)?, origins, base: Origin::File(path.to_path_buf()), env: Vec::new() })
+        let mut config = into_config(&table)?;
+        config.route_roles(&|name| std::env::var(name).ok())?;
+        Ok(Self { config, origins, base: Origin::File(path.to_path_buf()), env: Vec::new() })
     }
 
     /// `defaults` with the user's config, `profile`, the project config of
@@ -142,6 +144,15 @@ impl Layered {
         }
         env.extend(yield_to_env(&mut table, &mut origins, var));
         let mut config = into_config(&table)?;
+        // The user's role models, for the planner and memory, unless the environment sets them.
+        let routed = origins.iter().find(|(key, _)| key.starts_with("models.")).map(|(_, origin)| origin.clone());
+        let routes = molt_api::model::ROLE_MODELS_ENV;
+        if let Some(origin) = routed.filter(|_| var(routes).is_none_or(|v| v.trim().is_empty())) {
+            config.route_roles(var)?;
+            for name in ["planner", "memory"] {
+                origins.entry(format!("service.{name}.env.{routes}")).or_insert_with(|| origin.clone());
+            }
+        }
         // A web service the user added is one the planner may call, as with --allow-web.
         if let Some(origin) = origins.get(&format!("service.{WEB}")).cloned() {
             let fetch: molt_proto::Target = molt_api::web::FETCH.parse()?;
@@ -556,6 +567,28 @@ mod tests {
         assert_eq!(layered.origin("service.model.exec"), &Origin::Default);
         assert!(matches!(layered.origin("confirm.max_lines"), Origin::User(_)));
         assert_eq!(layered.origin("confirm.max_files"), &Origin::Default);
+    }
+
+    #[test]
+    fn the_users_role_models_reach_the_planner_and_memory_unless_the_environment_sets_them() {
+        let home = Home::new();
+        home.user("[models.roles]\nreviewer = \"haiku\"\nmemory = \"sonnet\"\n");
+        let layered = home.build(None).unwrap();
+        for name in ["planner", "memory"] {
+            let env = &layered.config.service(name).unwrap().env;
+            assert_eq!(env["MOLT_ROLE_MODELS"], r#"{"memory":"sonnet","reviewer":"haiku"}"#, "{name}");
+            assert!(matches!(layered.origin(&format!("service.{name}.env.MOLT_ROLE_MODELS")), Origin::User(_)));
+        }
+        assert!(!layered.config.service("model").unwrap().env.contains_key("MOLT_ROLE_MODELS"));
+        let layered = home.build_with(None, &[("MOLT_ROLE_MODELS", r#"{"judge":"opus"}"#)]).unwrap();
+        assert!(!layered.config.service("planner").unwrap().env.contains_key("MOLT_ROLE_MODELS"));
+
+        home.user("[models.roles]\nattempt = \"haiku\"\n");
+        let err = format!("{:#}", home.build(None).unwrap_err());
+        assert!(err.contains("--model"), "{err}");
+        // Projects cannot choose models for the roles.
+        home.user("").project("[models.roles]\nreviewer = \"opus\"\n");
+        assert!(home.build(None).is_err());
     }
 
     #[test]

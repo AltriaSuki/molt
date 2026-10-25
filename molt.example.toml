@@ -32,7 +32,7 @@ pass_env = [
   "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
   "MOLT_MODEL", "MOLT_EFFORT", "MOLT_MAX_TOKENS",
   "MOLT_MODEL_TIMEOUT_S", "MOLT_MODEL_RETRIES", "MOLT_MODEL_CONCURRENCY", "MOLT_FALLBACKS",
-  "MOLT_MODEL_PRICES", "MOLT_PRICES_FILE", "XDG_DATA_HOME",
+  "MOLT_MODEL_PRICES", "MOLT_PRICES_FILE", "MOLT_MODELS_FILE", "XDG_DATA_HOME",
 ]
 
 # Files and commands, confined to --root. Forks go to --scratch: replace
@@ -74,7 +74,7 @@ name = "memory"
 tier = "mutable"
 exec = { command = "molt-memory", args = ["--root", ".", "--db", ".molt/memory.db", "--forks", "/home/you/.cache/molt/work"] }
 provides = ["memory.*"]
-pass_env = ["MOLT_MEMORY_MODEL", "MOLT_MEMORY_EFFORT", "MOLT_MEMORY_MAX_TOKENS", "MOLT_MEMORY_MODEL_TIMEOUT_S", "MOLT_PLANNER_MODEL", "MOLT_MODEL"]
+pass_env = ["MOLT_MEMORY_MODEL", "MOLT_MEMORY_EFFORT", "MOLT_MEMORY_MAX_TOKENS", "MOLT_MEMORY_MODEL_TIMEOUT_S", "MOLT_PLANNER_MODEL", "MOLT_MODEL", "MOLT_ROLE_MODELS"]
 requests = [
   { target = "model.complete", budget = { tokens = 1000000000, calls = 1000000 } },
   { target = "kernel.audit.read", budget = { calls = 10000000 } },
@@ -105,7 +105,7 @@ pass_env = [
   "MOLT_PLANNER_MODEL", "MOLT_MAX_TURNS", "MOLT_MAX_CHECK_ROUNDS", "MOLT_BUDGET_USD", "MOLT_EXPLORE",
   "MOLT_EXPLORE_MODEL", "MOLT_COMPACT", "MOLT_MAX_TOKENS", "MOLT_MODEL_TIMEOUT_S", "MOLT_CHECK_TIMEOUT_S", "MOLT_MAP_TOKENS", "MOLT_CONTEXT_TOKENS",
   "MOLT_INSTRUCTION_FILES", "MOLT_SYNTAX_CHECK",
-  "MOLT_PROCESSES", "MOLT_GIT",
+  "MOLT_PROCESSES", "MOLT_GIT", "MOLT_ROLE_MODELS",
 ]
 requests = [
   { target = "model.complete", budget = { tokens = 4000000000, calls = 1000000 } },
@@ -124,6 +124,15 @@ requests = [
   { target = "memory.symbols", budget = { calls = 10000000 } },
   { target = "memory.fork_symbols", budget = { calls = 10000000 } },
 ]
+
+# The model each role's calls go to when its declaration names none; the
+# attempts keep the run's (--model). Roles: designer, vetter, reviewer, judge,
+# router, explorer, compactor, memory. The planner and memory get it as
+# MOLT_ROLE_MODELS, which, when set in the environment, is used instead.
+# [models.roles]
+# reviewer = "haiku"
+# explorer = "haiku"
+# memory = "haiku"
 
 # When the interface's confirm mode stops for you; these are the defaults.
 # [confirm]
