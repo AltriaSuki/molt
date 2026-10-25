@@ -19,7 +19,7 @@ use crate::compact::{self, Compacted};
 use crate::control;
 use crate::ctx::{Conversation, Ctx, Spend};
 use crate::tools::{self, Actor};
-use crate::{explore, judge, process, prompts};
+use crate::{explore, git, judge, process, prompts};
 
 /// Bytes of check output kept in a failed attempt's note.
 const NOTE_TAIL: usize = 2000;
@@ -334,6 +334,7 @@ impl Attempt {
         let tools = if ctx.interactive && !self.read_only { prompts::with_ask_user(&tools) } else { tools };
         let max_turns = seat.max_turns.unwrap_or(ctx.max_turns);
         let tools = if self.processes() { process::with_processes(tools) } else { tools };
+        let tools = if self.reads_history() { git::with_git(tools) } else { tools };
         // Last, after ask_user: without it the list is what it was.
         let tools = if self.explores() { explore::with_explore(tools) } else { tools };
         // A final reply the model gave before the run stopped, still to be checked.
@@ -615,6 +616,14 @@ impl Attempt {
             && self.ctx.seats().attempt.allows(molt_api::planner::tools::START_PROCESS)
     }
 
+    /// It is offered `git`: it is on and its role may have it. An attempt
+    /// that only reads, as an `ask` run's, may read the history too.
+    fn reads_history(&self) -> bool {
+        let seats = self.ctx.seats();
+        let seat = if self.read_only { &seats.explorer } else { &seats.attempt };
+        self.ctx.git && seat.allows(molt_api::planner::tools::GIT)
+    }
+
     /// It is offered `explore`: its workflow explores, it changes files,
     /// and its role may have the tool.
     fn explores(&self) -> bool {
@@ -640,8 +649,14 @@ impl Attempt {
         let is_explore = |c: &ToolUse| explores && c.name == EXPLORE;
         // Offered once turns were left out: it reads them back, so it is no tool before.
         let is_earlier = |c: &ToolUse| compacted.is_some() && c.name == compact::EARLIER_RESULT;
-        let refused =
-            |c: &ToolUse| !is_earlier(c) && self.read_only && !self.ctx.tools.offers(ToolRole::Attempt, true, &c.name);
+        // `git` only reads, so an attempt that only reads may make it when it is offered.
+        let reads_history = |c: &ToolUse| c.name == molt_api::planner::tools::GIT && self.reads_history();
+        let refused = |c: &ToolUse| {
+            !is_earlier(c)
+                && !reads_history(c)
+                && self.read_only
+                && !self.ctx.tools.offers(ToolRole::Attempt, true, &c.name)
+        };
         let others: Vec<ToolUse> = calls
             .iter()
             .filter(|c| !is_dispute(c) && !is_explore(c) && !is_earlier(c) && !refused(c))

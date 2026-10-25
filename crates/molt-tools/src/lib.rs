@@ -13,6 +13,7 @@ pub mod env_profile;
 mod error;
 mod files;
 mod fork;
+mod git;
 mod paths;
 mod process;
 pub mod sandbox;
@@ -54,12 +55,14 @@ pub struct Fs {
     /// Held by merge and drop, so two merges into one workspace cannot
     /// interleave their conflict checks and writes.
     forks: Arc<Mutex<()>>,
+    /// The content hashes of blobs `fs.git` has read.
+    blobs: Arc<git::Blobs>,
 }
 
 impl Fs {
     /// Canonicalizes the roots; `scratch` is created if missing, and checked.
     pub fn new(roots: Roots) -> anyhow::Result<Self> {
-        Ok(Self { roots: Arc::new(roots.canonical()?), forks: Arc::default() })
+        Ok(Self { roots: Arc::new(roots.canonical()?), forks: Arc::default(), blobs: Arc::default() })
     }
 
     /// Handle one `fs` method (`read`, `write`, ...) with its request payload.
@@ -174,6 +177,10 @@ impl Fs {
             "view" => blocking(method, payload, move |req| fork::view(&roots, &forks, req).map(quiet)).await,
             "drop" => blocking(method, payload, move |req| fork::drop_fork(&roots, &forks, req).map(quiet)).await,
             "narrow" => blocking(method, payload, move |req| fork::narrow(&roots, &forks, req).map(quiet)).await,
+            "git" => {
+                let blobs = self.blobs.clone();
+                blocking(method, payload, move |req| git::query(&roots, &blobs, req).map(quiet)).await
+            }
             _ => Err(invalid(format!("unknown method fs.{method}"))),
         }
     }
