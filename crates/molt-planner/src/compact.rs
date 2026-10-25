@@ -756,6 +756,7 @@ mod tests {
             usage: Default::default(),
             cost_usd: None,
             price_source: None,
+            context_tokens: None,
         };
         let notes = notes_from(
             &resp(json!({

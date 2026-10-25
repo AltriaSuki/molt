@@ -34,6 +34,10 @@ pub(crate) fn build(cfg: &Config, model: &str, req: CompleteRequest) -> Result<C
     if max_tokens == 0 {
         return Err(invalid("max_tokens must be positive"));
     }
+    // The checks above hold for both protocols; only the wire shape differs.
+    if caps.protocol == crate::provider::Protocol::Responses {
+        return crate::responses::build(model, req, &caps, effort, max_tokens);
+    }
     let mut messages = Vec::new();
     if let Some(system) = req.system.filter(|s| !s.is_empty()) {
         messages.push(json!({"role":"system", "content":system}));

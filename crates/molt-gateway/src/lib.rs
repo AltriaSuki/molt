@@ -1,5 +1,5 @@
 //! The model gateway: serves `model.complete` through explicit Anthropic
-//! Messages and OpenAI Chat Completions adapters.
+//! Messages, OpenAI Chat Completions and OpenAI Responses adapters.
 //!
 //! It is the only process that holds provider credentials. It turns a
 //! [`CompleteRequest`] into a Messages API request shaped for the chosen
@@ -13,6 +13,7 @@ mod openai;
 pub mod prices;
 mod profile;
 pub mod provider;
+mod responses;
 mod stream;
 
 use std::fmt;
@@ -345,6 +346,9 @@ impl Gateway {
             usage,
             cost_usd,
             price_source: priced.map(|(_, s)| s),
+            context_tokens: (provider == provider::Provider::Openai)
+                .then(|| self.cfg.providers.capabilities(&model).ok().and_then(|c| c.context))
+                .flatten(),
         })
     }
 }
@@ -1128,6 +1132,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.message.contains("usage and cost are unknown"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_responses_call_stops_locally_with_unknown_settlement() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .mount(&server)
+            .await;
+        let models =
+            r#"{"r":{"tools":true,"streaming":true,"output_schema":true,"max_output":100,"protocol":"responses"}}"#;
+        let mut cfg =
+            from(&[("OPENAI_API_KEY", "o"), ("MOLT_MODEL", "openai/r"), ("MOLT_OPENAI_MODELS", models)]).unwrap();
+        cfg.providers.openai_base_url = server.uri();
+        let gateway = Gateway::new(cfg).unwrap();
+        let payload = CompleteRequest { messages: vec![user_text("hi")], ..Default::default() };
+        let request = envelope("model.complete", serde_json::to_value(payload).unwrap());
+        let cancel = CancellationToken::new();
+        let work = handle_observed(&gateway, request, None, cancel.clone());
+        tokio::pin!(work);
+        tokio::select! {
+            result = &mut work => panic!("HTTP finished early: {result:?}"),
+            _ = async { while server.received_requests().await.unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }} => {}
+        }
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), work).await.unwrap().unwrap();
+        assert_eq!(result["error"]["code"], "cancelled");
+        assert!(result["settlement"]["usage"].is_null() && result["settlement"]["cost_usd"].is_null());
+        assert!(result["settlement"]["remote_cancel_confirmed"].is_null());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

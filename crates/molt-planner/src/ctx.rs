@@ -166,6 +166,9 @@ pub(crate) struct Ctx {
     /// Each role that has made a model call and its prompt, in the order
     /// they first did.
     spoke: Arc<Mutex<Vec<PromptUse>>>,
+    /// The run's model's context window, as the gateway last reported it
+    /// (#106); 0 until it does.
+    reported_context: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// A conversation that grows until it no longer fits a model call (see
@@ -333,6 +336,7 @@ impl Ctx {
             continues: req.continues.clone().map(Arc::new),
             base: None,
             spoke: Arc::default(),
+            reported_context: Arc::default(),
         }
     }
 
@@ -380,8 +384,15 @@ impl Ctx {
     }
 
     /// What one model call of this run can take.
+    /// `MOLT_CONTEXT_TOKENS` wins, then what the gateway's configuration
+    /// declares for the run's model, then a guess from its name.
     pub fn limits(&self) -> Limits {
-        let context = self.cfg.context_tokens.unwrap_or_else(|| Limits::context_of(self.model.as_deref()));
+        let reported = self.reported_context.load(std::sync::atomic::Ordering::Relaxed);
+        let context = self
+            .cfg
+            .context_tokens
+            .or((reported > 0).then_some(reported))
+            .unwrap_or_else(|| Limits::context_of(self.model.as_deref()));
         Limits::new(context, self.cfg.max_tokens, self.cfg.frame_bytes)
     }
 
@@ -522,6 +533,8 @@ impl Ctx {
                 spoke.push(prompt.clone());
             }
         }
+        // Only the run's own model's window bounds the run's conversations.
+        let runs_model = req.model == self.model;
         let ms = u64::try_from(self.cfg.model_timeout.as_millis()).unwrap_or(u64::MAX);
         let budget = Budget::new(self.cfg.max_tokens.into(), ms, 0);
         self.tally.send_modify(|t| t.pending += 1);
@@ -531,6 +544,9 @@ impl Ctx {
         let call = tokio::spawn(async move {
             let resp = ctx.call::<CompleteResponse>(model::COMPLETE, req, budget).await;
             drop(busy);
+            if let Some(context) = resp.as_ref().ok().and_then(|r| r.context_tokens).filter(|_| runs_model) {
+                ctx.reported_context.store(context, std::sync::atomic::Ordering::Relaxed);
+            }
             ctx.tally.send_modify(|t| {
                 t.pending -= 1;
                 match &resp {

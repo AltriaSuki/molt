@@ -517,6 +517,7 @@ fn response(content: Vec<Value>, stop: &str) -> CompleteResponse {
         // A binary fraction, so sums are exact.
         cost_usd: Some(0.125),
         price_source: None,
+        context_tokens: None,
     }
 }
 
@@ -2183,6 +2184,40 @@ async fn a_long_task_leaves_out_its_earliest_turns_to_fit_and_still_finishes() {
             if message.starts_with("attempt 1: ") && message.contains("earlier messages left out"))),
             "{name}"
         );
+    }
+}
+
+#[tokio::test]
+async fn the_context_window_the_gateway_reports_fits_the_conversation_without_a_setting() {
+    // The gateway's trusted declaration says 40,000 tokens; the planner's own guess would be 200,000.
+    let big: String = (0..1500).map(|i| format!("line {i}: “quoted” é\n")).collect();
+    let reader = long_reader(16);
+    let fake = Fake::new(
+        move |req: &CompleteRequest| {
+            let mut reply = reader(req);
+            reply.resp.as_mut().unwrap().context_tokens = Some(40_000);
+            reply
+        },
+        hello_check,
+    );
+    fake.set(|st| {
+        st.workspace.insert("big.txt".into(), big);
+    });
+    let resp = run_with(&fake, config(), request(Some("check"), 1)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    let requests = fake.requests();
+    let record = |r: &CompleteRequest| {
+        r.messages[0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["text"].as_str().is_some_and(|t| t.starts_with("<earlier_turns>")))
+    };
+    assert!(requests.iter().any(record), "the conversation was fitted");
+    for req in &requests {
+        assert!(well_formed(req));
+        let bytes = serde_json::to_vec(req).unwrap().len();
+        assert!(bytes / 4 <= 40_000 - 1000, "{bytes}");
     }
 }
 

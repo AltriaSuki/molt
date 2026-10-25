@@ -256,6 +256,7 @@ fn response(content: Vec<Value>, stop: &str) -> CompleteResponse {
         usage: Usage { input_tokens: 100, output_tokens: 10, ..Default::default() },
         cost_usd: Some(0.125),
         price_source: None,
+        context_tokens: None,
     }
 }
 

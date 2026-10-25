@@ -2,9 +2,9 @@
 
 ## Model providers
 
-The gateway keeps the existing Anthropic Messages adapter and also supports
-OpenAI Chat Completions. Provider choice belongs to the gateway, not the
-planner. With `OPENAI_API_KEY` set, use `molt do "task" --model openai/gpt-4.1`;
+The gateway speaks three protocols: Anthropic Messages, OpenAI Chat
+Completions and OpenAI Responses. Provider and protocol choice belong to the
+gateway, not the planner. With `OPENAI_API_KEY` set, use `molt do "task" --model openai/gpt-4.1`;
 `MOLT_PROVIDER=openai` sets the default provider and default model to GPT-4.1.
 `anthropic/opus`, `anthropic/sonnet` and `anthropic/haiku` explicitly choose
 Anthropic. Existing unprefixed aliases and Anthropic configuration are unchanged.
@@ -19,13 +19,20 @@ provider/model, for example `{"fast":"openai/gpt-4.1-mini"}`. It is trusted
 configuration, never loaded from project files.
 
 GPT-4.1, mini and nano (including their 2025-04-14 snapshots) have built-in
-capabilities for text, function tools, streaming and structured output, with a
-32,768 output cap and no effort parameter. Other OpenAI models require an
-explicit `MOLT_OPENAI_MODELS` JSON declaration, for example
-`{"my-model":{"tools":true,"streaming":true,"output_schema":false,"efforts":["low","medium","high"],"max_output":16000}}`.
-A declaration must describe a model that actually implements Chat Completions;
-it does not adapt other wire protocols. Unsupported requested capabilities fail
-before HTTP, including effort on Haiku rather than silently dropping it.
+capabilities for text, function tools, streaming and structured output over
+Chat Completions, with a 32,768 output cap, a 1,047,576-token context window
+and no effort parameter. Other OpenAI models require an explicit
+`MOLT_OPENAI_MODELS` JSON declaration, for example
+`{"my-model":{"tools":true,"streaming":true,"output_schema":false,"efforts":["low","medium","high"],"max_output":16000,"protocol":"responses","context":400000}}`.
+`protocol` is `chat_completions` (the default) or `responses`; a declaration
+must name the protocol the model's endpoint actually implements, and declaring
+a built-in model replaces its built-in capabilities. `context`, when given, is
+the model's context window in tokens, the reply included: every reply carries
+it, and the planner fits the run's conversations to it instead of guessing
+from the model's name (`MOLT_CONTEXT_TOKENS` still wins). Unsupported requested
+capabilities fail before HTTP, including effort on Haiku rather than silently
+dropping it. A protocol is never switched because an endpoint returned an
+error.
 
 The adapter converts unsigned text and function tool histories, preserving
 call IDs, tool errors and tool results. Signed thinking, native citations,
@@ -39,7 +46,50 @@ The spending limit remains a best-effort pre-call limit, not a guaranteed hard
 remote billing cap. Cancellation stops local HTTP and leaves remote billing
 unknown, as on the Anthropic path.
 
-The implementation follows the [Chat Completions reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+### OpenAI Responses
+
+A model declared with `"protocol":"responses"` is called at
+`OPENAI_BASE_URL/v1/responses`, with the same key, aliases, capability checks,
+retries, pricing and cancellation as Chat Completions. Every call sends
+`store: false` and the whole conversation as `input`: no
+`previous_response_id` or conversation object, so nothing depends on what the
+endpoint keeps, and a run resumes and audits from its own messages. Function
+calls and their outputs keep their `call_id`, and a failed tool's output says
+so. Tools are sent with `strict: false` unless a tool asks for strict, since
+Responses makes them strict by default; `output_schema` goes in
+`text.format`, effort in `reasoning.effort`.
+
+The native state a stateless conversation needs is a reasoning model's
+reasoning. For a model whose declaration names efforts, the call asks for
+`reasoning.encrypted_content`, and each reasoning item comes back as an
+`openai_reasoning` block with its id, summary and encrypted content. Passed
+back unchanged, as the planner does with every assistant turn, it goes to the
+next call in its place before the calls it led to. A reasoning item the
+endpoint sent without encrypted content is kept in the reply but cannot be
+sent back without server-side state, so it is left out of later calls, as the
+API allows. These blocks never cross protocols: a conversation holding one is
+refused before HTTP by the Messages and Chat Completions adapters, and signed
+Anthropic thinking is refused by the Responses adapter; start a new
+conversation instead.
+
+A reply maps to the shared blocks with `stop_details` naming
+`"protocol":"responses"`, its `status` and any `incomplete_reason`. A
+response cut at `max_output_tokens` stops with `max_tokens`, and a function
+call it cut is kept only as the last block, with empty input, which the
+planner never runs; an unfinished call anywhere else, a `failed` response,
+annotations and other native output items (web search, files, images) are
+refused, and their usage and cost stay unknown. A content-filtered response
+is a refusal. Streaming previews only output text; function arguments are
+taken from finished items, the reply and usage from the final
+`response.completed` (or `incomplete`) event, so a stream cut before it, or
+with an `error` event, has no answer and is never retried. Cached input
+tokens are separated from uncached ones for pricing. Only text and function
+tools are supported; built-in tools, media input and background responses
+are not. The adapter is checked against a scripted endpoint, not certified
+against any live model.
+
+The implementation follows the [Responses reference](https://developers.openai.com/api/reference/resources/responses/methods/create).
+The Chat Completions adapter follows the [Chat Completions reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
 and [streaming contract](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events).
 
 ## When a model call fails

@@ -90,7 +90,8 @@ pub struct Config {
     /// cost is counted. Calls still unanswered are reported as uncounted.
     pub late_reply_wait: Duration,
     /// The model's context window in tokens, the reply included. `None`
-    /// takes 200,000 for Claude models and 128,000 for any other.
+    /// takes what the gateway reports for the run's model once it does,
+    /// else 200,000 for Claude models and 128,000 for any other.
     pub context_tokens: Option<u32>,
     /// The largest model request the bus carries, in bytes.
     pub frame_bytes: usize,

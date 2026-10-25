@@ -194,10 +194,31 @@ struct Names {
     credential: &'static str,
 }
 
-/// A client for `POST {base_url}/v1/messages`.
+/// The protocol one call speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Wire {
+    Messages,
+    ChatCompletions,
+    Responses,
+}
+
+impl Wire {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Messages => "Messages API",
+            Self::ChatCompletions => "OpenAI Chat Completions API",
+            Self::Responses => "OpenAI Responses API",
+        }
+    }
+}
+
+/// A client for `POST {base_url}/v1/messages`, or for OpenAI's
+/// `/v1/chat/completions` and `/v1/responses`.
 pub(crate) struct Api {
     provider: Provider,
     names: Names,
+    /// OpenAI's `/v1/responses`, beside `url` for Chat Completions.
+    responses: Option<Url>,
     /// The base URL ends in `/v1`, which a 404 most likely comes from.
     doubled_v1: bool,
     http: reqwest::Client,
@@ -253,6 +274,7 @@ impl Api {
             doubled_v1: ends_in_v1(&cfg.base_url),
             http,
             url,
+            responses: None,
             headers,
             timeout: cfg.timeout,
             max_retries: cfg.max_retries,
@@ -261,9 +283,9 @@ impl Api {
     }
 
     pub fn openai(cfg: &Config, key: &str) -> anyhow::Result<Self> {
-        let url: Url = format!("{}/v1/chat/completions", cfg.providers.openai_base_url.trim_end_matches('/'))
-            .parse()
-            .context("bad OPENAI_BASE_URL")?;
+        let origin = cfg.providers.openai_base_url.trim_end_matches('/');
+        let url: Url = format!("{origin}/v1/chat/completions").parse().context("bad OPENAI_BASE_URL")?;
+        let responses: Url = format!("{origin}/v1/responses").parse().context("bad OPENAI_BASE_URL")?;
         anyhow::ensure!(
             url.username().is_empty() && url.password().is_none() && url.query().is_none() && url.fragment().is_none(),
             "OPENAI_BASE_URL cannot contain credentials, query or fragment"
@@ -291,6 +313,7 @@ impl Api {
             doubled_v1: ends_in_v1(&cfg.providers.openai_base_url),
             http,
             url,
+            responses: Some(responses),
             headers,
             timeout: cfg.timeout,
             max_retries: cfg.max_retries,
@@ -309,6 +332,14 @@ impl Api {
         deadline: Option<Instant>,
         mut observer: Observer<'_>,
     ) -> Result<Message, RemoteError> {
+        let wire = match self.provider {
+            Provider::Anthropic => Wire::Messages,
+            Provider::Openai if crate::responses::is_responses(body) => Wire::Responses,
+            Provider::Openai => Wire::ChatCompletions,
+        };
+        if wire == Wire::Messages {
+            crate::responses::refuse_on_messages(body)?;
+        }
         let streaming = body["stream"] == true;
         let bytes = serde_json::to_vec(body)
             .map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("encoding the request: {e}") })?;
@@ -323,13 +354,14 @@ impl Api {
                 let message = "the caller's deadline passed before the Messages API was called".to_owned();
                 return Err(RemoteError { code: ErrorCode::Timeout, message });
             }
-            let failure = match self.attempt(bytes.clone(), fallbacks, timeout, streaming, &mut observer.text).await {
-                Ok(msg) => return Ok(msg),
-                Err(f) => f,
-            };
+            let failure =
+                match self.attempt(wire, bytes.clone(), fallbacks, timeout, streaming, &mut observer.text).await {
+                    Ok(msg) => return Ok(msg),
+                    Err(f) => f,
+                };
             let cut = timeout < self.timeout;
             if !failure.retryable() || retries >= self.max_retries {
-                return Err(self.give_up(failure, retries + 1, timeout, cut, billed_before));
+                return Err(self.give_up(wire, failure, retries + 1, timeout, cut, billed_before));
             }
             let delay = match &failure {
                 Failure::Status { retry_after: Some(d), .. } => *d,
@@ -341,7 +373,7 @@ impl Api {
                     ?delay,
                     "Messages API call failed; no time to retry before the caller's deadline"
                 );
-                return Err(self.give_up(failure, retries + 1, timeout, cut, billed_before));
+                return Err(self.give_up(wire, failure, retries + 1, timeout, cut, billed_before));
             }
             tracing::warn!(?failure, retry = retries + 1, ?delay, "Messages API call failed; retrying");
             if let Some(on_retry) = observer.retry.as_mut() {
@@ -359,6 +391,7 @@ impl Api {
     /// `failed` when an earlier attempt may have been.
     fn give_up(
         &self,
+        wire: Wire,
         failure: Failure,
         attempts: u32,
         timeout: Duration,
@@ -369,12 +402,14 @@ impl Api {
             Failure::Status { status, .. } => Some(status.as_u16()),
             _ => None,
         };
-        let mut error = self.error(failure.into_error(attempts, timeout, cut));
+        let mut error = failure.into_error(attempts, timeout, cut);
+        error.message = error.message.replace(Wire::Messages.name(), wire.name());
         let names = &self.names;
+        let path = if wire == Wire::Responses { "/v1/responses" } else { names.path };
         match status {
             Some(404) if self.doubled_v1 => error.message.push_str(&format!(
-                "; {} ends in /v1 and molt adds {} itself: remove the trailing /v1",
-                names.base_url, names.path
+                "; {} ends in /v1 and molt adds {path} itself: remove the trailing /v1",
+                names.base_url
             )),
             Some(401) => error.message.push_str(&format!("; the credential was rejected: check {}", names.credential)),
             _ => {}
@@ -386,22 +421,17 @@ impl Api {
         error
     }
 
-    fn error(&self, mut error: RemoteError) -> RemoteError {
-        if self.provider == Provider::Openai {
-            error.message = error.message.replace("Messages API", "OpenAI Chat Completions API");
-        }
-        error
-    }
-
     async fn attempt(
         &self,
+        wire: Wire,
         body: Vec<u8>,
         fallbacks: bool,
         timeout: Duration,
         streaming: bool,
         on_text: &mut Option<&mut (dyn FnMut(String) + Send)>,
     ) -> Result<Message, Failure> {
-        let mut req = self.http.post(self.url.clone()).headers(self.headers.clone()).timeout(timeout).body(body);
+        let url = if wire == Wire::Responses { self.responses.as_ref().unwrap_or(&self.url) } else { &self.url };
+        let mut req = self.http.post(url.clone()).headers(self.headers.clone()).timeout(timeout).body(body);
         if fallbacks {
             req = req.header("anthropic-beta", FALLBACK_BETA);
         }
@@ -412,16 +442,18 @@ impl Api {
         let request_id = header("request-id");
         let location = header("location").filter(|_| status.is_redirection());
         if status.is_success() && streaming {
-            return read_stream(resp, on_text, self.provider).await;
+            return read_stream(resp, on_text, wire).await;
         }
         let bytes = resp.bytes().await.map_err(transport)?;
         if status.is_success() {
-            return match self.provider {
-                Provider::Anthropic => serde_json::from_slice(&bytes).map_err(|e| Failure::BadBody(e.to_string())),
-                Provider::Openai => serde_json::from_slice(&bytes)
-                    .map_err(|e| Failure::BadBody(e.to_string()))
-                    .and_then(|v| crate::openai::decode(v).map_err(Failure::BadBody)),
+            let decode = match wire {
+                Wire::Messages => return serde_json::from_slice(&bytes).map_err(|e| Failure::BadBody(e.to_string())),
+                Wire::ChatCompletions => crate::openai::decode,
+                Wire::Responses => crate::responses::decode,
             };
+            return serde_json::from_slice(&bytes)
+                .map_err(|e| Failure::BadBody(e.to_string()))
+                .and_then(|v| decode(v).map_err(Failure::BadBody));
         }
         let mut detail = match serde_json::from_slice::<ErrorBody>(&bytes) {
             Ok(b) => format!(": {}: {}", b.error.kind, b.error.message),
@@ -441,24 +473,28 @@ impl Api {
 enum ResponseStream {
     Anthropic(Accumulator),
     Openai(crate::openai::Accumulator),
+    Responses(crate::responses::Accumulator),
 }
 impl ResponseStream {
-    fn new(provider: Provider) -> Self {
-        match provider {
-            Provider::Anthropic => Self::Anthropic(Accumulator::default()),
-            Provider::Openai => Self::Openai(crate::openai::Accumulator::default()),
+    fn new(wire: Wire) -> Self {
+        match wire {
+            Wire::Messages => Self::Anthropic(Accumulator::default()),
+            Wire::ChatCompletions => Self::Openai(crate::openai::Accumulator::default()),
+            Wire::Responses => Self::Responses(crate::responses::Accumulator::default()),
         }
     }
     fn event(&mut self, event: Value) -> Result<Option<String>, String> {
         match self {
             Self::Anthropic(s) => s.event(event),
             Self::Openai(s) => s.event(event),
+            Self::Responses(s) => s.event(event),
         }
     }
     fn finish(self) -> Result<Message, String> {
         match self {
             Self::Anthropic(s) => s.finish(),
             Self::Openai(s) => s.finish(),
+            Self::Responses(s) => s.finish(),
         }
     }
 }
@@ -466,15 +502,17 @@ impl ResponseStream {
 async fn read_stream(
     mut response: reqwest::Response,
     on_text: &mut Option<&mut (dyn FnMut(String) + Send)>,
-    provider: Provider,
+    wire: Wire,
 ) -> Result<Message, Failure> {
     let bad = |e: String| Failure::BadBody(format!("invalid Messages API stream: {e}"));
     let content_type = response.headers().get(CONTENT_TYPE).and_then(|h| h.to_str().ok()).unwrap_or("");
     if content_type.split(';').next().unwrap_or("").trim() != "text/event-stream" {
         return Err(bad("expected text/event-stream".into()));
     }
-    let mut decoder = Decoder::for_provider(provider);
-    let mut accumulator = ResponseStream::new(provider);
+    // Only Chat Completions ends its stream with `[DONE]`.
+    let mut decoder =
+        Decoder::for_provider(if wire == Wire::ChatCompletions { Provider::Openai } else { Provider::Anthropic });
+    let mut accumulator = ResponseStream::new(wire);
     let mut preview = String::new();
     let mut last_flush = Instant::now() - Duration::from_secs(1);
     loop {
