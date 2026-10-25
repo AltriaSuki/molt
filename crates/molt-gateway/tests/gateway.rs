@@ -25,6 +25,7 @@ fn config(server: &MockServer) -> Config {
         fallbacks: true,
         retry_base: Duration::from_millis(2),
         prices: Default::default(),
+        probed: Default::default(),
     }
 }
 
@@ -506,6 +507,7 @@ async fn an_unreachable_api_is_unavailable() {
         fallbacks: true,
         retry_base: Duration::from_millis(1),
         prices: Default::default(),
+        probed: Default::default(),
     };
     let err = Gateway::new(cfg).unwrap().complete(request()).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Unavailable, "{}", err.message);

@@ -986,6 +986,7 @@ pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::
         extensions: Vec::new(),
         profiles: cfg.profiles.clone(),
         mcp: Default::default(),
+        models: cfg.models.clone(),
     };
     let running = crate::start(&alone).await?;
     let result = async {

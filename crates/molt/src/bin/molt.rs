@@ -105,6 +105,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PricesCmd,
     },
+    /// See the models molt knows, and find out what one does on its endpoint.
+    Models {
+        #[command(subcommand)]
+        cmd: ModelsCmd,
+    },
     /// Work with the audit log.
     Audit {
         #[command(subcommand)]
@@ -759,6 +764,30 @@ enum PricesCmd {
 }
 
 #[derive(Subcommand)]
+enum ModelsCmd {
+    /// Show the default model, the aliases and what probes found; or, for
+    /// MODEL, where its calls go, what it does and what it costs. Nothing
+    /// is called.
+    Show {
+        /// opus, sonnet, haiku, an alias or a model id.
+        model: Option<String>,
+    },
+    /// Find out what MODEL does on its endpoint: whether it calls tools,
+    /// streams, keeps to a JSON schema (output_schema) and takes an effort.
+    /// It makes up to four small calls, billed as usual, so it says what it
+    /// will call and asks first; nothing else ever probes. What it finds is
+    /// kept in ~/.local/share/molt/models.json (or MOLT_MODELS_FILE), and
+    /// the gateway goes by it from the next run on.
+    Probe {
+        /// opus, sonnet, haiku, an alias or a model id.
+        model: String,
+        /// Make the calls without asking, as from a script.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum AuditCmd {
     /// Check the hash chain of an audit log.
     Verify { path: Option<PathBuf> },
@@ -800,6 +829,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                 | Cmd::Memory { .. }
                 | Cmd::Bench { .. }
                 | Cmd::Prices { .. }
+                | Cmd::Models { .. }
                 | Cmd::Ui(_)
                 | Cmd::Serve(_)
                 | Cmd::Acp(_)
@@ -927,6 +957,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
         Cmd::Bench { cmd } => return molt_bench::cli::main(cmd).await,
         Cmd::Prices { cmd } => return prices_cmd(cmd).await,
+        Cmd::Models { cmd } => return models_cmd(cmd).await,
         Cmd::Audit { cmd: AuditCmd::Verify { path } } => {
             let path = audit_path(path)?;
             let n =
@@ -1721,6 +1752,137 @@ fn show_notes(notes: &[molt_api::memory::Recalled]) -> String {
         }
     }
     out
+}
+
+async fn models_cmd(cmd: ModelsCmd) -> anyhow::Result<ExitCode> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    use molt_gateway::catalog::{finding, Catalog};
+    use molt_gateway::probe::{self, Records};
+
+    // The gateway's own variables, from this environment, as `molt prices` reads them.
+    let var = |name: &str| std::env::var(name).ok();
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let ago = |ms: u64| {
+        let days = now_ms.saturating_sub(u128::from(ms)) / 86_400_000;
+        if days == 0 {
+            "today".to_owned()
+        } else {
+            format!("{days} days ago")
+        }
+    };
+    let found = |p: &probe::Probed| {
+        format!(
+            "tools {}, streaming {}, output_schema {}, effort {}, probed {}",
+            finding(p.tools),
+            finding(p.streaming),
+            finding(p.output_schema),
+            finding(p.effort),
+            ago(p.probed_at_ms)
+        )
+    };
+    match cmd {
+        ModelsCmd::Show { model: None } => {
+            let catalog = Catalog::from_vars(var)?;
+            let default = catalog.entry(&catalog.default_model).map(|e| format!(" ({}/{})", e.provider, e.model));
+            println!("default model: {}{}", catalog.default_model, default.unwrap_or_default());
+            let aliases: Vec<String> = catalog.aliases.iter().map(|(a, t)| format!("{a} = {t}")).collect();
+            println!("aliases: {}", aliases.join(", "));
+            if !catalog.declared.is_empty() {
+                println!("declared OpenAI models: {}", catalog.declared.join(", "));
+            }
+            match probe::records_path(var) {
+                Some(path) if !catalog.probed.models.is_empty() => {
+                    println!("probed, in {}:", path.display());
+                    for p in &catalog.probed.models {
+                        println!("  {}/{} at {}: {}", p.provider, p.model, p.base_url, found(p));
+                    }
+                }
+                _ => println!("probed: none yet (`molt models probe MODEL` finds out what a model does)"),
+            }
+        }
+        ModelsCmd::Show { model: Some(model) } => {
+            let catalog = Catalog::from_vars(var)?;
+            let entry = catalog.entry(&model).map_err(|e| anyhow::anyhow!("{model}: {}", e.message))?;
+            println!("{model}: {}/{} at {}", entry.provider, entry.model, entry.base_url);
+            println!("  {}", entry.known);
+            match &entry.probed {
+                Some(p) => println!("  probed: {}", found(p)),
+                None => println!("  probed: not on this endpoint (`molt models probe {model}` finds out)"),
+            }
+            match &entry.price {
+                Some((p, source)) => println!(
+                    "  price per million tokens: ${} input, ${} output (entry {} in {})",
+                    (p.input * 1e9).round() / 1e9,
+                    (p.output * 1e9).round() / 1e9,
+                    source.entry,
+                    source.source
+                ),
+                None => println!("  price: unknown, so a run stops after its first call (see `molt prices show`)"),
+            }
+        }
+        ModelsCmd::Probe { model, yes } => {
+            let gateway = molt_gateway::Gateway::new(probe::probing(molt_gateway::Config::from_env()?))?;
+            let plan = gateway.probe_plan(&model).map_err(|e| anyhow::anyhow!("{model}: {}", e.message))?;
+            let path =
+                probe::records_path(var).context("neither XDG_DATA_HOME nor HOME is set; set MOLT_MODELS_FILE")?;
+            eprintln!(
+                "Probing {}/{} at {} makes up to {} calls, one at a time, with no retries and at most {} output \
+                 tokens each. They are billed as usual:",
+                plan.provider,
+                plan.model,
+                plan.base_url,
+                plan.checks.len(),
+                probe::MAX_TOKENS
+            );
+            for check in &plan.checks {
+                eprintln!("  - {}", check.describe());
+            }
+            for skipped in &plan.skipped {
+                eprintln!("  not probed: {skipped}");
+            }
+            if plan.checks.is_empty() {
+                eprintln!("There is nothing to probe.");
+                return Ok(ExitCode::SUCCESS);
+            }
+            if !yes {
+                // Spending money is a person's word: a script says so with --yes.
+                anyhow::ensure!(
+                    std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+                    "molt models probe asks before it calls the model; pass --yes to make the calls without asking"
+                );
+                eprint!("Make these calls? [y/N] ");
+                std::io::stderr().flush()?;
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line)?;
+                if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    eprintln!("Nothing was called.");
+                    return Ok(ExitCode::FAILURE);
+                }
+            }
+            let report = gateway.probe(&plan, u64::try_from(now_ms).unwrap_or(u64::MAX)).await;
+            for f in &report.findings {
+                println!("{}: {} ({})", f.check.describe(), finding(f.works), f.detail);
+            }
+            let cost = match report.probed.cost_usd {
+                Some(usd) => format!("${usd:.4}"),
+                None => "unknown (some calls have no known price or may have been billed)".into(),
+            };
+            println!("{} calls, cost {cost}", report.calls);
+            if let Some(why) = &report.stopped {
+                eprintln!("The probe stopped: {why}. Nothing was recorded; fix that and probe again.");
+                return Ok(ExitCode::FAILURE);
+            }
+            let mut records = Records::from_vars(var)?;
+            records.put(report.probed);
+            records.write(&path)?;
+            println!(
+                "Recorded in {}. Runs started from now on go by it; one already running keeps what it started with.",
+                path.display()
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn prompts_cmd(cmd: PromptsCmd) -> anyhow::Result<()> {

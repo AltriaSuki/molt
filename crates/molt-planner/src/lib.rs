@@ -132,6 +132,12 @@ pub struct Config {
     /// leaves out to fit, beside Molt's own record of them (#108). Off by
     /// default: each fit then costs one more model call.
     pub compact_model: bool,
+    /// The model each role's calls go to when its declaration names none
+    /// (`MOLT_ROLE_MODELS`, #169): the reviewer on a cheaper model, say,
+    /// while the attempts keep the run's. A request's `judge_model`, the
+    /// explorer's `MOLT_EXPLORE_MODEL` and the router's `MOLT_ROUTE_MODEL`
+    /// still win for their roles.
+    pub role_models: std::collections::BTreeMap<molt_api::model::Role, String>,
 }
 
 impl Default for Config {
@@ -167,6 +173,7 @@ impl Default for Config {
             extension_skills: Vec::new(),
             skills_dir: None,
             compact_model: false,
+            role_models: Default::default(),
         }
     }
 }
@@ -177,7 +184,8 @@ impl Config {
     /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_EXPLORE`, `MOLT_EXPLORE_MODEL`, `MOLT_PROCESSES`, `MOLT_GIT`, `MOLT_MAX_TOKENS`,
     /// `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
     /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES`,
-    /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL`, `MOLT_PROMPTS_DIR`, `MOLT_SKILLS_DIR` and `MOLT_COMPACT`.
+    /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL`, `MOLT_PROMPTS_DIR`, `MOLT_SKILLS_DIR`, `MOLT_COMPACT` and
+    /// `MOLT_ROLE_MODELS`.
     ///
     /// | Variable | Default |
     /// |---|---|
@@ -202,6 +210,7 @@ impl Config {
     /// | `MOLT_SKILLS_DIR` | unset: no user skills; else the directory of the user's skills ([`skills`]) |
     /// | `MOLT_EXTENSION_SKILLS` | unset: none; else the extension packs' skill directories, as a `PATH`-style list ([`skills`]) |
     /// | `MOLT_COMPACT` | `record`: Molt's own record of the turns a conversation leaves out; `model` also has the `compactor` write notes on them ([`compact`]) |
+    /// | `MOLT_ROLE_MODELS` | unset: every role but the judge's uses the run's model; else a JSON object of role to model ([`molt_api::model::role_models`]) |
     ///
     /// An empty variable counts as unset. A value that does not parse is an
     /// error, and so is a zero: none of these limits has a "no limit" value.
@@ -322,6 +331,10 @@ impl Config {
             tools,
             pack: Arc::new(pack),
             skills_dir: get(skills::SKILLS_ENV).filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from),
+            role_models: match get(molt_api::model::ROLE_MODELS_ENV) {
+                Some(text) => molt_api::model::role_models(&text).map_err(anyhow::Error::msg)?,
+                None => d.role_models,
+            },
         })
     }
 }
@@ -781,6 +794,10 @@ mod tests {
         assert!(!cfg.explore && cfg.explore_model.is_none());
         let cfg = from(&[("MOLT_EXPLORE", "on"), ("MOLT_EXPLORE_MODEL", "haiku")]).unwrap();
         assert!(cfg.explore && cfg.explore_model.as_deref() == Some("haiku"));
+        let cfg = from(&[("MOLT_ROLE_MODELS", r#"{"reviewer":"haiku"}"#)]).unwrap();
+        assert_eq!(cfg.role_models.get(&molt_api::model::Role::Reviewer).map(String::as_str), Some("haiku"));
+        assert!(from(&[]).unwrap().role_models.is_empty());
+        assert!(from(&[("MOLT_ROLE_MODELS", r#"{"attempt":"opus"}"#)]).is_err());
         assert!(!from(&[("MOLT_EXPLORE", "off")]).unwrap().explore);
         assert!(format!("{:#}", from(&[("MOLT_EXPLORE", "yes")]).unwrap_err()).contains("use on or off"));
         // On, it is every workflow whose attempts change files, and never ask's.

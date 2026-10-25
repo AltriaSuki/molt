@@ -504,7 +504,11 @@ impl Ctx {
     /// so a caller that stops waiting leaves it pending until the reply lands.
     pub async fn complete(self: &Arc<Self>, conv: &Conversation, turn: u32) -> Result<CompleteResponse, RemoteError> {
         let req = CompleteRequest {
-            model: conv.model.clone().or_else(|| self.model.clone()),
+            model: conv
+                .model
+                .clone()
+                .or_else(|| self.cfg.role_models.get(&conv.role).cloned())
+                .or_else(|| self.model.clone()),
             system: Some(conv.system.to_string()),
             messages: conv.messages.clone(),
             tools: conv.tools.as_ref().clone(),

@@ -568,6 +568,8 @@ fn molt_in(server: &MockServer, workspace: &Path, data: &Path) -> tokio::process
         "MOLT_MEMORY_EFFORT",
         "MOLT_MEMORY_MAX_TOKENS",
         "MOLT_MEMORY_MODEL_TIMEOUT_S",
+        "MOLT_ROLE_MODELS",
+        "MOLT_MODELS_FILE",
     ] {
         cmd.env_remove(var);
     }
@@ -1248,6 +1250,85 @@ async fn molt_do_says_before_the_run_which_dependencies_commands_cannot_get_and_
     let err = tokio::time::timeout(RUN_LIMIT, err).await.expect("molt do hung").unwrap();
     assert!(!err.status.success());
     assert!(String::from_utf8_lossy(&err.stderr).contains("cannot be used with"), "{err:?}");
+}
+
+#[tokio::test]
+async fn the_reviewers_calls_go_to_the_model_role_models_name_through_molt_do() {
+    let server = fake_api(Fake::Greets).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let args = ["--check", CHECK, "--attempts", "1", "--no-memory"];
+    let cmd = molt_do(&server, workspace.path(), data.path(), &args)
+        .env("MOLT_ROLE_MODELS", r#"{"reviewer":"haiku"}"#)
+        .output();
+    let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let bodies = bodies(&server).await;
+    let reviews = |b: &&Value| b["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_REVIEW));
+    let (reviewer, others): (Vec<&Value>, Vec<&Value>) = bodies.iter().partition(reviews);
+    assert!(!reviewer.is_empty(), "the result was reviewed");
+    assert!(reviewer.iter().all(|b| b["model"] == "claude-haiku-4-5"), "{reviewer:?}");
+    assert!(!others.is_empty() && others.iter().all(|b| b["model"] == MODEL), "the attempts keep the run's model");
+}
+
+/// An Anthropic-compatible endpoint that calls tools and streams, but
+/// ignores `output_config.format` and refuses `output_config.effort`.
+struct ThirdParty;
+
+impl Respond for ThirdParty {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let body: Value = req.body_json().unwrap();
+        if body.pointer("/output_config/effort").is_some() {
+            return ResponseTemplate::new(400).set_body_json(error("invalid_request_error", "unknown field: effort"));
+        }
+        let content = match body["tools"].as_array().and_then(|t| t.first()) {
+            Some(tool) => {
+                vec![json!({ "type": "tool_use", "id": "toolu_1", "name": tool["name"], "input": { "n": 7 } })]
+            }
+            None => vec![json!({ "type": "text", "text": "2 + 3 is 5." })],
+        };
+        message(1, "glm-4.6", content, "end_turn", body["stream"] == true)
+    }
+}
+
+#[tokio::test]
+async fn molt_models_probe_asks_first_then_records_what_the_endpoint_does_and_show_reads_it() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/v1/messages")).respond_with(ThirdParty).mount(&server).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let probe = |extra: &[&str]| {
+        let mut cmd = molt_in(&server, workspace.path(), data.path());
+        cmd.args(["models", "probe", "glm-4.6"]).args(extra);
+        cmd.output()
+    };
+
+    // Not at a terminal and without --yes: it says what it would call, and calls nothing.
+    let out = tokio::time::timeout(RUN_LIMIT, probe(&[])).await.unwrap().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("makes up to 4 calls") && stderr.contains("--yes"), "{stderr}");
+    assert!(stderr.contains(&server.uri()), "it names the endpoint: {stderr}");
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let file = data.path().join("user-data/molt/models.json");
+    assert!(!file.exists());
+
+    let out = tokio::time::timeout(RUN_LIMIT, probe(&["--yes"])).await.unwrap().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    assert!(stdout.contains("output_schema): no"), "{stdout}");
+    let records = molt_gateway::probe::Records::load(&file).unwrap();
+    let p = &records.models[0];
+    assert_eq!((p.model.as_str(), p.base_url.as_str()), ("glm-4.6", server.uri().as_str()));
+    assert_eq!((p.tools, p.streaming, p.output_schema, p.effort), (Some(true), Some(true), Some(false), Some(false)));
+
+    let mut show = molt_in(&server, workspace.path(), data.path());
+    let out = show.args(["models", "show", "glm-4.6"]).output().await.unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("probed: tools yes, streaming yes, output_schema no, effort no"), "{stdout}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 4, "show calls nothing");
 }
 
 #[tokio::test]
