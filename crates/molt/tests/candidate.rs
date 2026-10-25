@@ -350,6 +350,25 @@ fn outcome<T, E: std::fmt::Display>(result: Result<T, E>) -> Value {
     }
 }
 
+/// The user's home is hidden when it cannot be listed, or when all it
+/// shows is the way to this program: the sandbox mounts the program at its
+/// own path, which in CI is a checkout under the home.
+fn home_listing(home: &Path) -> Value {
+    let program = std::env::current_exe().unwrap();
+    match std::fs::read_dir(home) {
+        Err(e) => json!({ "blocked": true, "why": e.to_string() }),
+        Ok(entries) => {
+            let shown: Vec<String> = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| !program.starts_with(path))
+                .map(|path| path.display().to_string())
+                .collect();
+            json!({ "blocked": shown.is_empty(), "shown": shown })
+        }
+    }
+}
+
 fn last_os_error(ret: libc::c_long) -> Result<(), std::io::Error> {
     if ret < 0 {
         Err(std::io::Error::last_os_error())
@@ -366,7 +385,7 @@ async fn probe(svc: &Service) -> Report {
         report.insert(what.to_owned(), value);
     };
     tried("read the user's file", outcome(std::fs::read_to_string(var("PROBE_HOST_FILE"))));
-    tried("list the user's home", outcome(std::fs::read_dir(var("PROBE_HOST_HOME"))));
+    tried("list the user's home", home_listing(&var("PROBE_HOST_HOME")));
     tried("read /etc/passwd", outcome(std::fs::read_to_string("/etc/passwd")));
     tried("read another service's state", outcome(std::fs::read_to_string(data.join("state/other/secret"))));
     tried("read the registry", outcome(std::fs::read(data.join("registry/registry.json"))));
