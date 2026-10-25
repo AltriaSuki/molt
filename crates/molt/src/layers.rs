@@ -4,7 +4,9 @@
 //! 1. the built-in agent setup ([`Config::agent`]);
 //! 2. the user's config, `~/.config/molt/config.toml` (or under
 //!    `$XDG_CONFIG_HOME`): trusted, so it may add or change services, hooks
-//!    and defaults, and define profiles;
+//!    and defaults, and define profiles; then the MCP servers, hooks and
+//!    skills of the extension packs the user installed, approved and
+//!    enabled ([`crate::extensions`]);
 //! 3. the profile picked with `--profile`;
 //! 4. the project's `.molt/config.toml` in the workspace: data only, since
 //!    anyone who wrote the project wrote it;
@@ -60,6 +62,8 @@ pub enum Origin {
     /// The file given with `--config`.
     File(PathBuf),
     User(PathBuf),
+    /// An extension pack the user installed, by name.
+    Extension(String),
     Profile(String),
     Project(PathBuf),
     Env(String),
@@ -71,6 +75,7 @@ impl fmt::Display for Origin {
             Self::Default => write!(f, "built-in default"),
             Self::File(path) => write!(f, "--config {}", path.display()),
             Self::User(path) => write!(f, "user config {}", path.display()),
+            Self::Extension(name) => write!(f, "extension {name}"),
             Self::Profile(name) => write!(f, "profile {name}"),
             Self::Project(path) => write!(f, "project config {}", path.display()),
             Self::Env(name) => write!(f, "environment {name}"),
@@ -134,6 +139,11 @@ impl Layered {
                 Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
             }
         }
+        let packs = match crate::extensions::Places::from_vars(var) {
+            Some(places) => crate::extensions::active(&places)?,
+            None => Vec::new(),
+        };
+        let pack_skills = merge_extensions(&mut table, &packs, workspace, &mut origins)?;
         use_profile(&mut table, profile, &mut origins)?;
         let path = workspace.join(PROJECT_FILE);
         let mut env = Vec::new();
@@ -171,6 +181,16 @@ impl Layered {
                 origins.insert(format!("service.planner.env.{env}"), Origin::User(dir));
             }
         }
+        // The extension packs' skills, for the planner, and their commands, for the interface.
+        if !pack_skills.is_empty() {
+            let env = molt_planner::skills::EXTENSION_SKILLS_ENV;
+            if let Some(planner) = config.service_mut("planner").filter(|p| !p.env.contains_key(env)) {
+                let joined = std::env::join_paths(&pack_skills).context("a pack's skills path holds a `:`")?;
+                planner.env.insert(env.into(), joined.into_string().map_err(|_| anyhow::anyhow!("not UTF-8"))?);
+                origins.insert(format!("service.planner.env.{env}"), Origin::Extension("packs".into()));
+            }
+        }
+        config.extensions = crate::extensions::command_dirs(&packs);
         // The user's skills, for the planner: from this layer only, as the pack.
         if let Some(dir) = crate::agent_skills::for_workspace(workspace, var)? {
             let env = molt_planner::skills::SKILLS_ENV;
@@ -287,6 +307,52 @@ fn merge_user(
     Ok(())
 }
 
+/// The MCP servers and hooks of the enabled extension `packs` into
+/// `table`, after the user's own; the packs' skill directories. A server
+/// with the name of one already there is refused, and so is a pack
+/// installed inside the workspace, where the agent's changes are applied.
+fn merge_extensions(
+    table: &mut Table,
+    packs: &[crate::extensions::Active],
+    workspace: &Path,
+    origins: &mut BTreeMap<String, Origin>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut skills = Vec::new();
+    let ws = workspace.canonicalize().ok();
+    for pack in packs {
+        let origin = Origin::Extension(pack.name.clone());
+        anyhow::ensure!(
+            !ws.as_ref().is_some_and(|ws| pack.dir.starts_with(ws)),
+            "extension {} is installed inside the workspace, at {}, where the agent's changes are applied: run \
+             molt from elsewhere, or set XDG_DATA_HOME outside it",
+            pack.name,
+            pack.dir.display()
+        );
+        for (key, server) in pack.servers()? {
+            let servers = table.entry("mcp").or_insert_with(|| Value::Table(Table::new()));
+            let servers = servers.as_table_mut().context("mcp is not a table")?;
+            anyhow::ensure!(
+                !servers.contains_key(&key),
+                "extension {}'s MCP server would be [mcp.{key}], which is there already: rename yours, or remove the \
+                 pack",
+                pack.name
+            );
+            servers.insert(key.clone(), Value::try_from(server)?);
+            origins.insert(format!("mcp.{key}"), origin.clone());
+        }
+        if !pack.manifest.hooks.is_empty() {
+            let hooks = table.entry("hooks").or_insert_with(|| Value::Array(Vec::new()));
+            let hooks = hooks.as_array_mut().context("hooks is not a list")?;
+            for hook in &pack.manifest.hooks {
+                hooks.push(Value::try_from(hook)?);
+            }
+            origins.entry("hooks".into()).or_insert(origin);
+        }
+        skills.extend(pack.skills_dir());
+    }
+    Ok(skills)
+}
+
 /// A service of the user's config replaces the keys it gives of the
 /// service with its name, or is added when there is none.
 fn merge_service(
@@ -373,6 +439,13 @@ fn merge_project(
             "{} defines `{key}`, which a project config may not: prompts and roles come only from your prompt pack, \
              ~/.config/molt/prompts/, so that a project cannot change what the agent, its reviewer or its judge \
              are told. A project's AGENTS.md is read as data that adds to the task",
+            path.display()
+        );
+    }
+    if let Some(key) = ["extension", "extensions"].iter().find(|key| raw.contains_key(**key)) {
+        bail!(
+            "{} defines `{key}`, which a project config may not: an extension pack is installed and enabled only \
+             by you, with molt ext add, which shows what it would get and asks first",
             path.display()
         );
     }
@@ -765,6 +838,73 @@ mod tests {
         std::fs::write(pack.join("pack.toml"), "[[role]]\nname = \"x\"\nbase = \"attempt\"\nprompt = \"none\"\n")
             .unwrap();
         assert!(format!("{:#}", home.build(None).unwrap_err()).contains("no prompt"));
+    }
+
+    #[test]
+    fn an_enabled_packs_servers_hooks_and_skills_join_the_users_and_a_project_cannot_enable_one() {
+        struct Yes;
+        impl crate::extensions::Approve for Yes {
+            fn approve(&mut self, _: &str) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            fn say(&mut self, _: &str) {}
+        }
+        let home = Home::new();
+        let data = home.dir.path().join("data");
+        let env = [("XDG_DATA_HOME", data.to_str().unwrap())];
+        let var = |name: &str| match name {
+            "XDG_CONFIG_HOME" => Some(home.dir.path().join("config").display().to_string()),
+            "XDG_DATA_HOME" => Some(data.display().to_string()),
+            _ => None,
+        };
+        let places = crate::extensions::Places::from_vars(&var).unwrap();
+        let src = home.dir.path().join("src");
+        std::fs::create_dir_all(src.join("skills/triage")).unwrap();
+        std::fs::write(
+            src.join(crate::extensions::MANIFEST),
+            "schema = 1\nname = \"tracker\"\nversion = \"1\"\n[mcp.issues]\ncommand = \"/opt/issues\"\n\
+             [[hooks]]\nevent = \"run.end\"\ncommand = \"true\"\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("skills/triage/SKILL.md"), "---\nname: triage\ndescription: T.\n---\nT.\n").unwrap();
+        crate::extensions::add(&places, &src, &mut Yes).unwrap();
+        home.user("[mcp.mine]\ncommand = \"/opt/mine\"\n[[hooks]]\nevent = \"run.start\"\ncommand = \"true\"\n");
+
+        let layered = home.build_with(None, &env).unwrap();
+        assert_eq!(layered.config.mcp.keys().collect::<Vec<_>>(), ["mine", "tracker-issues"]);
+        assert_eq!(layered.origin("mcp.tracker-issues.command"), &Origin::Extension("tracker".into()));
+        assert!(matches!(layered.origin("mcp.mine"), Origin::User(_)));
+        let events: Vec<&str> = layered.config.hooks.iter().map(|h| h.event.name()).collect();
+        assert_eq!(events, ["run.start", "run.end"], "the user's hooks first");
+        let planner = layered.config.service("planner").unwrap();
+        let dir = places.packs.join("tracker").canonicalize().unwrap();
+        let skills = &planner.env[molt_planner::skills::EXTENSION_SKILLS_ENV];
+        assert_eq!(skills, dir.join("skills").to_str().unwrap());
+        assert!(layered.show(true).unwrap().contains("# extension tracker"));
+
+        // A project can neither enable a pack nor bring one, and --config runs none.
+        for text in ["extensions = [\"tracker\"]\n", "[extension.tracker]\nenabled = true\n"] {
+            home.project(text);
+            let err = format!("{:#}", home.build_with(None, &env).unwrap_err());
+            assert!(err.contains("a project config may not"), "{err}");
+        }
+        home.project("");
+
+        // A user server of the same name is refused rather than shadowed.
+        home.user("[mcp.tracker-issues]\ncommand = \"/opt/mine\"\n");
+        let err = format!("{:#}", home.build_with(None, &env).unwrap_err());
+        assert!(err.contains("there already"), "{err}");
+        home.user("");
+
+        crate::extensions::set_enabled(&places, "tracker", false).unwrap();
+        let layered = home.build_with(None, &env).unwrap();
+        assert!(layered.config.mcp.is_empty() && layered.config.hooks.is_empty(), "a disabled pack adds nothing");
+        assert!(!layered
+            .config
+            .service("planner")
+            .unwrap()
+            .env
+            .contains_key(molt_planner::skills::EXTENSION_SKILLS_ENV));
     }
 
     #[test]
