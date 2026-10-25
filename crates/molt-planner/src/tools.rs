@@ -101,6 +101,8 @@ enum Tool {
     Ask(t::AskUser),
     /// A call about a background process (see [`crate::process`]).
     Process(crate::process::Call),
+    /// A query of the repository's history (see [`crate::git`]).
+    Git(molt_api::fs::GitQuery),
     /// A tool a service declared, with the model's input as it gave it.
     Provided(Arc<ProvidedTool>, Value),
 }
@@ -134,6 +136,8 @@ impl Tool {
             t::LOAD_SKILL => Self::LoadSkill(input(call)?),
             // Offered only to the attempts of an interactive run; see `execute`.
             t::ASK_USER => Self::Ask(input(call)?),
+            // Offered only when git is on; see `execute`.
+            t::GIT => Self::Git(crate::git::parse(call)?),
             other => match tools.provided(other).filter(|_| tools.offers(role, false, other)) {
                 // The service checks the input against its schema; the API already held the model to it.
                 Some(tool) if call.input.is_object() => Self::Provided(tool.clone(), call.input.clone()),
@@ -158,6 +162,7 @@ impl Tool {
                 | Self::Recall(_)
                 | Self::Fetch(_)
                 | Self::LoadSkill(_)
+                | Self::Git(_)
         ) || matches!(self, Self::Provided(tool, _) if tool.decl.read_only)
     }
 
@@ -199,6 +204,7 @@ impl Tool {
             },
             Self::Ask(a) => format!("ask the user: {}", a.question),
             Self::Process(p) => p.detail(),
+            Self::Git(q) => crate::git::detail(q),
             Self::Provided(tool, input) => format!("{} {input}", tool.decl.name),
         }
     }
@@ -235,6 +241,7 @@ impl Tool {
             Self::LoadSkill(_) => t::LOAD_SKILL,
             Self::Ask(_) => t::ASK_USER,
             Self::Process(p) => p.name(),
+            Self::Git(_) => t::GIT,
             Self::Provided(tool, _) => &tool.decl.name,
         }
     }
@@ -351,6 +358,7 @@ impl Tool {
             // `execute` asks for the attempt that made the call.
             Self::Ask(_) => Err(Failure::Rejected("ask_user cannot be used here".into())),
             Self::Process(p) => Ok(p.run(ctx, fork).await?),
+            Self::Git(q) => Ok(crate::git::run(ctx, fork, q).await?),
             Self::Provided(tool, input) => {
                 let decl = &tool.decl;
                 let call = ToolCall { tool: decl.name.clone(), workspace, input };
@@ -461,6 +469,9 @@ pub(crate) async fn execute(
             Err(prompts::CUT_OFF.to_owned())
         } else if !seat.as_ref().is_none_or(|seat| seat.allows(&call.name)) {
             // Its role was not offered the tool: to it there is no such tool.
+            Err(format!("There is no tool named {:?}.", call.name))
+        } else if call.name == t::GIT && !(ctx.git && matches!(actor, Actor::Attempt { .. })) {
+            // Only attempts read the history, and only when it is on.
             Err(format!("There is no tool named {:?}.", call.name))
         } else {
             Tool::parse(call, &ctx.tools, actor.role())

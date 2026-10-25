@@ -125,6 +125,9 @@ pub(crate) struct Ctx {
     /// Attempts are offered the process tools: the planner's starter turned
     /// them on and the planner holds a capability for `shell.start`.
     pub processes: bool,
+    /// Attempts are offered `git`: the planner's starter turned it on and
+    /// the planner holds a capability for `fs.git`.
+    pub git: bool,
     /// The tools this run may offer: the built-ins, and the provided tools
     /// whose method the planner holds a capability for.
     pub tools: Arc<Registry>,
@@ -282,6 +285,7 @@ impl Ctx {
         let model = req.model.clone().filter(|m| !m.trim().is_empty()).or_else(|| cfg.default_model.clone());
         let web = bus.holds(molt_api::web::FETCH);
         let processes = cfg.processes && bus.holds(molt_api::shell::START);
+        let git = cfg.git && bus.holds(fs::GIT);
         let tools = Arc::new(Registry::new(&cfg.tools, |target| bus.holds(target)));
         let budget_usd = req.budget_usd.unwrap_or(cfg.budget_usd);
         // The request was validated, which resolved its workflow.
@@ -308,6 +312,7 @@ impl Ctx {
             memory: Memory::default(),
             web,
             processes,
+            git,
             tools,
             web_health: Arc::default(),
             instructions: None,

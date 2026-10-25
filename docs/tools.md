@@ -66,6 +66,48 @@ The planner holds `shell.start`, `shell.read`, `shell.write` and
 command does not have: a command may already run for an hour in the same
 sandbox.
 
+## Git history
+
+A fork has no `.git`, so an attempt cannot run git. With `MOLT_GIT=on` in
+the planner's environment, attempts (and `ask` runs) get one more tool,
+`git`, after the other built-ins and before `explore`, which reads the
+history of the user's repository through `fs.git` (#111). It only reads.
+
+| `query` | What it answers |
+| --- | --- |
+| `status` | The baseline, the changes not committed that the user had when the attempt's copy was made (staged or not), and the attempt's own changes since, apart. |
+| `log` | Commits, newest first, with the files each changed. `rev` (a commit or a range `A..B`, default the baseline), `path`, `search` (only commits that added or removed that exact text, as `git log -S`) and `limit` (default 20, at most 100) narrow it. |
+| `show` | One commit (`rev`): its message and patch, `path` to narrow it. |
+| `diff` | From `from` (default the baseline) to `to`, another commit, or without `to` to the files as they are now. |
+| `blame` | Who last changed each line of `path` as of `rev` (default the baseline), `start_line` to `end_line`. |
+
+The baseline is the commit the user's `HEAD` named when the attempt's
+fork was made, recorded with the fork. `HEAD`, `HEAD~2` and `HEAD^` in a
+query mean it, even when the user has since committed or switched
+branches; every answer then starts with a note naming where `HEAD` is now.
+An `ask` run, which has no fork, reads `HEAD` as it is.
+
+What it never does: the fs service runs git with the repository's git
+directory as its work tree, so git never reads or refreshes the user's
+work tree or index, and with the user's and the system's configuration
+left out and every setting that could run a program, page, use the network
+or write overridden on the command line (hooks, fsmonitor, external diff
+and textconv drivers, signature checks, pagers, transports, lazy fetches of
+a partial clone, automatic gc). What differs between a commit and files on
+disk is worked out from content hashes, as `fs.diff` does, so no clean
+filter runs either. A revision is resolved to a commit id first, so it can
+be neither an option nor `REV:PATH`; paths are relative to the workspace,
+and when the workspace is a directory of a larger repository, only its
+part is shown, with paths relative to it. A linked work tree reads its own
+`HEAD`; a submodule is named, not entered; a repository whose configuration
+puts its work tree somewhere that does not hold the workspace is refused,
+and a workspace outside any repository gets an error saying it has no
+history.
+
+An answer is at most 40 KiB and a query takes at most 30 s. The planner
+holds `fs.*` in the default setup, so it holds `fs.git` too, and it offers
+the tool only when it does and `MOLT_GIT` is on.
+
 ## Adding a tool of your own
 
 A tool is served by a service you run: a program that connects to the bus
