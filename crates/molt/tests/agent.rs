@@ -19,7 +19,8 @@ use molt_api::fs::{ChangeKind, DROP, FORK, MERGE, WRITE};
 use molt_api::memory::SUBMIT_NOTES;
 use molt_api::model::COMPLETE;
 use molt_api::planner::tools::{
-    DISPUTE_CHECK, LIST_FILES, RUN, SUBMIT_CHECK, SUBMIT_JUDGEMENT, SUBMIT_REVIEW, SUBMIT_VETTING, WRITE_FILE,
+    DISPUTE_CHECK, LIST_FILES, RUN, SUBMIT_CHECK, SUBMIT_JUDGEMENT, SUBMIT_REVIEW, SUBMIT_ROUTE, SUBMIT_VETTING,
+    WRITE_FILE,
 };
 use molt_api::planner::{AttemptStatus, CheckSpec, Outcome, RunRequest, RunResponse, RUN as PLANNER_RUN};
 use molt_api::progress::Progress;
@@ -103,6 +104,15 @@ impl Respond for FakeApi {
                 json!({ "type": "thinking", "thinking": "", "signature": signature(n) }),
                 json!({ "type": "text", "text": "<notes>the check greps greeting.txt</notes>" }),
                 tool_use(n, SUBMIT_NOTES, json!({ "notes": [note], "supports": [] })),
+            ];
+            return message(n, model, content, "tool_use", stream);
+        }
+        // The router of a task that names `auto` picks the full workflow.
+        if body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_ROUTE)) {
+            let input = json!({ "workflow": "verify", "reason": "A change to check." });
+            let content = vec![
+                json!({ "type": "thinking", "thinking": "", "signature": signature(n) }),
+                tool_use(n, SUBMIT_ROUTE, input),
             ];
             return message(n, model, content, "tool_use", stream);
         }
@@ -510,10 +520,15 @@ fn molt_do(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) ->
 
 /// `molt ARGS` in `workspace` with state in `data`, using the fake API.
 fn molt(server: &MockServer, workspace: &Path, data: &Path, args: &[&str]) -> tokio::process::Command {
+    let mut cmd = molt_in(server, workspace, data);
+    cmd.args(args).arg("--data-dir").arg(data);
+    cmd
+}
+
+/// `molt` in `workspace`, using the fake API, with the project registry in `data`.
+fn molt_in(server: &MockServer, workspace: &Path, data: &Path) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_molt"));
-    cmd.args(args)
-        .arg("--data-dir")
-        .arg(data)
+    cmd
         // The project registry, kept out of the developer's own.
         .env("XDG_DATA_HOME", data.join("user-data"))
         // `--workspace` defaults to the current directory.
@@ -2526,6 +2541,362 @@ async fn a_task_stopped_through_the_protocol_keeps_the_attempts_work_and_its_com
     drop(rpc);
     assert!(tokio::time::timeout(Duration::from_secs(15), child.wait()).await.unwrap().unwrap().success());
     assert!(Path::new(&fork).is_dir(), "kept as the client asked");
+}
+
+/// An editor of `molt acp`, as Zed is one: ACP on the child's standard
+/// input and output, the permission prompts answered as a person would.
+struct Editor {
+    child: tokio::process::Child,
+    input: tokio::io::BufReader<tokio::process::ChildStdout>,
+    out: Option<tokio::process::ChildStdin>,
+    next: u64,
+    /// The session updates read so far.
+    updates: Vec<Value>,
+    /// Where `molt acp` keeps each folder's data dir.
+    cache: PathBuf,
+    log: PathBuf,
+}
+
+impl Editor {
+    fn start(server: &MockServer, data: &Path) -> Self {
+        let cache = data.join("cache");
+        let log = data.join("acp.log");
+        let mut cmd = molt_in(server, data, data);
+        cmd.arg("acp")
+            .env("XDG_CACHE_HOME", &cache)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(&log).unwrap());
+        let mut child = cmd.spawn().unwrap();
+        let input = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        let out = child.stdin.take();
+        Self { child, input, out, next: 0, updates: Vec::new(), cache, log }
+    }
+
+    async fn line(&mut self, value: &Value) {
+        use tokio::io::AsyncWriteExt;
+        let out = self.out.as_mut().expect("the input is open");
+        out.write_all(format!("{value}\n").as_bytes()).await.unwrap();
+        out.flush().await.unwrap();
+    }
+
+    async fn send(&mut self, method: &str, params: Value) -> u64 {
+        self.next += 1;
+        self.line(&json!({"jsonrpc": "2.0", "id": self.next, "method": method, "params": params})).await;
+        self.next
+    }
+
+    /// The next message from `molt acp`; a session update is kept too.
+    async fn recv(&mut self) -> Value {
+        use tokio::io::AsyncBufReadExt;
+        let mut line = String::new();
+        let read = self.input.read_line(&mut line).await.unwrap();
+        if read == 0 {
+            panic!("molt acp hung up:\n{}", std::fs::read_to_string(&self.log).unwrap_or_default());
+        }
+        let msg: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(msg["jsonrpc"], "2.0", "{msg}");
+        if msg["method"] == "session/update" {
+            self.updates.push(msg["params"]["update"].clone());
+        }
+        msg
+    }
+
+    /// The answer to request `id`. Each permission prompt that comes first
+    /// is answered with what `permit` picks from it.
+    async fn answer(&mut self, id: u64, mut permit: impl FnMut(&Value) -> Value) -> Value {
+        tokio::time::timeout(RUN_LIMIT, async {
+            loop {
+                let msg = self.recv().await;
+                if msg["method"] == "session/request_permission" {
+                    let result = permit(&msg["params"]);
+                    self.line(&json!({"jsonrpc": "2.0", "id": msg["id"], "result": result})).await;
+                } else if msg.get("method").is_none() && msg["id"] == id {
+                    return msg;
+                } else {
+                    assert_eq!(msg["method"], "session/update", "nothing else comes: {msg}");
+                }
+            }
+        })
+        .await
+        .expect("no answer")
+    }
+
+    async fn call(&mut self, method: &str, params: Value) -> Value {
+        let id = self.send(method, params).await;
+        self.answer(id, |asked| panic!("asked for nothing: {asked}")).await
+    }
+
+    /// The first update `pred` takes, read from what comes.
+    async fn update(&mut self, pred: impl Fn(&Value) -> bool) -> Value {
+        let found = tokio::time::timeout(RUN_LIMIT, async {
+            loop {
+                let msg = self.recv().await;
+                assert_eq!(msg["method"], "session/update", "something else came first: {msg}");
+                if pred(&msg["params"]["update"]) {
+                    return msg["params"]["update"].clone();
+                }
+            }
+        })
+        .await;
+        let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+        found.unwrap_or_else(|_| panic!("no such update in {:#?}\n{log}", self.updates))
+    }
+
+    /// Close the editor's side: `molt acp` stops its services and exits.
+    async fn close(mut self) {
+        drop(self.out.take());
+        let status = tokio::time::timeout(Duration::from_secs(60), self.child.wait()).await.expect("molt acp hung");
+        let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+        assert!(status.unwrap().success(), "{log}");
+    }
+
+    /// Close, and check that the forks left in every folder's data dir are
+    /// `kept`, and no other.
+    async fn close_and_check(self, kept: &[PathBuf]) {
+        let cache = self.cache.clone();
+        self.close().await;
+        let mut kept = kept.to_vec();
+        kept.sort();
+        assert_eq!(Self::forks(&cache), kept);
+    }
+
+    fn forks(cache: &Path) -> Vec<PathBuf> {
+        let mut forks = Vec::new();
+        for dir in std::fs::read_dir(cache.join("molt")).unwrap() {
+            let Ok(work) = std::fs::read_dir(dir.unwrap().path().join("work")) else { continue };
+            // A fork is a directory; the files beside it are its records.
+            forks.extend(work.map(|e| e.unwrap().path()).filter(|p| p.is_dir() && !p.ends_with(".molt")));
+        }
+        forks.sort();
+        forks
+    }
+}
+
+/// What a person picks in a permission prompt: the first option of `kind`.
+fn pick(asked: &Value, kind: &str) -> Value {
+    let option = asked["options"].as_array().unwrap().iter().find(|o| o["kind"] == kind).expect("no such option");
+    json!({"outcome": {"outcome": "selected", "optionId": option["optionId"]}})
+}
+
+/// The text between the first two backticks of `text`.
+fn quoted(text: &str) -> &str {
+    text.split('`').nth(1).unwrap_or_else(|| panic!("nothing quoted in {text}"))
+}
+
+fn text_of(update: &Value) -> String {
+    let texts = update["content"].as_array().into_iter().flatten();
+    texts.filter_map(|c| c["content"]["text"].as_str()).collect()
+}
+
+/// An editor runs a task through `molt acp` as Zed does: it initializes,
+/// opens a session in a folder, prompts, sees the run's plan, tool calls and
+/// messages, and is asked before anything is applied. Allowed, the result is
+/// applied; in another folder, kept aside, nothing is.
+#[tokio::test]
+async fn an_editor_runs_a_task_through_molt_acp_and_only_a_result_it_allows_is_applied() {
+    let server = fake_api(Fake::Greets).await;
+    let (one, two) = (Setup::new(&server), Setup::new(&server));
+    let data = tempfile::tempdir().unwrap();
+    let mut editor = Editor::start(&server, data.path());
+    let hello = editor
+        .call(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": true, "writeTextFile": true}, "terminal": true}, "clientInfo": {"name": "test-editor", "version": "1"}}),
+        )
+        .await;
+    assert_eq!(hello["result"]["protocolVersion"], 1, "{hello}");
+    let relative = editor.call("session/new", json!({"cwd": "greeting", "mcpServers": []})).await;
+    assert_eq!(relative["error"]["code"], -32602, "the folder must be an absolute path: {relative}");
+    let ws = one.workspace.path().canonicalize().unwrap();
+    let opened = editor.call("session/new", json!({"cwd": ws, "mcpServers": []})).await;
+    let session = opened["result"]["sessionId"].as_str().expect("a session").to_owned();
+
+    let prompt =
+        json!({"sessionId": session, "prompt": [{"type": "text", "text": "Write a greeting into greeting.txt."}]});
+    let id = editor.send("session/prompt", prompt).await;
+    let mut asked = Vec::new();
+    let answer = editor
+        .answer(id, |prompt| {
+            assert!(one.file("greeting.txt").is_none(), "nothing is applied before the person says so");
+            asked.push(prompt.clone());
+            pick(prompt, "allow_once")
+        })
+        .await;
+    assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
+    assert_eq!(one.file("greeting.txt").as_deref(), Some("hello\n"), "applied once allowed");
+    let [asked] = asked.as_slice() else { panic!("asked once: {asked:?}") };
+    assert_eq!(asked["sessionId"], session.as_str());
+    let options: Vec<(&str, &str)> = asked["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| (o["optionId"].as_str().unwrap(), o["kind"].as_str().unwrap()))
+        .collect();
+    assert_eq!(options, [("apply", "allow_once"), ("keep", "reject_once"), ("discard", "reject_once")]);
+    let content = asked["toolCall"]["content"].as_array().unwrap();
+    let diff = content.iter().find(|c| c["type"] == "diff" && c["path"] == ws.join("greeting.txt").to_str().unwrap());
+    let diff = diff.unwrap_or_else(|| panic!("a diff of greeting.txt: {content:#?}"));
+    assert_eq!((diff["newText"].as_str(), diff.get("oldText")), (Some("hello\n"), None), "{diff}");
+
+    let updates = editor.updates.clone();
+    let of = |kind: &'static str| updates.iter().filter(move |u| u["sessionUpdate"] == kind);
+    let write =
+        of("tool_call").find(|u| u["title"] == "write greeting.txt (attempt 1)" || u["title"] == "write greeting.txt");
+    let write = write.unwrap_or_else(|| panic!("the attempt's write: {updates:#?}"));
+    assert_eq!((write["kind"].as_str(), write["status"].as_str()), (Some("edit"), Some("in_progress")), "{write}");
+    let ended = of("tool_call_update").any(|u| u["toolCallId"] == write["toolCallId"] && u["status"] == "completed");
+    assert!(ended, "the write's call ends: {updates:#?}");
+    assert!(
+        of("tool_call")
+            .any(|u| u["title"].as_str().is_some_and(|t| t.starts_with("Run the check")) && u["status"] == "completed"),
+        "{updates:#?}"
+    );
+    let plans: Vec<&Value> = of("plan").collect();
+    let last = plans.last().expect("a plan");
+    let steps: Vec<(&str, &str)> = last["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["content"].as_str().unwrap(), e["status"].as_str().unwrap()))
+        .collect();
+    assert_eq!(steps[0], ("Design the check the result must pass", "completed"), "the router picked verify: {steps:?}");
+    assert!(steps.iter().all(|(_, status)| *status == "completed"), "{steps:?}");
+    let said: String = of("agent_message_chunk").filter_map(|u| u["content"]["text"].as_str()).collect();
+    assert!(said.contains("Passed its check `sh check.sh`."), "{said}");
+    let applied =
+        of("tool_call_update").find(|u| u["toolCallId"] == asked["toolCall"]["toolCallId"]).expect("the apply ends");
+    // The designed check's file is part of the result, as with `molt do`.
+    assert_eq!(
+        (applied["status"].as_str(), text_of(applied).as_str()),
+        (Some("completed"), "Applied 2 files."),
+        "{applied}"
+    );
+    assert_eq!(one.file("check.sh").as_deref(), Some("grep -q hello greeting.txt\n"));
+
+    // In another folder, a server of its own; the person keeps the result aside.
+    let ws2 = two.workspace.path().canonicalize().unwrap();
+    let opened = editor.call("session/new", json!({"cwd": ws2, "mcpServers": []})).await;
+    let other = opened["result"]["sessionId"].as_str().expect("a session").to_owned();
+    assert_ne!(other, session);
+    editor.updates.clear();
+    let prompt =
+        json!({"sessionId": other, "prompt": [{"type": "text", "text": "Write a greeting into greeting.txt."}]});
+    let id = editor.send("session/prompt", prompt).await;
+    let answer = editor.answer(id, |prompt| pick(prompt, "reject_once")).await;
+    assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
+    assert!(two.file("greeting.txt").is_none(), "nothing applied");
+    assert!(one.file("greeting.txt").is_some(), "the first folder is left alone");
+    let kept =
+        editor.updates.iter().rev().find(|u| u["sessionUpdate"] == "tool_call_update").expect("the apply ends").clone();
+    assert_eq!(kept["status"], "failed", "{kept}");
+    let said = text_of(&kept);
+    assert!(said.starts_with("Not applied. The result is kept in `"), "{said}");
+    let fork = PathBuf::from(quoted(&said));
+    assert_eq!(std::fs::read_to_string(fork.join("greeting.txt")).unwrap(), "hello\n");
+
+    editor.close_and_check(&[fork]).await;
+    assert_requests_valid(&server).await;
+}
+
+/// Cancelling in the editor stops the run and keeps what its attempts did:
+/// the prompt ends as cancelled, the attempts' forks are named and hold
+/// their writes, nothing is applied, and the next prompt runs.
+#[tokio::test]
+async fn cancelling_in_the_editor_stops_the_task_and_keeps_the_attempts_work() {
+    let server = fake_api(Fake::GreetsWithCalls(vec![(RUN, json!({ "command": "sleep 300" }))])).await;
+    let setup = Setup::new(&server);
+    let data = tempfile::tempdir().unwrap();
+    let mut editor = Editor::start(&server, data.path());
+    editor.call("initialize", json!({"protocolVersion": 1, "clientCapabilities": {}})).await;
+    let ws = setup.workspace.path().canonicalize().unwrap();
+    let opened = editor.call("session/new", json!({"cwd": ws, "mcpServers": []})).await;
+    let session = opened["result"]["sessionId"].as_str().expect("a session").to_owned();
+    let prompt =
+        json!({"sessionId": session, "prompt": [{"type": "text", "text": "Write a greeting into greeting.txt."}]});
+    let mut kept = Vec::new();
+    for round in 0..2 {
+        editor.updates.clear();
+        let id = editor.send("session/prompt", prompt.clone()).await;
+        let sleeping = |u: &Value| {
+            u["sessionUpdate"] == "tool_call" && u["title"].as_str().is_some_and(|t| t.starts_with("run sleep 300"))
+        };
+        editor.update(sleeping).await;
+        editor.line(&json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session}})).await;
+        let answer = editor.answer(id, |asked| panic!("nothing to ask: {asked}")).await;
+        assert_eq!(answer["result"]["stopReason"], "cancelled", "round {round}: {answer}");
+        let said: String = editor
+            .updates
+            .iter()
+            .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+            .filter_map(|u| u["content"]["text"].as_str())
+            .collect();
+        assert!(said.starts_with("Stopped. What the attempts did is kept, and nothing was applied: "), "{said}");
+        let forks: Vec<PathBuf> =
+            said.split('`').skip(1).step_by(2).filter(|f| f.starts_with('/')).map(PathBuf::from).collect();
+        assert!(!forks.is_empty(), "{said}");
+        for fork in &forks {
+            assert_eq!(std::fs::read_to_string(fork.join("greeting.txt")).unwrap(), "hello\n", "{}", fork.display());
+        }
+        let stopped =
+            editor.updates.iter().any(|u| u["sessionUpdate"] == "tool_call_update" && u["status"] == "failed");
+        assert!(stopped, "the calls still going end: {:#?}", editor.updates);
+        assert!(setup.file("greeting.txt").is_none());
+        kept.extend(forks);
+    }
+    kept.sort();
+    editor.close_and_check(&kept).await;
+    assert_requests_valid(&server).await;
+}
+
+/// An attempt's question (`ask_user`) is put to the person in the editor
+/// with its options, and the one they pick is the answer the attempt reads.
+#[tokio::test]
+async fn a_question_an_attempt_asks_is_put_to_the_editor_and_the_pick_reaches_the_attempt() {
+    use molt_api::planner::tools::ASK_USER;
+    let ask = json!({ "question": "Which greeting?", "options": ["hello there", "hi there"] });
+    let server = fake_api(Fake::GreetsWithCalls(vec![(ASK_USER, ask)])).await;
+    let setup = Setup::new(&server);
+    let data = tempfile::tempdir().unwrap();
+    let mut editor = Editor::start(&server, data.path());
+    editor.call("initialize", json!({"protocolVersion": 1, "clientCapabilities": {}})).await;
+    let ws = setup.workspace.path().canonicalize().unwrap();
+    let opened = editor.call("session/new", json!({"cwd": ws, "mcpServers": []})).await;
+    let session = opened["result"]["sessionId"].as_str().expect("a session").to_owned();
+    let prompt =
+        json!({"sessionId": session, "prompt": [{"type": "text", "text": "Write a greeting into greeting.txt."}]});
+    let id = editor.send("session/prompt", prompt).await;
+    let mut questions = Vec::new();
+    let answer = editor
+        .answer(id, |asked| {
+            if asked["toolCall"]["kind"] != "think" {
+                return pick(asked, "allow_once");
+            }
+            questions.push(asked.clone());
+            let option = asked["options"].as_array().unwrap().iter().find(|o| o["name"] == "hi there").unwrap();
+            json!({"outcome": {"outcome": "selected", "optionId": option["optionId"]}})
+        })
+        .await;
+    assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
+    assert!(!questions.is_empty(), "the attempts' questions were asked");
+    for asked in &questions {
+        assert_eq!(asked["toolCall"]["title"], "Which greeting?");
+        let names: Vec<&str> =
+            asked["options"].as_array().unwrap().iter().map(|o| o["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["hello there", "hi there", "Let it decide"]);
+    }
+    let answered =
+        editor.updates.iter().filter(|u| u["sessionUpdate"] == "tool_call_update" && text_of(u) == "Answer: hi there");
+    assert_eq!(answered.count(), questions.len(), "{:#?}", editor.updates);
+    let read = bodies(&server).await.iter().any(|body| {
+        let messages = body["messages"].as_array().into_iter().flatten();
+        let blocks = messages.filter_map(|m| m["content"].as_array()).flatten();
+        blocks.filter(|b| b["type"] == "tool_result").any(|b| b["content"].to_string().contains("hi there"))
+    });
+    assert!(read, "the attempt read the answer");
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    editor.close_and_check(&[]).await;
+    assert_requests_valid(&server).await;
 }
 
 /// `!cmd` in the interface: the session runs it through the shell service in

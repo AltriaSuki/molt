@@ -196,12 +196,14 @@ pub struct Notification {
     pub params: Value,
 }
 
-/// Anything the server sends: told apart by whether it has an `id`.
+/// Anything the server sends: told apart by whether it has a `method`.
+/// A notification is tried first: every field of an answer may be left
+/// out, so an event would read as an answer to nothing.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ServerMessage {
-    Response(Response),
     Notification(Notification),
+    Response(Response),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -579,6 +581,20 @@ mod tests {
         }
         let sha = hex::encode(Sha256::digest(V1.as_bytes()));
         assert_eq!(sha, V1_SHA256, "testdata/protocol-v1.jsonl is version 1 as released: add a new version instead");
+    }
+
+    #[test]
+    fn a_progress_event_reads_as_a_notification_and_an_answer_as_an_answer() {
+        let event = r#"{"jsonrpc":"2.0","method":"progress","params":{"event":"note","run":"r","message":"m"}}"#;
+        let ServerMessage::Notification(note) = serde_json::from_str(event).unwrap() else {
+            panic!("an event read as an answer with no id")
+        };
+        assert_eq!(note.method, method::PROGRESS);
+        let answer = r#"{"jsonrpc":"2.0","id":3,"result":{}}"#;
+        let ServerMessage::Response(response) = serde_json::from_str(answer).unwrap() else { panic!("{answer}") };
+        assert_eq!(response.id, Some(Id::Number(3)));
+        let refused = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"not JSON"}}"#;
+        assert!(matches!(serde_json::from_str(refused).unwrap(), ServerMessage::Response(_)));
     }
 
     #[test]
