@@ -105,6 +105,10 @@ impl Drop for Server {
 #[tokio::test]
 async fn nats_topic_subscribers_cannot_publish_or_widen_their_rights() {
     let Some(binary) = nats_binary() else {
+        assert!(
+            std::env::var_os("MOLT_REQUIRE_NATS_TESTS").is_none(),
+            "MOLT_REQUIRE_NATS_TESTS is set, and nats-server was not found: set MOLT_NATS_SERVER"
+        );
         eprintln!("nats-server not found; CI provisions it for this test");
         return;
     };

@@ -82,6 +82,9 @@ struct State {
     /// names (`""`: none), and refuses a model it does not hold; `None`: an
     /// older gateway, and a planner that does not hold the method.
     limits: Option<BTreeMap<String, model::LimitsResponse>>,
+    /// The shell service refuses to start the check with this, as it does a
+    /// command the host cannot afford.
+    check_refused: Option<RemoteError>,
     calls: Vec<Call>,
     requests: Vec<CompleteRequest>,
     events: Vec<Progress>,
@@ -161,6 +164,7 @@ impl Fake {
             yields: false,
             escapes: Vec::new(),
             limits: None,
+            check_refused: None,
             calls: Vec::new(),
             requests: Vec::new(),
             events: Vec::new(),
@@ -458,6 +462,9 @@ impl Bus for Fake {
             }
             "shell.run" => {
                 let r: shell::RunRequest = parse(payload);
+                if let Some(e) = self.state.lock().unwrap().check_refused.clone().filter(|_| r.command == "check") {
+                    return Err(e);
+                }
                 let snapshot = files(&mut self.state.lock().unwrap(), &r.workspace)?.clone();
                 Ok(serde_json::to_value((self.shell)(&r.command, &snapshot)).unwrap())
             }
@@ -6096,4 +6103,39 @@ async fn a_change_that_timed_out_is_not_simply_made_again_and_a_repeat_is_told_i
         text(&again[1])
     );
     assert_eq!(fake.calls_to("deploy.push").len(), 2, "Molt itself never makes it again");
+}
+
+#[tokio::test]
+async fn a_check_the_host_cannot_start_names_the_resource_and_no_attempt_starts_after_it() {
+    // As the shell service words a sandbox it could not start after its bounded tries (#230).
+    let message = format!(
+        "{}processes: bwrap: Creating new namespace failed: Resource temporarily unavailable (tried 5 times). This \
+         user runs 2047 processes and threads (RLIMIT_NPROC here: unlimited; the sandbox's `processes` limit, 2048, \
+         counts them all). The command did not run",
+        shell::SHORT_OF
+    );
+    let fake = Fake::new(
+        |req| match turn(req) % 2 {
+            1 => write_hello(req, "hi\n"),
+            _ => done("Done."),
+        },
+        hello_check,
+    );
+    fake.set(|st| st.check_refused = Some(RemoteError { code: ErrorCode::Busy, message: message.clone() }));
+    let resp = run_with(&fake, adaptive(&["haiku", "sonnet"]), request(Some("check"), 3)).await;
+    assert_eq!(resp.outcome, Outcome::Failed);
+    assert_eq!(resp.attempts.len(), 1, "another attempt would meet the same shortage");
+    assert_eq!(check_runs(&fake), 1, "the shell service already tried again; the planner does not");
+    let report = &resp.attempts[0];
+    assert_eq!(report.status, AttemptStatus::Error);
+    let failure = report.failure.clone().unwrap();
+    assert_eq!((failure.class, failure.action), (FailureClass::Exhausted, FailureAction::FixEnvironment));
+    assert!(failure.evidence.starts_with("short of host resources: processes: bwrap"), "{}", failure.evidence);
+    assert!(report.note.contains("could not run the done-check"), "{}", report.note);
+    let hold = decisions(&fake).pop().unwrap();
+    assert_eq!(hold.action, ScheduleAction::Hold);
+    assert!(hold.reason.contains("on the resources exhausted, not the code"), "{}", hold.reason);
+    assert!(resp.summary.contains("The machine's resources, not the code, stopped attempt 1"), "{}", resp.summary);
+    assert!(resp.summary.contains("short of host resources: processes"), "{}", resp.summary);
+    assert!(!resp.summary.contains("model endpoint"), "{}", resp.summary);
 }

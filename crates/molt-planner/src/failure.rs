@@ -9,7 +9,7 @@
 //! hold back a new one, never give a command more access or a run more budget.
 
 use molt_api::planner::{Failure, FailureAction, FailureClass, FailureSource};
-use molt_api::shell::RunResponse;
+use molt_api::shell::{self, RunResponse};
 use molt_proto::{ErrorCode, RemoteError};
 
 /// Bytes of the deciding line kept as evidence.
@@ -78,6 +78,9 @@ pub(crate) fn of_model(e: &RemoteError) -> Failure {
 /// act on: a call that may have changed something and was stopped before it
 /// answered has an unknown outcome, and must not simply be made again.
 pub(crate) fn of_tool(e: &RemoteError, read_only: bool) -> Option<Failure> {
+    if let Some(f) = of_shell(e, FailureSource::Tool) {
+        return Some(f);
+    }
     let (class, action) = match e.code {
         ErrorCode::Timeout | ErrorCode::Cancelled if !read_only => {
             (FailureClass::OutcomeUnknown, FailureAction::VerifyFirst)
@@ -87,6 +90,23 @@ pub(crate) fn of_tool(e: &RemoteError, read_only: bool) -> Option<Failure> {
         _ => return None,
     };
     Some(Failure { class, source: FailureSource::Tool, action, evidence: cut(first_line(&e.message)), exit_code: None })
+}
+
+/// What the shell service's error for a command it never started says
+/// (#230): the host was short of a resource, its queue was full, or it
+/// cannot isolate commands. `None` for any other error.
+pub(crate) fn of_shell(e: &RemoteError, source: FailureSource) -> Option<Failure> {
+    let (class, action) = if e.message.starts_with(shell::SHORT_OF) {
+        // The service already waited and tried again; the run cannot free processes or memory.
+        (FailureClass::Exhausted, FailureAction::FixEnvironment)
+    } else if e.message.starts_with(shell::QUEUE_FULL) {
+        (FailureClass::Exhausted, FailureAction::RetryLater)
+    } else if e.message.starts_with(shell::NO_ISOLATION) {
+        (FailureClass::Environment, FailureAction::FixEnvironment)
+    } else {
+        return None;
+    };
+    Some(Failure { class, source, action, evidence: cut(first_line(&e.message)), exit_code: None })
 }
 
 /// A shell, package manager or toolchain saying a program, package or
@@ -318,6 +338,26 @@ mod tests {
         assert!(!busy.needs_user());
         let bad = of_model(&e(ErrorCode::Invalid, "the Messages API returned 400: invalid_request_error"));
         assert_eq!(bad.class, C::Unknown);
+    }
+
+    #[test]
+    fn a_command_the_shell_never_started_names_the_resource_and_is_not_the_codes() {
+        let e = |code, message: String| RemoteError { code, message };
+        let short = e(
+            ErrorCode::Busy,
+            format!("{}processes: bwrap: Creating new namespace failed: Resource temporarily unavailable (tried 5 times). This user runs 2047 processes and threads", shell::SHORT_OF),
+        );
+        let f = of_shell(&short, FailureSource::Check).unwrap();
+        assert_eq!((f.class, f.action, f.source), (C::Exhausted, A::FixEnvironment, FailureSource::Check));
+        assert!(f.needs_user() && f.evidence.starts_with("short of host resources: processes: bwrap"), "{f:?}");
+        assert_eq!(of_tool(&short, false).unwrap().class, C::Exhausted, "not of unknown outcome: it never started");
+        let queue = e(ErrorCode::Busy, format!("{}4 running and 64 waiting", shell::QUEUE_FULL));
+        let f = of_shell(&queue, FailureSource::Tool).unwrap();
+        assert_eq!((f.class, f.action), (C::Exhausted, A::RetryLater));
+        assert!(!f.needs_user());
+        let isolation = e(ErrorCode::Unavailable, format!("{}this host cannot isolate commands", shell::NO_ISOLATION));
+        assert_eq!(of_shell(&isolation, FailureSource::Check).unwrap().class, C::Environment);
+        assert!(of_shell(&e(ErrorCode::Busy, "mailbox full".into()), FailureSource::Tool).is_none());
     }
 
     #[test]

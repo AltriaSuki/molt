@@ -74,6 +74,14 @@ struct ShellArgs {
     /// built-in ones; molt passes them from its trusted config.
     #[arg(long, value_name = "JSON", conflicts_with = "no_sandbox")]
     environments: Option<String>,
+    /// Commands `shell.run` runs at once; more wait their turn. Default:
+    /// the host's processors, and at least 4.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..=molt_tools::resources::MAX_JOBS as u64))]
+    jobs: Option<u64>,
+    /// Commands that may wait for a turn; past that one is refused at once.
+    #[arg(long, value_name = "N", default_value_t = molt_tools::resources::DEFAULT_QUEUE as u64,
+          value_parser = clap::value_parser!(u64).range(0..=molt_tools::resources::MAX_JOBS as u64))]
+    queue: u64,
 }
 
 #[derive(Args)]
@@ -122,6 +130,11 @@ async fn main() -> anyhow::Result<()> {
             molt_tools::serve_fs(svc, fs).await;
         }
         Cmd::Shell(args) => {
+            let admission = match args.jobs {
+                Some(jobs) => molt_tools::resources::Admission::new(jobs as usize, args.queue as usize),
+                None => molt_tools::resources::Admission::default().with_queue(args.queue as usize),
+            };
+            tracing::info!(jobs = admission.jobs(), queue = admission.queue(), "shell admission");
             let roots = args.roots.roots();
             let policy = if args.no_sandbox {
                 ExecutionPolicy::Unconfined
@@ -155,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 ExecutionPolicy::Configured(policy)
             };
-            let shell = Arc::new(Shell::with_policy(roots, policy)?);
+            let shell = Arc::new(Shell::with_policy(roots, policy)?.with_admission(admission));
             let stop = molt_tools::stop_signal()?;
             let svc = Arc::new(Service::connect_from_env().await?);
             let serving = molt_tools::serve_shell(svc, shell.clone());

@@ -317,3 +317,55 @@ async fn cancellation_terminates_children_and_escalates_after_grace() {
     assert_eq!(response.code, ErrorCode::Cancelled);
     assert!(!env.ws.join("forbidden").exists());
 }
+
+#[tokio::test]
+async fn commands_past_the_budget_wait_in_order_and_past_the_queue_are_refused_and_a_cancelled_one_never_runs() {
+    use molt_tools::resources::Admission;
+    use tokio_util::sync::CancellationToken;
+    let mut env = Env::new();
+    env.shell = env.shell.with_admission(Admission::new(1, 1));
+    let run = |command: &str, cancel: CancellationToken| {
+        env.shell.handle_cancellable("run", json!({ "workspace": "ws", "command": command }), cancel)
+    };
+    let admission = env.shell.admission();
+    // The first runs until it is told to go on; the second waits for it.
+    let first = run("while [ ! -e go ]; do sleep 0.02; done; echo first >> order", CancellationToken::new());
+    let cancel = CancellationToken::new();
+    let second = run("touch second-ran", cancel.clone());
+    let then = async {
+        while (admission.running(), admission.waiting()) != (1, 1) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // A third has no room to wait in: refused at once, naming the queue.
+        let refused = run("touch third-ran", CancellationToken::new()).await.unwrap_err();
+        // The second, cancelled, leaves the queue and makes room for a fourth.
+        cancel.cancel();
+        while admission.waiting() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let fourth = run("echo fourth >> order", CancellationToken::new());
+        let go = async {
+            while admission.waiting() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(!env.ws.join("order").exists(), "the fourth waits for the first");
+            fs::write(env.ws.join("go"), "").unwrap();
+        };
+        let (fourth, ()) = tokio::join!(fourth, go);
+        (refused, fourth)
+    };
+    let (first, second, (refused, fourth)) = tokio::join!(first, second, then);
+    assert_eq!(refused.code, ErrorCode::Busy);
+    assert!(refused.message.starts_with(molt_api::shell::QUEUE_FULL), "{}", refused.message);
+    assert!(refused.message.contains("1 running and 1 waiting"), "{}", refused.message);
+    let second = second.unwrap_err();
+    assert_eq!(second.code, ErrorCode::Cancelled, "{}", second.message);
+    assert!(second.message.contains("never started"), "{}", second.message);
+    first.unwrap();
+    fourth.unwrap();
+    assert_eq!(fs::read_to_string(env.ws.join("order")).unwrap(), "first\nfourth\n");
+    for never in ["second-ran", "third-ran"] {
+        assert!(!env.ws.join(never).exists(), "{never}");
+    }
+    assert_eq!((admission.running(), admission.waiting()), (0, 0));
+}

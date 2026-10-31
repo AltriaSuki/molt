@@ -101,6 +101,10 @@ async fn nats_kernel_supervises_a_crashing_service() {
     let Some(bin) = std::env::var_os("MOLT_NATS_SERVER").map(std::path::PathBuf::from).or_else(|| {
         std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join("nats-server")).find(|p| p.is_file())
     }) else {
+        assert!(
+            std::env::var_os("MOLT_REQUIRE_NATS_TESTS").is_none(),
+            "MOLT_REQUIRE_NATS_TESTS is set, and nats-server was not found: set MOLT_NATS_SERVER"
+        );
         eprintln!("skipping: nats-server not found");
         return;
     };

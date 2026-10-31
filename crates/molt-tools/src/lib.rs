@@ -17,6 +17,7 @@ mod git;
 mod matching;
 mod paths;
 mod process;
+pub mod resources;
 pub mod sandbox;
 mod shell;
 pub use env_profile::EnvProfile;
@@ -197,6 +198,8 @@ pub struct Shell {
     processes: Arc<process::Processes>,
     policy: Option<Arc<SandboxPolicy>>,
     cargo: Option<Arc<cargo_cache::CargoCache>>,
+    /// How many `shell.run` commands run at once, and wait.
+    admission: Arc<resources::Admission>,
 }
 
 impl Shell {
@@ -224,7 +227,20 @@ impl Shell {
             processes: Arc::default(),
             policy: policy.map(Arc::new),
             cargo,
+            admission: Arc::default(),
         })
+    }
+
+    /// Run `shell.run` commands as `admission` admits them, instead of the
+    /// default (see [`resources::Admission`]).
+    pub fn with_admission(mut self, admission: resources::Admission) -> Self {
+        self.admission = Arc::new(admission);
+        self
+    }
+
+    /// How `shell.run` commands are admitted, and how many run and wait now.
+    pub fn admission(&self) -> &resources::Admission {
+        &self.admission
     }
 
     /// Kill every command and process still running, with everything it
@@ -291,7 +307,8 @@ impl Shell {
                 let req = parse("shell", method, payload)?;
                 let policy = policy.clone();
                 serde_json::to_value(
-                    shell::run(&self.roots, &self.program, &self.running, policy, req, cancel, sink).await?,
+                    shell::run(&self.roots, &self.program, &self.running, &self.admission, policy, req, cancel, sink)
+                        .await?,
                 )
             }
             "start" => serde_json::to_value(process::start(cx(), parse("shell", method, payload)?, cancel).await?),

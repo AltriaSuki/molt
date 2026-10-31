@@ -1381,9 +1381,10 @@ fn blockers(finished: &[Finished]) -> String {
                 "Fix the model's configuration (its credential, name or endpoint; `molt models probe` checks it), \
                  then run the task again.",
             ),
-            (FailureClass::Exhausted, _) => {
-                ("The machine's resources", "Free disk space or memory, then run the task again.")
-            }
+            (FailureClass::Exhausted, _) => (
+                "The machine's resources",
+                "Free disk space, memory or processes, or run fewer commands at once, then run the task again.",
+            ),
             _ => (
                 "The environment",
                 "Provide it where commands run (`molt env doctor` shows what they get), then run the task again: \

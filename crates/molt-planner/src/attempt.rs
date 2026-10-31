@@ -944,9 +944,11 @@ impl Attempt {
                 .map_err(|e| End::error(format!("could not restore the check file {path}: {e}")))?;
         }
         let timeout_ms = u64::try_from(self.ctx.cfg.check_timeout.as_millis()).unwrap_or(u64::MAX);
-        tools::run_command(&self.ctx, fork, &check.command, timeout_ms)
-            .await
-            .map_err(|e| End::error(format!("could not run the done-check: {e}")))
+        tools::run_command(&self.ctx, fork, &check.command, timeout_ms).await.map_err(|e| {
+            // A check the host could not start says which resource it lacked, not that the code failed (#230).
+            let failure = failure::of_shell(&e, FailureSource::Check).map(Box::new);
+            End { failure, ..End::error(format!("could not run the done-check: {e}")) }
+        })
     }
 
     async fn or_cancel<T>(&self, work: impl Future<Output = T>) -> Result<T, End> {

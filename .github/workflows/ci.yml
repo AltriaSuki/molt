@@ -8,6 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   MOLT_REQUIRE_SANDBOX_TESTS: "1"
+  # A missing nats-server fails the NATS tests instead of skipping them.
+  MOLT_REQUIRE_NATS_TESTS: "1"
   GOTOOLCHAIN: local
 
 jobs:
@@ -79,4 +81,21 @@ jobs:
       - run: python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - name: Report the host's process, file and namespace limits
+        run: |
+          echo "processors: $(nproc)"
+          ulimit -a
+          echo "max_user_namespaces: $(cat /proc/sys/user/max_user_namespaces)"
+          echo "this user's processes and threads: $(ps -L -u "$(id -u)" --no-headers | wc -l)"
+      - name: cargo test --workspace
+        # Fixed rather than taken from the runner's size, so how many sandboxes
+        # start at once does not change with the machine.
+        env:
+          RUST_TEST_THREADS: "4"
+        run: cargo test --workspace
+      - name: Report the host's limits again after a failure
+        if: failure()
+        run: |
+          ulimit -a
+          echo "this user's processes and threads: $(ps -L -u "$(id -u)" --no-headers | wc -l)"
+          grep -E 'MemAvailable|MemTotal' /proc/meminfo
