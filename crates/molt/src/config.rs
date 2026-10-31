@@ -171,7 +171,7 @@ impl ServiceSection {
     /// What is wrong with a sandboxed service's settings, if anything: it
     /// needs a command, and its variables cannot name Molt's own settings,
     /// the model credentials or what the sandbox sets.
-    fn validate_isolation(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate_isolation(&self) -> anyhow::Result<()> {
         if self.isolation != Isolation::Sandbox {
             return Ok(());
         }
@@ -249,6 +249,11 @@ pub struct Config {
     pub mcp: BTreeMap<String, molt_mcp::McpServer>,
     #[serde(default, skip_serializing_if = "ModelsSection::is_empty")]
     pub models: ModelsSection,
+    /// `[improve]`: the gate `molt improve` promotes a prompt through
+    /// (`docs/improve.md`). Only the user's configuration sets it: a
+    /// project's holds no such key, and the improver reaches none of it.
+    #[serde(default, skip_serializing_if = "crate::improve::Gate::is_default")]
+    pub improve: crate::improve::Gate,
 }
 
 /// `[models]`: which model each role's calls go to (#169).
@@ -463,6 +468,7 @@ impl Config {
             server.validate(name).map_err(anyhow::Error::msg)?;
         }
         config.tui.validate()?;
+        config.improve.validate().context("in [improve]")?;
         if !config.models.roles.is_empty() {
             molt_api::model::role_models(&serde_json::to_string(&config.models.roles)?)
                 .map_err(|e| anyhow::anyhow!("[models.roles]: {e}"))?;
@@ -585,6 +591,7 @@ impl Config {
             profiles: BTreeMap::new(),
             mcp: BTreeMap::new(),
             models: ModelsSection::default(),
+            improve: Default::default(),
         })
     }
 

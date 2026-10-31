@@ -211,14 +211,28 @@ pub async fn main(cmd: Cmd) -> anyhow::Result<ExitCode> {
     }
 }
 
-async fn run_cmd(args: RunArgs) -> anyhow::Result<ExitCode> {
-    let tasks = args.tasks.load()?;
-    let arms = if args.arms.is_empty() {
-        vec![Arm::builtin("molt").expect("built in"), Arm::builtin("plain").expect("built in")]
-    } else {
-        args.arms.clone()
-    };
-    let plan = Plan { tasks, arms, trials: args.trials };
+/// What running a plan needs besides the plan itself: the settings, the
+/// agent, and the sandbox's policy for the tasks' toolchains.
+pub struct Prepared {
+    pub settings: Settings,
+    pub molt: Molt,
+    toolchains: Option<(Toolchains, PathBuf)>,
+}
+
+impl Prepared {
+    /// Write the sandbox's policy where the runs read it. Before any run.
+    pub fn write_policy(&self) -> anyhow::Result<()> {
+        if let Some((toolchains, path)) = &self.toolchains {
+            sandbox::write_policy(path, &toolchains.policy())?;
+        }
+        Ok(())
+    }
+}
+
+/// Check what `args` asks for and work out how `plan` would be run: the
+/// molt executable, the options of every arm, the toolchains the sandbox
+/// mounts (checked to run in it here) and the setup results record.
+pub async fn prepare(args: &RunArgs, plan: &Plan) -> anyhow::Result<Prepared> {
     let exe = match &args.molt {
         Some(p) => p.canonicalize().with_context(|| format!("the molt executable {}", p.display()))?,
         None => std::env::current_exe().context("finding this executable")?,
@@ -276,17 +290,28 @@ async fn run_cmd(args: RunArgs) -> anyhow::Result<ExitCode> {
         retry_errors: args.retry_errors,
     };
     let molt = Molt { exe, options, env: args.env.clone(), keep_audit: args.keep_audit };
+    Ok(Prepared { settings, molt, toolchains })
+}
 
+async fn run_cmd(args: RunArgs) -> anyhow::Result<ExitCode> {
+    let tasks = args.tasks.load()?;
+    let arms = if args.arms.is_empty() {
+        vec![Arm::builtin("molt").expect("built in"), Arm::builtin("plain").expect("built in")]
+    } else {
+        args.arms.clone()
+    };
+    let plan = Plan { tasks, arms, trials: args.trials };
+    let prepared = prepare(&args, &plan).await?;
     if args.dry_run {
-        dry_run(&plan, &settings, &args.results, &molt, toolchains.as_ref().map(|(t, _)| t))?;
+        let toolchains = prepared.toolchains.as_ref().map(|(t, _)| t);
+        dry_run(&plan, &prepared.settings, &args.results, &prepared.molt, toolchains)?;
         return Ok(ExitCode::SUCCESS);
     }
     let has_key = std::env::var_os("ANTHROPIC_API_KEY").is_some_and(|v| !v.is_empty())
         || args.env.iter().any(|(k, v)| k == "ANTHROPIC_API_KEY" && !v.is_empty());
     ensure!(has_key, "molt do needs ANTHROPIC_API_KEY; set it, or pass it with --env");
-    if let Some((toolchains, path)) = &toolchains {
-        sandbox::write_policy(path, &toolchains.policy())?;
-    }
+    prepared.write_policy()?;
+    let Prepared { settings, molt, .. } = prepared;
 
     let cancel = CancellationToken::new();
     let on_signal = cancel.clone();

@@ -743,8 +743,9 @@ fn run_message(c: &RunCommit) -> (String, String) {
         Some(check) => message.push_str(&format!("{CHECK_TRAILER}: {}\n", one_line(check))),
         None => message.push_str(&format!("{CHECK_TRAILER}: none (unverified)\n")),
     }
-    // The built-in prompts are the planner's version's; a prompt of the user's is named by its hash.
-    for used in c.prompts.iter().filter(|p| p.prompt.source == molt_api::role::Source::User) {
+    // The built-in prompts are the planner's version's; a prompt of the user's, or one `molt improve`
+    // promoted, is named by its hash.
+    for used in c.prompts.iter().filter(|p| p.prompt.source != molt_api::role::Source::Builtin) {
         let (role, prompt) = (one_line(&used.role), one_line(&used.prompt.name));
         message.push_str(&format!("{PROMPT_TRAILER}: role={role} prompt={prompt} sha256={}\n", used.prompt.sha256));
     }
@@ -794,7 +795,8 @@ mod tests {
             role: role.into(),
             prompt: PromptVersion { name: role.into(), sha256: "ab".repeat(32), source },
         };
-        let prompts = [used("designer", Source::Builtin), used("terse", Source::User)];
+        let prompts =
+            [used("designer", Source::Builtin), used("terse", Source::User), used("attempt", Source::Registry)];
         let c = RunCommit {
             run: "trace_1",
             summary: "Fix it",
@@ -803,7 +805,11 @@ mod tests {
             ..Default::default()
         };
         let (_, message) = run_message(&c);
-        let trailer = format!("Molt-Check: make\nMolt-Prompt: role=terse prompt=terse sha256={}\n", "ab".repeat(32));
+        let trailer = format!(
+            "Molt-Check: make\nMolt-Prompt: role=terse prompt=terse sha256={0}\n\
+             Molt-Prompt: role=attempt prompt=attempt sha256={0}\n",
+            "ab".repeat(32)
+        );
         assert!(message.ends_with(&trailer), "{message}");
         assert!(!message.contains("role=designer"), "built-in prompts get no trailer");
     }

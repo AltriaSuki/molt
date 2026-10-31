@@ -11,6 +11,7 @@
 //! | `memory`  | `remember recall forget retract consolidate index map symbols review correct` | [`memory`] |
 //! | `planner` | `run design control`, `plan`               | [`planner`], [`plan`] |
 //! | `web`     | `fetch`                                    | [`web`]       |
+//! | `improver`| `propose`                                  | [`improve`]   |
 //!
 //! The planner also publishes [`progress::Progress`] events on
 //! `topic:progress`, and the `fs` service [`fs::FilesChanged`] events on
@@ -18,6 +19,7 @@
 
 pub mod agent_skills;
 pub mod fs;
+pub mod improve;
 pub mod memory;
 pub mod model;
 pub mod plan;

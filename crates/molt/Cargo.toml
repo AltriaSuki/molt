@@ -24,6 +24,7 @@ molt-tools.workspace = true
 molt-transport.workspace = true
 molt-web.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
