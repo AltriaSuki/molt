@@ -40,6 +40,42 @@ fn strip_chat_reasoning(messages: &mut Vec<Value>) {
     }
 }
 
+/// Most cache marks a request's messages get: the API takes four in all,
+/// and the system prompt and the request's own automatic mark take two.
+const MESSAGE_CACHE_POINTS: usize = 2;
+
+/// Mark the last block of each message `points` names as the end of a
+/// cached prefix, so a change after it does not lose the cache before it.
+/// A point on the last message is left out, since the request's automatic
+/// mark is there already, and so is one past the end or on a message whose
+/// last block cannot be cached (thinking); the first
+/// [`MESSAGE_CACHE_POINTS`] of the rest are kept.
+fn mark_cache_points(messages: &mut [Value], points: &[usize]) {
+    let last = messages.len().saturating_sub(1);
+    let mut marked = 0;
+    let mut points = points.to_vec();
+    points.sort_unstable();
+    points.dedup();
+    for at in points {
+        if marked == MESSAGE_CACHE_POINTS {
+            break;
+        }
+        if at >= last {
+            continue;
+        }
+        let Some(message) = messages.get_mut(at) else { continue };
+        if let Some(text) = message["content"].as_str() {
+            message["content"] = json!([{ "type": "text", "text": text }]);
+        }
+        let Some(last) = message["content"].as_array_mut().and_then(|b| b.last_mut()) else { continue };
+        if matches!(last["type"].as_str(), Some("thinking" | "redacted_thinking") | None) {
+            continue;
+        }
+        last["cache_control"] = json!({ "type": "ephemeral" });
+        marked += 1;
+    }
+}
+
 /// Shape `req` for `model` (already resolved). Takes the request by value so
 /// a long conversation is moved into the body rather than copied.
 /// `probed` is what `molt models probe` found the model does on this
@@ -103,6 +139,8 @@ pub(crate) fn build(
         );
     }
     let mut messages = req.messages;
+    // Before the reasoning is stripped, which may leave out whole turns and move the indexes.
+    mark_cache_points(&mut messages, &req.cache_points);
     strip_chat_reasoning(&mut messages);
     body.insert("messages".into(), Value::Array(messages));
     if !req.tools.is_empty() {
@@ -222,6 +260,44 @@ mod tests {
             unprobed(&cfg(), "claude-haiku-4-5", CompleteRequest { output_schema: Some(schema.clone()), ..req() })
                 .unwrap();
         assert_eq!(call.body["output_config"], json!({ "format": { "type": "json_schema", "schema": schema } }));
+    }
+
+    #[test]
+    fn a_cache_point_marks_its_messages_last_block_and_the_marks_stay_within_the_apis_four() {
+        let messages = vec![
+            json!({ "role": "user", "content": "task" }),
+            json!({ "role": "assistant", "content": [{ "type": "text", "text": "ack" }] }),
+            json!({ "role": "user", "content": [{ "type": "text", "text": "a" }, { "type": "text", "text": "b" }] }),
+            json!({ "role": "assistant", "content": [{ "type": "thinking", "thinking": "t", "signature": "s" }] }),
+            user_text("next"),
+        ];
+        let marked = CompleteRequest {
+            system: Some("sys".into()),
+            messages: messages.clone(),
+            cache_points: vec![3, 2, 0, 0, 4, 99],
+            ..Default::default()
+        };
+        let call = unprobed(&cfg(), "claude-next-1", marked).unwrap();
+        let sent = &call.body["messages"];
+        let mark = json!({ "type": "ephemeral" });
+        // A string content becomes one text block, which renders the same.
+        assert_eq!(sent[0]["content"], json!([{ "type": "text", "text": "task", "cache_control": mark }]));
+        assert!(sent[2]["content"][0].get("cache_control").is_none());
+        assert_eq!(sent[2]["content"][1]["cache_control"], mark);
+        // Thinking cannot be marked; past two, nothing more is.
+        assert!(sent[3]["content"][0].get("cache_control").is_none());
+        assert!(sent[4]["content"][0].get("cache_control").is_none());
+        let marks = call.body.to_string().matches("cache_control").count();
+        assert_eq!(marks, 4, "{}", call.body);
+
+        // The last message has the request's own mark: it gets no second one.
+        let only = CompleteRequest { cache_points: vec![0], ..req() };
+        let call = unprobed(&cfg(), "claude-next-1", only).unwrap();
+        assert!(call.body["messages"][0]["content"][0].get("cache_control").is_none());
+
+        // Without points the messages go as they came.
+        let call = unprobed(&cfg(), "claude-next-1", CompleteRequest { messages: messages.clone(), ..req() }).unwrap();
+        assert_eq!(call.body["messages"], Value::Array(messages));
     }
 
     #[test]

@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::ctx::{Conversation, Ctx};
-use crate::fit::{part, result_text, RECORD_TAG};
+use crate::fit::{part, result_text, Limits, BYTES_PER_TOKEN, RECORD_TAG};
 use crate::prompts::{self, head};
 
 /// The tool that reads an item back.
@@ -559,6 +559,18 @@ pub(crate) async fn summarize(ctx: &Arc<Ctx>, conv: &Conversation, from: u32, ca
     if ctx.over_budget() || ctx.over_cap() {
         return fail("the budget is spent");
     }
+    // The compactor's own model, else the attempt's, and what a call to it can take.
+    let seat = ctx.seats().compactor;
+    let mut call = Conversation::seated(&seat, "", vec![notes_tool()], Value::Null, Role::Compactor, conv.attempt);
+    if call.model.is_none() && !ctx.cfg.role_models.contains_key(&Role::Compactor) {
+        call.model = conv.model.clone();
+    }
+    if call.effort.is_none() {
+        call.effort = conv.effort;
+    }
+    let model = ctx.model_of(&call);
+    ctx.learn(&model).await;
+    let room = input_room(ctx.limits_of(&model), call.system.len());
     let mut text = format!(
         "The agent's task, so you know what the work is for:\n<task>\n{}\n</task>",
         quoted(head(ctx.task.trim(), 4000))
@@ -588,7 +600,7 @@ pub(crate) async fn summarize(ctx: &Arc<Ctx>, conv: &Conversation, from: u32, ca
             (None, Some(body)) => format!("\n- [E{}] {}", item.id, quoted(&body)),
             _ => format!("\n- [E{}] {}", item.id, quoted(&item.line)),
         };
-        if used + entry.len() > SUMMARY_INPUT {
+        if used + entry.len() > room {
             text.push_str("\n- (the rest of these turns did not fit; their record lines stay)");
             break;
         }
@@ -598,15 +610,7 @@ pub(crate) async fn summarize(ctx: &Arc<Ctx>, conv: &Conversation, from: u32, ca
     text.push_str(
         "\n</turns>\n\nCall submit_notes with the agent's notes: your notes so far, with what these turns add.",
     );
-    let seat = ctx.seats().compactor;
-    let mut call = Conversation::seated(&seat, "", vec![notes_tool()], user_text(text), Role::Compactor, conv.attempt);
-    // The compactor's own model, else the attempt's.
-    if call.model.is_none() && !ctx.cfg.role_models.contains_key(&Role::Compactor) {
-        call.model = conv.model.clone();
-    }
-    if call.effort.is_none() {
-        call.effort = conv.effort;
-    }
+    call.messages = vec![user_text(text)];
     // Its reply is not the attempt's text: it is not previewed.
     let child = {
         let mut child = (**ctx).clone();
@@ -624,6 +628,14 @@ pub(crate) async fn summarize(ctx: &Arc<Ctx>, conv: &Conversation, from: u32, ca
     };
     let notes = notes_from(&resp, compacted.next);
     Summary { notes, reply: Some(resp) }
+}
+
+/// Bytes of the turns the compactor is shown: [`SUMMARY_INPUT`], or less
+/// when the model it calls takes less, so that its call fits in a quarter
+/// of that model's input with its system prompt, the task and the notes so far.
+fn input_room(limits: Limits, system: usize) -> usize {
+    let quarter = (limits.tokens.saturating_mul(BYTES_PER_TOKEN) / 4).min(limits.bytes as u64 / 4) as usize;
+    SUMMARY_INPUT.min(quarter.saturating_sub(system + 4000 + MAX_NOTES + 1024))
 }
 
 /// The notes a compactor's reply submits, each list bounded.
@@ -806,6 +818,21 @@ mod tests {
         let first = chunk(&body, 1);
         assert!(first.len() <= PART_BYTES && first.len() >= PART_BYTES - 1);
         assert_eq!(chunk(&body, 1).len() + chunk(&body, 2).len(), body.len());
+    }
+
+    #[test]
+    fn the_compactor_is_shown_less_when_the_model_it_calls_takes_less() {
+        let large = Limits::new(200_000, 32_000, 8 << 20);
+        assert_eq!(input_room(large, 2000), SUMMARY_INPUT);
+        let small = Limits::new(40_000, 4000, 8 << 20);
+        let room = input_room(small, 2000);
+        assert!(room < SUMMARY_INPUT && room > 0, "{room}");
+        // With its prompt, the task and the notes, the call stays within a quarter of the model's input.
+        let call = room + 2000 + 4000 + MAX_NOTES;
+        assert!(call as u64 <= small.tokens * BYTES_PER_TOKEN / 4, "{call}");
+        // A small frame bounds it too.
+        assert!(input_room(Limits::new(200_000, 32_000, 128 * 1024), 2000) < SUMMARY_INPUT);
+        assert_eq!(input_room(Limits::new(4000, 2000, 8 << 20), 2000), 0);
     }
 
     /// The `earlier_result` tool, as the model gets it.

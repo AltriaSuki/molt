@@ -237,6 +237,14 @@ pub struct CompleteRequest {
     /// older caller leaves it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<u32>,
+    /// Indexes into `messages` of the messages that end a prefix the caller
+    /// keeps the same over its next calls, such as a conversation's first
+    /// message. The gateway asks the provider to cache the request up to
+    /// each, where it takes such marks (the Messages API, at most two), so
+    /// that a later change after them does not lose what came before. New:
+    /// an older caller leaves it out, and an older gateway ignores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_points: Vec<usize>,
 }
 
 /// Token counts as the Messages API reports them. A count the API sends as

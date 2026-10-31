@@ -2238,19 +2238,14 @@ async fn a_long_task_leaves_out_its_earliest_turns_to_fit_and_still_finishes() {
 
         let requests = fake.requests();
         let limits_tokens = 40_000 - 1000;
-        let fitted: Vec<&CompleteRequest> = requests
-            .iter()
-            .filter(|r| {
-                r.messages[0]["content"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|b| b["text"].as_str().is_some_and(|t| t.starts_with("<earlier_turns>")))
-            })
-            .collect();
+        let fitted: Vec<&CompleteRequest> = requests.iter().filter(|r| record_of(r).is_some()).collect();
         assert!(!fitted.is_empty(), "{name}: the conversation was fitted");
         for req in &requests {
             assert!(well_formed(req), "{name}: {:?}", req.messages);
+            // The first message is the same in every call, so it stays cached; so is the checkpoint between fits.
+            assert_eq!(req.messages[0], requests[0].messages[0], "{name}");
+            let points: &[usize] = if record_of(req).is_some() { &[0, 2] } else { &[0] };
+            assert_eq!(req.cache_points, points, "{name}");
             // The task and the check are never left out.
             assert!(req.messages[0]["content"][0]["text"].as_str().unwrap().contains("<task>"), "{name}");
             let bytes = serde_json::to_vec(req).unwrap().len();
@@ -2288,14 +2283,7 @@ async fn the_context_window_the_gateway_reports_fits_the_conversation_without_a_
     let resp = run_with(&fake, config(), request(Some("check"), 1)).await;
     assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
     let requests = fake.requests();
-    let record = |r: &CompleteRequest| {
-        r.messages[0]["content"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|b| b["text"].as_str().is_some_and(|t| t.starts_with("<earlier_turns>")))
-    };
-    assert!(requests.iter().any(record), "the conversation was fitted");
+    assert!(requests.iter().any(|r| record_of(r).is_some()), "the conversation was fitted");
     for req in &requests {
         assert!(well_formed(req));
         let bytes = serde_json::to_vec(req).unwrap().len();
@@ -2495,9 +2483,11 @@ async fn an_undeclared_window_is_said_once_and_a_reply_that_differs_from_the_set
 
 // --- What a conversation keeps of the turns it leaves out (#108) ---------------
 
-/// The record of left-out turns in `req`'s first message, if it has one.
+/// The record of left-out turns in `req`'s checkpoint, the third message, if it has one.
 fn record_of(req: &CompleteRequest) -> Option<String> {
-    req.messages[0]["content"]
+    req.messages
+        .get(2)?
+        .get("content")?
         .as_array()?
         .iter()
         .filter_map(|b| b["text"].as_str())
@@ -2639,7 +2629,7 @@ async fn a_resumed_attempt_keeps_its_evidence_and_the_requirements_survive_compa
                 16..=27 => use_tools(req, &[("read_file", json!({ "path": "big.txt" }))]),
                 28 => {
                     // The message that told it is left out by now; the record still says it, from the run's state.
-                    let told = req.messages[1..].iter().any(|m| m.to_string().contains("Say it in lower case."));
+                    let told = req.messages[3..].iter().any(|m| m.to_string().contains("Say it in lower case."));
                     assert!(!told, "the requirement's message is still in the conversation");
                     let record = record_of(req).unwrap();
                     assert!(

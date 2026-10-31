@@ -692,6 +692,7 @@ pub(crate) async fn consolidate(
         output_schema: None,
         prompt: None,
         attempt: None,
+        cache_points: Vec::new(),
     };
     let (answer, spent) = match ask(bus, cfg, request, trace, deadline).await? {
         Ok(answered) => answered,
