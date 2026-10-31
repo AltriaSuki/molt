@@ -1032,6 +1032,10 @@ pub mod tools {
     /// read the git history of the user's repository. Its input is a
     /// [`crate::fs::GitQuery`].
     pub const GIT: &str = "git";
+    /// Offered to attempts when the planner may call `shell.output` (#238):
+    /// read a page of a command's saved output, search it for a text, or
+    /// follow a process's as it grows.
+    pub const READ_OUTPUT: &str = "read_output";
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ReadFile {
@@ -1217,6 +1221,23 @@ pub mod tools {
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct StopProcess {
         pub id: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ReadOutput {
+        /// The id a command's or a process's result named.
+        pub id: String,
+        /// The byte to read, or search, from.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub offset: Option<u64>,
+        /// Find the lines holding this text instead of reading.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub search: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub case_insensitive: Option<bool>,
+        /// How long to wait for more while the process runs on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub wait_s: Option<u64>,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

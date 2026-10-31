@@ -131,6 +131,8 @@ requests = [
   { target = "shell.read", budget = { calls = 1000000 } },
   { target = "shell.write", budget = { calls = 1000000 } },
   { target = "shell.stop", budget = { calls = 1000000 } },
+  # A command's whole output when its result was cut (read_output); reading runs nothing.
+  { target = "shell.output", budget = { calls = 1000000 } },
   { target = "memory.index", budget = { calls = 10000000 } },
   { target = "memory.map", budget = { calls = 10000000 } },
   { target = "memory.recall", budget = { calls = 10000000 } },

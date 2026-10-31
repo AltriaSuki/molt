@@ -15,12 +15,14 @@ mod files;
 mod fork;
 mod git;
 mod matching;
+mod outputs;
 mod paths;
 mod process;
 pub mod resources;
 pub mod sandbox;
 mod shell;
 pub use env_profile::EnvProfile;
+pub use outputs::OutputLimits;
 pub use sandbox::{host_cargo_home, ExecutionPolicy, SandboxPolicy};
 mod walk;
 
@@ -200,6 +202,8 @@ pub struct Shell {
     cargo: Option<Arc<cargo_cache::CargoCache>>,
     /// How many `shell.run` commands run at once, and wait.
     admission: Arc<resources::Admission>,
+    /// The outputs saved for `shell.output`.
+    outputs: Arc<outputs::Store>,
 }
 
 impl Shell {
@@ -220,7 +224,10 @@ impl Shell {
         }
         let cargo = policy.as_ref().and_then(|p| p.cargo_cache.as_deref()).map(cargo_cache::CargoCache::open);
         let cargo = cargo.transpose()?.map(Arc::new);
+        let outputs = outputs::Store::open(&roots.scratch, OutputLimits::default())
+            .map_err(|e| anyhow::anyhow!("the directory for saved outputs in {}: {e}", roots.scratch.display()))?;
         Ok(Self {
+            outputs: Arc::new(outputs),
             roots,
             program: shell::find_shell(),
             running: Arc::default(),
@@ -243,6 +250,14 @@ impl Shell {
         &self.admission
     }
 
+    /// Keep saved outputs within `limits` instead of the defaults.
+    pub fn with_output_limits(mut self, limits: OutputLimits) -> anyhow::Result<Self> {
+        let outputs = outputs::Store::open(&self.roots.scratch, limits)
+            .map_err(|e| anyhow::anyhow!("the directory for saved outputs in {}: {e}", self.roots.scratch.display()))?;
+        self.outputs = Arc::new(outputs);
+        Ok(self)
+    }
+
     /// Kill every command and process still running, with everything it
     /// started. Call it before the service exits: each has a process group
     /// of its own, which neither a signal to the service nor its exit reaches.
@@ -258,7 +273,7 @@ impl Shell {
         self.running.kill_all();
     }
 
-    /// Handle one `shell` method (`run`, `start`, `read`, `write`, `stop`) with its request payload.
+    /// Handle one `shell` method (`run`, `start`, `read`, `write`, `stop`, `output`) with its request payload.
     pub async fn handle(&self, method: &str, payload: Value) -> Result<Value, RemoteError> {
         self.handle_cancellable(method, payload, CancellationToken::new()).await
     }
@@ -269,7 +284,7 @@ impl Shell {
         payload: Value,
         cancel: CancellationToken,
     ) -> Result<Value, RemoteError> {
-        self.handle_streaming(None, method, payload, cancel, None).await
+        self.handle_streaming(&outputs::Asker::default(), method, payload, cancel, None).await
     }
 
     /// [`Shell::handle_cancellable`] for `caller`: a process it starts is
@@ -281,12 +296,13 @@ impl Shell {
         payload: Value,
         cancel: CancellationToken,
     ) -> Result<Value, RemoteError> {
-        self.handle_streaming(Some(caller), method, payload, cancel, None).await
+        let asker = outputs::Asker { caller: Some(caller.to_owned()), ..outputs::Asker::default() };
+        self.handle_streaming(&asker, method, payload, cancel, None).await
     }
 
     async fn handle_streaming(
         &self,
-        caller: Option<&str>,
+        asker: &outputs::Asker,
         method: &str,
         payload: Value,
         cancel: CancellationToken,
@@ -294,6 +310,7 @@ impl Shell {
     ) -> Result<Value, RemoteError> {
         let method = method.strip_prefix("shell.").unwrap_or(method);
         let policy = self.policy.as_deref().map(|policy| (policy, self.cargo.clone()));
+        let caller = asker.caller.as_deref();
         let cx = || process::Ctx {
             roots: &self.roots,
             program: &self.program,
@@ -301,15 +318,21 @@ impl Shell {
             processes: &self.processes,
             sandbox: policy.clone(),
             caller,
+            outputs: Some((&self.outputs, asker)),
         };
         let reply = match method {
             "run" => {
                 let req = parse("shell", method, payload)?;
                 let policy = policy.clone();
+                let out = shell::Out { sink, save: Some((self.outputs.clone(), asker.clone())) };
                 serde_json::to_value(
-                    shell::run(&self.roots, &self.program, &self.running, &self.admission, policy, req, cancel, sink)
+                    shell::run(&self.roots, &self.program, &self.running, &self.admission, policy, req, cancel, out)
                         .await?,
                 )
+            }
+            "output" => {
+                let req = parse("shell", method, payload)?;
+                serde_json::to_value(self.outputs.page(&self.roots, caller, req, cancel).await?)
             }
             "start" => serde_json::to_value(process::start(cx(), parse("shell", method, payload)?, cancel).await?),
             "read" => serde_json::to_value(process::read(cx(), parse("shell", method, payload)?, cancel).await?),
@@ -400,14 +423,18 @@ pub async fn serve_shell(svc: Arc<Service>, shell: Arc<Shell>) {
         let (shell, publisher) = (shell.clone(), publisher.clone());
         async move {
             let method = method_of(&req)?;
-            // The kernel stamps the sender: a process is the sender's alone.
-            let caller = req.from.as_ref().map(|from| from.to_string());
+            // The kernel stamps the sender: a process, and a saved output, is the sender's alone.
+            let asker = outputs::Asker {
+                caller: req.from.as_ref().map(|from| from.to_string()),
+                trace: Some(req.trace_id.to_string()),
+                request: Some(req.id.to_string()),
+            };
             let wanted = req.payload.get("stream").and_then(Value::as_bool) == Some(true);
             if !(report && wanted) {
-                return shell.handle_streaming(caller.as_deref(), &method, req.payload, cancel, None).await;
+                return shell.handle_streaming(&asker, &method, req.payload, cancel, None).await;
             }
             let (sink, published) = shell::stream(publisher, req.trace_id.clone());
-            let reply = shell.handle_streaming(caller.as_deref(), &method, req.payload, cancel, Some(sink)).await;
+            let reply = shell.handle_streaming(&asker, &method, req.payload, cancel, Some(sink)).await;
             // The output goes out before the reply that ends it; a stalled bus does not hold the reply.
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), published).await;
             reply

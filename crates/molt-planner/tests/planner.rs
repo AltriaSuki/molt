@@ -590,6 +590,7 @@ fn exit(code: i32, stderr: &str) -> shell::RunResponse {
         truncated: false,
         duration_ms: 1,
         offline_failure: false,
+        outputs: Vec::new(),
     }
 }
 
