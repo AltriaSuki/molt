@@ -1,7 +1,8 @@
 # Extension packs
 
 An extension pack bundles what you would otherwise add to your
-configuration by hand: [MCP servers](mcp.md), [lifecycle
+configuration by hand: [MCP servers](mcp.md), bus
+[services](services.md) run as sandboxed candidates, [lifecycle
 hooks](config.md#trusted-lifecycle-hooks), [Agent Skills](skills.md) and
 [command templates](tui.md#project-task-commands). It is a directory, a
 `.tar`, `.tar.gz` or `.tgz` archive of one, or a git repository, with a
@@ -41,6 +42,19 @@ calls = 200
 read_only = true
 roles = ["attempt", "designer"]
 
+# Bus services, each a candidate in the sandbox (see "Services" below).
+[service.notes]
+command = "${MOLT_EXTENSION_DIR}/bin/notes"
+requests = [{ target = "memory.search", budget = { calls = 30 } }]
+calls = 40                    # how often the agent may call it in a run
+
+[[service.notes.tools]]
+name = "find_note"
+description = "Find a team note by its title."
+target = "ext-issue-tracker-notes.find"
+read_only = true
+input_schema = { type = "object", properties = { title = { type = "string" } } }
+
 # Lifecycle hooks, with the keys of [[hooks]] in your config.
 [[hooks]]
 event = "tool.before"
@@ -65,10 +79,41 @@ own `mounts`. A server `NAME` of pack `PACK` is bridged as `PACK-NAME`, or
 `mcp__PACK-NAME__TOOL`. Hooks run in the workspace's sandbox, which cannot
 see the pack, so a hook's command is the whole of it.
 
-A manifest with services, environment profiles, roles, workflows, prompts or
-`env` is refused with the reason: packs cannot bring those yet. So is an
+A manifest with environment profiles, roles, workflows, prompts or `env` is
+refused with the reason: packs cannot bring those yet. So is an
 unknown key, a schema other than 1, and anything the user config would
 refuse in `[mcp]` or `[[hooks]]` (a server given `ANTHROPIC_API_KEY`, say).
+
+## Services
+
+A pack's `[service.NAME]` is a bus service, as a `[[service]]` of your
+config is ([Service trust](services.md)), but always a **candidate**: one
+an agent may replace, run in the Linux sandbox and never natively. The
+pack chooses less than your config would:
+
+- It runs as `ext-PACK-NAME` (`ext-PACK` when `NAME` is the pack's), and
+  provides that service's methods, `ext-PACK-NAME.*`, and no others. Its
+  tier is `mutable`, its isolation `sandbox`. `tier`, `isolation`,
+  `provides`, `exec` and `mounts` are not keys a pack has: they are refused
+  as unknown.
+- `command` and `args` are as an MCP server's, with `${MOLT_EXTENSION_DIR}`
+  for the installed directory, which it reads (and nothing else of your
+  machine) through its one mount. It has no network, its private state at
+  `<data dir>/state/ext-PACK-NAME`, and its `env`, `pass_env`, `memory_mb`
+  and `cpu_secs` as yours would; `MOLT_*`, `ANTHROPIC_*`, `OPENAI_*`,
+  `HOME`, `PATH` and `TMPDIR` are refused.
+- `requests` are the capabilities it holds, each with its budget, as a
+  `[[service]]`'s. A kernel method (`kernel.*`, the registry's included) is
+  refused.
+- `[[service.NAME.tools]]` are tools on its own methods, in the format of a
+  service's ([Tools](tools.md)), offered to the roles they name; `calls`
+  (1000 by default, 0 for none) is how often the agent may call the service
+  in a run, and without it its tools are not offered. A tool with the name
+  of one of the planner's own, of a tool of another pack, or with the
+  user's trust is refused.
+
+As any candidate, it does not start where the sandbox is unavailable, and
+then neither does `molt`: `molt ext disable PACK` to run without it.
 
 ## What installing shows and asks
 
@@ -85,14 +130,19 @@ It would get:
   MCP server issue-tracker-issues's tool get_issue is offered to attempt, designer, as a tool that only reads
   MCP server issue-tracker-issues's tools are offered to attempts unless listed here
   hook tool.before for tools matching "edit_file|write_file" for paths migrations/** runs `echo 'migrations are frozen' >&2; exit 2` in the workspace's sandbox, and denies when it fails
+  service ext-issue-tracker-notes may use memory.search within 30 calls, 0 tokens and 0 ms
+  service ext-issue-tracker-notes runs ${MOLT_EXTENSION_DIR}/bin/notes in a candidate's sandbox that sees the pack's files, without the network
+  service ext-issue-tracker-notes's tool find_note (ext-issue-tracker-notes.find) is offered to attempt, as a tool that only reads
   the agent may call MCP server issue-tracker-issues 200 times a run (mcp__issue-tracker-issues__*)
+  the agent may call service ext-issue-tracker-notes 40 times a run (ext-issue-tracker-notes.*)
 Install it? [y/N]
 ```
 
 These lines are the pack's **grant**: the programs it runs, their network,
 the host paths they read, your environment variables they get and the
-variables they are set, how often the agent may call them and who is
-offered their tools, each hook's command, and its skills and commands.
+variables they are set, the capabilities its services hold and their
+budgets, how often the agent may call them and who is offered their tools,
+each hook's command, and its skills and commands.
 Nothing the pack holds is run to install it.
 
 It asks at a terminal. Without one it installs only with `--yes`; otherwise
@@ -123,13 +173,15 @@ serve` or `molt acp` starts it.
   a pack unless you run `molt ext add` on it, and a pack installed inside
   the workspace is refused. `--config FILE` starts no packs, as it reads no
   user skills.
-- **Names do not shadow.** A pack whose server would be bridged under a name
-  your config's `[mcp]` or another pack already has is refused, at install
-  and at start. Your skills win over a pack's of the same name, and a
+- **Names do not shadow.** A pack whose server would be bridged, or whose
+  service would run, under a name your config's `[mcp]` or `[[service]]`
+  or another pack already has is refused, at install and at start; so is
+  a service's tool with the name of another pack's. Your skills win over a pack's of the same name, and a
   pack's command over a project's.
 - **The pack runs where yours would.** Its servers run in the MCP sandbox
   ([mcp.md](mcp.md#the-sandbox)), with the network only when the grant says
-  so; its hooks in the shell's sandbox. Its skills are offered as yours, in
+  so; its services in the candidates' sandbox, never with the network; its
+  hooks in the shell's sandbox. Its skills are offered as yours, in
   the same `<skills>` block and under the same limits.
 
 ## Paths and archives
@@ -197,11 +249,12 @@ runs none of its servers, hooks, skills or commands. `molt ext enable NAME`
 checks it as a start does and turns it back on.
 
 `molt ext remove NAME` deletes the installed files, the record and the
-approval, and the tool lists its servers left in the default data dirs
-(`~/.cache/molt/*/mcp/`). A data dir you chose with `--data-dir` is swept
-too when you name it: `molt ext remove NAME --data-dir DIR` (repeatable).
-Otherwise it keeps its cached list, which nothing reads once the server is
-gone.
+approval, and what its servers and services left in the default data dirs:
+the servers' tool lists (`~/.cache/molt/*/mcp/`) and the services' private
+state (`~/.cache/molt/*/state/ext-NAME…`). A data dir you chose with
+`--data-dir` is swept too when you name it: `molt ext remove NAME
+--data-dir DIR` (repeatable). Otherwise it keeps them, and nothing reads
+them once the pack is gone.
 
 ## Claude Code plugins
 
@@ -226,7 +279,8 @@ approved as any pack's.
 ## Not yet
 
 Installing from a registry, fetching git submodules or LFS files, git
-fetches in a sandbox of their own, services, environment profiles,
-roles, prompts and workflows in a pack, importing a Claude Code plugin's
+fetches in a sandbox of their own, environment profiles, roles, prompts
+and workflows in a pack, a pack's service with the network or a mount
+beyond the pack, importing a Claude Code plugin's
 hooks and agents, and evaluating a pack on the benchmark before it is
 enabled.

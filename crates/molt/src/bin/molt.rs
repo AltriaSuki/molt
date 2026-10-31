@@ -141,7 +141,7 @@ enum Cmd {
         cmd: ImproveCmd,
     },
     /// Install, approve, disable and remove extension packs (docs/extensions.md):
-    /// MCP servers, hooks, skills and commands bundled in a directory or an
+    /// MCP servers, services, hooks, skills and commands bundled in a directory or an
     /// archive with a molt-extension.toml, or fetched from a git repository.
     Ext {
         #[command(subcommand)]

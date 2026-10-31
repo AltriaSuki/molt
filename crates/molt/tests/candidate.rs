@@ -182,6 +182,12 @@ async fn a_hostile_candidate_reaches_only_what_it_was_granted() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let host_home = std::env::var("HOME").unwrap();
+    // A directory it is given to read. Apart from the others: the sandbox
+    // makes a mount's parents in its own /tmp, where writes reach no host file.
+    let given_tmp = tempfile::tempdir().unwrap();
+    let given = given_tmp.path().canonicalize().unwrap().join("given");
+    std::fs::create_dir_all(&given).unwrap();
+    std::fs::write(given.join("readme"), "for the service").unwrap();
     let exe = std::env::current_exe().unwrap();
     let sockets = data.join("sock");
 
@@ -199,11 +205,13 @@ async fn a_hostile_candidate_reaches_only_what_it_was_granted() {
         provides = ["rogue.*"]
         requests = [{{ target = "recorder.report", budget = {{ calls = 4 }} }}]
         max_restarts = 3
-        env = {{ PROBE_HOST_FILE = "{host_secret}", PROBE_HOST_HOME = "{host_home}", PROBE_EVALUATIONS = "{evaluations}", PROBE_DATA = "{data}", PROBE_SOCKET = "{socket}", PROBE_PORT = "{port}", PROBE_KERNEL_PID = "{pid}" }}
+        mounts = ["{given}"]
+        env = {{ PROBE_GIVEN = "{given}", PROBE_HOST_FILE = "{host_secret}", PROBE_HOST_HOME = "{host_home}", PROBE_EVALUATIONS = "{evaluations}", PROBE_DATA = "{data}", PROBE_SOCKET = "{socket}", PROBE_PORT = "{port}", PROBE_KERNEL_PID = "{pid}" }}
         "#,
         data = data.display(),
         exe = exe.display(),
         host_secret = host_secret.display(),
+        given = given.display(),
         evaluations = evaluations.display(),
         socket = sockets.join("recorder.sock").display(),
         pid = std::process::id(),
@@ -249,6 +257,7 @@ async fn a_hostile_candidate_reaches_only_what_it_was_granted() {
         "set up io_uring",
         "mount a file system",
         "write its own program",
+        "write a path it was given to read",
         "store a version over the bus",
         "promote itself over the bus",
     ];
@@ -256,7 +265,7 @@ async fn a_hostile_candidate_reaches_only_what_it_was_granted() {
         let outcome = report.get(what).unwrap_or_else(|| panic!("the fixture did not try to {what}: {report:#?}"));
         assert!(outcome["blocked"] == json!(true), "it could {what}: {outcome}");
     }
-    for what in ["write its private state", "call the capability it was granted"] {
+    for what in ["write its private state", "call the capability it was granted", "read a path it was given"] {
         assert_eq!(report[what]["blocked"], json!(false), "it could not {what}: {}", report[what]);
     }
     let env: BTreeSet<String> = serde_json::from_value(report["its environment"]["names"].clone()).unwrap();
@@ -271,6 +280,7 @@ async fn a_hostile_candidate_reaches_only_what_it_was_granted() {
         "PATH",
         "PROBE_DATA",
         "PROBE_EVALUATIONS",
+        "PROBE_GIVEN",
         "PROBE_HOST_FILE",
         "PROBE_HOST_HOME",
         "PROBE_KERNEL_PID",
@@ -283,6 +293,7 @@ async fn a_hostile_candidate_reaches_only_what_it_was_granted() {
     // The granted call arrived, and nothing it tried changed the host.
     assert_eq!(reports.recv().await.unwrap(), json!({ "from": "probe" }));
     assert_eq!(std::fs::read_to_string(&host_secret).unwrap(), "the user's file");
+    assert_eq!(std::fs::read_to_string(given.join("readme")).unwrap(), "for the service");
     assert_eq!(std::fs::read_to_string(&evaluations).unwrap(), r#"{"rogue": "rejected"}"#);
     assert_eq!(std::fs::read_to_string(data.join("state/rogue/note")).unwrap(), "mine");
     assert!(listener.set_nonblocking(true).is_ok() && listener.accept().is_err(), "nothing connected to the host port");
@@ -308,6 +319,111 @@ async fn a_hostile_candidate_reaches_only_what_it_was_granted() {
     let registry = std::fs::read_to_string(data.join("registry/registry.json")).unwrap();
     assert!(registry.contains(&live.0));
     assert!(audit::verify(&data.join("audit.jsonl")).await.is_ok(), "the audit log is intact");
+}
+
+/// A mount that would show a candidate the data dir, with the registry,
+/// the audit log and the other services' state, stops the start.
+#[tokio::test]
+async fn a_candidate_is_not_started_with_a_mount_that_shows_it_the_data_dir() {
+    if !sandbox_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    for mount in [tmp.path().to_path_buf(), data.join("state")] {
+        std::fs::create_dir_all(data.join("state")).unwrap();
+        let cfg = Config::parse(&format!(
+            r#"
+            [kernel]
+            data_dir = "{data}"
+            fsync = false
+
+            [[service]]
+            name = "echo"
+            isolation = "sandbox"
+            exec = {{ command = "{echo}" }}
+            provides = ["echo.*"]
+            mounts = ["{mount}"]
+            "#,
+            data = data.display(),
+            echo = env!("CARGO_BIN_EXE_molt-echo"),
+            mount = mount.display(),
+        ))
+        .unwrap();
+        let err = format!("{:#}", molt::start(&cfg).await.err().expect("it must not start"));
+        assert!(err.contains("would show it the data dir"), "{}: {err}", mount.display());
+    }
+}
+
+/// A pack's service, once approved, runs from the user's layer as a
+/// candidate: in the sandbox, with its private state, on the bus under its
+/// pack's name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_installed_packs_service_runs_as_a_sandboxed_candidate_on_the_bus() {
+    struct Yes;
+    impl molt::extensions::Approve for Yes {
+        fn approve(&mut self, _: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn say(&mut self, _: &str) {}
+    }
+    if !sandbox_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let var = |name: &str| match name {
+        "XDG_CONFIG_HOME" => Some(root.join("config").display().to_string()),
+        "XDG_DATA_HOME" => Some(root.join("share").display().to_string()),
+        "XDG_CACHE_HOME" => Some(root.join("cache").display().to_string()),
+        _ => None,
+    };
+    let places = molt::extensions::Places::from_vars(&var).unwrap();
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join(molt::extensions::MANIFEST),
+        format!(
+            "schema = 1\nname = \"echoes\"\nversion = \"1\"\n[service.echo]\ncommand = \"{}\"\n",
+            env!("CARGO_BIN_EXE_molt-echo")
+        ),
+    )
+    .unwrap();
+    molt::extensions::add(&places, &src, &mut Yes).unwrap();
+
+    let data = root.join("data");
+    let mut defaults = Config::default();
+    defaults.kernel.data_dir = data.clone();
+    defaults.kernel.fsync = false;
+    let workspace = root.join("project");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let cfg = molt::layers::Layered::build(&defaults, &workspace, None, &var).unwrap().config;
+    assert_eq!(cfg.service("ext-echoes-echo").unwrap().isolation, molt::Isolation::Sandbox);
+    let running = molt::start(&cfg).await.unwrap();
+    let client = join(&running, &cfg.socket_dir(), "client").await;
+    let cap = running
+        .kernel()
+        .grant(client.id(), "ext-echoes-echo.*".parse().unwrap(), Budget::new(0, 0, 100), None)
+        .await
+        .unwrap();
+    assert_eq!(call_until_ok(&client, &cap, "ext-echoes-echo.echo", json!("hi")).await, json!("hi"));
+    // Only a confined start gets a private state directory (MOLT_STATE_DIR), which count writes to.
+    assert_eq!(call(&client, &cap, "ext-echoes-echo.count", Value::Null).await.unwrap(), json!(1));
+    assert_eq!(std::fs::read_to_string(data.join("state/ext-echoes-echo/count")).unwrap(), "1");
+    let audit_path = running.kernel().audit_path().to_owned();
+    running.shutdown().await;
+    let entries = audit::read_all(&audit_path).await.unwrap();
+    assert!(
+        entries.iter().any(|e| matches!(
+            &e.event,
+            AuditEvent::ServiceStarted { service, .. } if service.as_str() == "ext-echoes-echo"
+        )),
+        "the pack's service started"
+    );
+
+    // Removed, its private state goes with it.
+    molt::extensions::remove(&places, "echoes", std::slice::from_ref(&data)).unwrap();
+    assert!(!data.join("state/ext-echoes-echo").exists());
 }
 
 /// The hostile candidate. A no-op when this binary runs as a test suite.
@@ -420,6 +536,9 @@ async fn probe(svc: &Service) -> Report {
     );
     let me = std::env::current_exe().unwrap();
     tried("write its own program", outcome(std::fs::OpenOptions::new().append(true).open(me)));
+    let given = var("PROBE_GIVEN");
+    tried("read a path it was given", outcome(std::fs::read_to_string(given.join("readme"))));
+    tried("write a path it was given to read", outcome(std::fs::write(given.join("readme"), "changed")));
     let state = PathBuf::from(std::env::var("MOLT_STATE_DIR").unwrap());
     tried(
         "write its private state",

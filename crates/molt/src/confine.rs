@@ -16,11 +16,18 @@ pub const LINUX_SANDBOX: &str = "linux-sandbox";
 #[derive(Clone, Debug, Default)]
 pub struct LinuxSandbox {
     policy: SandboxPolicy,
+    /// Host paths the service may read, besides the system's and its program.
+    reads: Vec<std::path::PathBuf>,
 }
 
 impl LinuxSandbox {
     pub fn new(policy: SandboxPolicy) -> Self {
-        Self { policy }
+        Self { policy, reads: Vec::new() }
+    }
+
+    /// The default sandbox, with `reads` mounted read-only at their own paths.
+    pub fn reading(reads: Vec<std::path::PathBuf>) -> Self {
+        Self { policy: SandboxPolicy::default(), reads }
     }
 
     fn policy_for(&self, start: &ConfinedStart<'_>) -> SandboxPolicy {
@@ -62,7 +69,7 @@ impl Backend for LinuxSandbox {
         }
         let (command, guard) = self
             .policy_for(start)
-            .service_command(program, &start.exec.args, start.env, start.state, start.bus_fd)
+            .service_command(program, &start.exec.args, start.env, start.state, &self.reads, start.bus_fd)
             .map_err(|e| format!("{e:#}"))?;
         Ok((command, Box::new(Sandboxed(guard))))
     }

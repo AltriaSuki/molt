@@ -222,13 +222,17 @@ impl SandboxPolicy {
     /// private `HOME` and `TMPDIR`, and `MOLT_STATE_DIR=/state`; nothing is
     /// read from this process's environment. Descriptor `keep` (its bus
     /// connection) stays open in it under the same number. The policy's
-    /// `read_only`, `environment`, `set_env` and `cargo_cache` are not used.
+    /// `read_only`, `environment`, `set_env` and `cargo_cache` are not used:
+    /// the host paths it sees read-only, besides the system's and its
+    /// program, are `reads`, and none may hold its state directory or lie
+    /// in it.
     pub fn service_command(
         &self,
         program: &Path,
         args: &[String],
         env: &[(String, String)],
         state: &Path,
+        reads: &[PathBuf],
         keep: std::os::fd::RawFd,
     ) -> anyhow::Result<(Command, Guard)> {
         let mut policy = self.clone();
@@ -256,6 +260,20 @@ impl SandboxPolicy {
             "the state directory must be a canonical absolute directory"
         );
         check_mount(state)?;
+        ensure!(reads.len() <= 32, "at most 32 paths to read");
+        for path in reads {
+            ensure!(path.is_absolute(), "the path to read {} must be absolute", path.display());
+            let path = path.canonicalize().with_context(|| format!("the path to read {}", path.display()))?;
+            check_mount(&path)?;
+            ensure!(
+                !state.starts_with(&path) && !path.starts_with(state),
+                "the path to read {} holds the state directory or is in it",
+                path.display()
+            );
+            let meta = std::fs::metadata(&path)?;
+            ensure!(meta.is_dir() || meta.is_file(), "the path to read {} is not a file or directory", path.display());
+            policy.read_only.push(path);
+        }
         ensure!(keep > 2, "the descriptor to keep cannot be a standard stream");
         for (name, value) in env {
             ensure!(

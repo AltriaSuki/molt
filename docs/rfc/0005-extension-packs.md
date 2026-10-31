@@ -12,12 +12,13 @@ and nothing records who added what, for what, or how to take it out again.
 
 An **extension pack** is a directory, a tar archive of one, or a commit of
 a git repository, with a `molt-extension.toml` that bundles those
-declarations. `molt ext add` installs it after showing what it would get
+declarations, and bus services run as candidates. `molt ext add` installs it after showing what it would get
 and getting a person's yes; `molt ext list`, `show`, `update`, `disable`,
 `enable` and `remove` manage it. A pack
 adds no new kind of extension and no new way to run code: its servers are
-the MCP bridge services of #43 and its hooks those of #165, under the same
-sandbox, capability and audit rules as the user's own.
+the MCP bridge services of #43, its services the candidate services of
+`docs/services.md` and its hooks those of #165, under the same sandbox,
+capability and audit rules as the user's own.
 
 ## The manifest, schema 1
 
@@ -29,12 +30,13 @@ description = "…"           # optional, at most 1024 bytes
 
 [mcp.SERVER]                # molt_mcp::McpServer, as [mcp.NAME] in the user config
 [[hooks]]                   # molt_planner::hooks::Hook, as [[hooks]] in the user config
+[service.SERVICE]           # extensions::PackService: a candidate service, below
 ```
 
 and, by the layout of a Claude Code plugin, `skills/NAME/SKILL.md` and
-`commands/NAME.md`. Unknown keys are refused. `service`, `environment`,
-`role`, `workflow`, `prompts`, `env` and `pass_env` are refused with a
-message saying packs cannot bring them yet, so that a pack written for a
+`commands/NAME.md`. Unknown keys are refused. `environment`, `role`,
+`workflow`, `prompts`, `env` and `pass_env` are refused with a message
+saying packs cannot bring them yet, so that a pack written for a
 later schema fails loudly rather than losing part of itself.
 
 `${MOLT_EXTENSION_DIR}` in a server's `command`, `args` and `env` values
@@ -47,6 +49,38 @@ A pack's server `S` is `[mcp.PACK-S]` (`[mcp.PACK]` when `S` is `PACK`), so
 packs do not collide with each other's names or with the user's, and a
 collision that remains is refused rather than resolved by order.
 
+## Services
+
+A pack's service `S` runs as `ext-PACK-S` (`ext-PACK` when `S` is `PACK`);
+no service of Molt's and no MCP bridge (`mcp-NAME`) has the prefix, and a
+collision with the user's `[[service]]` or another pack's is refused.
+`PackService::section` turns it into the `[[service]]` the user config
+would hold, with only what a pack may not choose fixed:
+
+- `tier = "mutable"`, `isolation = "sandbox"`, `provides = ["ext-PACK-S.*"]`;
+  the keys are not in `PackService`, so a manifest naming them is refused;
+- `exec` from `command` and `args`, with `${MOLT_EXTENSION_DIR}` expanded,
+  under the same rule as a server's command;
+- `mounts = [the installed directory]`: `ServiceSection::mounts`, new, is
+  the host paths a sandboxed service reads, bound read-only at their own
+  paths by `SandboxPolicy::service_command`. The user config may set it
+  too; it is refused on a native service, and a mount that is the data
+  dir, holds it or lies in it stops the start;
+- `requests`, `env`, `pass_env`, `tools`, `memory_mb` and `cpu_secs` as
+  given, under the checks of a sandboxed `[[service]]` (no `MOLT_*`,
+  `ANTHROPIC_*`, `OPENAI_*`, `HOME`, `PATH`, `TMPDIR`) and of RFC 0002's
+  tools (targets on its own methods, no planner tool's name, no user
+  trust). A request for a kernel method is refused at install, before the
+  kernel would refuse the registry's at launch.
+
+`calls` (default 1000, as a server's) becomes the planner's capability for
+`ext-PACK-S.*` with that budget, only when the service declares tools.
+The service is then a candidate like any other: the supervisor starts it
+only in the sandbox, without the network, with its private state, and a
+gate may promote a version of it under the registry's rules, which never
+widen its capabilities. A pack with a service does not start where the
+sandbox is unavailable.
+
 ## The grant
 
 `extensions::grant(manifest, root)` is the list of what the pack would get,
@@ -57,6 +91,12 @@ one human-readable line per thing, sorted:
   variable it is set (`env`, with its value); how many calls a run the
   planner gets for it (the capability `mcp-PACK-S.call` with that budget);
   who is offered its tools, and which only read;
+- per service: the command line it runs in the candidates' sandbox, each
+  capability it requests with its budget (calls, tokens, ms), each of the
+  user's variables it gets and each variable it is set, and, when it has
+  tools, how many calls a run the planner gets for it and each tool with
+  its target, roles, whether it only reads and whether its results are
+  believed as the workspace's;
 - per hook: its event, matcher, paths and command, and whether it may deny;
 - each skill, and each command.
 
@@ -90,8 +130,12 @@ contents, in path order), whether it is enabled, and the approved lines.
    or an archive with an entry that is absolute, contains `..`, or is a
    link or a device, is refused before anything is moved into place.
 6. **Uninstall removes what was added**: the installed directory, the record
-   and approval, and the servers' cached tool lists in the default data
-   dirs and in those named with `--data-dir`.
+   and approval, and the servers' cached tool lists and the services'
+   private state in the default data dirs and in those named with
+   `--data-dir`.
+7. **A pack's code is never trusted.** Its servers run in the MCP sandbox
+   and its services as candidates; neither runs as a native host process,
+   and a service of a pack can hold no kernel capability.
 
 Why approval is of capabilities rather than code: a pack's code runs in the
 sandbox its grant describes, with the network, paths, variables and calls
@@ -164,7 +208,10 @@ written only for such a pack: a file without one reads as before, and a
 Molt older than it refuses a file with one, and so starts nothing, rather
 than lose the pin. The planner gets the packs' skills in
 `MOLT_EXTENSION_SKILLS`, a new variable; a planner without it simply
-offers none.
+offers none. `[service]` is new in schema 1 without a bump: a Molt before
+it refused the key by name, so no pack with services was ever read
+without them. `mounts` on a `[[service]]` is a new optional key of the
+user config, absent by default.
 
 ## Acceptance
 
@@ -178,6 +225,15 @@ offers none.
 - An update asking for more is approved again; a changed or over-reaching
   installed pack stops the start; path traversal and links install nothing
   (`extensions::tests`).
+- A pack's service is shown with what it may use, runs only as a sandboxed
+  candidate under its pack's name and is removed with its state; it cannot
+  choose its tier, isolation or methods, or request a kernel method
+  (`extensions::tests::a_packs_service_is_shown_with_what_it_may_use_and_runs_only_as_a_sandboxed_candidate`,
+  `a_packs_service_cannot_choose_its_tier_isolation_methods_or_kernel_rights`;
+  `layers::tests::an_enabled_packs_service_joins_as_a_sandboxed_candidate_the_planner_may_call`;
+  `crates/molt/tests/candidate.rs`,
+  `an_installed_packs_service_runs_as_a_sandboxed_candidate_on_the_bus`,
+  `a_candidate_is_not_started_with_a_mount_that_shows_it_the_data_dir`).
 - A pack from git is pinned to its commit, nothing of the repository runs,
   a symlink or submodule refuses it, only https and ssh are fetched, and an
   update reports the moved ref and asks again only for more
@@ -191,9 +247,10 @@ offers none.
 
 - Installing from a registry. Fetching git submodules and LFS files, and
   running the git fetch in a sandbox of its own.
-- Services with capabilities of their own, environment profiles, roles,
-  prompts and workflows in a pack. Roles and prompts need RFC 0003's
-  promotion to cover a pack's protected prompts.
+- Environment profiles, roles, prompts and workflows in a pack. Roles and
+  prompts need RFC 0003's promotion to cover a pack's protected prompts.
+- A pack's service with the network, or with mounts beyond the pack's
+  directory: a candidate has neither today.
 - Importing Claude Code hooks (their tool names and `${CLAUDE_PLUGIN_ROOT}`
   scripts do not carry over to Molt's sandboxed hooks) and agents (roles).
 - Comparing a server's `calls` numerically, so that fewer calls is not a

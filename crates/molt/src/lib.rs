@@ -167,13 +167,34 @@ async fn launch_all(kernel: &Kernel, cfg: &Config, secrets: Option<&Secrets>) ->
             }
             // Never started any other way: an unavailable sandbox stops molt here.
             Isolation::Sandbox => {
-                let backend = Arc::new(confine::LinuxSandbox::default());
+                let backend = Arc::new(confine::LinuxSandbox::reading(mounts(svc, &cfg.kernel.data_dir)?));
                 kernel.launch_confined(&svc.name, secret, limits, restart, env, backend).await?;
             }
         }
         tracing::info!(service = %svc.name, isolation = ?svc.isolation, "launched");
     }
     Ok(())
+}
+
+/// The host paths sandboxed `svc` reads, canonical: none may be the data
+/// dir, hold it or lie in it, as the registry, the audit log and the other
+/// services' state are there.
+fn mounts(svc: &ServiceSection, data_dir: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let data = data_dir.canonicalize().with_context(|| format!("the data dir {}", data_dir.display()))?;
+    let mut out = Vec::new();
+    for path in &svc.mounts {
+        let path =
+            path.canonicalize().with_context(|| format!("service {}: the mount {}", svc.name, path.display()))?;
+        anyhow::ensure!(
+            !data.starts_with(&path) && !path.starts_with(&data),
+            "service {}: the mount {} would show it the data dir {}, with the registry and the audit log",
+            svc.name,
+            path.display(),
+            data.display()
+        );
+        out.push(path);
+    }
+    Ok(out)
 }
 
 /// A command named in the configuration, as an absolute path: itself when
