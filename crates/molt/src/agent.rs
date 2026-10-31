@@ -414,6 +414,64 @@ pub fn dependency_warnings(cfg: &Config, workspace: &Path, cargo_home: Option<&P
     missing_dependencies(workspace, cargo)
 }
 
+/// The sandbox policy the standard shell's commands run under, with the
+/// user's environment profiles, read from its arguments as `molt-tools
+/// shell` reads them: `None` when commands run unconfined or the shell
+/// service is not the standard one.
+pub fn shell_policy(
+    cfg: &Config,
+) -> anyhow::Result<Option<(SandboxPolicy, std::collections::BTreeMap<String, molt_tools::EnvProfile>)>> {
+    let Some(exec) = cfg.service("shell").and_then(|shell| shell.exec.as_ref()).filter(|exec| standard_shell(exec))
+    else {
+        return Ok(None);
+    };
+    if exec.args.iter().any(|arg| arg == "--no-sandbox") {
+        return Ok(None);
+    }
+    let values = |flag: &str| exec.args.windows(2).filter(|w| w[0] == flag).map(|w| w[1].clone()).collect::<Vec<_>>();
+    let one = |flag: &str| values(flag).into_iter().next();
+    let mut policy = match one("--sandbox-policy") {
+        Some(path) => {
+            let roots = molt_tools::Roots {
+                root: PathBuf::from(one("--root").context("the shell service has no --root")?).canonicalize()?,
+                scratch: PathBuf::from(one("--scratch").context("the shell service has no --scratch")?),
+            };
+            SandboxPolicy::load(Path::new(&path), &roots)?
+        }
+        None => SandboxPolicy::default(),
+    };
+    policy.environment.extend(values("--sandbox-env"));
+    if values("--deps-cache").iter().any(|kind| kind == "cargo") {
+        policy.cargo_cache = Some(molt_tools::host_cargo_home()?);
+    }
+    let user = match one("--environments") {
+        Some(json) => serde_json::from_str(&json).context("the shell service's --environments")?,
+        None => cfg.environments.clone(),
+    };
+    Ok(Some((policy, user)))
+}
+
+/// The readiness check of `workspace` before a run, when the user's
+/// `[readiness] before_run` asks for it and commands run in the sandbox,
+/// with passing environment checks kept in the data dir.
+pub async fn readiness_before_run(cfg: &Config, workspace: &Path) -> anyhow::Result<Option<crate::doctor::Checked>> {
+    if !cfg.readiness.before_run {
+        return Ok(None);
+    }
+    let Some((policy, user)) = shell_policy(cfg)? else { return Ok(None) };
+    let workspace = workspace.canonicalize().with_context(|| format!("workspace {}", workspace.display()))?;
+    let cache = crate::readiness::cache_path(&cfg.kernel.data_dir, &workspace);
+    let opts = crate::doctor::Options {
+        workspace: &workspace,
+        user: &user,
+        policy,
+        readiness: &cfg.readiness,
+        cache: Some(cache),
+        fresh: false,
+    };
+    Ok(Some(crate::doctor::check(opts).await?))
+}
+
 /// The dependencies of the project in `workspace` that commands without
 /// network cannot get, as one line each with what to do. `cargo` is whether
 /// they can build from a Cargo cache.
@@ -1031,6 +1089,7 @@ pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::
         profiles: cfg.profiles.clone(),
         mcp: Default::default(),
         models: cfg.models.clone(),
+        readiness: cfg.readiness.clone(),
         improve: cfg.improve.clone(),
     };
     let running = crate::start(&alone).await?;
@@ -1648,6 +1707,25 @@ mod tests {
         assert_eq!(dependency_warnings(&own, &ws, Some(&cargo_home)).len(), 1);
         cfg.service_mut("shell").unwrap().exec.as_mut().unwrap().args.push("--no-sandbox".into());
         assert!(dependency_warnings(&cfg, &ws, None).is_empty());
+    }
+
+    #[test]
+    fn the_readiness_check_reads_the_shells_policy_as_the_shell_does_and_skips_unconfined_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("project");
+        std::fs::create_dir(&ws).unwrap();
+        let mut cfg = Config::agent(&ws, &tmp.path().join("data"), Path::new("/opt/molt/bin")).unwrap();
+        let (policy, user) = shell_policy(&cfg).unwrap().unwrap();
+        assert!(policy.environment.is_empty() && policy.cargo_cache.is_none() && user.is_empty());
+        cfg.environments.insert("notes".into(), molt_tools::EnvProfile::default());
+        environments(&mut cfg).unwrap();
+        let exec = cfg.service_mut("shell").unwrap().exec.as_mut().unwrap();
+        exec.args.extend(["--sandbox-env".into(), "DATABASE_URL".into()]);
+        let (policy, user) = shell_policy(&cfg).unwrap().unwrap();
+        assert_eq!(policy.environment, ["DATABASE_URL"]);
+        assert!(user.contains_key("notes"));
+        cfg.service_mut("shell").unwrap().exec.as_mut().unwrap().args.push("--no-sandbox".into());
+        assert!(shell_policy(&cfg).unwrap().is_none(), "unconfined commands are not checked in a sandbox");
     }
 
     #[test]

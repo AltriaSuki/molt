@@ -217,7 +217,8 @@ impl Tool {
             Failure::Rejected(text) => text,
             Failure::Remote(e) => {
                 let mut msg = format!("{name} failed: {}", e.message);
-                if edit && e.code == ErrorCode::Invalid {
+                // An error that shows the file's lines already says how to correct the call.
+                if edit && e.code == ErrorCode::Invalid && !e.message.contains(fs::EDIT_SHOWS_LINES) {
                     msg.push_str(
                         ". Read the file again and copy old_string exactly, with enough context to be unique.",
                     );
@@ -258,6 +259,8 @@ impl Tool {
                 syntax_result(done, &w.path, resp.syntax)
             }
             Self::Edit(e) => {
+                let anchor = e.anchor.as_deref().map(fs::Anchor::parse).transpose();
+                let anchor = anchor.map_err(|why| Failure::Rejected(format!("{} failed: {why}.", t::EDIT_FILE)))?;
                 let req = fs::EditRequest {
                     workspace,
                     path: e.path.clone(),
@@ -265,11 +268,10 @@ impl Tool {
                     new: e.new_string,
                     replace_all: e.replace_all,
                     syntax: ctx.syntax_check,
+                    anchor,
                 };
                 let resp: fs::EditResponse = ctx.call(fs::EDIT, req, files).await?;
-                let s = if resp.replacements == 1 { "" } else { "s" };
-                let done = format!("Replaced {} occurrence{s} in {}.", resp.replacements, e.path);
-                syntax_result(done, &e.path, resp.syntax)
+                syntax_result(show_edit(&resp, &e.path), &e.path, resp.syntax)
             }
             Self::List(l) => {
                 let req = fs::ListRequest { workspace, path: l.path, depth: l.depth };
@@ -646,6 +648,27 @@ fn one_line(s: &str, max: usize) -> String {
     }
 }
 
+fn show_edit(r: &fs::EditResponse, path: &str) -> String {
+    let s = if r.replacements == 1 { "" } else { "s" };
+    let mut out = format!("Replaced {} occurrence{s} in {path}", r.replacements);
+    if let Some(line) = r.line {
+        let from = if r.replacements == 1 { "at" } else { "the first at" };
+        out.push_str(&format!(" ({from} line {line})"));
+    }
+    out.push('.');
+    match r.tolerance {
+        None => {}
+        Some(fs::Tolerance::LineEndings) => out.push_str(
+            " old_string matched only ignoring line endings; new_string was written with the file's line endings.",
+        ),
+        Some(fs::Tolerance::TrailingWhitespace) => out.push_str(
+            " old_string matched only ignoring line endings and trailing whitespace; new_string was written as \
+             given, with the file's line endings.",
+        ),
+    }
+    out
+}
+
 fn show_read(r: fs::ReadResponse) -> String {
     if r.total_lines == 0 {
         return "(empty file)".to_owned();
@@ -795,6 +818,17 @@ mod tests {
         assert!(parse(&call("read_file", json!({ "file": "a" }))).unwrap_err().contains("Invalid input"));
         assert!(parse(&call("rm_rf", json!({}))).unwrap_err().contains("no tool named \"rm_rf\""));
         assert!(parse(&call("submit_check", json!({}))).is_err());
+    }
+
+    #[test]
+    fn an_edit_result_says_where_it_matched_and_what_it_ignored() {
+        let r = |replacements, line, tolerance| fs::EditResponse { replacements, syntax: None, line, tolerance };
+        assert_eq!(show_edit(&r(1, None, None), "a.rs"), "Replaced 1 occurrence in a.rs.");
+        assert_eq!(show_edit(&r(1, Some(12), None), "a.rs"), "Replaced 1 occurrence in a.rs (at line 12).");
+        let crlf = show_edit(&r(3, Some(2), Some(fs::Tolerance::LineEndings)), "win.txt");
+        assert!(crlf.starts_with("Replaced 3 occurrences in win.txt (the first at line 2). old_string matched only ignoring line endings"), "{crlf}");
+        let ws = show_edit(&r(1, Some(2), Some(fs::Tolerance::TrailingWhitespace)), "a.py");
+        assert!(ws.contains("ignoring line endings and trailing whitespace"), "{ws}");
     }
 
     #[test]

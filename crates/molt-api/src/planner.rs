@@ -953,6 +953,20 @@ pub mod tools {
         pub new_string: String,
         #[serde(default)]
         pub replace_all: bool,
+        /// `LINE` or `LINE:HASH` ([`crate::fs::Anchor`]); a bare number is taken as a line.
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "line_or_text")]
+        pub anchor: Option<String>,
+    }
+
+    /// A string, or a number as one: models give a line as either.
+    fn line_or_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+        use serde::de::Error;
+        match Option::<serde_json::Value>::deserialize(d)? {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s)),
+            Some(serde_json::Value::Number(n)) => Ok(Some(n.to_string())),
+            Some(other) => Err(D::Error::custom(format!("anchor must be a string such as \"42:1a2b\", not {other}"))),
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

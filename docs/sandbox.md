@@ -23,7 +23,7 @@ Each command starts from an empty mount namespace with read-only system runtime 
 
 Dependencies mount at their canonical absolute paths. `--pass-env NAME` explicitly allows another variable; HOME always points to private `/home/molt`, and service bus / Anthropic credentials cannot be passed. The environment profiles below mount the toolchains a project uses; other paths outside `/usr` need declared read-only mounts. `"set_env": {"NAME": "value"}` sets a variable for commands, over the passed ones, with `$WORKSPACE`, `$BUILD` and `$PATH` replaced as in a profile. Build output already goes to the private build directory above; a dependency cache that normally lives in a host directory must be put in private `/tmp`. For example, declare a Rust toolchain mount and RUSTUP_HOME, set CARGO_HOME to a private `/tmp` location, and explicitly enable network when downloading dependencies; for offline builds from the Cargo cache you already have, use `--deps-cache cargo` (below). A cache in private `/tmp` disappears after each command. A C build using system `cc` needs no extra mounts.
 
-### Environment profiles and `molt env doctor`
+### Environment profiles
 
 What a toolchain's commands need from the sandbox is an environment profile: data, not code. Molt has five built in (`crates/molt-tools/src/env_profiles.toml`), and each applies to a project that has one of its files:
 
@@ -39,7 +39,30 @@ A tool in the system directories needs no mount. Otherwise the prefix above its 
 
 A project only picks which profiles apply, by having their files: what is mounted, set or opened comes from Molt or from you, never from a path the project names. So `.venv`'s own `pyvenv.cfg` is not followed to mount its base interpreter; a `.venv` made from a Python outside the system directories needs that Python mounted with a policy. Profiles of your own go in your user config `~/.config/molt/config.toml` (or a `--config` file), as `[environment.NAME]` with the same fields (`detect`, `tools`, `read_only`, `env`, `cargo_cache`, `network`, `probes`), and replace the built-in profile of the same name; `detect = []` turns one off. Only a profile of yours may mount a path you name or set `network = true`. In `env` values, `$WORKSPACE` is the command's workspace (the fork), `$BUILD` the workspace's private build directory and `$PATH` the PATH commands get.
 
-`molt env doctor [--workspace DIR] [--sandbox-policy FILE]` says which profiles apply, runs each one's probes in the sandbox from a fork of the workspace, as a run's commands would (`cargo tree --offline`, `python -c ...` in the `.venv`, `go list -deps ./...`, `npm ls`), and prints `ok` or `failed` for each with the line of output that says why and a one-line fix, such as `run cargo fetch in the project on this machine` when the Cargo cache lacks the project's crates. It exits 1 when a probe fails, and calls no model.
+### The readiness check: `molt env doctor`
+
+`molt env doctor [--workspace DIR] [--sandbox-policy FILE] [--pass-env NAME] [--deps-cache cargo] [--build COMMAND] [--fresh] [--json]` checks that a workspace is ready for its commands before any change is made. It runs everything in the sandbox from a fork of the workspace, as a run's commands would, drops the fork after, and calls no model. Each check prints one line with its result, what it found and how long it took, and a one-line fix under each one that fails:
+
+- **Probes.** Which profiles apply, and each one's probes (`cargo tree --offline`, `python -c ...` in the `.venv`, `go list -deps ./...`, `npm ls`), with the line of output that says why one fails, such as `run cargo fetch in the project on this machine` when the Cargo cache lacks the project's crates.
+- **Toolchains.** The versions the project declares, compared with the ones commands get: `rust-toolchain.toml` (or `rust-toolchain`) and `rust-version` in `Cargo.toml` against `rustc --version`, `.nvmrc`, `.node-version` and `engines.node` against `node --version`, `.python-version` and `requires-python` against `python3 --version`, and the `go` line of `go.mod` against `go env GOVERSION`. A toolchain rustup does not have is named, with `rustup toolchain install` for it. A range it does not read (`||`, `lts/*`) is not checked rather than guessed.
+- **Dependencies.** The file checks of the dependency preflight below, unless commands have network.
+- **Variables.** Each one `[readiness] env` lists must be set here and reach commands (`--pass-env`, or set by a profile or the policy). Only whether it is set is looked at, never its value. A model or service credential (`ANTHROPIC_*`, `OPENAI_*`, `MOLT_*`) or `HOME` cannot be listed, since commands are never given them.
+- **The build.** `[readiness] build`, or `--build`, is the project's own build command. It runs once the environment checks pass (it is `skipped` when one is blocked), in the sandbox, from the fork, and nothing it writes reaches the workspace.
+
+The verdict is the worst result, and the exit code says which: 0 `ready`, 1 `blocked` (the environment lacks something; fix what is marked blocked), 2 `build_fails` (the environment is ready, and the project's build already fails before any change, so its failures are the project's own, not a run's), 3 `unknown` (a check timed out or was killed). A build that fails for a dependency it could not download is `blocked`, not `build_fails`. `--json` prints the report for CI: the status, each check with its `kind`, `status`, `detail`, `fix` and `ms`, the fingerprint and the total time.
+
+The fingerprint is the SHA-256 of what the environment checks depend on: Molt's version, the profiles that apply, the sandbox policy, the lock and toolchain files (`Cargo.lock`, `package-lock.json`, `yarn.lock`, `go.sum`, `uv.lock`, `rust-toolchain.toml`, `.nvmrc`, `.python-version`, ... and each profile's `detect` files), whether `node_modules`, `vendor` and `.venv` are there and when they last changed, which file each tool on PATH is and when it changed, rustup's installed toolchains, the Cargo cache's directories, `PATH`, and whether each required variable is set. When every environment check passes, the report is kept in the data dir (`readiness/` under it) and an unchanged fingerprint later reuses it (`environment checks cached`); `--fresh` checks again anyway. A blocked or unknown result is never kept, so the check after a fix probes again. The build is never kept: it depends on the project's code, and runs each time.
+
+`[readiness]` goes in your user config, or a `--config` file:
+
+```toml
+[readiness]
+build = "cargo build --offline"   # the project's build; leave it out to check without one
+env = ["DATABASE_URL"]            # variables the project's commands need
+before_run = true                 # check before each `molt do`, and when the interface starts
+```
+
+A project's `.molt/config.toml` may set `build` and `env` (they are data: the build runs in the sandbox, as the done-check does), and adds to yours; only you can set `before_run`. With `before_run`, `molt do` runs the same check before it plans, from the cache when the fingerprint is unchanged, prints each check that is not ok and the verdict, and does not start, with exit code 1 and no model call, when the environment is blocked. A failing build is printed as the project's own and the run goes on. The interface runs it when it starts and shows the result in its log. Without `before_run`, both keep the cheap file checks below. The check is skipped when commands run unconfined (`--no-sandbox`) or the shell service is not Molt's.
 
 ### Dependencies offline
 

@@ -16,6 +16,7 @@ mod lock;
 pub mod project;
 pub mod prompts;
 pub mod protocol;
+pub mod readiness;
 pub mod runs;
 pub mod serve;
 pub mod session;

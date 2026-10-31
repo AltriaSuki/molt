@@ -259,14 +259,18 @@ fn declare_builtins() -> Vec<BuiltinTool> {
             Needs::Nothing,
             declare(
                 t::EDIT_FILE,
-                "Replace exact text in a file. old_string must match the file exactly, including whitespace and \
-                 indentation, and occur exactly once unless replace_all is true: include enough surrounding lines \
-                 to make it unique. Read the file first.",
+                "Replace exact text in a file. old_string must match the file exactly, including indentation, \
+                 and occur exactly once unless replace_all is true: include enough surrounding lines to make it \
+                 unique. Line endings, and whitespace at the ends of lines, are ignored when nothing matches \
+                 exactly; new_string gets the file's line endings. When old_string is not found, the error shows \
+                 the closest lines as they are now; when it occurs several times, it lists the anchor of each. \
+                 Read the file first.",
                 json!({
                     "path": path,
                     "old_string": { "type": "string", "description": "The exact text to replace." },
                     "new_string": { "type": "string", "description": "The text to put in its place." },
                     "replace_all": { "type": "boolean", "description": "Replace every occurrence. Default false." },
+                    "anchor": { "type": "string", "description": "LINE or LINE:HASH from an edit_file error: the line old_string starts on, to pick one of several matches; refused if the line has changed since." },
                 }),
                 &["path", "old_string", "new_string"],
                 fs::EDIT,
