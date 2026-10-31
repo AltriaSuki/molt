@@ -238,6 +238,7 @@ async fn resume_run(
                     summary: String::new(),
                     findings: Vec::new(),
                     dispute: None,
+                    failure: None,
                 };
                 ctx.save(|s| s.attempt(attempt.index).end = Some(end.clone()));
                 slots.push(Slot::Done(Finished::saved(attempt, &end)));
@@ -881,6 +882,7 @@ async fn race(
                 status: report.status,
                 cost_usd: report.cost_usd,
                 note: report.note.clone(),
+                failure: report.failure.clone(),
             };
             let decided = schedule.decide(ended, &view(ctx, &cancel, !passed.is_empty(), before));
             scheduled(ctx, &mut racers, schedule, decided).await;
@@ -1351,7 +1353,50 @@ fn failure_summary(spec: Option<&CheckSpec>, rubric: &[Criterion], finished: &[F
             summary.push_str(&format!(": {}", f.report.note));
         }
     }
+    summary.push_str(&blockers(finished));
     summary
+}
+
+/// What stopped the attempts that only the user can fix (#228), each said
+/// once with every attempt it stopped, and what to do about it.
+fn blockers(finished: &[Finished]) -> String {
+    use molt_api::planner::{FailureAction, FailureClass};
+    let mut out = String::new();
+    let failures: Vec<_> =
+        finished.iter().filter_map(|f| f.report.failure.as_ref().filter(|x| x.needs_user()).map(|x| (f, x))).collect();
+    let mut told: Vec<&str> = Vec::new();
+    for (_, failure) in &failures {
+        if told.contains(&failure.evidence.as_str()) {
+            continue;
+        }
+        told.push(&failure.evidence);
+        let names: Vec<String> = failures
+            .iter()
+            .filter(|(_, other)| other.evidence == failure.evidence)
+            .map(|(f, _)| attempt_name(f.report.index))
+            .collect();
+        let (what, todo) = match (failure.class, failure.action) {
+            (_, FailureAction::FixConfig) => (
+                "The model endpoint",
+                "Fix the model's configuration (its credential, name or endpoint; `molt models probe` checks it), \
+                 then run the task again.",
+            ),
+            (FailureClass::Exhausted, _) => {
+                ("The machine's resources", "Free disk space or memory, then run the task again.")
+            }
+            _ => (
+                "The environment",
+                "Provide it where commands run (`molt env doctor` shows what they get), then run the task again: \
+                 another attempt without it would fail the same way.",
+            ),
+        };
+        out.push_str(&format!(
+            "\n\n{what}, not the code, stopped {}: `{}`. {todo}",
+            names.join(", "),
+            failure.evidence
+        ));
+    }
+    out
 }
 
 /// What a dispute says, for the run's summary.

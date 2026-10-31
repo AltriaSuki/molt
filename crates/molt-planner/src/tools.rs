@@ -213,10 +213,17 @@ impl Tool {
     async fn execute(self, ctx: &Ctx, fork: &str) -> Result<String, String> {
         let name = self.name().to_owned();
         let edit = matches!(self, Self::Edit(_));
+        let read_only = self.read_only();
         self.call(ctx, fork).await.map_err(|e| match e {
             Failure::Rejected(text) => text,
             Failure::Remote(e) => {
                 let mut msg = format!("{name} failed: {}", e.message);
+                // A change that may have happened must not be made twice (#228).
+                let unknown = crate::failure::of_tool(&e, read_only)
+                    .is_some_and(|f| f.class == molt_api::planner::FailureClass::OutcomeUnknown);
+                if unknown {
+                    msg.push_str(prompts::OUTCOME_UNKNOWN);
+                }
                 // An error that shows the file's lines already says how to correct the call.
                 if edit && e.code == ErrorCode::Invalid && !e.message.contains(fs::EDIT_SHOWS_LINES) {
                     msg.push_str(
@@ -793,6 +800,10 @@ fn show_run(r: &shell::RunResponse, timeout_s: u64) -> String {
     }
     if r.offline_failure {
         out.push_str(&format!("\n{}", prompts::OFFLINE));
+    } else if let Some(f) = crate::failure::of_command(r, molt_api::planner::FailureSource::Tool)
+        .filter(|f| f.class == molt_api::planner::FailureClass::Environment)
+    {
+        out.push_str(&prompts::missing(&f.evidence));
     }
     out
 }
