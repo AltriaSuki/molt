@@ -84,6 +84,11 @@ pub fn resolve_config(
             eprintln!("a prompt pack named in a project configuration is ignored; keep it in ~/.config/molt/prompts/");
             planner.env.remove(pack);
         }
+        let roles = molt_planner::pack::EXTENSIONS_ENV;
+        if let Some(planner) = cfg.service_mut("planner").filter(|p| !trusted && p.env.contains_key(roles)) {
+            eprintln!("extension roles named in a project configuration are ignored; install packs with molt ext add");
+            planner.env.remove(roles);
+        }
         if !trusted && !cfg.hooks.is_empty() {
             eprintln!("lifecycle hooks in a project configuration are ignored; keep trusted hook configuration outside the project");
             cfg.hooks.clear();
@@ -1659,19 +1664,22 @@ mod tests {
             .iter()
             .map(|name| match *name {
                 "planner" => "[[service]]\nname = \"planner\"\nexec = { command = \"/bin/true\" }\n\
-                              env = { MOLT_PROMPTS_DIR = \"/somewhere\" }\n"
+                              env = { MOLT_PROMPTS_DIR = \"/somewhere\", MOLT_EXTENSION_ROLES_JSON = \"[]\" }\n"
                     .to_owned(),
                 name => format!("[[service]]\nname = \"{name}\"\nexec = {{ command = \"/bin/true\" }}\n"),
             })
             .collect::<String>();
         let pack = |cfg: &Config| cfg.service("planner").unwrap().env.get(molt_planner::pack::PROMPTS_ENV).cloned();
+        let roles = |cfg: &Config| cfg.service("planner").unwrap().env.get(molt_planner::pack::EXTENSIONS_ENV).cloned();
         let outside = root.path().join("config.toml");
         std::fs::write(&outside, &services).unwrap();
         let trusted = resolve_config(Some(&outside), &workspace, None, None, None).unwrap();
         assert_eq!(pack(&trusted).as_deref(), Some("/somewhere"));
+        assert_eq!(roles(&trusted).as_deref(), Some("[]"));
         let inside = workspace.join("config.toml");
         std::fs::write(&inside, services).unwrap();
-        assert_eq!(pack(&resolve_config(Some(&inside), &workspace, None, None, None).unwrap()), None);
+        let untrusted = resolve_config(Some(&inside), &workspace, None, None, None).unwrap();
+        assert_eq!((pack(&untrusted), roles(&untrusted)), (None, None));
     }
 
     #[test]

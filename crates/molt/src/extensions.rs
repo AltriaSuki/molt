@@ -1,13 +1,15 @@
 //! Extension packs (issue #170, RFC 0005): a directory or a tar archive
 //! with a `molt-extension.toml` that bundles MCP servers, bus services
-//! (always candidates in the sandbox), lifecycle hooks, Agent Skills and
+//! (always candidates in the sandbox), lifecycle hooks, roles and their
+//! prompts (which join the user's prompt pack under the pack's name, and
+//! guard a gate only once a person promotes them), Agent Skills and
 //! command templates, installed with `molt ext add`.
 //!
 //! A pack gets nothing it was not approved for. Installing it reads and
 //! copies files and runs none of them; it lists what the pack would get
 //! (its [`grant`]: the programs it runs, their network, host paths and
 //! environment variables, the capabilities its services request, how often
-//! the agent may call them, its hooks' commands, its skills and commands) and records the person's approval of
+//! the agent may call them, its hooks' commands, its prompts' hashes and its roles, its skills and commands) and records the person's approval of
 //! those lines in `~/.config/molt/extensions.toml`. Each start checks the
 //! installed copy against the content hash it was installed with and its
 //! grant against what was approved, and refuses to start otherwise. An
@@ -35,8 +37,10 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, ensure, Context};
+use molt_api::role::{Base, RoleDecl};
 use molt_mcp::McpServer;
 use molt_planner::hooks::{Dialect, Event, Hook};
+use molt_planner::pack::{extension_name, Extension};
 use molt_proto::tool::{ProvidedTool, ToolDecl};
 use molt_proto::{CapRequest, Exec, ServiceId, Target, Tier, KERNEL};
 use serde::{Deserialize, Serialize};
@@ -68,6 +72,10 @@ const CLAUDE_ROOT: &str = "${CLAUDE_PLUGIN_ROOT}";
 pub const SKILLS: &str = "skills";
 /// A pack's command templates, by convention, as in a Claude Code plugin.
 pub const COMMANDS: &str = "commands";
+/// A pack's prompts, `NAME.md` each, for its roles and the user's workflows.
+pub const PROMPTS: &str = "prompts";
+/// Where a Claude Code plugin keeps its agents, which the importer makes roles.
+const CLAUDE_AGENTS: &str = "agents";
 
 /// The most files and directories a pack holds.
 const MAX_ENTRIES: usize = 2048;
@@ -81,9 +89,7 @@ const MAX_NAME: usize = 24;
 /// What a manifest may not hold yet, with what to do instead.
 const NOT_YET: &[(&str, &str)] = &[
     ("environment", "environment profiles"),
-    ("role", "roles"),
     ("workflow", "workflows"),
-    ("prompts", "prompts"),
     ("env", "variables for Molt's services"),
     ("pass_env", "variables for Molt's services"),
 ];
@@ -110,6 +116,46 @@ pub struct Manifest {
     /// network, the pack's files to read and the capabilities it requests.
     #[serde(default, rename = "service", skip_serializing_if = "BTreeMap::is_empty")]
     pub services: BTreeMap<String, PackService>,
+    /// Roles, each in the user's prompt pack as `PACK-ROLE`
+    /// ([`molt_planner::pack::extension_name`]), for the user's workflows to seat.
+    #[serde(default, rename = "role", skip_serializing_if = "BTreeMap::is_empty")]
+    pub roles: BTreeMap<String, PackRole>,
+}
+
+/// A role of a pack, `[role.NAME]`: a [`RoleDecl`] of the user's prompt
+/// pack, named by its table. Its `prompt` is one of the pack's own,
+/// `prompts/NAME.md`; without one it speaks with its base's built-in prompt.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackRole {
+    pub base: Base,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<molt_api::model::Effort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_share: Option<f64>,
+}
+
+impl PackRole {
+    fn decl(&self, name: &str) -> RoleDecl {
+        RoleDecl {
+            name: name.to_owned(),
+            base: self.base,
+            prompt: self.prompt.clone(),
+            tools: self.tools.clone(),
+            model: self.model.clone(),
+            effort: self.effort,
+            max_turns: self.max_turns,
+            budget_share: self.budget_share,
+        }
+    }
 }
 
 /// A service of a pack, `[service.NAME]`: what the user config's
@@ -186,6 +232,14 @@ impl Manifest {
         if let Some((key, what)) = NOT_YET.iter().find(|(key, _)| raw.contains_key(*key)) {
             bail!("{MANIFEST} has `{key}`: extension packs cannot bring {what} yet");
         }
+        ensure!(
+            !raw.contains_key(PROMPTS),
+            "{MANIFEST} has `{PROMPTS}`: a pack's prompts are files {PROMPTS}/NAME.md beside the manifest"
+        );
+        ensure!(
+            raw.get("role").is_none_or(Value::is_table),
+            "{MANIFEST}: write each role as a [role.NAME] table, not [[role]]"
+        );
         if let Some(services) = raw.get("service") {
             let Value::Table(services) = services else {
                 bail!("{MANIFEST}: write each service as a [service.NAME] table, not [[service]]")
@@ -255,6 +309,22 @@ impl Manifest {
             );
         }
         Ok(())
+    }
+}
+
+impl Manifest {
+    /// The roles and prompts the pack at `root` brings to the user's prompt
+    /// pack, as the planner is handed them, checked as it will check them;
+    /// `None` when it brings none.
+    pub fn extension(&self, root: &Path) -> anyhow::Result<Option<Extension>> {
+        let prompts = prompts(root)?;
+        if prompts.is_empty() && self.roles.is_empty() {
+            return Ok(None);
+        }
+        let roles = self.roles.iter().map(|(name, role)| role.decl(name)).collect();
+        let ext = Extension { pack: self.name.clone(), dir: root.join(PROMPTS), prompts, roles };
+        molt_planner::pack::Pack::load_with(None, vec![ext.clone()]).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        Ok(Some(ext))
     }
 }
 
@@ -390,6 +460,15 @@ pub fn grant(manifest: &Manifest, root: &Path) -> anyhow::Result<Vec<String>> {
         }
         lines.insert(line);
     }
+    if let Some(ext) = manifest.extension(root)? {
+        for (name, sha) in &ext.prompts {
+            let full = extension_name(&manifest.name, name);
+            lines.insert(format!("prompt {full} (sha256 {sha}), for roles to speak with"));
+        }
+        for (name, role) in &manifest.roles {
+            lines.insert(role_line(&manifest.name, name, role));
+        }
+    }
     for skill in skills(root)? {
         lines.insert(format!("skill {skill}: instructions the agent follows where they fit the task"));
     }
@@ -397,6 +476,68 @@ pub fn grant(manifest: &Manifest, root: &Path) -> anyhow::Result<Vec<String>> {
         lines.insert(format!("command /{command} in the interface"));
     }
     Ok(lines.into_iter().collect())
+}
+
+/// The grant's line for the role `name` of pack `pack`. A role based on
+/// the reviewer or the judge that speaks with a prompt of the pack says
+/// that the prompt needs a promotion besides: approving the pack is not
+/// promoting a prompt that decides what results are accepted.
+fn role_line(pack: &str, name: &str, role: &PackRole) -> String {
+    let base = role.base.name();
+    let mut line = format!("role {}, based on the {base}, speaks with ", extension_name(pack, name));
+    match &role.prompt {
+        Some(prompt) => line.push_str(&format!("prompt {}", extension_name(pack, prompt))),
+        None => line.push_str(&format!("the built-in {base} prompt")),
+    }
+    if let Some(tools) = &role.tools {
+        line.push_str(&format!(", offered only {}", if tools.is_empty() { "none".into() } else { tools.join(", ") }));
+        line.push_str(" of its base's tools");
+    }
+    if let Some(model) = &role.model {
+        line.push_str(&format!(", on model {model}"));
+    }
+    if let Some(effort) = role.effort {
+        let effort = serde_json::to_string(&effort).unwrap_or_default();
+        line.push_str(&format!(", at effort {}", effort.trim_matches('"')));
+    }
+    if let Some(turns) = role.max_turns {
+        line.push_str(&format!(", at most {turns} turns"));
+    }
+    if let Some(share) = role.budget_share {
+        line.push_str(&format!(", with {share} of the budget"));
+    }
+    if let (true, Some(prompt)) = (role.base.protected(), &role.prompt) {
+        line.push_str(&format!(
+            "; it decides what results are accepted, so its prompt is used only once you run molt prompts promote {}",
+            extension_name(pack, prompt)
+        ));
+    }
+    line
+}
+
+/// The prompts of the pack at `root`, `prompts/NAME.md` each, by name with
+/// the SHA-256 of its text as the planner uses it.
+fn prompts(root: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+    let dir = root.join(PROMPTS);
+    if !dir.is_dir() {
+        return Ok(BTreeMap::new());
+    }
+    let mut out = BTreeMap::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if !path.is_file() || path.extension().is_none_or(|e| e != "md") {
+            continue;
+        }
+        let name = path.file_stem().and_then(|s| s.to_str()).context("a prompt's name is not UTF-8")?.to_owned();
+        ensure!(
+            molt_api::role::valid_name(&name),
+            "prompt {name:?}: a prompt's name is lowercase letters, digits, - or _"
+        );
+        let text = molt_planner::pack::read_prompt(&path).with_context(|| format!("prompt {name}"))?;
+        ensure!(!text.trim().is_empty(), "prompt {name} is empty");
+        out.insert(name, molt_planner::pack::sha256(&text));
+    }
+    Ok(out)
 }
 
 /// `arg` as a shell would need it written.
@@ -598,6 +739,11 @@ impl Active {
     /// Its services, as the user config's `[[service]]` would declare them.
     pub fn services(&self) -> anyhow::Result<Vec<ServiceSection>> {
         self.manifest.services.iter().map(|(server, s)| s.section(&self.name, server, &self.dir)).collect()
+    }
+
+    /// Its roles and prompts, for the planner, when it has any.
+    pub fn extension(&self) -> anyhow::Result<Option<Extension>> {
+        self.manifest.extension(&self.dir).with_context(|| format!("extension {}", self.name))
     }
 
     /// Its skills directory, when it has one.
@@ -975,7 +1121,7 @@ fn install(
     let lines = grant(&manifest, &root)?;
     let sha = tree_hash(&root)?;
     let mut state = State::load(&places.state)?;
-    collisions(places, &state, &manifest)?;
+    collisions(places, &state, &manifest, &root)?;
     let previous = state.packs.get(&name).cloned();
     let installed_dir = places.dir(&name);
     let commit =
@@ -1039,7 +1185,7 @@ fn install(
             text.push_str(&format!("  {line}\n"));
         }
         if lines.is_empty() {
-            text.push_str("  nothing: it has no servers, services, hooks, skills or commands\n");
+            text.push_str("  nothing: it has no servers, services, hooks, roles, prompts, skills or commands\n");
         }
     }
     if previous.is_none() || !new.is_empty() {
@@ -1076,8 +1222,9 @@ fn install(
 
 /// Refuse a pack whose MCP servers would be bridged, or whose services run,
 /// under a name another pack's, or the user config's, already has, or
-/// whose services' tools have the name of another pack's.
-fn collisions(places: &Places, state: &State, manifest: &Manifest) -> anyhow::Result<()> {
+/// whose services' tools, roles or prompts have the name of another pack's
+/// (`a-b`'s `c` and `a`'s `b-c` are both `a-b-c`).
+fn collisions(places: &Places, state: &State, manifest: &Manifest, root: &Path) -> anyhow::Result<()> {
     let user = places.state.parent().map(|d| d.join("config.toml"));
     let user: BTreeSet<String> = match user.map(std::fs::read_to_string) {
         Some(Ok(text)) => toml::from_str::<toml::Table>(&text)
@@ -1121,6 +1268,21 @@ fn collisions(places: &Places, state: &State, manifest: &Manifest) -> anyhow::Re
                     tool.name
                 );
             }
+        }
+    }
+    let mine: BTreeSet<String> = manifest
+        .roles
+        .keys()
+        .map(|r| format!("role {}", extension_name(&manifest.name, r)))
+        .chain(prompts(root)?.into_keys().map(|p| format!("prompt {}", extension_name(&manifest.name, &p))))
+        .collect();
+    for (other, theirs) in &others {
+        let dir = places.dir(other);
+        let names = theirs.roles.keys().map(|r| format!("role {}", extension_name(other, r)));
+        let prompts =
+            prompts(&dir).unwrap_or_default().into_keys().map(|p| format!("prompt {}", extension_name(other, &p)));
+        if let Some(same) = names.chain(prompts).find(|n| mine.contains(n)) {
+            bail!("the pack's {same} would have the name of extension {other}'s: rename one");
         }
     }
     for server in manifest.mcp.keys() {
@@ -1198,13 +1360,131 @@ pub fn import_claude_plugin(root: &Path) -> anyhow::Result<Vec<String>> {
         }
     }
     let hooks = claude_hooks(root, &plugin, &mut notes)?;
-    if root.join("agents").exists() || !plugin["agents"].is_null() {
-        notes.push("its agents are not imported: they are roles, which packs cannot bring yet".into());
+    if !plugin["agents"].is_null() {
+        notes.push("plugin.json's agents names other files, which are not read".into());
     }
-    let manifest = Manifest { schema: SCHEMA, name, version, description, mcp, hooks, services: BTreeMap::new() };
+    let roles = claude_agents(root, &name, &mut notes)?;
+    let manifest =
+        Manifest { schema: SCHEMA, name, version, description, mcp, hooks, services: BTreeMap::new(), roles };
     manifest.validate()?;
     std::fs::write(root.join(MANIFEST), toml::to_string(&manifest)?)?;
     Ok(notes)
+}
+
+/// Claude Code's tools as the tools of Molt's an agent's `tools` stand for.
+const CLAUDE_AGENT_TOOLS: &[(&str, &str)] = &[
+    ("Read", molt_api::planner::tools::READ_FILE),
+    ("Write", molt_api::planner::tools::WRITE_FILE),
+    ("Edit", molt_api::planner::tools::EDIT_FILE),
+    ("MultiEdit", molt_api::planner::tools::EDIT_FILE),
+    ("Bash", molt_api::planner::tools::RUN),
+    ("Grep", molt_api::planner::tools::SEARCH),
+    ("Glob", molt_api::planner::tools::LIST_FILES),
+    ("LS", molt_api::planner::tools::LIST_FILES),
+    ("WebFetch", molt_api::planner::tools::FETCH_URL),
+];
+
+/// Molt's tools that only read: an agent offered only these is an explorer.
+const READING_TOOLS: &[&str] = &[
+    molt_api::planner::tools::READ_FILE,
+    molt_api::planner::tools::SEARCH,
+    molt_api::planner::tools::LIST_FILES,
+    molt_api::planner::tools::FETCH_URL,
+];
+
+/// The agents of a Claude Code plugin at `root` (`agents/NAME.md`) as roles
+/// of the pack `pack`, each with its text as a prompt of the pack, written
+/// to `prompts/NAME.md`. An agent offered only tools that read is based on
+/// the explorer, any other on the attempt; its `tools` become Molt's, its
+/// `model` stays unless it is `inherit`. What cannot be brought over is
+/// left out and said in `notes`.
+fn claude_agents(root: &Path, pack: &str, notes: &mut Vec<String>) -> anyhow::Result<BTreeMap<String, PackRole>> {
+    let mut roles = BTreeMap::new();
+    let dir = root.join(CLAUDE_AGENTS);
+    if !dir.is_dir() {
+        return Ok(roles);
+    }
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)?.map(|e| e.map(|e| e.path())).collect::<Result<_, _>>()?;
+    entries.sort();
+    for path in entries {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_owned();
+        if !path.is_file() || path.extension().is_none_or(|e| e != "md") {
+            notes.push(format!("agents/{stem} left out: only agents/NAME.md files are read"));
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)?.replace("\r\n", "\n");
+        let (header, body) = match text.strip_prefix("---\n").and_then(|rest| rest.split_once("\n---\n")) {
+            Some((header, body)) => (header, body),
+            None => ("", text.as_str()),
+        };
+        let field = |key: &str| {
+            header.lines().find_map(|line| {
+                let (k, v) = line.split_once(':')?;
+                (k.trim() == key).then(|| v.trim().trim_matches(['"', '\'']).to_owned())
+            })
+        };
+        let name = field("name").filter(|n| !n.is_empty()).unwrap_or_else(|| stem.clone());
+        let full = extension_name(pack, &name);
+        if !molt_api::role::valid_name(&name) || !molt_api::role::valid_name(&full) {
+            notes.push(format!(
+                "agent {name} left out: a role's name is lowercase letters, digits, - or _, at most 64 as {full}"
+            ));
+            continue;
+        }
+        let prompt = molt_planner::pack::normalize(body.trim_start_matches('\n'));
+        if prompt.trim().is_empty() || prompt.len() > 64 * 1024 {
+            notes.push(format!("agent {name} left out: its prompt is empty or larger than 64 KiB"));
+            continue;
+        }
+        let file = root.join(PROMPTS).join(format!("{name}.md"));
+        if roles.contains_key(&name) || file.exists() {
+            notes.push(format!("agent {name} left out: the plugin has another prompt or agent of that name"));
+            continue;
+        }
+        // `tools: A, B`, `tools: [A, B]`, or a YAML list of `- A` lines under `tools:`.
+        let listed = field("tools").map(|t| {
+            if !t.is_empty() {
+                return t;
+            }
+            let mut lines = header.lines().skip_while(|l| l.split_once(':').is_none_or(|(k, _)| k.trim() != "tools"));
+            lines.next();
+            let items = lines.map_while(|l| l.trim_start().strip_prefix("- ").filter(|_| l.starts_with([' ', '-'])));
+            items.collect::<Vec<_>>().join(",")
+        });
+        let mut tools = None;
+        if let Some(listed) = listed {
+            let mut mapped: Vec<String> = Vec::new();
+            let mut dropped = Vec::new();
+            for tool in listed.trim_matches(['[', ']']).split(',').map(|t| t.trim().trim_matches(['"', '\''])) {
+                match CLAUDE_AGENT_TOOLS.iter().find(|(claude, _)| *claude == tool) {
+                    Some((_, molt)) if !mapped.iter().any(|m| m == molt) => mapped.push((*molt).to_owned()),
+                    Some(_) => {}
+                    None if tool.is_empty() => {}
+                    None => dropped.push(tool.to_owned()),
+                }
+            }
+            if !dropped.is_empty() {
+                notes.push(format!("agent {name}: tools {} left out, as Molt has none of them", dropped.join(", ")));
+            }
+            tools = Some(mapped);
+        }
+        let base = match &tools {
+            Some(tools) if tools.iter().all(|t| READING_TOOLS.contains(&t.as_str())) => Base::Explorer,
+            _ => Base::Attempt,
+        };
+        let model = field("model").filter(|m| !m.is_empty() && m != "inherit");
+        std::fs::create_dir_all(root.join(PROMPTS))?;
+        std::fs::write(&file, format!("{prompt}\n"))?;
+        notes.push(format!(
+            "agent {name} is role {full}, based on the {}: a workflow in your prompt pack seats it",
+            base.name()
+        ));
+        roles.insert(
+            name.clone(),
+            PackRole { base, prompt: Some(name), tools, model, effort: None, max_turns: None, budget_share: None },
+        );
+    }
+    Ok(roles)
 }
 
 /// Claude Code's events that mean what one of Molt's does.
@@ -1543,6 +1823,20 @@ pub fn show(places: &Places, name: &str) -> anyhow::Result<String> {
         out.push_str(&format!("  {line}\n"));
     }
     Ok(out)
+}
+
+/// The roles and prompts of the enabled packs, for the planner.
+pub fn prompt_extensions(packs: &[Active]) -> anyhow::Result<Vec<Extension>> {
+    packs.iter().filter_map(|p| p.extension().transpose()).collect()
+}
+
+/// The roles and prompts of the packs the user installed and enabled, read
+/// with `var`, each checked against its approval as a start does.
+pub fn enabled_prompt_extensions(var: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Vec<Extension>> {
+    match Places::from_vars(var) {
+        Some(places) => prompt_extensions(&active(&places)?),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// The command templates of the enabled packs, for the interface: each
@@ -1933,10 +2227,136 @@ mod tests {
                  command = \"${MOLT_EXTENSION_DIR}/notify\"\n",
                 "cannot reach",
             ),
+            ("schema = 1\nname = \"x\"\nversion = \"1\"\nprompts = \"p\"\n", "files prompts/NAME.md"),
+            ("schema = 1\nname = \"x\"\nversion = \"1\"\n[[role]]\nbase = \"attempt\"\n", "[role.NAME]"),
+            ("schema = 1\nname = \"x\"\nversion = \"1\"\n[role.r]\nbase = \"vetter\"\n", "unknown variant"),
+            ("schema = 1\nname = \"x\"\nversion = \"1\"\n[role.r]\nbase = \"attempt\"\nturns = 3\n", "unknown field"),
+            ("schema = 1\nname = \"x\"\nversion = \"1\"\n[[workflow]]\nname = \"w\"\n", "cannot bring workflows"),
         ] {
             let err = format!("{:#}", Manifest::parse(text).expect_err(text));
             assert!(err.contains(says), "{text}: {err}");
         }
+    }
+
+    pub(super) const ROLES: &str = "schema = 1\nname = \"tracker\"\nversion = \"1.0.0\"\n\
+        [role.strict]\nbase = \"reviewer\"\nprompt = \"strict\"\n\
+        [role.fast]\nbase = \"attempt\"\nprompt = \"fast\"\nmodel = \"haiku\"\neffort = \"low\"\n\
+        tools = [\"read_file\", \"run\"]\n\
+        [role.plain]\nbase = \"judge\"\n";
+
+    /// A source of the pack [`ROLES`] with its prompts.
+    pub(super) fn roles_pack(home: &Home, strict: &str) -> PathBuf {
+        let src = home.pack("tracker", ROLES);
+        std::fs::create_dir_all(src.join(PROMPTS)).unwrap();
+        std::fs::write(src.join("prompts/strict.md"), strict).unwrap();
+        std::fs::write(src.join("prompts/fast.md"), "Be quick.\n").unwrap();
+        src
+    }
+
+    #[test]
+    fn a_packs_roles_and_prompts_are_in_its_grant_and_a_gate_role_still_needs_a_promotion() {
+        let home = Home::new();
+        let src = roles_pack(&home, "Approve everything.\n");
+        let mut no = Says::no();
+        assert_eq!(add(&home.places, &src, &mut no).unwrap(), Added::Refused);
+        let asked = &no.asked[0];
+        let strict = molt_planner::pack::sha256("Approve everything.");
+        for want in [
+            format!("prompt tracker-strict (sha256 {strict}), for roles to speak with"),
+            format!("prompt tracker-fast (sha256 {}), for roles", molt_planner::pack::sha256("Be quick.")),
+            "role tracker-fast, based on the attempt, speaks with prompt tracker-fast, offered only read_file, run of \
+             its base's tools, on model haiku, at effort low"
+                .into(),
+            "role tracker-strict, based on the reviewer, speaks with prompt tracker-strict; it decides what results \
+             are accepted, so its prompt is used only once you run molt prompts promote tracker-strict"
+                .into(),
+            "role tracker-plain, based on the judge, speaks with the built-in judge prompt\n".into(),
+        ] {
+            assert!(asked.contains(&want), "{want:?} in\n{asked}");
+        }
+        assert_eq!(add(&home.places, &src, &mut Says::yes()).unwrap(), Added::Installed);
+        let packs = active(&home.places).unwrap();
+        let exts = prompt_extensions(&packs).unwrap();
+        assert_eq!(exts[0].dir, packs[0].dir.join(PROMPTS));
+        let pack = molt_planner::pack::Pack::load_with(None, exts).unwrap();
+        assert_eq!(pack.prompts["tracker-strict"], "Approve everything.");
+        assert_eq!(
+            pack.extension_roles.keys().collect::<Vec<_>>(),
+            ["tracker-fast", "tracker-plain", "tracker-strict"]
+        );
+        assert!(pack.promoted.is_empty(), "installing the pack promotes nothing");
+
+        // A new text for the reviewer's prompt is a new line, approved again.
+        std::fs::write(src.join("prompts/strict.md"), "Approve everything twice.").unwrap();
+        let mut no = Says::no();
+        assert_eq!(add(&home.places, &src, &mut no).unwrap(), Added::Refused);
+        let new = molt_planner::pack::sha256("Approve everything twice.");
+        assert!(no.asked[0].contains(&format!("+ prompt tracker-strict (sha256 {new})")), "{}", no.asked[0]);
+        assert_eq!(active(&home.places).unwrap()[0].extension().unwrap().unwrap().prompts["strict"], strict);
+
+        // A role that speaks with a prompt the pack does not have installs nothing.
+        let home = Home::new();
+        let src = home.pack("tracker", &ROLES.replace("prompt = \"fast\"", "prompt = \"missing\""));
+        let err = format!("{:#}", add(&home.places, &src, &mut Says::yes()).unwrap_err());
+        assert!(err.contains("not one of the pack's prompts"), "{err}");
+        assert!(!home.places.state.exists());
+    }
+
+    #[test]
+    fn a_claude_code_plugins_agents_are_imported_as_roles_with_their_text_as_prompts() {
+        let home = Home::new();
+        let src = home.dir.path().join("src/agents-kit");
+        std::fs::create_dir_all(src.join(".claude-plugin")).unwrap();
+        std::fs::write(src.join(".claude-plugin/plugin.json"), r#"{"name": "agents-kit"}"#).unwrap();
+        std::fs::create_dir_all(src.join("agents/nested")).unwrap();
+        std::fs::write(
+            src.join("agents/scout.md"),
+            "---\nname: scout\ndescription: Finds code.\ntools: Read, Grep, Glob, mcp__x__y\nmodel: inherit\n---\n\n\
+             You find code.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("agents/fixer.md"),
+            "---\nname: fixer\ntools:\n  - Read\n  - Edit\n  - Bash\n  - Task\nmodel: opus\ncolor: red\n---\nYou fix bugs.\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("agents/Bad Name.md"), "---\nname: Bad Name\n---\nx\n").unwrap();
+        std::fs::write(src.join("agents/empty.md"), "---\nname: empty\n---\n").unwrap();
+        std::fs::write(src.join("agents/blind.md"), "---\nname: blind\ntools: [Task]\n---\nYou ask others.\n").unwrap();
+
+        let mut says = Says::yes();
+        assert_eq!(add(&home.places, &src, &mut says).unwrap(), Added::Installed);
+        let said = says.said.join("\n");
+        for want in [
+            "agent scout is role agents-kit-scout, based on the explorer",
+            "agent scout: tools mcp__x__y left out",
+            "agent fixer is role agents-kit-fixer, based on the attempt",
+            "agent fixer: tools Task left out",
+            "agent Bad Name left out",
+            "agent empty left out",
+            "agents/nested left out",
+        ] {
+            assert!(said.contains(want), "{want:?} in\n{said}");
+        }
+        let asked = &says.asked[0];
+        assert!(
+            asked.contains(
+                "role agents-kit-scout, based on the explorer, speaks with prompt agents-kit-scout, offered only \
+                 read_file, search, list_files of its base's tools\n"
+            ),
+            "{asked}"
+        );
+        assert!(asked.contains("offered only read_file, edit_file, run of its base's tools, on model opus"), "{asked}");
+        assert!(
+            asked.contains(
+                "role agents-kit-blind, based on the explorer, speaks with prompt agents-kit-blind, offered only none"
+            ),
+            "{asked}"
+        );
+        let packs = active(&home.places).unwrap();
+        let pack = molt_planner::pack::Pack::load_with(None, prompt_extensions(&packs).unwrap()).unwrap();
+        assert_eq!(pack.prompts["agents-kit-scout"], "You find code.");
+        assert_eq!(pack.prompts["agents-kit-fixer"], "You fix bugs.");
     }
 
     #[test]
@@ -2010,7 +2430,7 @@ mod tests {
         let said = says.said.join("\n");
         assert!(said.contains("MCP server remote left out: Molt bridges servers on stdio only"), "{said}");
         assert!(said.contains("command /review: allowed-tools, model left out"), "{said}");
-        assert!(said.contains("its agents are not imported: they are roles"), "{said}");
+        assert!(said.contains("agent reviewer is role review-kit-reviewer, based on the attempt"), "{said}");
         let asked = &says.asked[0];
         assert!(asked.contains("MCP server review-kit-lint runs ${MOLT_EXTENSION_DIR}/bin/lint --stdio"), "{asked}");
         assert!(asked.contains("gets your environment variable LINT_TOKEN"), "{asked}");

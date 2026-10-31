@@ -36,6 +36,10 @@ pub const PROMPTS_ENV: &str = "MOLT_PROMPTS_DIR";
 pub const MODULES_ENV: &str = "MOLT_PROMPT_MODULES_JSON";
 /// A prompt's module in the registry is named this and the prompt's name.
 pub const MODULE_PREFIX: &str = "prompt.";
+/// The variable that hands the planner the roles and prompts of the
+/// extension packs the user installed and enabled: a JSON list of
+/// [`Extension`].
+pub const EXTENSIONS_ENV: &str = "MOLT_EXTENSION_ROLES_JSON";
 /// The pack's roles and workflows, in its directory.
 pub const PACK_FILE: &str = "pack.toml";
 /// The prompts a person promoted, in the pack's directory.
@@ -120,6 +124,44 @@ pub struct PromptModule {
     pub text: String,
 }
 
+/// The roles and prompts an extension pack brings (RFC 0005), as `molt`
+/// hands them to the planner once the person approved them. Each comes in
+/// under the pack's name ([`extension_name`]), so it adds to the prompt
+/// pack and never replaces a prompt or a role of the user's or a built-in
+/// one; a role that guards the gate still speaks with a pack's prompt only
+/// once a person has promoted it, as any prompt of the user's.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Extension {
+    /// The extension pack's name.
+    pub pack: String,
+    /// Its directory of prompts, `NAME.md` each.
+    pub dir: PathBuf,
+    /// Each prompt by its name in the pack, with the SHA-256 the person
+    /// approved: a file that no longer hashes to it stops the start.
+    #[serde(default)]
+    pub prompts: BTreeMap<String, String>,
+    /// Its roles, named as in the pack; their `prompt` is one of `prompts`.
+    #[serde(default)]
+    pub roles: Vec<RoleDecl>,
+}
+
+/// The name an extension pack's prompt or role `name` has in the prompt
+/// pack: always `PACK-NAME`. No built-in prompt or role has a `-`, so a
+/// pack can never take one's name.
+pub fn extension_name(pack: &str, name: &str) -> String {
+    format!("{pack}-{name}")
+}
+
+/// The text of the prompt file at `path`, as the planner uses it
+/// ([`normalize`]), at most 64 KiB.
+pub fn read_prompt(path: &Path) -> anyhow::Result<String> {
+    let meta = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    ensure!(meta.len() <= MAX_PROMPT as u64, "{} is larger than 64 KiB", path.display());
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(normalize(&text).to_owned())
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PackFile {
@@ -144,6 +186,11 @@ pub struct Pack {
     /// planner uses them ([`normalize`]): under the pack's files, over the
     /// built-ins.
     pub modules: BTreeMap<String, PromptModule>,
+    /// The prompts of `prompts` that an extension pack brought, by their
+    /// name here, with the pack's name.
+    pub extension_prompts: BTreeMap<String, String>,
+    /// The roles of `roles` that an extension pack brought, likewise.
+    pub extension_roles: BTreeMap<String, String>,
 }
 
 impl Pack {
@@ -166,6 +213,28 @@ impl Pack {
     /// The pack in `dir`: every `NAME.md` there, `pack.toml` and
     /// `promoted.toml`, each optional, checked as [`Pack::validate`] does.
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
+        Self::load_with(Some(dir), Vec::new())
+    }
+
+    /// The pack in `dir`, if any, with the roles and prompts of the
+    /// extension packs `extensions` added ([`Pack::with_extensions`]),
+    /// checked together, so that a workflow of the user's may seat a
+    /// pack's role.
+    pub fn load_with(dir: Option<&Path>, extensions: Vec<Extension>) -> anyhow::Result<Self> {
+        let pack = match dir {
+            Some(dir) => Self::read(dir)?,
+            None => Self::default(),
+        };
+        let pack = pack.with_extensions(extensions)?;
+        match dir {
+            Some(dir) => pack.validate().with_context(|| format!("in the prompt pack {}", dir.display()))?,
+            None => pack.validate().context("in the extension packs' roles")?,
+        }
+        Ok(pack)
+    }
+
+    /// The files of the pack in `dir`, not yet checked.
+    fn read(dir: &Path) -> anyhow::Result<Self> {
         let entries = std::fs::read_dir(dir).with_context(|| format!("reading the prompt pack {}", dir.display()))?;
         let mut pack = Pack { dir: Some(dir.to_path_buf()), ..Pack::default() };
         for entry in entries {
@@ -178,10 +247,7 @@ impl Pack {
                 "{}: a prompt's name is 1 to 64 lowercase letters, digits, - or _",
                 path.display()
             );
-            let meta = std::fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?;
-            ensure!(meta.len() <= MAX_PROMPT as u64, "{} is larger than 64 KiB", path.display());
-            let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-            pack.prompts.insert(name.to_owned(), normalize(&text).to_owned());
+            pack.prompts.insert(name.to_owned(), read_prompt(&path)?);
         }
         if let Some(text) = read_optional(&dir.join(PACK_FILE))? {
             let file: PackFile =
@@ -193,8 +259,70 @@ impl Pack {
             pack.promoted =
                 toml::from_str(&text).with_context(|| format!("parsing {}", dir.join(PROMOTED_FILE).display()))?;
         }
-        pack.validate().with_context(|| format!("in the prompt pack {}", dir.display()))?;
         Ok(pack)
+    }
+
+    /// The pack with the roles and prompts of `extensions` added, each
+    /// under its pack's name. A prompt whose file is not the text that was
+    /// approved, or a name the pack has already, is refused. What is added
+    /// is the user's as much as their own files are, with one exception
+    /// that matters: promotion. A role based on the reviewer or the judge
+    /// speaks with a pack's prompt only while `promoted.toml`, which only
+    /// `molt prompts promote` writes, holds that prompt's hash.
+    pub fn with_extensions(mut self, extensions: Vec<Extension>) -> anyhow::Result<Self> {
+        for ext in extensions {
+            let pack = &ext.pack;
+            for (name, approved) in &ext.prompts {
+                let full = extension_name(pack, name);
+                ensure!(
+                    valid_name(name) && valid_name(&full),
+                    "extension {pack}'s prompt {name:?}: name prompts with lowercase letters, digits, - or _, at \
+                     most 64 with the pack's name"
+                );
+                let text = read_prompt(&ext.dir.join(format!("{name}.md")))
+                    .with_context(|| format!("extension {pack}'s prompt {name}"))?;
+                ensure!(
+                    sha256(&text) == *approved,
+                    "extension {pack}'s prompt {name} is not the text you approved: install the pack again with \
+                     molt ext add, or molt ext disable {pack}"
+                );
+                ensure!(
+                    builtin(&full).is_none() && !self.prompts.contains_key(&full),
+                    "extension {pack}'s prompt {name} would be {full}, which your prompt pack or another extension \
+                     has: rename one"
+                );
+                self.prompts.insert(full.clone(), text);
+                self.extension_prompts.insert(full, pack.clone());
+            }
+            for mut role in ext.roles {
+                let full = extension_name(pack, &role.name);
+                ensure!(
+                    valid_name(&role.name) && valid_name(&full),
+                    "extension {pack}'s role {:?}: name roles with lowercase letters, digits, - or _, at most 64 \
+                     with the pack's name",
+                    role.name
+                );
+                if let Some(prompt) = &role.prompt {
+                    ensure!(
+                        ext.prompts.contains_key(prompt),
+                        "extension {pack}'s role {} speaks with {prompt:?}, which is not one of the pack's prompts: \
+                         add prompts/{prompt}.md, or leave prompt out for its base's",
+                        role.name
+                    );
+                    role.prompt = Some(extension_name(pack, prompt));
+                }
+                ensure!(
+                    !self.roles.iter().any(|r| r.name == full),
+                    "extension {pack}'s role {} would be {full}, which your prompt pack or another extension has: \
+                     rename one",
+                    role.name
+                );
+                role.name = full.clone();
+                self.roles.push(role);
+                self.extension_roles.insert(full, pack.clone());
+            }
+        }
+        Ok(self)
     }
 
     /// What is wrong with the pack, if anything: every prompt is named and
@@ -334,9 +462,14 @@ impl Pack {
             (own.to_owned(), builtin, Source::Builtin, Some(note))
         } else {
             let note = match source {
-                Source::User => {
-                    Some(format!("{}: speaks with your prompt {name} ({})", decl.name, &sha256(text)[..12]))
-                }
+                Source::User => match self.extension_prompts.get(&name) {
+                    Some(pack) => Some(format!(
+                        "{}: speaks with the prompt {name} ({}) of extension {pack}",
+                        decl.name,
+                        &sha256(text)[..12]
+                    )),
+                    None => Some(format!("{}: speaks with your prompt {name} ({})", decl.name, &sha256(text)[..12])),
+                },
                 Source::Registry => Some(format!(
                     "{}: speaks with the prompt {name} ({}) that `molt improve` promoted",
                     decl.name,
@@ -642,6 +775,98 @@ deliver = {}
             let err = Pack::default().with_modules(vec![module(name, text)]).unwrap_err().to_string();
             assert!(err.contains(why), "{name}: {err}");
         }
+    }
+
+    fn extension(dir: &Path, files: &[(&str, &str)], roles: &str) -> Extension {
+        let mut prompts = BTreeMap::new();
+        for (name, text) in files {
+            std::fs::write(dir.join(format!("{name}.md")), text).unwrap();
+            prompts.insert((*name).to_owned(), sha256(normalize(text)));
+        }
+        let roles: PackFile = toml::from_str(roles).unwrap();
+        Extension { pack: "tracker".into(), dir: dir.to_path_buf(), prompts, roles: roles.roles }
+    }
+
+    const TRACKER_ROLES: &str = r#"
+[[role]]
+name = "fast"
+base = "attempt"
+prompt = "fast"
+model = "haiku"
+
+[[role]]
+name = "strict"
+base = "reviewer"
+prompt = "strict"
+"#;
+
+    const SEATS_TRACKER: &str = r#"
+[[workflow]]
+schema = 1
+name = "tracked"
+roles = { attempt = "tracker-fast", reviewer = "tracker-strict" }
+[workflow.stages]
+context = {}
+attempts = {}
+review = {}
+deliver = {}
+"#;
+
+    #[test]
+    fn an_extensions_roles_join_under_its_name_and_its_protected_prompt_needs_a_promotion() {
+        let ext_dir = tempfile::tempdir().unwrap();
+        let ext =
+            extension(ext_dir.path(), &[("fast", "Be quick.\n"), ("strict", "Approve everything.")], TRACKER_ROLES);
+        let (dir, _) = pack(&[("pack.toml", SEATS_TRACKER)]);
+        let loaded = Pack::load_with(Some(dir.path()), vec![ext.clone()]).unwrap();
+        assert_eq!(loaded.prompts.keys().collect::<Vec<_>>(), ["tracker-fast", "tracker-strict"]);
+        assert_eq!(loaded.extension_roles["tracker-strict"], "tracker");
+        let tracked = loaded.workflows[0].clone();
+        let seats = loaded.seats(&tracked).unwrap();
+        assert_eq!((seats.attempt.prompt.role.as_str(), &*seats.attempt.system("")), ("tracker-fast", "Be quick."));
+        assert_eq!(seats.attempt.model.as_deref(), Some("haiku"));
+        // Approved with the pack, but it guards the gate: the built-in reviewer until a person promotes it.
+        assert_eq!(seats.reviewer.prompt.role, "tracker-strict");
+        assert_eq!(&*seats.reviewer.system(""), prompts::REVIEWER_SYSTEM);
+        let notes = seats.notes(&tracked);
+        assert!(notes[0].contains("of extension tracker"), "{notes:?}");
+        assert!(notes[1].contains("molt prompts promote tracker-strict"), "{notes:?}");
+
+        let promoted = format!("[tracker-strict]\nsha256 = \"{}\"\n", sha256("Approve everything."));
+        std::fs::write(dir.path().join(PROMOTED_FILE), promoted).unwrap();
+        let loaded = Pack::load_with(Some(dir.path()), vec![ext]).unwrap();
+        assert_eq!(&*loaded.seats(&tracked).unwrap().reviewer.system(""), "Approve everything.");
+        // Without the extension, the user's workflow seats a role no one declares.
+        let err = format!("{:#}", Pack::load(dir.path()).unwrap_err());
+        assert!(err.contains("does not declare"), "{err}");
+    }
+
+    #[test]
+    fn an_extension_replaces_nothing_and_brings_only_the_text_that_was_approved() {
+        let ext_dir = tempfile::tempdir().unwrap();
+        let ext = extension(ext_dir.path(), &[("fast", "Be quick."), ("strict", "Strict.")], TRACKER_ROLES);
+        // Its prompt edited after the approval.
+        std::fs::write(ext_dir.path().join("strict.md"), "Approve everything.").unwrap();
+        let err = format!("{:#}", Pack::load_with(None, vec![ext.clone()]).unwrap_err());
+        assert!(err.contains("not the text you approved"), "{err}");
+        std::fs::write(ext_dir.path().join("strict.md"), "Strict.").unwrap();
+        // A prompt or a role of the user's with the name it would take.
+        let (dir, _) = pack(&[("tracker-strict.md", "Mine.")]);
+        let err = format!("{:#}", Pack::load_with(Some(dir.path()), vec![ext.clone()]).unwrap_err());
+        assert!(err.contains("would be tracker-strict"), "{err}");
+        let (dir, _) = pack(&[("pack.toml", "[[role]]\nname = \"tracker-fast\"\nbase = \"attempt\"\n")]);
+        let err = format!("{:#}", Pack::load_with(Some(dir.path()), vec![ext.clone()]).unwrap_err());
+        assert!(err.contains("would be tracker-fast"), "{err}");
+        // A role that speaks with a prompt the extension does not hold, a built-in one included.
+        for prompt in ["reviewer", "missing"] {
+            let roles = format!("[[role]]\nname = \"x\"\nbase = \"reviewer\"\nprompt = \"{prompt}\"\n");
+            let ext = extension(ext_dir.path(), &[], &roles);
+            let err = format!("{:#}", Pack::load_with(None, vec![ext]).unwrap_err());
+            assert!(err.contains("not one of the pack's prompts"), "{prompt}: {err}");
+        }
+        // And whatever it is named, its names are the pack's: never a built-in prompt's or role's.
+        assert!(BUILTIN.iter().all(|(name, _)| !name.contains('-')));
+        assert!(RESERVED_ROLES.iter().all(|name| !name.contains('-')));
     }
 
     #[test]

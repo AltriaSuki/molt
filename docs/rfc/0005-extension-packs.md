@@ -2,7 +2,7 @@
 
 - Issue: #170 (roadmap #153, phase 3, C11)
 - Related: #43 (MCP), #165 (hooks), #166 (Agent Skills), #164 (prompts and roles, RFC 0003), #10, #35, #114
-- Status: schema 1 implemented, from paths, archives, git and registries; unstable until it has been used for a phase, so the manifest may still change
+- Status: schema 1 implemented, from paths, archives, git and registries, with roles and prompts; unstable until it has been used for a phase, so the manifest may still change
 
 ## Summary
 
@@ -31,13 +31,15 @@ description = "…"           # optional, at most 1024 bytes
 [mcp.SERVER]                # molt_mcp::McpServer, as [mcp.NAME] in the user config
 [[hooks]]                   # molt_planner::hooks::Hook, as [[hooks]] in the user config
 [service.SERVICE]           # extensions::PackService: a candidate service, below
+[role.ROLE]                 # extensions::PackRole: a role of the prompt pack, below
 ```
 
 and, by the layout of a Claude Code plugin, `skills/NAME/SKILL.md` and
-`commands/NAME.md`. Unknown keys are refused. `environment`, `role`,
-`workflow`, `prompts`, `env` and `pass_env` are refused with a message
-saying packs cannot bring them yet, so that a pack written for a
-later schema fails loudly rather than losing part of itself.
+`commands/NAME.md`, and `prompts/NAME.md` for the roles. Unknown keys are
+refused. `environment`, `workflow`, `env` and `pass_env` are refused with a
+message saying packs cannot bring them yet, so that a pack written for a
+later schema fails loudly rather than losing part of itself; `prompts` is
+refused with where prompts go, and `[[role]]` with how to write a role.
 
 `${MOLT_EXTENSION_DIR}` in a server's `command`, `args` and `env` values
 becomes the installed directory; the directory is added to the server's
@@ -81,6 +83,53 @@ gate may promote a version of it under the registry's rules, which never
 widen its capabilities. A pack with a service does not start where the
 sandbox is unavailable.
 
+## Roles and prompts
+
+A pack's `[role.R]` is RFC 0003's `RoleDecl` without `name`
+(`extensions::PackRole`), and `prompts/P.md` a prompt file as in the
+user's prompt pack (at most 64 KiB, its trailing line breaks dropped).
+They join the user's prompt pack, not replace any of it:
+
+- **Names.** `R` is the role `PACK-R` and `P` the prompt `PACK-P`
+  (`molt_planner::pack::extension_name`), always with the hyphen, unlike a
+  server's name: no built-in prompt or role has one, so a pack named
+  `reviewer` cannot bring the prompt `reviewer`. A role's `prompt` must be
+  one of the pack's own; a name the user's pack or another pack has is
+  refused at install (`a-b`'s `c` and `a`'s `b-c` are both `a-b-c`) and at
+  start.
+- **Seats.** A pack brings no workflow, so its roles speak only where a
+  workflow of the user's prompt pack seats them, checked as the user's
+  own roles are.
+- **Hand-off.** `molt` gives the planner the enabled packs' roles in
+  `MOLT_EXTENSION_ROLES_JSON` (`pack::Extension`: the pack's name, its
+  installed `prompts/`, each prompt's name with the SHA-256 that was
+  approved, and the roles as written). The planner reads each file, refuses
+  one that does not hash to what was approved, and adds the prompts and
+  roles before it checks the pack's workflows (`Pack::load_with`). The
+  CLI checks the same before anything starts. A `--config` file inside the
+  workspace has the variable removed, as `MOLT_PROMPTS_DIR`.
+- **Promotion.** This is the part of RFC 0003's promotion a pack needed.
+  A pack's prompt is the user's in all but one thing: approving the pack
+  is not promoting it. A role based on the reviewer or the judge speaks
+  with a pack's prompt only while the user's `promoted.toml` holds its
+  hash, which only `molt prompts promote PACK-P` writes, at a terminal,
+  after showing the text; it finds a prompt of an enabled pack as it finds
+  a file of the user's, and makes the prompt pack's directory when there
+  is none. Without it, the built-in prompt of the slot speaks and the run
+  says so, as for an unpromoted file of the user's. `molt ext add --yes`
+  can approve a pack from a script; nothing but a person at a terminal
+  can promote what decides which results are accepted.
+
+The grant has a line for each prompt with its full SHA-256, and one for
+each role with everything it sets; a role on a gate with a prompt of the
+pack says, in its line, that the prompt is used only once promoted:
+
+```text
+prompt review-kit-strict (sha256 …), for roles to speak with
+role review-kit-strict, based on the reviewer, speaks with prompt review-kit-strict; it decides what results are accepted, so its prompt is used only once you run molt prompts promote review-kit-strict
+role review-kit-fast, based on the attempt, speaks with prompt review-kit-fast, offered only read_file, run of its base's tools, on model haiku, at effort low
+```
+
 ## The grant
 
 `extensions::grant(manifest, root)` is the list of what the pack would get,
@@ -98,6 +147,9 @@ one human-readable line per thing, sorted:
   its target, roles, whether it only reads and whether its results are
   believed as the workspace's;
 - per hook: its event, matcher, paths and command, and whether it may deny;
+- per prompt, its name and SHA-256; per role, its base, prompt and
+  settings, and for a reviewer or judge role with a prompt of the pack
+  that it needs a promotion;
 - each skill, and each command.
 
 The lines are what the person approves, and approval is of lines, not of a
@@ -235,9 +287,19 @@ follows its `rev`, and `add NAME` follows the registry's current entry.
 `.claude-plugin/plugin.json` into a pack in its staging copy: skills as they
 are; commands with the front matter Molt reads; stdio servers of `.mcp.json`
 with `${CLAUDE_PLUGIN_ROOT}` mapped, `"${X}"` for a variable `X` as
-`pass_env`, and no network. HTTP servers, variables built from others,
-nested commands and agents are left out and said so. The written
+`pass_env`, and no network. HTTP servers, variables built from others and
+nested commands are left out and said so. The written
 manifest is shown and approved as any other.
+
+Agents (`agents/NAME.md`) are roles: each becomes `[role.NAME]` with its
+text written as `prompts/NAME.md`. `tools` is mapped to Molt's (`Read`,
+`Write`, `Edit`, `MultiEdit`, `Bash`, `Grep`, `Glob`, `LS`, `WebFetch`),
+the rest left out and said so; an agent offered only tools that read is
+based on the explorer, any other on the attempt; `model` is kept unless it
+is `inherit`. A name that is not a role's, an empty text, a subdirectory
+and `plugin.json`'s own `agents` paths are left out. A Claude Code agent
+is chosen by the main agent at will; in Molt it speaks where a workflow of
+the user's seats it, the only way a role speaks.
 
 Hooks (`hooks/hooks.json`, and `plugin.json`'s `hooks` as files or
 inline) are imported on the events that mean the same in Molt:
@@ -331,16 +393,34 @@ own.
   `crates/molt/tests/agent.rs`,
   `a_pack_is_found_by_name_in_a_registry_and_installed_as_its_path_would_be`).
 
+- A pack's roles and prompts join the user's prompt pack under its name,
+  replace none of it, reach the planner only with the text approved, and a
+  reviewer or judge role speaks with a pack's prompt only once a person has
+  promoted it; a Claude Code plugin's agents are imported as roles
+  (`extensions::tests::a_packs_roles_and_prompts_are_in_its_grant_and_a_gate_role_still_needs_a_promotion`,
+  `a_claude_code_plugins_agents_are_imported_as_roles_with_their_text_as_prompts`;
+  `pack::tests::an_extensions_roles_join_under_its_name_and_its_protected_prompt_needs_a_promotion`,
+  `an_extension_replaces_nothing_and_brings_only_the_text_that_was_approved`;
+  `prompts::tests::an_extensions_prompt_is_promoted_as_the_users_own_by_a_person_typing_its_name`;
+  `layers::tests::an_enabled_packs_roles_reach_the_planner_for_the_users_workflows_to_seat`;
+  `crates/molt-planner/tests/planner.rs`,
+  `an_extension_packs_reviewer_role_speaks_with_its_prompt_only_once_a_person_has_promoted_it`).
+
 ## Deferred
 
 - Signing registries or packs, and caching a registry's index. Fetching git submodules and LFS files, and
   running the git fetch in a sandbox of its own.
-- Environment profiles, roles, prompts and workflows in a pack. Roles and
-  prompts need RFC 0003's promotion to cover a pack's protected prompts.
+- Environment profiles and workflows in a pack. A workflow of a pack would
+  seat roles without the user writing one; with roles on a gate it also
+  needs the promotion above to cover the whole declaration (RFC 0003
+  defers protecting a role's model, tools and turns).
+- A pack's prompt that replaces a built-in one, such as `attempt`: today
+  a pack only adds. Storing a pack's prompts as registry modules for
+  `molt improve`.
 - A pack's service with the network, or with mounts beyond the pack's
   directory: a candidate has neither today.
-- Importing Claude Code agents (roles, RFC 0003), hooks on events Molt
-  has no counterpart of, and hook scripts that need files beside them
+- Claude Code agents chosen by the model at will (a `Task` tool), rather
+  than seated by a workflow; hooks on events Molt has no counterpart of, and hook scripts that need files beside them
   (that would take a hook sandbox that sees the pack).
 - Comparing a server's `calls` numerically, so that fewer calls is not a
   new line.

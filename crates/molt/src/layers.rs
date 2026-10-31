@@ -183,12 +183,21 @@ impl Layered {
                 origins.insert("service.planner.requests".into(), origin);
             }
         }
-        // The user's prompt pack, for the planner: from this layer only, never the project's.
-        if let Some(dir) = crate::prompts::for_workspace(workspace, var)? {
+        // The user's prompt pack, for the planner: from this layer only, never the project's, with the
+        // roles and prompts of the packs, checked together, since a workflow of the user's may seat theirs.
+        let prompt_extensions = crate::extensions::prompt_extensions(&packs)?;
+        if let Some(dir) = crate::prompts::for_workspace(workspace, var, &prompt_extensions)? {
             let env = molt_planner::pack::PROMPTS_ENV;
             if let Some(planner) = config.service_mut("planner").filter(|p| !p.env.contains_key(env)) {
                 planner.env.insert(env.into(), dir.to_str().context("the prompt pack path is not UTF-8")?.into());
                 origins.insert(format!("service.planner.env.{env}"), Origin::User(dir));
+            }
+        }
+        if !prompt_extensions.is_empty() {
+            let env = molt_planner::pack::EXTENSIONS_ENV;
+            if let Some(planner) = config.service_mut("planner").filter(|p| !p.env.contains_key(env)) {
+                planner.env.insert(env.into(), serde_json::to_string(&prompt_extensions)?);
+                origins.insert(format!("service.planner.env.{env}"), Origin::Extension("packs".into()));
             }
         }
         // The extension packs' skills, for the planner, and their commands, for the interface.
@@ -1038,6 +1047,65 @@ mod tests {
         assert!(layered.config.service("ext-tracker-notes").is_none(), "a disabled pack runs no service");
         let planner = layered.config.service("planner").unwrap();
         assert!(!planner.requests.iter().any(|r| r.target.to_string().starts_with("ext-")));
+    }
+
+    #[test]
+    fn an_enabled_packs_roles_reach_the_planner_for_the_users_workflows_to_seat() {
+        struct Yes;
+        impl crate::extensions::Approve for Yes {
+            fn approve(&mut self, _: &str) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            fn say(&mut self, _: &str) {}
+        }
+        let home = Home::new();
+        let data = home.dir.path().join("data");
+        let env = [("XDG_DATA_HOME", data.to_str().unwrap())];
+        let var = |name: &str| match name {
+            "XDG_CONFIG_HOME" => Some(home.dir.path().join("config").display().to_string()),
+            "XDG_DATA_HOME" => Some(data.display().to_string()),
+            _ => None,
+        };
+        let places = crate::extensions::Places::from_vars(&var).unwrap();
+        let src = home.dir.path().join("src");
+        std::fs::create_dir_all(src.join("prompts")).unwrap();
+        std::fs::write(
+            src.join(crate::extensions::MANIFEST),
+            "schema = 1\nname = \"tracker\"\nversion = \"1\"\n[role.fast]\nbase = \"attempt\"\nprompt = \"fast\"\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("prompts/fast.md"), "Be quick.").unwrap();
+        crate::extensions::add(&places, &src, &mut Yes).unwrap();
+        let workflow = |role: &str| {
+            format!(
+                "[[workflow]]\nschema = 1\nname = \"tracked\"\nroles = {{ attempt = \"{role}\" }}\n\
+                 stages = {{ attempts = {{}}, deliver = {{}} }}\n"
+            )
+        };
+        let prompts = home.dir.path().join("config/molt/prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("pack.toml"), workflow("tracker-fast")).unwrap();
+
+        let roles = molt_planner::pack::EXTENSIONS_ENV;
+        let layered = home.build_with(None, &env).unwrap();
+        let planner = layered.config.service("planner").unwrap();
+        let handed: Vec<molt_planner::pack::Extension> = serde_json::from_str(&planner.env[roles]).unwrap();
+        assert_eq!((handed[0].pack.as_str(), handed[0].roles[0].name.as_str()), ("tracker", "fast"));
+        assert_eq!(layered.origin(&format!("service.planner.env.{roles}")), &Origin::Extension("packs".into()));
+        let pack = molt_planner::pack::Pack::load_with(Some(&prompts), handed).unwrap();
+        assert_eq!(pack.prompts["tracker-fast"], "Be quick.");
+
+        // A workflow that seats a role no pack has stops the start, as one of the user's own would.
+        std::fs::write(prompts.join("pack.toml"), workflow("tracker-slow")).unwrap();
+        let err = format!("{:#}", home.build_with(None, &env).unwrap_err());
+        assert!(err.contains("does not declare"), "{err}");
+        // Disabled, the pack's roles are gone, and so is a workflow's seat for them.
+        crate::extensions::set_enabled(&places, "tracker", false).unwrap();
+        std::fs::write(prompts.join("pack.toml"), "").unwrap();
+        let layered = home.build_with(None, &env).unwrap();
+        assert!(!layered.config.service("planner").unwrap().env.contains_key(roles));
+        std::fs::write(prompts.join("pack.toml"), workflow("tracker-fast")).unwrap();
+        assert!(home.build_with(None, &env).is_err(), "the workflow seats a role of a disabled pack");
     }
 
     #[test]

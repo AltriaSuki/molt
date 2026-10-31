@@ -200,7 +200,7 @@ impl Config {
     /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_EXPLORE`, `MOLT_EXPLORE_MODEL`, `MOLT_PROCESSES`, `MOLT_GIT`, `MOLT_MAX_TOKENS`,
     /// `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
     /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES`,
-    /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL`, `MOLT_PROMPTS_DIR`, `MOLT_SKILLS_DIR`, `MOLT_COMPACT`,
+    /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL`, `MOLT_PROMPTS_DIR`, `MOLT_EXTENSION_ROLES_JSON`, `MOLT_SKILLS_DIR`, `MOLT_COMPACT`,
     /// `MOLT_ROLE_MODELS`, `MOLT_SCHEDULE`, `MOLT_ESCALATION_MODELS` and `MOLT_MAX_ESCALATIONS`.
     ///
     /// | Variable | Default |
@@ -223,6 +223,7 @@ impl Config {
     /// | `MOLT_SYNTAX_CHECK` | `report`; or `reject`, or `off` |
     /// | `MOLT_ROUTE_MODEL` | unset: the run's model picks the workflow of a run that names `auto` |
     /// | `MOLT_PROMPTS_DIR` | unset: the built-in prompts; else the prompt pack to read ([`pack::Pack::load`]) |
+    /// | `MOLT_EXTENSION_ROLES_JSON` | unset: none; else the roles and prompts of the extension packs, added to the pack ([`pack::Pack::with_extensions`]) |
     /// | `MOLT_PROMPT_MODULES_JSON` | unset: none; else the promoted prompt versions, under the pack's files ([`pack::Pack::with_modules`]) |
     /// | `MOLT_SKILLS_DIR` | unset: no user skills; else the directory of the user's skills ([`skills`]) |
     /// | `MOLT_EXTENSION_SKILLS` | unset: none; else the extension packs' skill directories, as a `PATH`-style list ([`skills`]) |
@@ -281,10 +282,13 @@ impl Config {
             .context("MOLT_TOOLS_JSON is not a list of tool declarations")?
             .unwrap_or_default();
         validate_tools(&tools)?;
-        let mut pack = match get(pack::PROMPTS_ENV) {
-            Some(dir) => pack::Pack::load(std::path::Path::new(&dir))?,
-            None => pack::Pack::default(),
-        };
+        let extensions = get(pack::EXTENSIONS_ENV)
+            .map(|json| serde_json::from_str::<Vec<pack::Extension>>(&json))
+            .transpose()
+            .with_context(|| format!("{} is not a list of extension roles", pack::EXTENSIONS_ENV))?
+            .unwrap_or_default();
+        let dir = get(pack::PROMPTS_ENV).map(std::path::PathBuf::from);
+        let mut pack = pack::Pack::load_with(dir.as_deref(), extensions)?;
         if let Some(json) = get(pack::MODULES_ENV) {
             let modules = serde_json::from_str(&json)
                 .with_context(|| format!("{} is not a list of prompt modules", pack::MODULES_ENV))?;
@@ -711,6 +715,18 @@ mod tests {
         std::fs::write(dir.path().join("pack.toml"), "[[role]]\nname = \"x\"\nbase = \"nobody\"\n").unwrap();
         assert!(from(&[(pack::PROMPTS_ENV, path)]).is_err(), "a pack that does not read stops the planner");
         assert!(from(&[(pack::PROMPTS_ENV, "/no/such/pack")]).is_err());
+        // The extension packs' roles, added with their prompts under the pack's name.
+        std::fs::write(dir.path().join("pack.toml"), "").unwrap();
+        std::fs::write(dir.path().join("fast.md"), "Be quick.").unwrap();
+        let ext =
+            serde_json::json!([{ "pack": "tracker", "dir": path, "prompts": { "fast": pack::sha256("Be quick.") },
+            "roles": [{ "name": "fast", "base": "attempt", "prompt": "fast" }] }])
+            .to_string();
+        let cfg = from(&[(pack::EXTENSIONS_ENV, &ext)]).unwrap();
+        assert_eq!(cfg.pack.prompts["tracker-fast"], "Be quick.");
+        assert_eq!(cfg.pack.roles[0].prompt.as_deref(), Some("tracker-fast"));
+        let other = ext.replace(&pack::sha256("Be quick."), &pack::sha256("Be slow."));
+        assert!(from(&[(pack::EXTENSIONS_ENV, &other)]).is_err(), "not the text that was approved");
     }
 
     #[test]

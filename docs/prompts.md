@@ -131,6 +131,35 @@ pack's workflow cannot take the name of `verify`, `ask`, `quick` or
 `auto`. Unknown keys are refused, and a pack that does not read stops the
 run before it starts, with the reason.
 
+## Roles from extension packs
+
+An [extension pack](extensions.md#roles-and-prompts) can bring roles and
+prompts. They join your pack under the pack's name: its role `triage`
+is `PACK-triage` here, and its prompt `strict` is `PACK-strict`, so they
+never replace a prompt or role of yours or a built-in one. A workflow of
+yours seats them by that name:
+
+```toml
+[[workflow]]
+schema = 1
+name = "tracked"
+roles = { attempt = "issue-tracker-fast", reviewer = "issue-tracker-strict" }
+[workflow.stages]
+context = {}
+attempts = {}
+review = {}
+deliver = {}
+```
+
+A pack's prompt is used with the text you approved when you installed
+it. One that a role based on the reviewer or the judge speaks with is
+protected as yours is: installing the pack does not promote it, so the
+built-in prompt is used until you run `molt prompts promote
+issue-tracker-strict`, which shows the pack's text and records its hash in
+your `promoted.toml` (and makes `~/.config/molt/prompts/` if you have
+none). `molt prompts list` shows the pack's prompts and roles with the
+pack's name.
+
 ## What a project can and cannot do
 
 Prompts, roles and workflows come only from your pack. A project's

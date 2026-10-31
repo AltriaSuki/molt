@@ -3,7 +3,8 @@
 An extension pack bundles what you would otherwise add to your
 configuration by hand: [MCP servers](mcp.md), bus
 [services](services.md) run as sandboxed candidates, [lifecycle
-hooks](config.md#trusted-lifecycle-hooks), [Agent Skills](skills.md) and
+hooks](config.md#trusted-lifecycle-hooks), [roles and their
+prompts](#roles-and-prompts), [Agent Skills](skills.md) and
 [command templates](tui.md#project-task-commands). It is a directory, a
 `.tar`, `.tar.gz` or `.tgz` archive of one, or a git repository, with a
 `molt-extension.toml` at the top, and can be found by its name in a
@@ -66,10 +67,19 @@ matcher = "edit_file|write_file"
 paths = ["migrations/**"]
 command = "echo 'migrations are frozen' >&2; exit 2"
 blocking = true
+
+# Roles, with the keys of [[role]] in your prompt pack (see "Roles and prompts" below).
+[role.triage]
+base = "explorer"
+prompt = "triage"             # prompts/triage.md in the pack
+tools = ["read_file", "search"]
+model = "haiku"
 ```
 
 Beside it, by convention as in a Claude Code plugin:
 
+- `prompts/NAME.md`: prompts for the pack's roles (and your roles) to
+  speak with, in the format of your prompt pack's files;
 - `skills/NAME/SKILL.md`: Agent Skills, offered as yours are;
 - `commands/NAME.md`: command templates for the interface, in the format of
   a project's `.molt/commands`.
@@ -83,7 +93,7 @@ own `mounts`. A server `NAME` of pack `PACK` is bridged as `PACK-NAME`, or
 `mcp__PACK-NAME__TOOL`. Hooks run in the workspace's sandbox, which cannot
 see the pack, so a hook's command is the whole of it.
 
-A manifest with environment profiles, roles, workflows, prompts or `env` is
+A manifest with environment profiles, workflows or `env` is
 refused with the reason: packs cannot bring those yet. So is an
 unknown key, a schema other than 1, and anything the user config would
 refuse in `[mcp]` or `[[hooks]]` (a server given `ANTHROPIC_API_KEY`, say).
@@ -119,6 +129,47 @@ pack chooses less than your config would:
 As any candidate, it does not start where the sandbox is unavailable, and
 then neither does `molt`: `molt ext disable PACK` to run without it.
 
+## Roles and prompts
+
+A pack's `[role.NAME]` is a role of your [prompt pack](prompts.md#roles-and-workflows),
+with the keys of a `[[role]]` there (`base`, `prompt`, `tools`, `model`,
+`effort`, `max_turns`, `budget_share`) and its name from the table. Its
+`prompt` is one of the pack's own, `prompts/NAME.md`; without one it
+speaks with its base's built-in prompt.
+
+- **Under the pack's name.** The role `NAME` of pack `PACK` is the role
+  `PACK-NAME` in your prompt pack, and its prompt `P` the prompt `PACK-P`.
+  No built-in prompt or role has a `-` in its name, so a pack cannot
+  replace one, and a name your pack or another pack has already is
+  refused, at install and at start. A pack's prompt adds; it never
+  replaces a prompt of yours.
+- **Seated by you.** A pack's role speaks only where a workflow of your
+  prompt pack seats it, as yours would be:
+  `roles = { explorer = "issue-tracker-triage" }`. The pack brings no workflow.
+  A workflow of yours that seats the role of a pack you disable or remove
+  stops the start, with why, as one that seats a role no one declares.
+- **In the grant, by hash.** Each prompt is a line with the SHA-256 of
+  its text, and each role a line with all it sets, so a new text or a new
+  setting is a new line an update asks you about, and a changed installed
+  file stops the start. The planner checks each prompt it reads against
+  the hash you approved.
+- **A gate's prompt still needs a promotion.** A role based on the
+  reviewer or the judge decides what results are accepted. Approving the
+  pack does not promote its prompt: the run uses the built-in reviewer or
+  judge prompt, and says so, until you run `molt prompts promote
+  PACK-P` at a terminal, which shows you the text and records its hash in
+  your `promoted.toml` ([prompts.md](prompts.md#protected-prompts-promote-them)),
+  as for a prompt of your own. A new text from an update is the built-in
+  again until you promote it. The grant line of such a role says so:
+
+```text
+  prompt review-kit-strict (sha256 3f2a…), for roles to speak with
+  role review-kit-strict, based on the reviewer, speaks with prompt review-kit-strict; it decides what results are accepted, so its prompt is used only once you run molt prompts promote review-kit-strict
+```
+
+`molt prompts list` shows a pack's prompts as `extension PACK's`, and its
+roles with `(extension PACK)`.
+
 ## What installing shows and asks
 
 `molt ext add` copies the pack into a staging directory, checks it, and
@@ -146,7 +197,8 @@ These lines are the pack's **grant**: the programs it runs, their network,
 the host paths they read, your environment variables they get and the
 variables they are set, the capabilities its services hold and their
 budgets, how often the agent may call them and who is offered their tools,
-each hook's command, and its skills and commands.
+each hook's command, each prompt by its hash and each role with what it
+sets, and its skills and commands.
 Nothing the pack holds is run to install it.
 
 It asks at a terminal. Without one it installs only with `--yes`; otherwise
@@ -304,7 +356,7 @@ molt ext registry remove team
 ## Disabling and removing
 
 `molt ext disable NAME` keeps the pack and its approval, and the next start
-runs none of its servers, hooks, skills or commands. `molt ext enable NAME`
+runs none of its servers, hooks, roles, skills or commands. `molt ext enable NAME`
 checks it as a start does and turns it back on.
 
 `molt ext remove NAME` deletes the installed files, the record and the
@@ -334,7 +386,8 @@ them once the pack is gone.
   inline) on `PreToolUse`, `PostToolUse` and `UserPromptSubmit` become the
   pack's `tool.before`, `tool.after` and `prompt.submit` hooks, with
   `dialect = "claude-code"` (see below) and their `matcher` and `timeout`;
-- agents are not imported: they are roles, which packs cannot bring yet.
+- agents (`agents/NAME.md`) become the pack's roles, with their text as
+  the prompt `prompts/NAME.md` (see below).
 
 A hook runs in the workspace's sandbox, which cannot see the pack, so a
 hook whose command runs one of the plugin's scripts
@@ -349,6 +402,17 @@ command that does more than run one script, a hook of another type than
 otherwise), and the events Molt has none of (`Stop`, `SessionStart`,
 `Notification`, …) are left out, each with why. `$CLAUDE_PROJECT_DIR` is
 the directory the hook runs in. At most 32 hooks are taken.
+
+An agent becomes `[role.NAME]`, `NAME` being its `name` (or its file's),
+and a workflow of yours seats it as `PLUGIN-NAME`. Its `tools` become
+Molt's (`Read`, `Write`, `Edit`, `MultiEdit`, `Bash`, `Grep`, `Glob`, `LS`
+and `WebFetch` as `read_file`, `write_file`, `edit_file`, `run`, `search`,
+`list_files` and `fetch_url`); the rest, such as `Task` or an MCP tool, are
+left out with a note. An agent offered only tools that read is based on
+the explorer, any other on the attempt. Its `model` is kept unless it is
+`inherit`; `description`, `color` and the other keys are left out. An
+agent whose name is not a role's, whose text is empty, or that is in a
+subdirectory is left out.
 
 A hook with `dialect = "claude-code"` is told of a tool call in Claude
 Code's names: `tool_name` is `Read`, `Write`, `Edit`, `Bash`, `Grep` or
@@ -366,8 +430,9 @@ approved as any pack's.
 ## Not yet
 
 Signed registries or packs, fetching git submodules or LFS files, git
-fetches in a sandbox of their own, environment profiles, roles, prompts
-and workflows in a pack, a pack's service with the network or a mount
-beyond the pack, importing a Claude Code plugin's
-agents, or its hooks on events Molt does not have, and evaluating a pack on the benchmark before it is
+fetches in a sandbox of their own, environment profiles and workflows in
+a pack, a pack's role in place of a built-in one without a workflow of
+yours, a pack's service with the network or a mount
+beyond the pack, a Claude Code plugin's hooks on events Molt does not
+have, and evaluating a pack on the benchmark before it is
 enabled.

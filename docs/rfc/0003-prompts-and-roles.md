@@ -202,6 +202,12 @@ Only the prompt is protected. A reviewer role's `model`, `tools` and
   is; a project's own `.molt/prompts/` is never read. A `--config` file
   inside the workspace has a `MOLT_PROMPTS_DIR` in the planner's
   environment removed, as its hooks are.
+- An extension pack the user installed and approved (RFC 0005) adds roles
+  and prompts under its own name, `PACK-NAME`, and replaces none: no
+  built-in name has a `-`. Its prompts are the user's for every rule here
+  but one: approving the pack is not a promotion, so a role based on the
+  reviewer or the judge speaks with a pack's prompt only once `molt
+  prompts promote PACK-NAME` has recorded its hash in `promoted.toml`.
 - A pack inside the workspace is refused (`molt` stops with why), since the
   agent's changes are merged there: with the home directory as the
   workspace, a result could otherwise carry its own `promoted.toml`.

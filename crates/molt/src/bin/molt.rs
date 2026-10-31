@@ -2332,10 +2332,11 @@ fn prompts_cmd(cmd: PromptsCmd) -> anyhow::Result<()> {
     use std::io::{BufRead, IsTerminal, Write};
     let dir = molt::prompts::dir(&|name| std::env::var(name).ok());
     let promoted = || molt::improve::live_prompts(&|name| std::env::var(name).ok());
+    let extensions = || molt::extensions::enabled_prompt_extensions(&|name| std::env::var(name).ok());
     match cmd {
-        PromptsCmd::List => print!("{}", molt::prompts::list(dir.as_deref(), promoted()?)?),
+        PromptsCmd::List => print!("{}", molt::prompts::list(dir.as_deref(), promoted()?, extensions()?)?),
         PromptsCmd::Show { name, builtin } => {
-            print!("{}", molt::prompts::show(dir.as_deref(), promoted()?, &name, builtin)?)
+            print!("{}", molt::prompts::show(dir.as_deref(), promoted()?, extensions()?, &name, builtin)?)
         }
         PromptsCmd::Promote { name } => {
             let dir = dir.context("there is no prompt pack: HOME is not set, or MOLT_PROMPTS_DIR is none")?;
@@ -2351,7 +2352,7 @@ fn prompts_cmd(cmd: PromptsCmd) -> anyhow::Result<()> {
                 std::io::stdin().lock().read_line(&mut line)?;
                 Ok(line)
             };
-            molt::prompts::promote(&dir, &name, &mut std::io::stderr(), &mut confirm)?;
+            molt::prompts::promote(&dir, &name, extensions()?, &mut std::io::stderr(), &mut confirm)?;
         }
     }
     Ok(())
