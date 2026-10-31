@@ -1155,6 +1155,30 @@ pub fn step_line(step: u32, steps: u32, goal: &str) -> String {
     format!("step {}/{steps}: {goal}", step + 1)
 }
 
+/// The line that says what the adaptive schedule decided, and why.
+pub fn scheduled_line(d: &molt_api::planner::Scheduling) -> String {
+    use molt_api::planner::ScheduleAction;
+    let what = match (d.action, d.attempt) {
+        (ScheduleAction::Hold, _) | (_, None) => "no new attempt".to_owned(),
+        (ScheduleAction::Start, Some(a)) => format!("{} starts", attempt_name(a)),
+        (ScheduleAction::Parallel, Some(a)) => format!("{} starts alongside", attempt_name(a)),
+        (ScheduleAction::Escalate, Some(a)) => format!("{} starts, escalated", attempt_name(a)),
+        (ScheduleAction::Retry, Some(a)) => format!("{} starts, another approach", attempt_name(a)),
+    };
+    let on = match (&d.model, d.attempt) {
+        (Some(model), Some(_)) => format!(" on {model}"),
+        _ => String::new(),
+    };
+    let unknown = match d.budget.unknown_calls {
+        0 => String::new(),
+        n => format!(", {n} calls of unknown cost"),
+    };
+    format!(
+        "schedule: {what}{on}: {} (${:.2} of ${:.2} spent{unknown}; escalations {}/{})",
+        d.reason, d.budget.spent_usd, d.budget.limit_usd, d.escalations, d.max_escalations
+    )
+}
+
 /// One short line for the terminal, made [`printable`].
 pub fn describe(event: &Progress) -> String {
     printable(&match event {
@@ -1214,6 +1238,7 @@ pub fn describe(event: &Progress) -> String {
         Progress::Routed { workflow, reason, .. } => routed_line(workflow, reason, "--workflow verify"),
         Progress::Planned { steps, edited, .. } => planned_line(steps, *edited),
         Progress::Step { step, steps, goal, .. } => step_line(*step, *steps, goal),
+        Progress::Scheduled { decision, .. } => scheduled_line(decision),
         Progress::Required { requirement, .. } => requirement_line(requirement),
         Progress::Adopted { attempt, version, turn, .. } => {
             format!("{}: follows requirements v{version} from turn {turn}", attempt_name(*attempt))

@@ -28,6 +28,7 @@ mod registry;
 mod review;
 mod route;
 mod runner;
+pub mod schedule;
 pub mod scoped;
 mod select;
 pub mod skills;
@@ -39,7 +40,7 @@ use std::time::Duration;
 
 use anyhow::{ensure, Context};
 use async_trait::async_trait;
-use molt_api::planner::{Control, ControlRequest, ControlResponse, DesignResponse, RunRequest, RunResponse};
+use molt_api::planner::{Control, ControlRequest, ControlResponse, DesignResponse, RunRequest, RunResponse, Schedule};
 use molt_api::progress::{self, Progress};
 use molt_proto::{Budget, Envelope, ErrorCode, RemoteError, Target, TraceId};
 use molt_sdk::{CallOpts, SdkError, Service};
@@ -139,6 +140,17 @@ pub struct Config {
     /// explorer's `MOLT_EXPLORE_MODEL` and the router's `MOLT_ROUTE_MODEL`
     /// still win for their roles.
     pub role_models: std::collections::BTreeMap<molt_api::model::Role, String>,
+    /// How runs that do not say start their attempts (`MOLT_SCHEDULE`, #13):
+    /// all at once ([`Schedule::Fixed`], the default) or one at a time on
+    /// evidence ([`Schedule::Adaptive`], see [`schedule`]).
+    pub schedule: Schedule,
+    /// The models an adaptive run escalates through, cheapest first
+    /// (`MOLT_ESCALATION_MODELS`). Empty: every attempt keeps the run's model,
+    /// and adaptive runs only decide how many attempts start.
+    pub escalation_models: Vec<String>,
+    /// The most escalations (a model up, or an attempt alongside a stuck one)
+    /// one adaptive run makes (`MOLT_MAX_ESCALATIONS`); 0 for none.
+    pub max_escalations: u32,
 }
 
 impl Default for Config {
@@ -175,6 +187,9 @@ impl Default for Config {
             skills_dir: None,
             compact_model: false,
             role_models: Default::default(),
+            schedule: Schedule::Fixed,
+            escalation_models: Vec::new(),
+            max_escalations: 2,
         }
     }
 }
@@ -185,8 +200,8 @@ impl Config {
     /// `MOLT_DESIGN_BUDGET_SHARE`, `MOLT_EXPLORE`, `MOLT_EXPLORE_MODEL`, `MOLT_PROCESSES`, `MOLT_GIT`, `MOLT_MAX_TOKENS`,
     /// `MOLT_MODEL_TIMEOUT_S`, `MOLT_CHECK_TIMEOUT_S`,
     /// `MOLT_MAP_TOKENS`, `MOLT_CONTEXT_TOKENS`, `MOLT_INSTRUCTION_FILES`,
-    /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL`, `MOLT_PROMPTS_DIR`, `MOLT_SKILLS_DIR`, `MOLT_COMPACT` and
-    /// `MOLT_ROLE_MODELS`.
+    /// `MOLT_SYNTAX_CHECK`, `MOLT_ROUTE_MODEL`, `MOLT_PROMPTS_DIR`, `MOLT_SKILLS_DIR`, `MOLT_COMPACT`,
+    /// `MOLT_ROLE_MODELS`, `MOLT_SCHEDULE`, `MOLT_ESCALATION_MODELS` and `MOLT_MAX_ESCALATIONS`.
     ///
     /// | Variable | Default |
     /// |---|---|
@@ -212,6 +227,9 @@ impl Config {
     /// | `MOLT_EXTENSION_SKILLS` | unset: none; else the extension packs' skill directories, as a `PATH`-style list ([`skills`]) |
     /// | `MOLT_COMPACT` | `record`: Molt's own record of the turns a conversation leaves out; `model` also has the `compactor` write notes on them ([`compact`]) |
     /// | `MOLT_ROLE_MODELS` | unset: every role but the judge's uses the run's model; else a JSON object of role to model ([`molt_api::model::role_models`]) |
+    /// | `MOLT_SCHEDULE` | `fixed`: a run's attempts start at once; `adaptive` starts one and adds more on evidence ([`schedule`]). A request's `schedule` wins |
+    /// | `MOLT_ESCALATION_MODELS` | unset: adaptive runs keep the run's model; else the models to escalate through, cheapest first, separated by commas |
+    /// | `MOLT_MAX_ESCALATIONS` | `2`; `0` makes no escalation |
     ///
     /// An empty variable counts as unset. A value that does not parse is an
     /// error, and so is a zero: none of these limits has a "no limit" value.
@@ -335,6 +353,18 @@ impl Config {
             role_models: match get(molt_api::model::ROLE_MODELS_ENV) {
                 Some(text) => molt_api::model::role_models(&text).map_err(anyhow::Error::msg)?,
                 None => d.role_models,
+            },
+            schedule: match get("MOLT_SCHEDULE") {
+                Some(v) => v.parse().map_err(|e| anyhow::anyhow!("MOLT_SCHEDULE: {e}"))?,
+                None => d.schedule,
+            },
+            escalation_models: match get("MOLT_ESCALATION_MODELS") {
+                Some(v) => schedule::ladder(&v).map_err(|e| anyhow::anyhow!("MOLT_ESCALATION_MODELS={v:?}: {e}"))?,
+                None => d.escalation_models,
+            },
+            max_escalations: match get("MOLT_MAX_ESCALATIONS") {
+                Some(v) => v.parse().with_context(|| format!("MOLT_MAX_ESCALATIONS={v:?} is not a number"))?,
+                None => d.max_escalations,
             },
         })
     }
@@ -477,6 +507,18 @@ pub async fn run(
     trace: TraceId,
 ) -> Result<RunResponse, RemoteError> {
     runner::run(bus, cfg, req, trace).await
+}
+
+/// [`run`], stopped when `cancel` fires: no attempt starts after that, and
+/// the run answers with what it had, as one its caller cancels over the bus.
+pub async fn run_cancellable(
+    bus: Arc<dyn Bus>,
+    cfg: Arc<Config>,
+    req: RunRequest,
+    trace: TraceId,
+    cancel: CancellationToken,
+) -> Result<RunResponse, RemoteError> {
+    runner::run_cancellable(bus, cfg, req, trace, cancel).await
 }
 
 /// Design the done-check for a run without starting it (`planner.design`).
@@ -807,6 +849,24 @@ mod tests {
         assert!(runner::workflow(&cfg, Some("quick")).unwrap().explores());
         assert!(!runner::workflow(&cfg, Some("ask")).unwrap().explores());
         assert!(!runner::workflow(&Config::default(), None).unwrap().explores());
+    }
+
+    #[test]
+    fn runs_are_scheduled_fixed_unless_the_planners_starter_says_adaptive() {
+        let cfg = from(&[]).unwrap();
+        assert_eq!((cfg.schedule, cfg.escalation_models.len(), cfg.max_escalations), (Schedule::Fixed, 0, 2));
+        let cfg = from(&[
+            ("MOLT_SCHEDULE", "adaptive"),
+            ("MOLT_ESCALATION_MODELS", "haiku, sonnet,opus"),
+            ("MOLT_MAX_ESCALATIONS", "0"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.schedule, Schedule::Adaptive);
+        assert_eq!(cfg.escalation_models, ["haiku", "sonnet", "opus"]);
+        assert_eq!(cfg.max_escalations, 0, "zero escalations is a setting, not no limit");
+        assert!(format!("{:#}", from(&[("MOLT_SCHEDULE", "smart")]).unwrap_err()).contains("fixed or adaptive"));
+        assert!(format!("{:#}", from(&[("MOLT_ESCALATION_MODELS", "a,a")]).unwrap_err()).contains("twice"));
+        assert!(from(&[("MOLT_MAX_ESCALATIONS", "-1")]).is_err());
     }
 
     #[test]

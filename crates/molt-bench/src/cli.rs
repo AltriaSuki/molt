@@ -498,6 +498,15 @@ fn priced(prices: &molt_gateway::prices::PriceTable, model: Option<&str>, arms: 
                 }
             } else if let Some(m) = arg.strip_prefix("--model=") {
                 models.push((m.to_owned(), &arm.name));
+            } else if arg == "--escalate" || arg.starts_with("--escalate=") {
+                // An adaptive arm's escalation models are paid for like its model.
+                let list = match arg.strip_prefix("--escalate=") {
+                    Some(list) => Some(list.to_owned()),
+                    None => args.next().cloned(),
+                };
+                for m in list.iter().flat_map(|l| l.split(',')).map(str::trim).filter(|m| !m.is_empty()) {
+                    models.push((m.to_owned(), &arm.name));
+                }
             }
         }
     }
@@ -568,6 +577,10 @@ mod tests {
         assert!(priced(None, &[arm("cheap=--model haiku")]).is_ok());
         let err = priced(None, &[arm("odd=--attempts 1 --model=claude-unknown-1")]).unwrap_err();
         assert!(err.to_string().starts_with("odd:"), "{err}");
+        // An adaptive arm pays for every model it may escalate to.
+        assert!(priced(None, &[arm("adaptive=--schedule adaptive --escalate haiku,sonnet,opus")]).is_ok());
+        let err = priced(None, &[arm("adaptive=--schedule adaptive --escalate=haiku,claude-unknown-1")]).unwrap_err();
+        assert!(err.to_string().contains("claude-unknown-1"), "{err}");
     }
 
     #[test]

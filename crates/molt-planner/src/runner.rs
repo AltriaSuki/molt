@@ -8,7 +8,7 @@ use std::time::Duration;
 use molt_api::model::attempt_name;
 use molt_api::planner::{
     AttemptStatus, Candidate, CheckDispute, CheckFile, CheckSpec, Criterion, DesignResponse, Outcome, Resume, Review,
-    RunRequest, RunResponse, Select, Selection, Verdict, Verification,
+    RunRequest, RunResponse, Schedule, Select, Selection, Verdict, Verification,
 };
 use molt_api::progress::Progress;
 use molt_api::workflow::{self, Workflow};
@@ -22,6 +22,7 @@ use crate::control::{self, Control, Registered};
 use crate::ctx::Ctx;
 use crate::designer::{self, Design};
 use crate::review::{self, Winner};
+use crate::schedule::{self, Adaptive, Evidence};
 use crate::{instructions, memory, referenced, select, tools};
 use crate::{Bus, Config};
 
@@ -107,8 +108,35 @@ pub(crate) async fn run_on(
     };
     save_check(&ctx, &settled, designed);
     let count = attempt_count(&req, &settled, &ctx.workflow);
-    let slots = (0..count).map(|index| Slot::Run { index, saved: None }).collect();
-    Ok(finish(&ctx, &req, settled, designed, slots).await)
+    let adaptive = adaptive(&ctx, &req, count).await;
+    // An adaptive run's schedule starts its first attempt itself.
+    let slots = match adaptive {
+        Some(_) => Vec::new(),
+        None => (0..count).map(|index| Slot::Run { index, saved: None }).collect(),
+    };
+    Ok(finish(&ctx, &req, settled, designed, slots, adaptive).await)
+}
+
+/// The adaptive schedule of a run that asks for one, or whose planner
+/// does by default (#13): `None` for a fixed run, and for one with room for
+/// one attempt only, which has nothing to decide.
+async fn adaptive(ctx: &Ctx, req: &RunRequest, count: u32) -> Option<Adaptive> {
+    if req.schedule.unwrap_or(ctx.cfg.schedule) != Schedule::Adaptive {
+        return None;
+    }
+    if count <= 1 {
+        ctx.note("this run has room for one attempt only, so the adaptive schedule has nothing to decide").await;
+        return None;
+    }
+    let asked = req.model.as_deref().filter(|m| !m.trim().is_empty());
+    let pinned = ctx.seats().attempt.model.is_some();
+    // The request's escalation models win over the planner's.
+    let ladder = if req.escalation_models.is_empty() { &ctx.cfg.escalation_models } else { &req.escalation_models };
+    let (schedule, note) = Adaptive::new(ladder, ctx.cfg.max_escalations, asked, ctx.model.as_deref(), pinned, count);
+    if let Some(note) = note {
+        ctx.note(note).await;
+    }
+    Some(schedule)
 }
 
 /// Go on with the checkpointed run `resume.run`.
@@ -189,6 +217,10 @@ async fn resume_run(
     };
 
     let count = attempt_count(&run_req, &settled, &ctx.workflow);
+    let mut adaptive = adaptive(&ctx, &run_req, count).await;
+    if let Some(schedule) = &mut adaptive {
+        schedule.restore(&saved.attempts, saved.escalations, resume.retry);
+    }
     let passed = saved.attempts.iter().any(|a| a.end.as_ref().is_some_and(|e| e.status == AttemptStatus::Passed));
     let mut slots = Vec::new();
     for attempt in &saved.attempts {
@@ -214,16 +246,19 @@ async fn resume_run(
         }
     }
     let first = saved.attempts.iter().map(|a| a.index + 1).max().unwrap_or(0);
-    if resume.retry {
+    if adaptive.is_some() {
+        // The schedule starts the new attempt itself, after the ones that go on.
+    } else if resume.retry {
         slots.extend((first..first + count).map(|index| Slot::Run { index, saved: None }));
     } else if saved.attempts.is_empty() {
         // Stopped before any attempt started.
         slots.extend((0..count).map(|index| Slot::Run { index, saved: None }));
     }
-    if !passed && !slots.iter().any(|s| matches!(s, Slot::Run { .. })) {
+    let starts = adaptive.is_some() && (resume.retry || saved.attempts.is_empty());
+    if !passed && !starts && !slots.iter().any(|s| matches!(s, Slot::Run { .. })) {
         ctx.note("every attempt of this run had ended; resume with retry to start new ones").await;
     }
-    Ok(finish(&ctx, &run_req, settled, designed, slots).await)
+    Ok(finish(&ctx, &run_req, settled, designed, slots, adaptive).await)
 }
 
 /// Make the run steerable with `planner.control` and report its state, until
@@ -460,7 +495,14 @@ enum Slot {
 
 /// Race the attempts, apply the winner and total up. A checkpointed run
 /// stopped before it finished keeps its checkpoint and forks.
-async fn finish(ctx: &Arc<Ctx>, req: &RunRequest, settled: Settled, designed: bool, slots: Vec<Slot>) -> RunResponse {
+async fn finish(
+    ctx: &Arc<Ctx>,
+    req: &RunRequest,
+    settled: Settled,
+    designed: bool,
+    slots: Vec<Slot>,
+    adaptive: Option<Adaptive>,
+) -> RunResponse {
     let Settled { check, rubric } = settled;
     let spec = check.as_ref().map(|c| CheckSpec {
         command: c.command.clone(),
@@ -478,7 +520,7 @@ async fn finish(ctx: &Arc<Ctx>, req: &RunRequest, settled: Settled, designed: bo
     .await;
     let check = check.map(Arc::new);
     let rubric = Arc::new(rubric);
-    let (finished, passed) = race(ctx, slots, check.clone(), rubric.clone(), req.select).await;
+    let (finished, passed) = race(ctx, slots, check.clone(), rubric.clone(), req.select, adaptive).await;
     ctx.control.freeze("the run is finishing");
     let stopped = ctx.checkpoint.is_some() && ctx.run_cancel.is_cancelled();
     // Cancelled attempts may have left model calls running, which are billed: give their replies a moment
@@ -683,6 +725,8 @@ pub(crate) fn validate(req: &RunRequest, cfg: &Config) -> Result<(), RemoteError
         "workspace is empty".to_owned()
     } else if !(1..=MAX_ATTEMPTS).contains(&req.attempts) {
         format!("attempts must be 1 to {MAX_ATTEMPTS}, not {}", req.attempts)
+    } else if let Some(why) = escalation_problem(&req.escalation_models) {
+        format!("escalation_models: {why}")
     } else if req.check.as_ref().is_some_and(|c| c.trim().is_empty()) {
         "check is empty: leave it out to have one designed".to_owned()
     } else if req.check.is_none() && !req.check_files.is_empty() {
@@ -724,21 +768,44 @@ pub(crate) fn validate(req: &RunRequest, cfg: &Config) -> Result<(), RemoteError
     Err(RemoteError { code: ErrorCode::Invalid, message: problem })
 }
 
+/// What is wrong with a request's escalation models, if anything.
+fn escalation_problem(models: &[String]) -> Option<String> {
+    for (i, m) in models.iter().enumerate() {
+        if m.trim().is_empty() || m.contains(',') {
+            return Some(format!("{m:?} is not a model name"));
+        }
+        if models[..i].contains(m) {
+            return Some(format!("{m} is named twice"));
+        }
+    }
+    None
+}
+
 /// Run the attempts at once until `select` says to stop: with
 /// [`Select::First`] the first to pass cancels the rest. Every attempt is
 /// waited for. Ones that passed before a resume count without running.
-/// Reports come back in index order, the passing attempts in the order they
-/// passed.
+/// Under an `adaptive` schedule, attempts start as it decides, on what the
+/// attempts report and how they end. Reports come back in index order, the
+/// passing attempts in the order they passed.
 async fn race(
     ctx: &Arc<Ctx>,
     slots: Vec<Slot>,
     check: Option<Arc<Check>>,
     rubric: Arc<Vec<Criterion>>,
     select: Select,
+    mut adaptive: Option<Adaptive>,
 ) -> (Vec<Finished>, Vec<u32>) {
     let cancel = ctx.cancel.child_token();
-    let mut tasks = JoinSet::new();
-    let mut indices = HashMap::new();
+    let mut racers = Racers {
+        tasks: JoinSet::new(),
+        indices: HashMap::new(),
+        check,
+        rubric,
+        cancel: cancel.clone(),
+        signals: tokio::sync::mpsc::unbounded_channel(),
+    };
+    // What the run spent before its attempts, which the schedule leaves out of their cost.
+    let before = ctx.tally().spend.cost_usd;
     let mut finished = Vec::new();
     let mut passed = Vec::new();
     for slot in slots {
@@ -750,23 +817,33 @@ async fn race(
                 finished.push(done);
             }
             Slot::Run { index, saved } => {
-                let token = cancel.child_token();
-                let attempt =
-                    attempt::run(ctx.scoped(token.clone()), index, check.clone(), rubric.clone(), token, saved);
-                let handle = tasks.spawn(attempt);
-                indices.insert(handle.id(), index);
+                // A resumed attempt of an adaptive run keeps its model.
+                let model = adaptive.as_ref().map(|a| a.model_of(index));
+                racers.spawn(ctx, index, saved, model.map(|m| (m, None)));
             }
         }
+    }
+    if let Some(schedule) = adaptive.as_mut() {
+        let decided = schedule.start(&view(ctx, &cancel, !passed.is_empty(), before));
+        scheduled(ctx, &mut racers, schedule, decided).await;
     }
     // When the others stop being waited for, once one has passed.
     let mut deadline: Option<tokio::time::Instant> = None;
     loop {
         let wait = deadline.unwrap_or_else(tokio::time::Instant::now);
         let joined = tokio::select! {
-            joined = tasks.join_next_with_id() => match joined {
+            joined = racers.tasks.join_next_with_id() => match joined {
                 Some(joined) => joined,
                 None => break,
             },
+            Some(signal) = racers.signals.1.recv(), if adaptive.is_some() => {
+                if let Some(schedule) = adaptive.as_mut() {
+                    let view = view(ctx, &cancel, !passed.is_empty(), before);
+                    let decided = schedule.decide(Evidence::Heard(signal), &view);
+                    scheduled(ctx, &mut racers, schedule, decided).await;
+                }
+                continue;
+            }
             _ = tokio::time::sleep_until(wait), if deadline.is_some() && !cancel.is_cancelled() => {
                 ctx.note("the time to wait for more passing attempts is up; the ones still going are cancelled").await;
                 cancel.cancel();
@@ -776,14 +853,14 @@ async fn race(
         let done = match joined {
             Ok((_, done)) => done,
             Err(e) => {
-                let index = indices.get(&e.id()).copied().unwrap_or_default();
+                let index = racers.indices.get(&e.id()).copied().unwrap_or_default();
                 tracing::error!(run = %ctx.trace, attempt = index, error = %e, "an attempt task died");
                 Finished::lost(index, format!("the attempt died: {e}"))
             }
         };
         if done.report.status == AttemptStatus::Passed && (passed.is_empty() || !select.is_first()) {
             passed.push(done.report.index);
-            if passed.len() == 1 && !tasks.is_empty() {
+            if passed.len() == 1 && !racers.tasks.is_empty() {
                 match stop_after_first(ctx, select, &done).await {
                     None => cancel.cancel(),
                     // A wait too long to represent is no deadline at all.
@@ -797,10 +874,95 @@ async fn race(
             let more = serde_json::json!({ "attempt": done.report.index, "status": done.report.status });
             crate::hooks::notify_with(ctx, crate::hooks::Event::AttemptFailed, &[], more).await;
         }
+        if let Some(schedule) = adaptive.as_mut() {
+            let report = &done.report;
+            let ended = Evidence::Ended {
+                attempt: report.index,
+                status: report.status,
+                cost_usd: report.cost_usd,
+                note: report.note.clone(),
+            };
+            let decided = schedule.decide(ended, &view(ctx, &cancel, !passed.is_empty(), before));
+            scheduled(ctx, &mut racers, schedule, decided).await;
+        }
         finished.push(done);
     }
     finished.sort_by_key(|f| f.report.index);
     (finished, passed)
+}
+
+/// The attempts of a race still going, and what each new one is given.
+struct Racers {
+    tasks: JoinSet<Finished>,
+    indices: HashMap<tokio::task::Id, u32>,
+    check: Option<Arc<Check>>,
+    rubric: Arc<Vec<Criterion>>,
+    cancel: CancellationToken,
+    signals:
+        (tokio::sync::mpsc::UnboundedSender<schedule::Signal>, tokio::sync::mpsc::UnboundedReceiver<schedule::Signal>),
+}
+
+impl Racers {
+    /// Start attempt `index`, on from `saved` when it is resumed. `scheduled`:
+    /// it is an adaptive run's, with its model (`None`: the run's) and what
+    /// the attempts before it did.
+    fn spawn(
+        &mut self,
+        ctx: &Arc<Ctx>,
+        index: u32,
+        saved: Option<SavedAttempt>,
+        scheduled: Option<(Option<String>, Option<String>)>,
+    ) {
+        let token = self.cancel.child_token();
+        let scope = match scheduled {
+            Some((model, prior)) => {
+                let model = model.map(Some);
+                ctx.attempt_scope(token.clone(), model, self.signals.0.clone(), prior.map(Arc::from))
+            }
+            None => ctx.scoped(token.clone()),
+        };
+        let attempt = attempt::run(scope, index, self.check.clone(), self.rubric.clone(), token, saved);
+        let handle = self.tasks.spawn(attempt);
+        self.indices.insert(handle.id(), index);
+    }
+}
+
+/// The run as the adaptive schedule sees it now.
+fn view(ctx: &Ctx, cancel: &CancellationToken, won: bool, before: f64) -> schedule::View {
+    let stopped = if ctx.over_budget() {
+        Some("the run's budget is spent, or a call's cost is unknown".to_owned())
+    } else if ctx.run_cancel.is_cancelled() || cancel.is_cancelled() {
+        Some("the run was stopped".to_owned())
+    } else {
+        None
+    };
+    let budget = ctx.budget_state();
+    let attempts_spent = (budget.spent_usd - before).max(0.0);
+    schedule::View { budget, stopped, won, attempts_spent }
+}
+
+/// Say what the schedule decided, in the run's progress and so in the audit
+/// log, and start the attempt it starts, keeping its model in the checkpoint.
+async fn scheduled(
+    ctx: &Arc<Ctx>,
+    racers: &mut Racers,
+    schedule: &Adaptive,
+    decided: Option<(Option<schedule::Launch>, molt_api::planner::Scheduling)>,
+) {
+    let Some((launch, decision)) = decided else { return };
+    tracing::info!(
+        run = %ctx.trace, action = ?decision.action, attempt = ?decision.attempt, after = ?decision.after,
+        model = ?decision.model, reason = %decision.reason, "scheduled"
+    );
+    ctx.progress(Progress::Scheduled { run: ctx.run_id(), decision }).await;
+    if let Some(launch) = launch {
+        let escalations = schedule.escalations();
+        ctx.save(|s| {
+            s.escalations = escalations;
+            s.attempt(launch.index).model = launch.model.clone();
+        });
+        racers.spawn(ctx, launch.index, None, Some((launch.model, launch.prior)));
+    }
 }
 
 /// What to do about the attempts still going once `first` has passed:

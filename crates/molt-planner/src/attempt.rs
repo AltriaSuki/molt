@@ -18,6 +18,7 @@ use crate::checkpoint::{SavedAttempt, SavedEnd};
 use crate::compact::{self, Compacted};
 use crate::control;
 use crate::ctx::{Conversation, Ctx, Spend};
+use crate::schedule::{Signal, TOOL_ERROR_TURNS};
 use crate::tools::{self, Actor};
 use crate::{explore, git, judge, process, prompts};
 
@@ -161,11 +162,13 @@ pub(crate) async fn run(
         version: ctx.control.version(),
         read_only: ctx.workflow.read_only(),
         conversation: Vec::new(),
+        last_failure: None,
+        failing_turns: 0,
     };
     if let Some(saved) = &resume {
         attempt.meter = Meter {
             turns: saved.turns,
-            spend: Spend { usage: saved.usage, cost_usd: saved.cost_usd, unknown_calls: 0 },
+            spend: Spend { usage: saved.usage, cost_usd: saved.cost_usd, ..Spend::default() },
         };
         attempt.check_runs = saved.check_runs;
         attempt.fork = saved.fork.clone();
@@ -245,6 +248,10 @@ struct Attempt {
     read_only: bool,
     /// Its conversation once it passed, fitted to go back over the bus.
     conversation: Vec<Value>,
+    /// The output of its last failed check run, to tell a repeat.
+    last_failure: Option<String>,
+    /// Turns in a row whose tool calls all failed.
+    failing_turns: u32,
 }
 
 impl Attempt {
@@ -383,7 +390,7 @@ impl Attempt {
                     }
                 }
                 let paths = self.check.as_ref().map(|c| c.paths()).unwrap_or_default();
-                let first = prompts::attempt_first_message(
+                let mut first = prompts::attempt_first_message(
                     &ctx.task,
                     self.check.as_ref().map(|c| (c.command.as_str(), paths.as_slice())),
                     &self.rubric,
@@ -391,6 +398,10 @@ impl Attempt {
                     &ctx.preamble(),
                     &ctx.control.upto(self.version),
                 );
+                // What the attempts an adaptive run started before this one did, last: the blocks before stay cached.
+                if let (Some(prior), Some(blocks)) = (&ctx.prior, first["content"].as_array_mut()) {
+                    blocks.push(molt_api::model::text_block(prior.to_string()));
+                }
                 let mut conv = Conversation::seated(seat, part, tools, first, Role::Attempt, Some(self.index));
                 if let Some(earlier) =
                     ctx.continues.as_ref().map(|c| continued(&c.conversation)).filter(|c| !c.is_empty())
@@ -445,6 +456,7 @@ impl Attempt {
                             self.or_cancel(self.execute(&fork, &calls, cut_off, actor, compacted)).await?;
                         // What its explorer spent is the attempt's too; the run already counts it.
                         self.meter.spend.absorb(&explored);
+                        self.count_errors(&results);
                         conv.push(user_blocks(results));
                         self.save(&conv);
                         continue;
@@ -550,6 +562,9 @@ impl Attempt {
                 asked = false;
                 continue;
             }
+            let output = prompts::output_tail(&ran, NOTE_TAIL);
+            let repeated = self.last_failure.as_ref() == Some(&output);
+            self.last_failure = Some(output);
             if self.check_runs >= ctx.max_check_rounds {
                 let note = match refused {
                     Some(reason) => format!("the done-check passed, but a check.after hook refused it: {reason}"),
@@ -561,6 +576,7 @@ impl Attempt {
                 };
                 return Err(End::new(AttemptStatus::Failed, note));
             }
+            self.signal(Signal::CheckFailed { attempt: self.index, repeated });
             asked = false;
             let feedback = match refused {
                 Some(reason) => format!(
@@ -572,6 +588,25 @@ impl Attempt {
             };
             conv.push(user_text(format!("{feedback}{}", hooked.context_text(crate::hooks::Event::CheckAfter))));
             self.save(&conv);
+        }
+    }
+
+    /// Tell an adaptive run's schedule `signal`; a fixed run has no one to tell.
+    fn signal(&self, signal: Signal) {
+        if let Some(signals) = &self.ctx.signals {
+            // The schedule stops listening once the run is decided: nothing to tell then.
+            let _ = signals.send(signal);
+        }
+    }
+
+    /// Count a turn whose tool calls all failed, and tell the schedule when
+    /// [`TOOL_ERROR_TURNS`] come in a row.
+    fn count_errors(&mut self, results: &[Value]) {
+        let failed = !results.is_empty() && results.iter().all(|r| r["is_error"] == true);
+        self.failing_turns = if failed { self.failing_turns + 1 } else { 0 };
+        if self.failing_turns >= TOOL_ERROR_TURNS {
+            self.signal(Signal::ToolErrors { attempt: self.index, turns: self.failing_turns });
+            self.failing_turns = 0;
         }
     }
 

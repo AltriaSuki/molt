@@ -22,7 +22,7 @@ use molt_api::planner::tools::{
     DISPUTE_CHECK, LIST_FILES, RUN, SUBMIT_CHECK, SUBMIT_JUDGEMENT, SUBMIT_REVIEW, SUBMIT_ROUTE, SUBMIT_VETTING,
     WRITE_FILE,
 };
-use molt_api::planner::{AttemptStatus, CheckSpec, Outcome, RunRequest, RunResponse, RUN as PLANNER_RUN};
+use molt_api::planner::{AttemptStatus, CheckSpec, Outcome, RunRequest, RunResponse, Schedule, RUN as PLANNER_RUN};
 use molt_api::progress::Progress;
 use molt_api::shell::RUN as RUN_CHECK;
 use molt_kernel::audit::AuditEvent;
@@ -74,6 +74,9 @@ enum Fake {
     /// Attempts greet and, when they are offered the first of these tools,
     /// make each call in turn, in the same turn.
     GreetsWithCalls(Vec<(&'static str, Value)>),
+    /// Attempts greet only on a model whose id has this in it; on any other
+    /// they write the wrong word.
+    GreetsOn(&'static str),
 }
 
 #[derive(Debug, PartialEq)]
@@ -172,6 +175,9 @@ impl Respond for FakeApi {
                 (vec![tool_use(n, DISPUTE_CHECK, input)], "tool_use")
             }
             (Fake::FixesAfterFeedback, false, Turn::First) => (vec![write("greeting.txt", "goodbye\n")], "tool_use"),
+            (Fake::GreetsOn(on), false, Turn::First) if !model.contains(on) => {
+                (vec![write("greeting.txt", "goodbye\n")], "tool_use")
+            }
             (Fake::Hangs(pidfile), false, Turn::First) => {
                 let command = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
                 (vec![tool_use(n, RUN, json!({ "command": command }))], "tool_use")
@@ -840,6 +846,54 @@ async fn a_failed_check_goes_back_to_the_attempt_which_fixes_it() {
         .collect();
     assert_eq!(feedback.len(), 1, "the failed check goes back to the model once");
     assert!(feedback[0].contains("exit code 1"), "{}", feedback[0]);
+    assert_requests_valid(&server).await;
+    setup.assert_forks_dropped();
+}
+
+#[tokio::test]
+async fn an_adaptive_run_starts_on_a_cheap_model_and_escalates_with_its_reason_in_the_audit_log() {
+    let server = fake_api(Fake::GreetsOn("sonnet")).await;
+    let mut setup = Setup::new(&server);
+    let planner = setup.cfg.service_mut("planner").unwrap();
+    planner.env.insert("MOLT_ESCALATION_MODELS".into(), "haiku,sonnet".into());
+    let mut req = setup.request(Some(CHECK), 3);
+    req.schedule = Some(Schedule::Adaptive);
+    req.max_check_rounds = Some(1);
+    // The reviewer has the run's model; only the attempts' are scheduled.
+    req.review = false;
+    let (resp, _) = setup.run(req).await;
+    assert_eq!((resp.outcome, resp.winner), (Outcome::Passed, Some(1)), "{resp:#?}");
+    assert_eq!(resp.attempts.len(), 2, "{resp:#?}");
+    assert_eq!(setup.file("greeting.txt").as_deref(), Some("hello\n"));
+    let firsts: Vec<String> = bodies(&server)
+        .await
+        .iter()
+        .filter(|b| b["messages"].as_array().is_some_and(|m| m.len() == 1) && !offers_submit_check(b))
+        .filter_map(|b| b["model"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(firsts.len(), 2, "{firsts:?}");
+    assert!(firsts[0].contains("haiku") && firsts[1].contains("sonnet"), "{firsts:?}");
+
+    // Each decision is in the audit log, with its reason, price assumption and policy version.
+    let audit = setup.data.path().join("audit.jsonl");
+    molt_kernel::audit::verify(&audit).await.unwrap();
+    let decided: Vec<Value> = molt_kernel::audit::read_all(&audit)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|entry| match entry.event {
+            AuditEvent::Message { envelope } if envelope.payload["event"] == "scheduled" => Some(envelope.payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(decided.len(), 2, "{decided:#?}");
+    assert_eq!(decided[0]["action"], "start");
+    let up = &decided[1];
+    assert_eq!((up["action"].as_str(), up["model"].as_str()), (Some("escalate"), Some("sonnet")), "{up:#}");
+    assert_eq!(up["policy"], molt_api::planner::ADAPTIVE_POLICY);
+    assert!(up["reason"].as_str().unwrap().contains("attempt 1 failed"), "{up:#}");
+    assert!(up["price"]["basis"].as_str().unwrap().contains("sonnet has not run"), "{up:#}");
+    assert!(up["budget"]["limit_usd"].as_f64().is_some(), "{up:#}");
     assert_requests_valid(&server).await;
     setup.assert_forks_dropped();
 }

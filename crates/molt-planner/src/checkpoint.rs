@@ -56,6 +56,14 @@ pub struct Saved {
     /// What was added to the run while it went.
     #[serde(default)]
     pub requirements: Vec<Requirement>,
+    /// The escalations an adaptive run made, which count against its cap
+    /// after a resume too.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub escalations: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -119,6 +127,10 @@ pub struct SavedAttempt {
     /// The instruction files of directories it reached that it was given.
     #[serde(default, skip_serializing_if = "crate::scoped::Saved::is_empty")]
     pub dir_instructions: crate::scoped::Saved,
+    /// The model an adaptive run gave it, which it keeps after a resume;
+    /// `None`: the run's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,6 +163,7 @@ impl Saved {
             open_calls: 0,
             attempts: Vec::new(),
             requirements: Vec::new(),
+            escalations: 0,
         }
     }
 
@@ -175,6 +188,7 @@ impl Saved {
                     end: None,
                     requirements: 0,
                     dir_instructions: Default::default(),
+                    model: None,
                 });
                 self.attempts.len() - 1
             }

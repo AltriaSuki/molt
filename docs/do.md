@@ -1,7 +1,8 @@
 # `molt do`
 
 ```
-molt do TASK [--check CMD | --no-check | --criterion TEXT...] [--workflow NAME] [--attempts N] [--select MODE] [--model M] [--effort E] [--max-turns N]
+molt do TASK [--check CMD | --no-check | --criterion TEXT...] [--workflow NAME] [--attempts N] [--select MODE]
+        [--schedule fixed|adaptive [--escalate MODELS]] [--model M] [--effort E] [--max-turns N]
         [--budget-usd X] [--design-budget-usd X] [--no-apply | --commit [--branch NAME]] [--no-review] [--json] [--stream]
         [--workspace DIR] [--data-dir DIR] [--pass-env NAME]... [--no-memory] [--no-learn]
         [--memory-model MODEL] [--judge-model MODEL] [--checkpoint] [--config FILE]
@@ -22,6 +23,8 @@ the report says `outcome: unverified answer`.
 | `--criterion TEXT` | A criterion the result must meet, for a task no command can check (repeatable, at most 12): the criteria are the run's rubric, an independent judge decides each, and no check is designed (see [Tasks no command can check](#tasks-no-command-can-check)). Not with `--check` or `--no-check`. |
 | `--attempts N` | Parallel attempts, 1 to 8 (default 2). The first to pass wins and the others are cancelled, unless `--select` says otherwise. |
 | `--select MODE` | How to pick among attempts that pass: `first` (default) takes the first; `wait:<seconds>` gives the others that long after the first passes; `all` lets every attempt finish. Then the passing ones are compared (see below). |
+| `--schedule MODE` | `fixed` (the default, or the planner's `MOLT_SCHEDULE`) starts `--attempts` at once; `adaptive` starts one and adds more, up to `--attempts`, on evidence (see [Adaptive schedule](#adaptive-schedule)). |
+| `--escalate MODELS` | With `--schedule adaptive`: the models to escalate through, cheapest first, such as `haiku,sonnet,opus`. Default: the planner's `MOLT_ESCALATION_MODELS`, else none. |
 | `--model`, `--effort` | Model for the attempts (`opus`, `sonnet`, `haiku` or an id) and how hard it thinks. |
 | `--max-turns`, `--budget-usd` | Model turns per attempt, and the spending limit for the whole run. |
 | `--design-budget-usd X` | The most designing the check may spend, out of the run's budget and at most all of it (see [Designing has a budget](#designing-has-a-budget)). Default: a quarter of the run's budget, or the share `MOLT_DESIGN_BUDGET_SHARE` sets. |
@@ -74,6 +77,62 @@ candidate with its scores, and the choice is noted in the audit log. When
 less budget is left than the first passing attempt cost, the run takes it
 without waiting, as `first` would. To compare the modes on the benchmark, add
 an arm: `molt bench --arm molt --arm select-all="--select all"`.
+
+### Adaptive schedule
+
+By default a run starts all its attempts at once, on its model: an easy task
+pays for every one. `--schedule adaptive` (or `MOLT_SCHEDULE=adaptive` for the
+planner) starts one attempt, on the cheapest model it may use, and starts
+another only when the evidence asks for it and the budget allows it:
+
+- An attempt that **fails or errs**, with none other going, is followed by a
+  new attempt on the next model of the escalation list (an escalation), or,
+  at the top of the list or at the escalation cap, by one on the same model
+  with another approach. The new attempt is told what the failed ones did.
+- An attempt that **makes no progress** (its check fails twice in a row with
+  the same output) or is **stuck** (every tool call fails three turns in a
+  row) gets one attempt alongside it, on the next model up when there is one
+  (an escalation). A first failed check is fed back to the attempt as always.
+- **Nothing new starts** once an attempt passed, the run was stopped or its
+  budget spent, its `--attempts` are all started, or the budget left is less
+  than a new attempt is assumed to cost. That assumption is the most an
+  attempt of the run cost so far (or what its attempts spent per attempt
+  started); the planner knows no price list, so an attempt on a model that has
+  not run yet may cost more, and the decision says so. Budget is held back for
+  the model calls in flight, at the most one call has cost. While any call's
+  cost is unknown (an unknown price, a reply without usage, a call stopped
+  locally that the provider may still bill, a call a stopped run left
+  unanswered), what is left of the budget is unknown, and nothing new starts.
+
+Which settings win: under `fixed` nothing here applies, and it stays the
+control to compare with. Under `adaptive`, `--attempts` (or `[tui] attempts`,
+or the workflow's count) is the most attempts the run starts in all; a run with
+room for one attempt only (`quick`, `ask`, `--no-check`, a kept result to go
+on from) runs as fixed. The first attempt's model is `--model` when it is on
+the escalation list, which then goes up from there; a `--model` not on the list
+keeps every attempt on it; without `--model`, the list's first model takes the
+place of `MOLT_PLANNER_MODEL`. A prompt pack whose attempt role names a model
+keeps it. `--escalate` replaces `MOLT_ESCALATION_MODELS`; without either, every
+attempt has the run's model and the schedule only decides how many start.
+`MOLT_MAX_ESCALATIONS` (default 2, `0` for none) caps the escalations of a run.
+The other roles (designer, reviewer, judge, ...) keep their own models.
+
+Every decision is a `scheduled` progress event, so the audit log keeps it:
+the action (`start`, `parallel`, `escalate`, `retry`, or `hold` with what held
+it back), the attempt it starts and the one whose evidence led to it, the
+model, the reason, the price assumed and where it comes from, the budget seen
+(`limit_usd`, `spent_usd`, `reserved_usd`, `in_flight_calls`, `unknown_calls`,
+and `remaining_usd` only when it is known), the escalations against the cap,
+and the policy version (`adaptive/1`). `molt do` prints each as a
+`schedule:` line. The budget is checked before each model call and the costs
+are the gateway's estimates, so this is not an exact cost ceiling. An attempt
+that ends after one passed, or reports after it ended, changes nothing: the
+first to pass stays the winner. A resumed run keeps each attempt's model and
+the escalations made so far.
+
+To compare the schedules on the benchmark, add an arm, such as
+`molt bench --arm molt --arm adaptive="--schedule adaptive --escalate haiku,sonnet,opus"`.
+How they compare on success, cost and time has not been measured yet.
 
 ### Tasks no command can check
 

@@ -13,7 +13,7 @@ use molt_api::memory::{
 };
 use molt_api::model::Effort;
 use molt_api::plan::PlanRequest;
-use molt_api::planner::{Criterion, Outcome, Resume, RunRequest, Select};
+use molt_api::planner::{Criterion, Outcome, Resume, RunRequest, Schedule, Select};
 use molt_planner::checkpoint;
 use molt_proto::{ServiceId, TraceId};
 
@@ -223,6 +223,18 @@ struct DoArgs {
     /// compared (project suite, diff size, review).
     #[arg(long, default_value = "first", value_name = "first|wait:<seconds>|all")]
     select: Select,
+    /// How the attempts start: `fixed` starts --attempts at once; `adaptive`
+    /// starts one, on the cheapest of MOLT_ESCALATION_MODELS, and adds more,
+    /// up to --attempts, when the evidence and the budget call for it.
+    /// Default: the planner's MOLT_SCHEDULE, else fixed.
+    #[arg(long, value_name = "fixed|adaptive")]
+    schedule: Option<Schedule>,
+    /// The models an adaptive schedule escalates through, cheapest first,
+    /// separated by commas, such as haiku,sonnet,opus. Default: the
+    /// planner's MOLT_ESCALATION_MODELS, else none: every attempt keeps
+    /// the run's model.
+    #[arg(long, value_name = "MODELS", value_delimiter = ',', requires = "schedule")]
+    escalate: Vec<String>,
     /// Model for the attempts: opus, sonnet, haiku or a model id.
     #[arg(long)]
     model: Option<String>,
@@ -1172,6 +1184,8 @@ async fn do_task(config: Option<&Path>, profile: Option<&str>, args: DoArgs) -> 
     req.rubric = args.criterion.into_iter().map(|text| Criterion { text, command: None }).collect();
     req.attempts = args.attempts.or(cfg.tui.attempts).unwrap_or(2);
     req.select = args.select;
+    req.schedule = args.schedule;
+    req.escalation_models = args.escalate.into_iter().map(|m| m.trim().to_owned()).filter(|m| !m.is_empty()).collect();
     req.model = args.model.or_else(|| cfg.tui.model.clone());
     req.effort = args.effort.or(cfg.tui.effort);
     req.max_turns = args.max_turns;

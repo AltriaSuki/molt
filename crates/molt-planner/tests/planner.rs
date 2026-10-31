@@ -5416,3 +5416,248 @@ async fn cancelling_an_attempt_cancels_its_explorer() {
     assert_eq!(resp.uncounted_calls, 1);
     assert!(fake.forks_alive().is_empty());
 }
+
+// --- The adaptive schedule (#13) ---------------------------------------------
+
+use molt_api::planner::{Schedule, ScheduleAction, Scheduling};
+
+/// A planner that schedules runs adaptively, escalating through `models`.
+fn adaptive(models: &[&str]) -> Config {
+    Config {
+        schedule: Schedule::Adaptive,
+        escalation_models: models.iter().map(|m| m.to_string()).collect(),
+        ..config()
+    }
+}
+
+fn decisions(fake: &Fake) -> Vec<Scheduling> {
+    fake.events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Progress::Scheduled { decision, .. } => Some(decision),
+            _ => None,
+        })
+        .collect()
+}
+
+fn model_of(req: &CompleteRequest) -> &str {
+    req.model.as_deref().unwrap_or("none")
+}
+
+/// Whether `req`'s first message tells what earlier attempts did.
+fn told_earlier(req: &CompleteRequest) -> bool {
+    req.messages[0]["content"].as_array().unwrap().iter().any(|b| {
+        b["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("<earlier_attempts>") && t.contains("attempt 1 (on haiku): failed"))
+    })
+}
+
+#[tokio::test]
+async fn a_fixed_run_starts_every_attempt_at_once_and_a_requests_schedule_wins_over_the_planners() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => write_hello(req, "bye\n"),
+            _ => done("Done."),
+        },
+        hello_check,
+    );
+    // The planner says adaptive; the request says fixed, and it wins.
+    let req = RunRequest { schedule: Some(Schedule::Fixed), max_check_rounds: Some(1), ..request(Some("check"), 3) };
+    let resp = run_with(&fake, adaptive(&["haiku", "sonnet"]), req).await;
+    assert_eq!(resp.outcome, Outcome::Failed);
+    assert_eq!(resp.attempts.len(), 3);
+    assert_eq!(fake.calls_to("fs.fork").len(), 3);
+    assert!(decisions(&fake).is_empty(), "a fixed run decides nothing");
+    assert!(fake.requests().iter().all(|r| r.model.is_none()), "every attempt has the run's model");
+    assert!(!fake.requests().iter().any(told_earlier));
+}
+
+#[tokio::test]
+async fn an_adaptive_run_starts_with_one_cheap_attempt_and_escalates_when_it_fails() {
+    let fake = Fake::new(
+        |req| match (model_of(req), turn(req)) {
+            ("haiku", 1) => write_hello(req, "bye\n"),
+            ("sonnet", 1) => write_hello(req, "hi\n"),
+            _ => done("Done."),
+        },
+        hello_check,
+    );
+    let req = RunRequest { max_check_rounds: Some(1), ..request(Some("check"), 3) };
+    let resp = run_with(&fake, adaptive(&["haiku", "sonnet"]), req).await;
+    assert_eq!((resp.outcome, resp.winner), (Outcome::Passed, Some(1)), "{}", resp.summary);
+    assert_eq!(resp.attempts.len(), 2, "the third attempt was never needed");
+    assert_eq!(fake.workspace()["hello.txt"], "hi\n");
+    let models: Vec<String> = fake.requests().iter().map(|r| model_of(r).to_owned()).collect();
+    assert_eq!(models, ["haiku", "haiku", "sonnet", "sonnet"]);
+    // The escalated attempt is told what the failed one did.
+    assert!(fake.requests().iter().filter(|r| model_of(r) == "sonnet").all(told_earlier));
+
+    let d = decisions(&fake);
+    assert_eq!(d.len(), 2, "{d:?}");
+    assert_eq!((d[0].action, d[0].attempt, d[0].model.as_deref()), (ScheduleAction::Start, Some(0), Some("haiku")));
+    let up = &d[1];
+    assert_eq!((up.action, up.after, up.attempt), (ScheduleAction::Escalate, Some(0), Some(1)));
+    assert_eq!((up.model.as_deref(), up.escalations, up.max_escalations), (Some("sonnet"), 1, 2));
+    assert_eq!(up.policy, molt_api::planner::ADAPTIVE_POLICY);
+    assert!(up.reason.contains("attempt 1 failed: the done-check still failed"), "{}", up.reason);
+    // The price it assumed: what the failed attempt cost, and that sonnet's price is not known.
+    assert!(close(up.price.estimate_usd.unwrap(), 0.25), "{:?}", up.price);
+    assert!(up.price.basis.contains("sonnet has not run in this run"), "{}", up.price.basis);
+    assert!(close(up.budget.spent_usd, 0.25) && up.budget.remaining_usd.is_some(), "{:?}", up.budget);
+}
+
+#[tokio::test]
+async fn escalations_stop_at_their_cap_and_attempts_at_the_runs_count() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => write_hello(req, "bye\n"),
+            _ => done("Done."),
+        },
+        hello_check,
+    );
+    // The request's escalation models win over the planner's.
+    let cfg = Config { max_escalations: 1, ..adaptive(&["gpt-small", "gpt-large"]) };
+    let ladder = ["haiku", "sonnet", "opus"].map(String::from).to_vec();
+    let req = RunRequest { max_check_rounds: Some(1), escalation_models: ladder, ..request(Some("check"), 4) };
+    let bus: Arc<dyn Bus> = fake.clone();
+    let twice = RunRequest { escalation_models: vec!["haiku".into(), "haiku".into()], ..req.clone() };
+    let err = molt_planner::run(bus, Arc::new(cfg.clone()), twice, TraceId::random()).await.unwrap_err();
+    assert!(err.code == ErrorCode::Invalid && err.message.contains("haiku is named twice"), "{}", err.message);
+    let resp = run_with(&fake, cfg, req).await;
+    assert_eq!(resp.outcome, Outcome::Failed);
+    assert_eq!(resp.attempts.len(), 4);
+    let firsts: Vec<String> = fake.requests().iter().filter(|r| turn(r) == 1).map(|r| model_of(r).to_owned()).collect();
+    assert_eq!(firsts, ["haiku", "sonnet", "sonnet", "sonnet"], "opus is past the cap");
+    let actions: Vec<ScheduleAction> = decisions(&fake).iter().map(|d| d.action).collect();
+    use ScheduleAction::*;
+    assert_eq!(actions, [Start, Escalate, Retry, Retry, Hold]);
+    let d = decisions(&fake);
+    assert!(d[2].reason.contains("the escalation cap (1) is reached"), "{}", d[2].reason);
+    assert!(d[4].reason.contains("may start 4 attempts and has started them all"), "{}", d[4].reason);
+    assert!(d.iter().all(|d| d.escalations <= 1));
+}
+
+#[tokio::test]
+async fn an_attempt_making_no_progress_gets_one_alongside_and_its_late_result_does_not_replace_the_winner() {
+    let fake = Fake::new(
+        |req| match (model_of(req), turn(req) % 2) {
+            // The same wrong file every round, slowly: its check fails the same way each time.
+            ("haiku", 1) => Reply { delay: Duration::from_millis(40), ..write_hello(req, "bye\n") },
+            ("haiku", _) => Reply { delay: Duration::from_millis(40), ..done("Done.") },
+            ("sonnet", 1) => write_hello(req, "hi\n"),
+            _ => done("Fixed it."),
+        },
+        hello_check,
+    );
+    let req = RunRequest { max_check_rounds: Some(6), ..request(Some("check"), 3) };
+    let resp = run_with(&fake, adaptive(&["haiku", "sonnet"]), req).await;
+    assert_eq!((resp.outcome, resp.winner), (Outcome::Passed, Some(1)), "{}", resp.summary);
+    assert_eq!(resp.summary, "Fixed it.");
+    assert_eq!(fake.workspace()["hello.txt"], "hi\n", "the stuck attempt's file never reaches the workspace");
+    assert_eq!(resp.attempts[0].status, AttemptStatus::Cancelled);
+    assert_eq!(resp.attempts.len(), 2);
+    let d = decisions(&fake);
+    assert_eq!(d.len(), 2, "{d:?}");
+    assert_eq!((d[1].action, d[1].after, d[1].model.as_deref()), (ScheduleAction::Parallel, Some(0), Some("sonnet")));
+    assert!(d[1].reason.contains("failed twice in a row with the same output"), "{}", d[1].reason);
+    assert!(fake.forks_alive().is_empty());
+}
+
+#[tokio::test]
+async fn an_adaptive_run_starts_nothing_the_budget_left_cannot_pay_for() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => write_hello(req, "bye\n"),
+            _ => done("Done."),
+        },
+        hello_check,
+    );
+    // The first attempt costs $0.25 of $0.30: what is left would not pay for another.
+    let req = RunRequest { max_check_rounds: Some(1), budget_usd: Some(0.3), ..request(Some("check"), 3) };
+    let resp = run_with(&fake, adaptive(&["haiku", "sonnet"]), req).await;
+    assert_eq!(resp.outcome, Outcome::Failed);
+    assert_eq!(resp.attempts.len(), 1);
+    assert_eq!(fake.calls_to("fs.fork").len(), 1);
+    let d = decisions(&fake);
+    let hold = d.last().unwrap();
+    assert_eq!((hold.action, hold.attempt, hold.after), (ScheduleAction::Hold, None, Some(0)));
+    assert!(hold.reason.contains("$0.05 of the budget is left"), "{}", hold.reason);
+    assert!(hold.reason.contains("less than the $0.25 a new attempt is assumed to cost"), "{}", hold.reason);
+}
+
+#[tokio::test]
+async fn a_cancelled_adaptive_run_starts_no_new_attempt() {
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    let fake = Fake::new(
+        move |req| match turn(req) {
+            1 => write_hello(req, "bye\n"),
+            _ => {
+                // The user stops the run while the first attempt is still at it.
+                stop.cancel();
+                done("Done.")
+            }
+        },
+        hello_check,
+    );
+    let bus: Arc<dyn Bus> = fake.clone();
+    let req = RunRequest { max_check_rounds: Some(1), ..request(Some("check"), 3) };
+    let cfg = Arc::new(adaptive(&["haiku", "sonnet"]));
+    let run = molt_planner::run_cancellable(bus, cfg, req, TraceId::from_raw("trace_test"), cancel);
+    let resp = tokio::time::timeout(Duration::from_secs(5), run).await.unwrap().unwrap();
+    assert_eq!(resp.outcome, Outcome::Failed);
+    assert_eq!(resp.attempts.len(), 1);
+    assert_eq!(resp.attempts[0].status, AttemptStatus::Cancelled);
+    assert_eq!(fake.calls_to("fs.fork").len(), 1);
+    let actions: Vec<ScheduleAction> = decisions(&fake).iter().map(|d| d.action).collect();
+    assert_eq!(actions, [ScheduleAction::Start]);
+}
+
+#[tokio::test]
+async fn calls_of_unknown_cost_leave_the_budget_unknown_and_hold_back_escalation() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => write_hello(req, "bye\n"),
+            _ => done("Done."),
+        },
+        hello_check,
+    );
+    let state = tempfile::tempdir().unwrap();
+    let cfg = Config { state_dir: Some(state.path().into()), ..adaptive(&["haiku", "sonnet"]) };
+    // A stopped run whose first attempt failed on haiku, with a call left unanswered when it stopped.
+    let req = RunRequest { max_check_rounds: Some(1), checkpoint: true, ..request(Some("check"), 3) };
+    let mut saved = molt_planner::checkpoint::Saved::new("trace_test", req);
+    saved.settled = true;
+    saved.check = Some(molt_planner::checkpoint::SavedCheck {
+        command: "check".into(),
+        files: vec![],
+        designed: false,
+        suite: None,
+    });
+    saved.spend.cost_usd = 0.25;
+    saved.open_calls = 1;
+    let attempt = saved.attempt(0);
+    attempt.model = Some("haiku".into());
+    attempt.cost_usd = 0.25;
+    attempt.end = Some(molt_planner::checkpoint::SavedEnd {
+        status: AttemptStatus::Failed,
+        note: "the done-check still failed".into(),
+        summary: String::new(),
+        findings: vec![],
+        dispute: None,
+    });
+    std::fs::write(state.path().join("trace_test.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+
+    let resp = run_with(&fake, cfg, resume("trace_test", true)).await;
+    assert_eq!(resp.outcome, Outcome::Failed);
+    assert_eq!(resp.attempts.len(), 2, "the retry's attempt, and nothing after it");
+    assert!(fake.requests().iter().all(|r| model_of(r) == "haiku"));
+    let d = decisions(&fake);
+    assert_eq!(d[0].action, ScheduleAction::Start);
+    let hold = d.last().unwrap();
+    assert_eq!(hold.action, ScheduleAction::Hold);
+    assert!(hold.reason.contains("the cost of 1 calls is not known"), "{}", hold.reason);
+    assert_eq!((hold.budget.unknown_calls, hold.budget.remaining_usd), (1, None));
+    assert!(resp.uncounted_calls >= 1);
+}
