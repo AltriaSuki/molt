@@ -268,6 +268,10 @@ pub struct Config {
     /// project's holds no such key, and the improver reaches none of it.
     #[serde(default, skip_serializing_if = "crate::improve::Gate::is_default")]
     pub improve: crate::improve::Gate,
+    /// `[readiness]`: the project's build and required variables for the
+    /// readiness check, and whether runs check first (`docs/sandbox.md`).
+    #[serde(default, skip_serializing_if = "crate::readiness::ReadinessSection::is_default")]
+    pub readiness: crate::readiness::ReadinessSection,
 }
 
 /// `[models]`: the user's endpoints, and which model each role's calls go
@@ -492,6 +496,7 @@ impl Config {
         }
         config.tui.validate()?;
         config.improve.validate().context("in [improve]")?;
+        config.readiness.validate()?;
         if !config.models.roles.is_empty() {
             molt_api::model::role_models(&serde_json::to_string(&config.models.roles)?)
                 .map_err(|e| anyhow::anyhow!("[models.roles]: {e}"))?;
@@ -618,6 +623,7 @@ impl Config {
             mcp: BTreeMap::new(),
             models: ModelsSection::default(),
             improve: Default::default(),
+            readiness: Default::default(),
         })
     }
 
@@ -1116,6 +1122,20 @@ mod tests {
         let glm = &cfg.models.endpoints["glm"];
         assert_eq!(glm.key_env, "GLM_API_KEY");
         assert!(!glm.models["glm-4.6"].output_schema);
+    }
+
+    #[test]
+    fn the_examples_commented_readiness_parses_once_uncommented_and_credentials_cannot_be_required() {
+        let text = include_str!("../../../molt.example.toml");
+        let start = text.find("# [readiness]").unwrap();
+        let block = text[start..].split("\n\n").next().unwrap();
+        let uncommented: String =
+            block.lines().map(|l| l.trim_start_matches('#').trim_start()).collect::<Vec<_>>().join("\n");
+        let cfg = Config::parse(&uncommented).unwrap();
+        assert_eq!(cfg.readiness.build.as_deref(), Some("cargo build --offline"));
+        assert!(cfg.readiness.before_run && cfg.readiness.env == ["DATABASE_URL"]);
+        let err = Config::parse("[readiness]\nenv = [\"OPENAI_API_KEY\"]\n").unwrap_err();
+        assert!(format!("{err:#}").contains("never given"), "{err:#}");
     }
 
     #[test]
