@@ -232,6 +232,17 @@ impl Fake {
                     .get_mut(&e.path)
                     .ok_or_else(|| invalid(format!("no such file: {}", e.path)))?;
                 let found = file.matches(&e.old).count() as u64;
+                if found == 0 && e.old.starts_with("almost") {
+                    // What the files service says when it can show the closest lines.
+                    return Err(invalid(format!(
+                        "old text not found in {} (version 0123456789ab). The closest lines:\n\nlines 1-1 (90% alike, \
+                         anchor 1:abcd):\n```\n# project\n```\n\nThe lines above are {} as it is now: correct the old \
+                         text from them, {}.",
+                        e.path,
+                        e.path,
+                        fs::EDIT_SHOWS_LINES
+                    )));
+                }
                 if found == 0 || (found > 1 && !e.replace_all) {
                     return Err(invalid(format!("old text occurs {found} times in {}", e.path)));
                 }
@@ -240,7 +251,7 @@ impl Fake {
                 if !syntax.as_ref().is_some_and(|s| s.rejected) {
                     *file = new;
                 }
-                json!(fs::EditResponse { replacements: found, syntax })
+                json!(fs::EditResponse { replacements: found, syntax, line: None, tolerance: None })
             }
             fs::LIST => {
                 let l: fs::ListRequest = parse(payload);
@@ -1187,6 +1198,44 @@ async fn tool_results_go_back_together_and_assistant_turns_verbatim() {
     // The read after the write in the same turn sees the write.
     assert_eq!(text(5), "new\n");
     assert_eq!(text(6), "README.md:1: # project");
+}
+
+#[tokio::test]
+async fn an_edit_error_that_shows_the_closest_lines_is_not_told_to_read_the_file_again_and_anchors_reach_the_service() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => use_tools(
+                req,
+                &[
+                    (
+                        "edit_file",
+                        json!({ "path": "README.md", "old_string": "almost # project", "new_string": "y", "anchor": 1 }),
+                    ),
+                    (
+                        "edit_file",
+                        json!({ "path": "README.md", "old_string": "# project", "new_string": "y", "anchor": "1:zz" }),
+                    ),
+                    (
+                        "edit_file",
+                        json!({ "path": "README.md", "old_string": "# project", "new_string": "# 项目", "anchor": "1:ABCD" }),
+                    ),
+                ],
+            ),
+            _ => done("Done."),
+        },
+        |_, _| exit(0, ""),
+    );
+    let resp = run(&fake, request(Some("check"), 1)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    let requests = fake.requests();
+    let blocks = requests[1].messages[2]["content"].as_array().unwrap().clone();
+    let text = |i: usize| blocks[i]["content"].as_str().unwrap().to_owned();
+    assert!(text(0).contains("The closest lines") && !text(0).contains("Read the file again"), "{}", text(0));
+    assert!(text(1).contains("anchor \"1:zz\" is not LINE or LINE:HASH"), "{}", text(1));
+    assert_eq!(text(2), "Replaced 1 occurrence in README.md.");
+    // The bad anchor never reached the service; the others did, as lines and hashes.
+    let anchors: Vec<Value> = fake.calls_to(fs::EDIT).iter().map(|c| c.payload["anchor"].clone()).collect();
+    assert_eq!(anchors, [json!({ "line": 1 }), json!({ "line": 1, "hash": "abcd" })]);
 }
 
 #[tokio::test]
