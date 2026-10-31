@@ -132,6 +132,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PromptsCmd,
     },
+    /// Have the improver propose a better version of one of the planner's
+    /// prompts from how benchmark runs failed, and promote it only when the
+    /// gate finds it beats the live one on the regression and held-out sets
+    /// (docs/improve.md).
+    Improve {
+        #[command(subcommand)]
+        cmd: ImproveCmd,
+    },
     /// Install, approve, disable and remove extension packs (docs/extensions.md):
     /// MCP servers, hooks, skills and commands bundled in a directory or an
     /// archive with a molt-extension.toml.
@@ -164,6 +172,53 @@ enum ExtCmd {
     Enable { name: String },
     /// Uninstall a pack: its files, its approval and its servers' cached tool lists.
     Remove { name: String },
+}
+
+#[derive(Subcommand)]
+enum ImproveCmd {
+    /// Measure the live version on the regression set (the tasks of split
+    /// dev), have the improver propose a text from its failures, measure
+    /// both on the regression and held-out sets, and promote the candidate
+    /// if it passes the gate's thresholds in your [improve] configuration.
+    #[command(after_help = "Exit status: 0 when the candidate was promoted or there was nothing to improve; 3 when \
+                            the gate did not promote it; 1 on an error, when nothing is promoted.")]
+    Run {
+        /// The prompt to improve: attempt, explorer, designer, router, steps or compactor.
+        #[arg(long, default_value = "attempt")]
+        prompt: String,
+        /// The tasks: their dev split is the regression set, heldout the held-out set.
+        #[arg(long, default_value = "bench/tasks")]
+        tasks: PathBuf,
+        /// Spending limit for the whole cycle, in US dollars, as for `molt bench run`.
+        #[arg(long)]
+        max_usd: f64,
+        /// Spending limit of each run.
+        #[arg(long, default_value_t = 2.0)]
+        task_usd: f64,
+        /// Seconds each run may take.
+        #[arg(long, default_value_t = 1800)]
+        timeout_s: u64,
+        /// Runs at a time.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=32))]
+        jobs: u32,
+        /// Where each run's workspace is made, as for `molt bench run --scratch`.
+        #[arg(long)]
+        scratch: Option<PathBuf>,
+        /// Run the agent's commands outside Molt's sandbox.
+        #[arg(long)]
+        no_sandbox: bool,
+        /// Model for every run of both versions. Default: molt's.
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Make the live version's parent live again: the version promoted
+    /// before it, or the built-in prompt.
+    Rollback {
+        #[arg(long, default_value = "attempt")]
+        prompt: String,
+    },
+    /// Show each promoted prompt and the gate's decisions.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -1051,6 +1106,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             print!("{}", layered.show(origin)?);
         }
         Cmd::Prompts { cmd } => prompts_cmd(cmd)?,
+        Cmd::Improve { cmd } => return improve_cmd(cli.config.as_deref(), cli.profile.as_deref(), cmd).await,
         Cmd::Ext { cmd } => return ext_cmd(cmd),
         Cmd::NatsConfig => {
             let cfg = config()?;
@@ -2184,12 +2240,54 @@ async fn models_cmd(cmd: ModelsCmd) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+async fn improve_cmd(config: Option<&Path>, profile: Option<&str>, cmd: ImproveCmd) -> anyhow::Result<ExitCode> {
+    use molt::improve::{self, Ended};
+    let dir = improve::dir(&|name| std::env::var(name).ok())
+        .context("there is no improvement directory: HOME is not set, or MOLT_IMPROVE_DIR is none")?;
+    let mut out = std::io::stdout();
+    match cmd {
+        ImproveCmd::Run { prompt, tasks, max_usd, task_usd, timeout_s, jobs, scratch, no_sandbox, model } => {
+            anyhow::ensure!(max_usd.is_finite() && max_usd > 0.0, "--max-usd must be a positive amount");
+            anyhow::ensure!(task_usd.is_finite() && task_usd > 0.0, "--task-usd must be a positive amount");
+            improve::improvable(&prompt)?;
+            let base = improve::base_config(&dir, config, profile)?;
+            let opts = improve::RunOptions {
+                prompt,
+                dir,
+                tasks,
+                max_usd,
+                task_usd,
+                timeout_s,
+                jobs,
+                scratch,
+                no_sandbox,
+                model,
+            };
+            Ok(match improve::run(&opts, &base.improve, &base, &mut out).await? {
+                Ended::NothingToImprove | Ended::Promoted { .. } => ExitCode::SUCCESS,
+                Ended::NotPromoted { .. } => ExitCode::from(3),
+            })
+        }
+        ImproveCmd::Rollback { prompt } => {
+            improve::rollback(&dir, &prompt, &mut out).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        ImproveCmd::Status => {
+            improve::status(&dir, &mut out).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
 fn prompts_cmd(cmd: PromptsCmd) -> anyhow::Result<()> {
     use std::io::{BufRead, IsTerminal, Write};
     let dir = molt::prompts::dir(&|name| std::env::var(name).ok());
+    let promoted = || molt::improve::live_prompts(&|name| std::env::var(name).ok());
     match cmd {
-        PromptsCmd::List => print!("{}", molt::prompts::list(dir.as_deref())?),
-        PromptsCmd::Show { name, builtin } => print!("{}", molt::prompts::show(dir.as_deref(), &name, builtin)?),
+        PromptsCmd::List => print!("{}", molt::prompts::list(dir.as_deref(), promoted()?)?),
+        PromptsCmd::Show { name, builtin } => {
+            print!("{}", molt::prompts::show(dir.as_deref(), promoted()?, &name, builtin)?)
+        }
         PromptsCmd::Promote { name } => {
             let dir = dir.context("there is no prompt pack: HOME is not set, or MOLT_PROMPTS_DIR is none")?;
             // A promotion is a person's word: a script or an agent has no terminal to type it at.

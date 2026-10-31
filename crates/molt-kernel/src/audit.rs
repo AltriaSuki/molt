@@ -98,6 +98,23 @@ pub enum AuditEvent {
         to: VersionId,
         by: String,
     },
+    /// A data module's version stored in the registry ([`crate::registry`]).
+    ModuleStored {
+        module: String,
+        version: VersionId,
+        by: String,
+    },
+    /// A data module's live version moved; `None` is the reader's built-in.
+    ModulePromoted {
+        module: String,
+        from: Option<VersionId>,
+        to: Option<VersionId>,
+        by: String,
+    },
+    /// What a gate decided about a candidate version of a data module, and
+    /// the evidence it decided on, whether or not it promoted it. Written
+    /// before the promotion it allows.
+    GateDecision(Decision),
     /// A page of the log handed to a service by `kernel.audit.read`, in
     /// place of a copy of the reply: entries `first_seq..=last_seq` of
     /// `trace`, and the SHA-256 of the reply payload as delivered.
@@ -111,6 +128,22 @@ pub enum AuditEvent {
         last_seq: Option<u64>,
         sha256: String,
     },
+}
+
+/// A gate's decision about a candidate version of a data module.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Decision {
+    pub module: String,
+    pub candidate: VersionId,
+    /// The live version it was compared with; `None` for the built-in.
+    pub baseline: Option<VersionId>,
+    /// The gate, as `gate:NAME`.
+    pub by: String,
+    pub promote: bool,
+    /// Why, one line per rule that held or failed.
+    pub reasons: Vec<String>,
+    /// What it measured, in the gate's own format.
+    pub evidence: serde_json::Value,
 }
 
 #[derive(Serialize)]
