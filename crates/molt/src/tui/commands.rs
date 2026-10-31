@@ -89,7 +89,7 @@ definitions! {
     Protect, "protect", "PATH...", "the running task must leave these as they are", &[];
     Pause, "pause", "", "start nothing new in the running task", &[];
     Resume, "resume", "", "continue the paused task", &[];
-    Runs, "runs", "[resume RUN|discard RUN]", "runs stopped with a checkpoint: go on with one, or drop it and its forks", &["resume", "discard"];
+    Runs, "runs", "[resume RUN|discard RUN]", "the project's latest runs, and those stopped with a checkpoint: go on with one, or drop it and its forks", &["resume", "discard"];
     New, "new", "", "a new conversation: later tasks forget the earlier ones", &[];
     Ask, "ask", "QUESTION", "answer with tools that only read; nothing changes, the answer is unverified", &[];
     Quick, "quick", "TASK", "one attempt, no designed check, the fixed review rules", &[];

@@ -57,6 +57,8 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
         "molt needs a terminal for its interface; in scripts, use `molt do TASK`"
     );
     let stop = crate::stop_signal()?;
+    // One session each time the interface is opened, unless one is named.
+    let session = opts.session.clone().unwrap_or_else(crate::runs::new_session);
     let (cfg, path, project) = crate::serve::configure(opts)?;
     std::fs::create_dir_all(&cfg.kernel.data_dir)
         .with_context(|| format!("data dir {}", cfg.kernel.data_dir.display()))?;
@@ -78,7 +80,7 @@ pub async fn run(opts: Options) -> anyhow::Result<Vec<String>> {
     // A virtual project's output directory is otherwise hard to discover.
     let home = std::env::var("HOME").ok().filter(|_| !project.as_ref().is_some_and(|p| p.paths.is_empty()));
     let mut unexecuted = Vec::new();
-    let result = event_loop(&mut terminal, cfg, path, home.as_deref(), stop, &mut unexecuted).await;
+    let result = event_loop(&mut terminal, cfg, path, home.as_deref(), session, stop, &mut unexecuted).await;
     emit(notice::POP_TITLE);
     let _ = execute!(std::io::stdout(), DisableFocusChange, DisableBracketedPaste);
     ratatui::restore();
@@ -95,6 +97,7 @@ async fn event_loop(
     cfg: Config,
     workspace: String,
     home: Option<&str>,
+    session: String,
     stop: impl Future<Output = i32> + Send + 'static,
     unexecuted: &mut Vec<String>,
 ) -> anyhow::Result<Vec<String>> {
@@ -115,6 +118,7 @@ async fn event_loop(
     });
 
     let mut app = App::new(&workspace, home);
+    app.run_session = session;
     app.secrets = secrets_in_env();
     app.secrets.extend(
         cfg.services
@@ -261,6 +265,16 @@ async fn event_loop(
                     let (tx, root) = (lister.clone(), root.clone());
                     tokio::task::spawn_blocking(move || {
                         let _ = tx.send(list_files(&root));
+                    });
+                }
+                Action::RunHistory => {
+                    let (tx, data_dir) = (lister.clone(), data_dir.clone());
+                    tokio::task::spawn_blocking(move || {
+                        let listed = crate::runs::list(&data_dir).map(|mut runs| {
+                            runs.drain(..runs.len().saturating_sub(app::HISTORY));
+                            runs
+                        });
+                        let _ = tx.send(Msg::RunHistory(listed.map_err(|e| format!("{e:#}"))));
                     });
                 }
                 Action::ReadAudit { trace, cursor } => {

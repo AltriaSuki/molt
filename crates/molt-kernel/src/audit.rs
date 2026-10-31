@@ -545,6 +545,90 @@ pub fn read_trace_within(path: &Path, req: &ReadRequest, scan: Scan) -> Result<R
     }
 }
 
+/// A place in the log: just past entry `seq`, `offset` bytes in. Where
+/// [`scan_from`] stopped, and where a later one goes on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mark {
+    pub offset: u64,
+    pub seq: u64,
+}
+
+/// Read the log at `path` on from `from` (its start when `None`), handing
+/// `each` every entry whose line `wanted` accepts, its taken-out values put
+/// back, with the byte it starts at (a `cursor` for [`read_trace`]) and the
+/// mark just past it. Returns the mark past the last whole
+/// entry: a last line still being written counts as not there yet. The hash
+/// chain is not checked ([`verify`] does that).
+///
+/// `wanted` sees the line as written, so it can pass over most entries
+/// without parsing them; strings in a payload are escaped, so a field of
+/// the envelope itself can be matched as text. Fails with
+/// [`AuditError::Cursor`] when `from` is not just past an entry `from.seq`
+/// of this log: the log was replaced since the mark was taken. Reads the
+/// file directly and blocks: run it off the async runtime.
+pub fn scan_from(
+    path: &Path,
+    from: Option<Mark>,
+    mut wanted: impl FnMut(&str) -> bool,
+    mut each: impl FnMut(Entry, u64, Mark),
+) -> Result<Mark, AuditError> {
+    let mut file = std::fs::File::open(path)?;
+    let mut mark = from.unwrap_or_default();
+    if mark.offset > file.metadata()?.len() {
+        return Err(AuditError::Cursor(mark.offset));
+    }
+    if mark.offset > 0 {
+        let mut before = [0u8];
+        file.seek(SeekFrom::Start(mark.offset - 1))?;
+        file.read_exact(&mut before)?;
+        if before[0] != b'\n' {
+            return Err(AuditError::Cursor(mark.offset));
+        }
+    }
+    file.seek(SeekFrom::Start(mark.offset))?;
+    let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
+    let mut line = Vec::new();
+    let mut lines = None;
+    loop {
+        line.clear();
+        let n = reader.by_ref().take(MAX_ENTRY_BYTES as u64 + 1).read_until(b'\n', &mut line)? as u64;
+        if n == 0 || line.last() != Some(&b'\n') {
+            return Ok(mark);
+        }
+        let here = mark.offset;
+        let corrupt = |reason: String| AuditError::CorruptAt { offset: here, reason };
+        if refs::is_stored(&line) {
+            mark.offset += n;
+            continue;
+        }
+        // Every entry starts with its seq, so it is read without parsing the rest.
+        let seq = line
+            .strip_prefix(b"{\"seq\":")
+            .map(|rest| {
+                rest.iter()
+                    .take_while(|b| b.is_ascii_digit())
+                    .fold(0u64, |n, d| n.saturating_mul(10).saturating_add(u64::from(d - b'0')))
+            })
+            .ok_or_else(|| corrupt("the line is not an entry".into()))?;
+        if seq != mark.seq + 1 {
+            return Err(if here == from.map_or(0, |m| m.offset) {
+                AuditError::Cursor(here)
+            } else {
+                corrupt(format!("sequence {seq} where {} was expected", mark.seq + 1))
+            });
+        }
+        mark = Mark { offset: here + n, seq };
+        let text = std::str::from_utf8(&line).map_err(|e| corrupt(e.to_string()))?;
+        if !wanted(text) {
+            continue;
+        }
+        let entry: EntryIn = serde_json::from_str(text).map_err(|e| corrupt(e.to_string()))?;
+        let restored = entry.restore(&mut lines, path, here).map_err(corrupt)?;
+        let event = serde_json::from_str(&restored).map_err(|e| corrupt(e.to_string()))?;
+        each(Entry { seq, ts_ms: entry.ts_ms, hash: entry.hash, event }, here, mark);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,6 +894,47 @@ mod tests {
         assert!(matches!(read_trace(&path, &req), Err(AuditError::Cursor(3))));
         req.cursor = Some(u64::MAX);
         assert!(matches!(read_trace(&path, &req), Err(AuditError::Cursor(_))));
+    }
+
+    #[tokio::test]
+    async fn scan_from_goes_on_from_its_mark_puts_values_back_and_refuses_a_replaced_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open(&path, false).await.unwrap();
+        let trace = TraceId::random();
+        // Big enough to be taken out of its entry, and the same in both, so the second is a reference.
+        let big = serde_json::json!({ "task": "x".repeat(4096) });
+        log.append(message(&trace, "planner.run", Kind::Request, big.clone())).await.unwrap();
+        log.append(ev(1)).await.unwrap();
+        log.close().await;
+        let wanted = |line: &str| line.contains("\"to\":\"planner.run\"");
+        let mut seen = Vec::new();
+        let first = scan_from(&path, None, wanted, |e, _, m| seen.push((e, m))).unwrap();
+        assert_eq!(first, Mark { offset: std::fs::metadata(&path).unwrap().len(), seq: 2 });
+        assert_eq!(seen.len(), 1, "the other entry is passed over");
+        let AuditEvent::Message { envelope } = &seen[0].0.event else { panic!("{:?}", seen[0].0) };
+        assert_eq!(envelope.payload, big);
+
+        let log = AuditLog::open(&path, false).await.unwrap();
+        log.append(message(&trace, "planner.run", Kind::Reply, big.clone())).await.unwrap();
+        log.close().await;
+        // A line still being written is not there yet.
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{\"seq\":4,").unwrap();
+        let mut more = Vec::new();
+        let next = scan_from(&path, Some(first), wanted, |e, _, m| more.push((e, m))).unwrap();
+        assert_eq!((more.len(), more[0].0.seq, next.seq), (1, 3, 3));
+        assert_eq!(more[0].1, next);
+        let AuditEvent::Message { envelope } = &more[0].0.event else { panic!() };
+        assert_eq!((envelope.kind, &envelope.payload), (Kind::Reply, &big), "a referenced value is put back");
+
+        // A mark of another log: not past an entry of it, or past one with another seq.
+        let stale = Mark { offset: first.offset, seq: 7 };
+        assert!(matches!(scan_from(&path, Some(stale), wanted, |_, _, _| {}), Err(AuditError::Cursor(_))));
+        let inside = Mark { offset: 5, seq: 0 };
+        assert!(matches!(scan_from(&path, Some(inside), wanted, |_, _, _| {}), Err(AuditError::Cursor(5))));
+        let past = Mark { offset: u64::MAX, seq: 0 };
+        assert!(matches!(scan_from(&path, Some(past), wanted, |_, _, _| {}), Err(AuditError::Cursor(_))));
     }
 
     #[tokio::test]

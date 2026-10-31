@@ -77,6 +77,9 @@ impl Env {
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(["-c", "user.name=Ann", "-c", "user.email=ann@example.com", "-c", "commit.gpgsign=false"])
+        // A commit may start maintenance in the background, which takes a lock
+        // in .git/objects while a test compares the repository before and after.
+        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
