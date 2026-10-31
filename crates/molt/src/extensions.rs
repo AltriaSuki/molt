@@ -20,6 +20,10 @@
 //! commit approved is recorded, and `molt ext update NAME` fetches the
 //! reference again and goes through the same approval.
 //!
+//! A pack can be found by its name in a registry ([`registry`]): an index
+//! the person added that says where a pack of that name is. What it lists
+//! is installed as `molt ext add` of that source would be, under that name.
+//!
 //! The installed copy is in `~/.local/share/molt/extensions/NAME/`, outside
 //! every workspace. Only the user's layer of the configuration starts packs:
 //! a project config cannot name one, `--config` starts none, and nothing in
@@ -43,7 +47,9 @@ use crate::config::{Isolation, ServiceSection};
 use crate::layers::user_path;
 
 mod git;
+mod registry;
 pub use git::GitSource;
+pub use registry::{add_named, add_registry, registries, remove_registry, search};
 
 /// The manifest at the top of a pack.
 pub const MANIFEST: &str = "molt-extension.toml";
@@ -485,6 +491,11 @@ impl Places {
     fn dir(&self, name: &str) -> PathBuf {
         self.packs.join(name)
     }
+
+    /// `~/.config/molt/registries.toml`, beside the state file.
+    pub fn registries(&self) -> PathBuf {
+        self.state.with_file_name(registry::REGISTRIES_FILE)
+    }
 }
 
 /// The installed packs and what the person approved of each.
@@ -534,17 +545,21 @@ impl State {
         }
     }
 
-    /// Written whole to a file beside it, then moved into place, private.
     fn save(&self, path: &Path) -> anyhow::Result<()> {
-        let dir = path.parent().context("the state file has no directory")?;
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-        tmp.write_all(b"# Written by `molt ext`: the extension packs you installed and what you approved.\n")?;
-        tmp.write_all(toml::to_string(self)?.as_bytes())?;
-        tmp.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        tmp.persist(path).map_err(|e| e.error).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        save_toml(path, "the extension packs you installed and what you approved", self)
     }
+}
+
+/// Written whole to a file beside `path`, then moved into place, private.
+fn save_toml(path: &Path, what: &str, value: &impl Serialize) -> anyhow::Result<()> {
+    let dir = path.parent().context("the state file has no directory")?;
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(format!("# Written by `molt ext`: {what}.\n").as_bytes())?;
+    tmp.write_all(toml::to_string(value)?.as_bytes())?;
+    tmp.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    tmp.persist(path).map_err(|e| e.error).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 /// An enabled pack, checked against what was approved.
@@ -839,6 +854,17 @@ struct Origin {
 /// approved one did not, is installed only once `ask` approves what it
 /// would get; the installed pack stays as it was otherwise.
 pub fn add(places: &Places, source: &Path, ask: &mut dyn Approve) -> anyhow::Result<Added> {
+    add_path(places, source, "", None, ask)
+}
+
+/// [`add`], with `note` after the source where it is shown and recorded.
+fn add_path(
+    places: &Places,
+    source: &Path,
+    note: &str,
+    expect: Option<Expect>,
+    ask: &mut dyn Approve,
+) -> anyhow::Result<Added> {
     let source = source.canonicalize().with_context(|| format!("{} does not exist", source.display()))?;
     let stage = staging(places)?;
     let files = stage.path().join("files");
@@ -847,7 +873,14 @@ pub fn add(places: &Places, source: &Path, ask: &mut dyn Approve) -> anyhow::Res
     } else {
         unpack(&source, &files)?;
     }
-    install(places, &stage, Origin { shown: source.display().to_string(), git: None }, None, ask)
+    install(places, &stage, Origin { shown: format!("{}{note}", source.display()), git: None }, expect, ask)
+}
+
+/// The name a staged pack must have, and what it was looked up as, for the
+/// message when it has another.
+struct Expect<'a> {
+    name: &'a str,
+    what: String,
 }
 
 /// Install the pack at one commit of a git repository, as [`add`] does a
@@ -856,11 +889,14 @@ pub fn add(places: &Places, source: &Path, ask: &mut dyn Approve) -> anyhow::Res
 pub fn add_git(places: &Places, source: &GitSource, ask: &mut dyn Approve) -> anyhow::Result<Added> {
     let stage = staging(places)?;
     let commit = git::fetch(source, stage.path(), &stage.path().join("files"))?;
-    install(places, &stage, git_origin(source, commit), None, ask)
+    install(places, &stage, git_origin(source, commit, ""), None, ask)
 }
 
-fn git_origin(source: &GitSource, commit: String) -> Origin {
-    Origin { shown: source.shown(), git: Some(Pinned { url: source.url.clone(), rev: source.rev.clone(), commit }) }
+fn git_origin(source: &GitSource, commit: String, note: &str) -> Origin {
+    Origin {
+        shown: format!("{}{note}", source.shown()),
+        git: Some(Pinned { url: source.url.clone(), rev: source.rev.clone(), commit }),
+    }
 }
 
 /// Fetch the reference an installed pack was fetched at again and, when it
@@ -901,7 +937,8 @@ fn update_with(places: &Places, name: &str, ask: &mut dyn Approve, schemes: &[&'
         short(&pin.commit),
         short(&commit)
     ));
-    install(places, &stage, git_origin(&source, commit), Some(name), ask)
+    let expect = Expect { name, what: format!("the update of extension {name}") };
+    install(places, &stage, git_origin(&source, commit, ""), Some(expect), ask)
 }
 
 /// A private directory beside the installed packs, with an empty `files` in it.
@@ -918,7 +955,7 @@ fn install(
     places: &Places,
     stage: &tempfile::TempDir,
     origin: Origin,
-    expect: Option<&str>,
+    expect: Option<Expect>,
     ask: &mut dyn Approve,
 ) -> anyhow::Result<Added> {
     let root = pack_root(&stage.path().join("files"))?;
@@ -930,7 +967,7 @@ fn install(
     let manifest = read_manifest(&root)?;
     let name = manifest.name.clone();
     if let Some(expect) = expect {
-        ensure!(name == expect, "the update of extension {expect} is a pack named {name:?}; nothing was installed");
+        ensure!(name == expect.name, "{} is a pack named {name:?}; nothing was installed", expect.what);
     }
     let lines = grant(&manifest, &root)?;
     let sha = tree_hash(&root)?;
@@ -1326,17 +1363,17 @@ pub fn command_dirs(packs: &[Active]) -> Vec<(String, PathBuf)> {
 mod tests {
     use super::*;
 
-    struct Says {
+    pub(super) struct Says {
         answer: bool,
-        asked: Vec<String>,
-        said: Vec<String>,
+        pub(super) asked: Vec<String>,
+        pub(super) said: Vec<String>,
     }
 
     impl Says {
-        fn yes() -> Self {
+        pub(super) fn yes() -> Self {
             Self { answer: true, asked: Vec::new(), said: Vec::new() }
         }
-        fn no() -> Self {
+        pub(super) fn no() -> Self {
             Self { answer: false, ..Self::yes() }
         }
     }
@@ -1351,13 +1388,13 @@ mod tests {
         }
     }
 
-    struct Home {
-        dir: tempfile::TempDir,
-        places: Places,
+    pub(super) struct Home {
+        pub(super) dir: tempfile::TempDir,
+        pub(super) places: Places,
     }
 
     impl Home {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().to_path_buf();
             let var = move |name: &str| match name {
@@ -1378,7 +1415,7 @@ mod tests {
         }
     }
 
-    const TRACKER: &str = "schema = 1\nname = \"tracker\"\nversion = \"1.0.0\"\ndescription = \"Issues.\"\n\
+    pub(super) const TRACKER: &str = "schema = 1\nname = \"tracker\"\nversion = \"1.0.0\"\ndescription = \"Issues.\"\n\
         [mcp.issues]\ncommand = \"${MOLT_EXTENSION_DIR}/bin/issues\"\nargs = [\"--stdio\"]\n\
         pass_env = [\"TRACKER_TOKEN\"]\ncalls = 20\n\
         [mcp.issues.tools.get]\nread_only = true\nroles = [\"attempt\", \"designer\"]\n\
@@ -1797,7 +1834,7 @@ mod tests {
     }
 
     /// Git for building a test's repository, reading no configuration of the machine's.
-    fn git(dir: &Path, args: &[&str]) -> String {
+    pub(super) fn git(dir: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1811,7 +1848,7 @@ mod tests {
     }
 
     /// A repository with `files` committed, on branch main.
-    fn make_repo(home: &Home, name: &str, files: &[(&str, &str)]) -> PathBuf {
+    pub(super) fn make_repo(home: &Home, name: &str, files: &[(&str, &str)]) -> PathBuf {
         let dir = home.dir.path().join("repos").join(name);
         std::fs::create_dir_all(&dir).unwrap();
         git(&dir, &["init", "-q"]);
@@ -1819,7 +1856,7 @@ mod tests {
         dir
     }
 
-    fn commit(dir: &Path, files: &[(&str, &str)]) -> String {
+    pub(super) fn commit(dir: &Path, files: &[(&str, &str)]) -> String {
         for (path, text) in files {
             let path = dir.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1830,9 +1867,12 @@ mod tests {
         git(dir, &["rev-parse", "HEAD"])
     }
 
+    pub(super) fn file_url_text(repo: &Path) -> String {
+        format!("file://{}", repo.display())
+    }
+
     fn file_url(repo: &Path, rev: &str) -> GitSource {
-        let url =
-            format!("file://{}{}", repo.display(), if rev.is_empty() { String::new() } else { format!("#{rev}") });
+        let url = format!("{}{}", file_url_text(repo), if rev.is_empty() { String::new() } else { format!("#{rev}") });
         GitSource::parse_with(&url, git::SCHEMES_AND_FILE).unwrap()
     }
 

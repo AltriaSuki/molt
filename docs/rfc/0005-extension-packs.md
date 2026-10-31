@@ -2,7 +2,7 @@
 
 - Issue: #170 (roadmap #153, phase 3, C11)
 - Related: #43 (MCP), #165 (hooks), #166 (Agent Skills), #164 (prompts and roles, RFC 0003), #10, #35, #114
-- Status: schema 1 implemented, from paths, archives and git; unstable until it has been used for a phase, so the manifest may still change
+- Status: schema 1 implemented, from paths, archives, git and registries; unstable until it has been used for a phase, so the manifest may still change
 
 ## Summary
 
@@ -188,6 +188,47 @@ keys, and git's own switches already turn off every program it would run.
 The scrubbed invocation is the floor; running it under the MCP sandbox with
 the network is deferred.
 
+## Registries
+
+A registry (`extensions::registry`) is a git repository or a directory
+with a `molt-registry.toml`:
+
+```toml
+schema = 1                   # required; another number is refused
+[pack.NAME]                  # NAME: a pack's name
+description = "…"            # optional, at most 1024 bytes
+git = "https://…"            # a URL as `molt ext add URL` takes, without #
+rev = "v1.2.0"               # optional, with git: branch, tag or commit id
+path = "packs/NAME"          # instead of git, only in a directory's registry
+```
+
+Unknown keys are refused; an index is at most 1 MiB and 4096 packs, and
+each entry's URL and reference pass `GitSource`'s checks when the index is
+read. The person adds registries with `molt ext registry add NAME SOURCE`,
+which reads the index once and records the source in
+`~/.config/molt/registries.toml` (a file of its own, so `extensions.toml`
+and a Molt older than registries are unchanged); `molt ext registry list`
+and `remove` manage them, and `molt ext search [TERM]` lists their packs.
+
+`molt ext add NAME`, for a pack's name that is not a path that exists (or
+with `--registry R`), reads every registry (only `R`'s), and installs the
+one entry listing `NAME` through `install` as `add_git` or `add` of what it
+lists would, with ` (listed by registry R)` after the source in the
+approval text and the record. A registry decides only where a pack is:
+
+- the grant is shown and approved as for any source, and an update it
+  points to is approved again for anything new;
+- the staged pack must be named `NAME`, or nothing is installed;
+- two registries listing `NAME`, or one that cannot be read, refuse the
+  install unless `--registry` chooses, so a registry that fails to answer
+  cannot let another's entry win;
+- a git registry is fetched by `git::fetch`, as a pack is, each time it is
+  read; a `path` is taken only from a directory's registry, and refused
+  when it leads out of the directory.
+
+A pack installed from a registry is pinned as one from its URL: `update`
+follows its `rev`, and `add NAME` follows the registry's current entry.
+
 ## Claude Code plugins
 
 `extensions::import_claude_plugin` turns a directory with
@@ -211,7 +252,9 @@ than lose the pin. The planner gets the packs' skills in
 offers none. `[service]` is new in schema 1 without a bump: a Molt before
 it refused the key by name, so no pack with services was ever read
 without them. `mounts` on a `[[service]]` is a new optional key of the
-user config, absent by default.
+user config, absent by default. Registries are kept in `registries.toml`,
+which a Molt before them does not read; their index is schema 1 of its
+own.
 
 ## Acceptance
 
@@ -243,9 +286,19 @@ user config, absent by default.
   `an_update_from_git_reports_the_ref_that_moved_and_asks_again_only_for_more`;
   `extensions::git::tests::only_https_and_ssh_urls_are_fetched_and_never_through_a_transport_program`).
 
+- A pack is found by its name in a registry and installed only as its
+  listed source would be, under that name; an index or registry that is
+  not one is refused before it is recorded
+  (`extensions::registry::tests`,
+  `a_pack_is_found_by_name_in_a_registry_and_installed_only_once_its_grant_is_approved`,
+  `a_directory_registry_lists_packs_beside_its_index_and_a_listed_name_must_be_the_packs`,
+  `a_registry_or_index_that_is_not_one_is_refused_before_it_is_recorded`;
+  `crates/molt/tests/agent.rs`,
+  `a_pack_is_found_by_name_in_a_registry_and_installed_as_its_path_would_be`).
+
 ## Deferred
 
-- Installing from a registry. Fetching git submodules and LFS files, and
+- Signing registries or packs, and caching a registry's index. Fetching git submodules and LFS files, and
   running the git fetch in a sandbox of its own.
 - Environment profiles, roles, prompts and workflows in a pack. Roles and
   prompts need RFC 0003's promotion to cover a pack's protected prompts.
