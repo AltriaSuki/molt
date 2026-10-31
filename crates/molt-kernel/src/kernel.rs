@@ -276,6 +276,48 @@ impl Kernel {
         Ok(previous)
     }
 
+    /// Store a data module's version ([`crate::registry`]) on behalf of `by`
+    /// (such as `human`, or the service that proposed it), and log it.
+    pub async fn store_module(&self, module: molt_proto::Module, by: &str) -> Result<VersionId, KernelError> {
+        let name = module.name.clone();
+        let version = self.inner.registry.store_module(module)?;
+        self.inner
+            .audit
+            .append(AuditEvent::ModuleStored { module: name, version: version.clone(), by: by.into() })
+            .await?;
+        Ok(version)
+    }
+
+    /// Move the live version of data module `name` to `version` (`None`:
+    /// the reader's built-in) if it is still `expected`, under the
+    /// registry's tier rules for `by`, and log it.
+    pub async fn promote_module(
+        &self,
+        name: &str,
+        expected: Option<&VersionId>,
+        version: Option<&VersionId>,
+        by: &Authority,
+    ) -> Result<Option<VersionId>, KernelError> {
+        let previous = self.inner.registry.promote_module(name, expected, version, by)?;
+        self.inner
+            .audit
+            .append(AuditEvent::ModulePromoted {
+                module: name.into(),
+                from: previous.clone(),
+                to: version.cloned(),
+                by: by.to_string(),
+            })
+            .await?;
+        Ok(previous)
+    }
+
+    /// Log a gate's decision about a candidate module version; durable
+    /// when this returns, so before any promotion it allows.
+    pub async fn record_decision(&self, decision: audit::Decision) -> Result<(), KernelError> {
+        self.inner.audit.append(AuditEvent::GateDecision(decision)).await?;
+        Ok(())
+    }
+
     /// Start the live version of `service` under the supervisor: open its
     /// endpoint, grant the capabilities its manifest requests, and pass the
     /// address, secret and capabilities to the process environment.

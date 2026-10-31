@@ -1,14 +1,78 @@
-# Models: probes and role models
+# Models: endpoints, probes and role models
 
 The gateway knows what the Claude models and GPT-4.1 accept, and takes
 your word for other OpenAI models in `MOLT_OPENAI_MODELS` (see
-[Model providers and prices](providers-and-prices.md)). A third-party
+[Model providers and prices](providers-and-prices.md)). Endpoints of your
+own, each with its protocol, key and models, are declared by name in your
+config ([Named endpoints](#named-endpoints)). A third-party
 endpoint can still differ from what a model's name suggests: one ignores
 `output_schema` and answers in prose, another refuses `effort` with a 400.
 `molt models probe` finds that out once, so the gateway shapes calls for
 what the endpoint does instead of failing in the middle of a run. And
 `[models.roles]` sends each role's calls to its own model: the reviewer and
 the explorer on a cheaper one, the attempts on the strong one.
+
+## Named endpoints
+
+```toml
+# ~/.config/molt/config.toml
+[models.endpoints.glm]
+protocol = "anthropic"                 # or "chat_completions", "responses"
+base_url = "https://open.bigmodel.cn/api/anthropic"
+key_env = "GLM_API_KEY"                # the variable that holds the key
+
+[models.endpoints.glm.models."glm-4.6"]
+tools = true
+streaming = true
+output_schema = false
+efforts = []                           # the efforts it takes; none: no effort is sent
+max_output = 32000
+context = 200000                       # optional: its context window, the reply included
+price = { input = 0.6, output = 2.2 }  # optional: dollars per million tokens
+
+[models.roles]
+reviewer = "glm/glm-4.6"
+```
+
+A call reaches a model on a named endpoint as `NAME/MODEL`: `molt do
+--model glm/glm-4.6`, a role model as above, `MOLT_MODEL`, or an alias in
+`MOLT_MODEL_ALIASES` (`{"glm":"glm/glm-4.6"}`). Several endpoints of one
+protocol can be declared at once, beside the built-in Anthropic and OpenAI
+ones, which keep their variables (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`,
+`MOLT_OPENAI_MODELS`) as before.
+
+- **protocol**: `anthropic` sends `POST {base_url}/v1/messages` (Messages
+  compatible), `chat_completions` `POST {base_url}/v1/chat/completions` and
+  `responses` `POST {base_url}/v1/responses` (with `store: false`, as for
+  OpenAI's own). `base_url` is the origin without `/v1`; it must be `https`,
+  or `http` on loopback, and cannot hold credentials or a query.
+- **key_env** names the environment variable that holds the key; the config
+  never holds the key itself. Only the gateway is given that variable: the
+  default setup passes it to the gateway alone, and a config, `--pass-env`
+  or an MCP server that would give it to another service is refused. It is
+  sent as `x-api-key` on the Anthropic protocol and as `Authorization:
+  Bearer` on the OpenAI ones; `auth = "bearer"` sends a bearer token to an
+  Anthropic-compatible endpoint instead. An endpoint whose variable is not
+  set is left out, and a call to it is refused saying which to set.
+- **models** are the only ones called there: a call naming another is
+  refused before anything is sent. What each is declared to do is never
+  sent beyond: a request with tools to one with `tools = false`, or an
+  effort it does not list, is refused before HTTP; one with `streaming =
+  false` is called whole; and on the Anthropic protocol, one with
+  `output_schema = false` is asked for a schema through a tool, as a probe
+  finding it would ([below](#what-the-gateway-does-with-it)). `max_output`
+  caps `max_tokens`. `context` is reported to the planner with each reply.
+- **price** is what every call to that model there costs, ahead of
+  `MOLT_MODEL_PRICES` and the snapshot; a left-out cache price errs high as
+  there. Without one, the model id is looked up in the price table, and a
+  model with no price has an unknown cost, never zero.
+
+The gateway gets the endpoints as `MOLT_ENDPOINTS`, the same table as JSON;
+set in the environment, it is used instead of `[models.endpoints]`. Only
+your own config has them: a project's `.molt/config.toml` cannot name an
+endpoint. A bad declaration (an unknown field or protocol, a base URL
+ending in `/v1`, a key itself in `key_env`, a model with no `max_output`)
+is refused when the config is read, saying what to change.
 
 ## What molt knows: `molt models show`
 
@@ -17,13 +81,16 @@ molt models show            # the default model, the aliases, and what probes fo
 molt models show glm-4.6    # where its calls go, what the gateway knows, what a probe found, its price
 ```
 
-It reads the gateway's variables from your environment, as `molt prices`
-does, and calls nothing.
+It reads the gateway's variables as the default setup gives them to it:
+your environment, with what your user config sets for the gateway
+(`[models.endpoints]`, a `[[service]]` `model` `env`) over it. It lists the
+named endpoints, and calls nothing.
 
 ## Probing a model: `molt models probe`
 
 ```sh
-molt models probe glm-4.6
+molt models probe glm-4.6        # glm-4.6 on ANTHROPIC_BASE_URL
+molt models probe glm/glm-4.6    # glm-4.6 on the named endpoint glm
 ```
 
 ```
@@ -52,15 +119,16 @@ A 400 or 422 is the endpoint's answer about the feature: it does not work
 there. A 401, 403 or 404, or an endpoint out of reach, says nothing about
 the feature, so the probe stops at its first such answer, records nothing
 and says what to fix. Any other failure (a 429, a timeout) leaves that
-feature unknown. Haiku takes no effort and an OpenAI model only the
-efforts declared for it, so the probe does not ask for what the gateway
-never sends. It prints what each call cost; a call with no known price
+feature unknown. Haiku takes no effort, and an OpenAI model or a model on
+a named endpoint only what is declared for it, so the probe does not ask
+for what the gateway never sends. It prints what each call cost; a call with no known price
 makes the total unknown, never zero.
 
 What it finds is kept in `~/.local/share/molt/models.json`
 (`$XDG_DATA_HOME/molt` when set; `MOLT_MODELS_FILE` names another file),
-beside the prices, for the model on that endpoint: once `ANTHROPIC_BASE_URL`
-or `OPENAI_BASE_URL` changes, the record no longer applies. Probing again
+beside the prices, for the model on that endpoint: once `ANTHROPIC_BASE_URL`,
+`OPENAI_BASE_URL` or a named endpoint's `base_url` changes, the record no
+longer applies. Probing again
 replaces it. The gateway reads the file when it starts, so a run started
 after the probe goes by it, and one already running keeps what it started
 with.

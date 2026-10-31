@@ -6,6 +6,7 @@ use serde_json::{json, Map, Value};
 
 use crate::probe::{schema_as_tool, Probed};
 use crate::profile::profile;
+use crate::provider::EndpointModel;
 use crate::Config;
 
 /// A request body ready to send.
@@ -24,25 +25,44 @@ pub(crate) struct Call {
 /// a long conversation is moved into the body rather than copied.
 /// `probed` is what `molt models probe` found the model does on this
 /// endpoint, which wins over what the gateway knows of the model.
+/// `declared` is what the user declared of it on a named endpoint: a
+/// feature declared missing is never sent, as one a probe found missing.
 pub(crate) fn build(
     cfg: &Config,
     model: &str,
     req: CompleteRequest,
     probed: Option<&Probed>,
+    declared: Option<&EndpointModel>,
 ) -> Result<Call, RemoteError> {
     if req.messages.is_empty() {
         return Err(RemoteError { code: ErrorCode::Invalid, message: "messages is empty".into() });
     }
+    let refused = |message: String| RemoteError { code: ErrorCode::Invalid, message };
     let mut profile = profile(model);
     if probed.is_some_and(|p| p.effort == Some(false)) {
         profile.effort = false;
         profile.default_effort = None;
     }
+    if let Some(d) = declared {
+        profile.max_output = Some(profile.max_output.map_or(d.max_output, |cap| cap.min(d.max_output)));
+        if d.efforts.is_empty() {
+            profile.effort = false;
+        }
+        profile.default_effort = profile.default_effort.filter(|e| d.efforts.contains(e));
+    }
+    if !req.tools.is_empty() && declared.is_some_and(|d| !d.tools) {
+        return Err(refused(format!("{model} does not call tools: its endpoint declares tools = false")));
+    }
     if !req.tools.is_empty() && probed.is_some_and(|p| p.tools == Some(false)) {
-        return Err(RemoteError {
-            code: ErrorCode::Invalid,
-            message: format!("{model} does not call tools on this endpoint (found by `molt models probe`)"),
-        });
+        return Err(refused(format!("{model} does not call tools on this endpoint (found by `molt models probe`)")));
+    }
+    if let Some((d, effort)) = declared.zip(req.effort.or(cfg.effort)).filter(|(d, e)| !d.efforts.contains(e)) {
+        if !d.efforts.is_empty() {
+            return Err(refused(format!(
+                "{model} does not take effort {effort:?}: its endpoint declares only {:?}",
+                d.efforts
+            )));
+        }
     }
     let wanted = req.max_tokens.unwrap_or(cfg.max_tokens);
     let max_tokens = profile.max_output.map_or(wanted, |cap| wanted.min(cap));
@@ -82,13 +102,19 @@ pub(crate) fn build(
             code: ErrorCode::Invalid,
             message: format!(
                 "{model} does not support effort {effort:?}{}",
-                if probed.is_some() { " (found by `molt models probe`)" } else { "" }
+                if declared.is_some_and(|d| d.efforts.is_empty()) {
+                    ": its endpoint declares no efforts"
+                } else if probed.is_some() {
+                    " (found by `molt models probe`)"
+                } else {
+                    ""
+                }
             ),
         });
     }
     let mut schema_tool = false;
     if let Some(schema) = req.output_schema {
-        if probed.is_some_and(|p| p.output_schema == Some(false)) {
+        if probed.is_some_and(|p| p.output_schema == Some(false)) || declared.is_some_and(|d| !d.output_schema) {
             schema_as_tool(&mut body, schema)?;
             schema_tool = true;
         } else {
@@ -134,7 +160,7 @@ mod tests {
     }
 
     fn unprobed(cfg: &Config, model: &str, req: CompleteRequest) -> Result<Call, RemoteError> {
-        build(cfg, model, req, None)
+        build(cfg, model, req, None, None)
     }
 
     fn req() -> CompleteRequest {
@@ -202,28 +228,29 @@ mod tests {
 
         // Ignored output_schema: asked for as a forced tool, without thinking, which a forced call does not take.
         let p = probed(None, Some(false), Some(false));
-        let call = build(&cfg(), "claude-sonnet-5-5", asked.clone(), Some(&p)).unwrap();
+        let call = build(&cfg(), "claude-sonnet-5-5", asked.clone(), Some(&p), None).unwrap();
         assert!(call.schema_tool);
         assert_eq!(call.body["tools"][0]["name"], crate::probe::SCHEMA_TOOL);
         assert_eq!(call.body["tools"][0]["input_schema"], schema);
         assert_eq!(call.body["tool_choice"], json!({ "type": "tool", "name": crate::probe::SCHEMA_TOOL }));
         assert!(call.body.get("thinking").is_none() && call.body.get("output_config").is_none(), "{}", call.body);
         // Effort refused there: the default is left out, and one asked for is refused before HTTP.
-        let call = build(&cfg(), "claude-sonnet-5-5", req(), Some(&p)).unwrap();
+        let call = build(&cfg(), "claude-sonnet-5-5", req(), Some(&p), None).unwrap();
         assert!(call.body.get("output_config").is_none(), "{}", call.body);
-        let err = build(&cfg(), "claude-sonnet-5-5", CompleteRequest { effort: Some(Effort::Low), ..req() }, Some(&p));
+        let err =
+            build(&cfg(), "claude-sonnet-5-5", CompleteRequest { effort: Some(Effort::Low), ..req() }, Some(&p), None);
         assert!(err.err().unwrap().message.contains("molt models probe"));
         // With tools of its own the schema cannot go through a tool.
         let tool = json!({ "name": "t", "input_schema": { "type": "object" } });
         let both = CompleteRequest { tools: vec![tool.clone()], ..asked.clone() };
-        assert!(build(&cfg(), "claude-sonnet-5-5", both, Some(&p)).is_err());
+        assert!(build(&cfg(), "claude-sonnet-5-5", both, Some(&p), None).is_err());
         // No tools there: a request with tools is refused before HTTP.
         let p = probed(Some(false), None, None);
         let tooled = CompleteRequest { tools: vec![tool], ..req() };
-        assert_eq!(build(&cfg(), "claude-sonnet-5-5", tooled, Some(&p)).err().unwrap().code, ErrorCode::Invalid);
+        assert_eq!(build(&cfg(), "claude-sonnet-5-5", tooled, Some(&p), None).err().unwrap().code, ErrorCode::Invalid);
         // Honoured, or not probed: output_config.format as before.
         for p in [Some(probed(None, Some(true), None)), None] {
-            let call = build(&cfg(), "claude-sonnet-5-5", asked.clone(), p.as_ref()).unwrap();
+            let call = build(&cfg(), "claude-sonnet-5-5", asked.clone(), p.as_ref(), None).unwrap();
             assert!(!call.schema_tool);
             assert_eq!(call.body["output_config"]["format"]["schema"], schema);
         }

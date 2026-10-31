@@ -102,6 +102,9 @@ pub enum Source {
     Builtin,
     /// A file of the user's prompt pack.
     User,
+    /// A version a gate promoted in the registry of prompt modules, after
+    /// it beat the one before it (`molt improve`, `docs/improve.md`).
+    Registry,
 }
 
 /// One version of a prompt: its name and the SHA-256 of its text.

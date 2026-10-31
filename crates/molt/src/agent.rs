@@ -114,18 +114,36 @@ pub fn resolve_config(
         let set = |value: Option<&String>| value.is_some_and(|key| !key.trim().is_empty());
         set(std::env::var(name).ok().as_ref()) || set(cfg.service("model").and_then(|m| m.env.get(*name)))
     };
-    if !["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"].iter().any(credential) {
+    let keys = cfg.endpoint_keys(&|name| std::env::var(name).ok())?;
+    let named = keys.iter().map(String::as_str);
+    if !["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"].into_iter().chain(named).any(|n| credential(&n))
+    {
         bail!(
-            "ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or OPENAI_API_KEY is not set: export your provider credential, or pass --config with services of your own"
+            "ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or OPENAI_API_KEY is not set, nor a named endpoint's key_env: export your provider credential, or pass --config with services of your own"
         );
     }
     install_hooks(&mut cfg)?;
+    install_promoted_prompts(&mut cfg, &|name| std::env::var(name).ok())?;
     require_services(&cfg).context("the user config leaves the agent unable to run tasks")?;
     crate::lock::create_private_dir(&data_dir)?;
     let canonical = data_dir.canonicalize().with_context(|| format!("data dir {}", data_dir.display()))?;
     outside(workspace, &canonical)?;
     anyhow::ensure!(canonical == data_dir, "the data dir {} moved while molt started", data_dir.display());
     Ok(cfg)
+}
+
+/// Hand the planner the prompt versions `molt improve` promoted
+/// (`docs/improve.md`), which it speaks with where the user's prompt pack
+/// has no file of its own. They come from the user's improvement registry
+/// only, never from a project.
+fn install_promoted_prompts(cfg: &mut Config, var: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<()> {
+    let env = molt_planner::pack::MODULES_ENV;
+    let Some(planner) = cfg.service_mut("planner").filter(|p| !p.env.contains_key(env)) else { return Ok(()) };
+    let modules = crate::improve::live_prompts(var)?;
+    if !modules.is_empty() {
+        planner.env.insert(env.into(), serde_json::to_string(&modules)?);
+    }
+    Ok(())
 }
 
 /// Hand the planner the config's lifecycle hooks, once they are checked.
@@ -178,6 +196,16 @@ pub fn layered(
         defaults.with_user_db(&Registry::user()?.user_db())?;
     }
     Layered::build(&defaults, workspace, profile, &|name| std::env::var(name).ok())
+}
+
+/// The variables the default setup sets for the model gateway in
+/// `workspace`, beyond what it passes from the environment: the user
+/// config's `[[service]] model` env and `[models.endpoints]`. For a command
+/// that acts as the gateway would, such as `molt models probe`.
+pub fn gateway_env(workspace: &Path) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let defaults = Config::agent(workspace, &workspace.join(".molt"), Path::new("/"))?;
+    let layered = Layered::build(&defaults, workspace, None, &|name| std::env::var(name).ok())?;
+    Ok(layered.config.service("model").map(|m| m.env.clone()).unwrap_or_default())
 }
 
 /// What `molt config show` prints: what [`resolve_config`] would run with,
@@ -453,7 +481,7 @@ pub fn missing_dependencies(workspace: &Path, cargo: bool) -> Vec<String> {
 }
 
 /// The directory of the running executable, where the services are.
-fn bin_dir() -> anyhow::Result<PathBuf> {
+pub(crate) fn bin_dir() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe().context("finding the molt executable")?;
     Ok(exe.parent().context("the molt executable has no parent directory")?.to_path_buf())
 }
@@ -1003,6 +1031,7 @@ pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::
         profiles: cfg.profiles.clone(),
         mcp: Default::default(),
         models: cfg.models.clone(),
+        improve: cfg.improve.clone(),
     };
     let running = crate::start(&alone).await?;
     let result = async {

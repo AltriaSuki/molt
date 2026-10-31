@@ -63,6 +63,11 @@ impl Prices {
     /// (1.25 times input) and a missing cache read costs a full input token.
     /// No provider charges less for writing a token to the cache than for
     /// reading it uncached, so a cache write is never priced below input.
+    pub fn stated(input: f64, output: f64, cache_write: Option<f64>, cache_read: Option<f64>) -> Self {
+        Self::from_stated(Stated(input, output, cache_write, cache_read))
+    }
+
+    /// [`Prices::stated`], from what a source states.
     fn from_stated(stated: Stated) -> Self {
         let Stated(input, output, cache_write, cache_read) = stated;
         Self {

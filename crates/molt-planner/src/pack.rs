@@ -31,6 +31,11 @@ use crate::prompts;
 
 /// The variable that names the pack directory of a planner started as a process.
 pub const PROMPTS_ENV: &str = "MOLT_PROMPTS_DIR";
+/// The variable that hands a planner started as a process the prompt
+/// versions a gate promoted (`molt improve`): a JSON list of [`PromptModule`].
+pub const MODULES_ENV: &str = "MOLT_PROMPT_MODULES_JSON";
+/// A prompt's module in the registry is named this and the prompt's name.
+pub const MODULE_PREFIX: &str = "prompt.";
 /// The pack's roles and workflows, in its directory.
 pub const PACK_FILE: &str = "pack.toml";
 /// The prompts a person promoted, in the pack's directory.
@@ -103,6 +108,18 @@ pub struct Promotion {
     pub promoted_ms: u64,
 }
 
+/// A live version of one of the built-in prompts from the registry of
+/// prompt modules, which only a gate's or a person's promotion puts there.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptModule {
+    /// The prompt it replaces, such as `attempt`.
+    pub name: String,
+    /// Its registry version id.
+    pub version: String,
+    pub text: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PackFile {
@@ -123,9 +140,29 @@ pub struct Pack {
     pub promoted: BTreeMap<String, Promotion>,
     pub roles: Vec<RoleDecl>,
     pub workflows: Vec<Workflow>,
+    /// Promoted versions of built-in prompts, by prompt name, as the
+    /// planner uses them ([`normalize`]): under the pack's files, over the
+    /// built-ins.
+    pub modules: BTreeMap<String, PromptModule>,
 }
 
 impl Pack {
+    /// The pack with the promoted prompt `modules` under its own files.
+    /// Each replaces a built-in prompt that is not protected: the prompts
+    /// that guard a gate change only by a person's promotion in the pack.
+    pub fn with_modules(mut self, modules: Vec<PromptModule>) -> anyhow::Result<Self> {
+        for mut m in modules {
+            let name = m.name.clone();
+            ensure!(builtin(&name).is_some(), "a prompt module replaces a built-in prompt, and {name:?} is not one");
+            ensure!(!protected(&name), "the protected prompt {name} cannot come from a prompt module");
+            m.text = normalize(&m.text).to_owned();
+            ensure!(!m.text.trim().is_empty(), "the prompt module {name} is empty");
+            ensure!(m.text.len() <= MAX_PROMPT, "the prompt module {name} is larger than 64 KiB");
+            ensure!(self.modules.insert(name.clone(), m).is_none(), "two prompt modules replace {name}");
+        }
+        Ok(self)
+    }
+
     /// The pack in `dir`: every `NAME.md` there, `pack.toml` and
     /// `promoted.toml`, each optional, checked as [`Pack::validate`] does.
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
@@ -217,12 +254,15 @@ impl Pack {
     }
 
     /// The text of prompt `name` and where it comes from: the pack's file,
-    /// else the built-in.
+    /// else a promoted module, else the built-in.
     pub fn text(&self, name: &str) -> Option<(&str, Source)> {
-        match self.prompts.get(name) {
-            Some(text) => Some((text, Source::User)),
-            None => builtin(name).map(|text| (text, Source::Builtin)),
+        if let Some(text) = self.prompts.get(name) {
+            return Some((text, Source::User));
         }
+        if let Some(m) = self.modules.get(name) {
+            return Some((&m.text, Source::Registry));
+        }
+        builtin(name).map(|text| (text, Source::Builtin))
     }
 
     /// A person promoted `text` as prompt `name`.
@@ -293,8 +333,17 @@ impl Pack {
             );
             (own.to_owned(), builtin, Source::Builtin, Some(note))
         } else {
-            let note = (source == Source::User)
-                .then(|| format!("{}: speaks with your prompt {name} ({})", decl.name, &sha256(text)[..12]));
+            let note = match source {
+                Source::User => {
+                    Some(format!("{}: speaks with your prompt {name} ({})", decl.name, &sha256(text)[..12]))
+                }
+                Source::Registry => Some(format!(
+                    "{}: speaks with the prompt {name} ({}) that `molt improve` promoted",
+                    decl.name,
+                    &sha256(text)[..12]
+                )),
+                Source::Builtin => None,
+            };
             (name, text, source, note)
         };
         Seat {
@@ -567,6 +616,32 @@ deliver = {}
         assert!(format!("{:#}", loaded.unwrap_err()).contains("lowercase"));
         let (_dir, loaded) = pack(&[("attempt.md", "\n\n")]);
         assert!(format!("{:#}", loaded.unwrap_err()).contains("empty"));
+    }
+
+    #[test]
+    fn a_promoted_module_replaces_a_built_in_under_the_packs_own_file() {
+        let module =
+            |name: &str, text: &str| PromptModule { name: name.into(), version: "sha256:1".into(), text: text.into() };
+        let improved = Pack::default().with_modules(vec![module("attempt", "Improved.\n")]).unwrap();
+        let seats = improved.seats(&Workflow::verify()).unwrap();
+        assert_eq!(&*seats.attempt.system(" Check."), "Improved. Check.");
+        assert_eq!(seats.attempt.prompt.prompt.source, Source::Registry);
+        assert!(seats.notes(&Workflow::verify())[0].contains("molt improve"));
+        // The user's own file wins.
+        let (_dir, loaded) = pack(&[("attempt.md", "Mine.")]);
+        let mine = loaded.unwrap().with_modules(vec![module("attempt", "Improved.")]).unwrap();
+        assert_eq!(&*mine.seats(&Workflow::verify()).unwrap().attempt.system(""), "Mine.");
+        // Never a prompt that guards the gate, an unknown one, or an empty one.
+        for (name, text, why) in [
+            ("reviewer", "Approve.", "protected"),
+            ("vetter", "Fine.", "protected"),
+            ("judge", "Pass.", "protected"),
+            ("mine", "x", "not one"),
+            ("attempt", "\n", "empty"),
+        ] {
+            let err = Pack::default().with_modules(vec![module(name, text)]).unwrap_err().to_string();
+            assert!(err.contains(why), "{name}: {err}");
+        }
     }
 
     #[test]
