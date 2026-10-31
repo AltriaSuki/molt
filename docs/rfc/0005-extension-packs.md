@@ -2,7 +2,7 @@
 
 - Issue: #170 (roadmap #153, phase 3, C11)
 - Related: #43 (MCP), #165 (hooks), #166 (Agent Skills), #164 (prompts and roles, RFC 0003), #10, #35, #114
-- Status: schema 1 implemented; unstable until it has been used for a phase, so the manifest may still change
+- Status: schema 1 implemented, from paths, archives and git; unstable until it has been used for a phase, so the manifest may still change
 
 ## Summary
 
@@ -10,10 +10,11 @@ Phase 2 made the extension points declarations: MCP servers and hooks in the
 user config, skills and command templates as files. Each is added by hand,
 and nothing records who added what, for what, or how to take it out again.
 
-An **extension pack** is a directory, or a tar archive of one, with a
-`molt-extension.toml` that bundles those declarations. `molt ext add`
-installs it after showing what it would get and getting a person's yes;
-`molt ext list`, `show`, `disable`, `enable` and `remove` manage it. A pack
+An **extension pack** is a directory, a tar archive of one, or a commit of
+a git repository, with a `molt-extension.toml` that bundles those
+declarations. `molt ext add` installs it after showing what it would get
+and getting a person's yes; `molt ext list`, `show`, `update`, `disable`,
+`enable` and `remove` manage it. A pack
 adds no new kind of extension and no new way to run code: its servers are
 the MCP bridge services of #43 and its hooks those of #165, under the same
 sandbox, capability and audit rules as the user's own.
@@ -90,13 +91,58 @@ contents, in path order), whether it is enabled, and the approved lines.
    link or a device, is refused before anything is moved into place.
 6. **Uninstall removes what was added**: the installed directory, the record
    and approval, and the servers' cached tool lists in the default data
-   dirs.
+   dirs and in those named with `--data-dir`.
 
 Why approval is of capabilities rather than code: a pack's code runs in the
 sandbox its grant describes, with the network, paths, variables and calls
 the grant names, and its hooks' commands are in the grant verbatim. New code
 inside the same grant can do nothing the old could not. Pinning by code
 would ask for approval on every update and teach people to say yes.
+
+## Git sources
+
+`molt ext add URL[#REF]` (`extensions::GitSource`, `extensions::git`)
+takes `https://`, `ssh://` and `USER@HOST:PATH` URLs, and a branch, tag or
+full commit id after `#` (the remote's `HEAD` without one). It refuses
+`http://` and `git://` (unencrypted), `file://` (a directory is copied
+instead), git's `TRANSPORT::` forms such as `ext::`, an https URL with a
+user or token in it (it would be recorded), a host or user starting with
+`-`, and a reference that is not a plain ref name.
+
+Fetching runs nothing of the repository's:
+
+1. `git init --bare` with an empty template directory, in the staging
+   directory.
+2. `git fetch --depth=1 --no-tags --no-recurse-submodules URL +REF:refs/molt/fetched`,
+   with an environment emptied but for `PATH`, `HOME`, `SSH_AUTH_SOCK` and
+   the proxy and CA variables; `GIT_CONFIG_NOSYSTEM=1`,
+   `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`,
+   `GIT_SSH_COMMAND="ssh -o BatchMode=yes"`, `GIT_ALLOW_PROTOCOL` and
+   `protocol.allow=never` with only the URL's own protocol allowed; and on
+   the command line `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
+   `core.askPass=`, `credential.helper=`, `transfer.fsckObjects=true`,
+   `fetch.recurseSubmodules=false`, `gc.auto=0`. It is stopped after 120 s,
+   or once the scratch repository passes 128 MiB.
+3. The commit's tree is listed (`ls-tree -r -l -z`) and its blobs read
+   (`cat-file --batch`) and written by Molt: nothing is checked out, so
+   no attribute, filter, smudge or LFS process applies. A symlink (mode
+   120000), a submodule (160000), a path that is not plain or names `.git`
+   refuses the pack; sizes are checked against the pack's limits before
+   any blob is read.
+
+The files then go through the same staging as a directory's: the importer,
+the manifest, the hash and the grant. The record gains a `git` table with
+the URL, the reference and the full commit id, and the approval is
+otherwise the same. `molt ext update NAME` fetches the reference again (the
+recorded URL is checked again as above); the same commit changes nothing,
+a moved one is reported from commit to commit and installed under rule 3
+below, so a grant with a new line is shown with `+` and needs a yes. A pack
+installed at a commit id does not move, and one from a path is not fetched.
+
+Why not a sandbox for git: the fetch needs the network and the user's ssh
+keys, and git's own switches already turn off every program it would run.
+The scrubbed invocation is the floor; running it under the MCP sandbox with
+the network is deferred.
 
 ## Claude Code plugins
 
@@ -113,8 +159,12 @@ manifest is shown and approved as any other.
 Schema 1 is the first; nothing earlier reads packs. A Molt that meets a
 higher schema refuses the pack and says to update. `extensions.toml` denies
 unknown fields, so a newer Molt that adds one must also bump how it reads
-the file. The planner gets the packs' skills in `MOLT_EXTENSION_SKILLS`, a
-new variable; a planner without it simply offers none.
+the file. The `git` table of a pack installed from git is optional and
+written only for such a pack: a file without one reads as before, and a
+Molt older than it refuses a file with one, and so starts nothing, rather
+than lose the pin. The planner gets the packs' skills in
+`MOLT_EXTENSION_SKILLS`, a new variable; a planner without it simply
+offers none.
 
 ## Acceptance
 
@@ -128,10 +178,19 @@ new variable; a planner without it simply offers none.
 - An update asking for more is approved again; a changed or over-reaching
   installed pack stops the start; path traversal and links install nothing
   (`extensions::tests`).
+- A pack from git is pinned to its commit, nothing of the repository runs,
+  a symlink or submodule refuses it, only https and ssh are fetched, and an
+  update reports the moved ref and asks again only for more
+  (`extensions::tests::a_pack_from_a_git_repository_is_installed_at_its_ref_and_pinned_to_the_commit`,
+  `nothing_in_a_fetched_repository_runs`,
+  `a_fetched_tree_with_a_symlink_is_refused_as_a_directory_is`,
+  `an_update_from_git_reports_the_ref_that_moved_and_asks_again_only_for_more`;
+  `extensions::git::tests::only_https_and_ssh_urls_are_fetched_and_never_through_a_transport_program`).
 
 ## Deferred
 
-- Installing from a git URL or a registry, and pinning a remote by hash.
+- Installing from a registry. Fetching git submodules and LFS files, and
+  running the git fetch in a sandbox of its own.
 - Services with capabilities of their own, environment profiles, roles,
   prompts and workflows in a pack. Roles and prompts need RFC 0003's
   promotion to cover a pack's protected prompts.
