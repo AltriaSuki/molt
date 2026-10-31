@@ -128,6 +128,7 @@ impl Fake {
                     truncated: false,
                     duration_ms: 1,
                     offline_failure: false,
+                    outputs: Vec::new(),
                 })
             }
             other => return Err(RemoteError { code: ErrorCode::Unavailable, message: format!("no {other}") }),

@@ -609,6 +609,8 @@ impl Config {
         for method in [molt_api::shell::START, molt_api::shell::READ, molt_api::shell::WRITE, molt_api::shell::STOP] {
             planner.requests.push(request(method, Budget::new(0, 0, 1_000_000))?);
         }
+        // A command's whole output when its result had to cut it; reading runs nothing.
+        planner.requests.push(request(molt_api::shell::OUTPUT, Budget::new(0, 0, 1_000_000))?);
         // What memory knows about the workspace; not remember, forget or consolidate.
         for method in [
             molt_api::memory::INDEX,
@@ -1306,6 +1308,7 @@ mod tests {
                 "shell.read",
                 "shell.write",
                 "shell.stop",
+                "shell.output",
                 "memory.index",
                 "memory.map",
                 "memory.recall",

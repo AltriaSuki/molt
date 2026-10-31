@@ -103,6 +103,8 @@ enum Tool {
     Process(crate::process::Call),
     /// A query of the repository's history (see [`crate::git`]).
     Git(molt_api::fs::GitQuery),
+    /// A read of a command's saved output (see [`crate::output`]).
+    Output(t::ReadOutput),
     /// A tool a service declared, with the model's input as it gave it.
     Provided(Arc<ProvidedTool>, Value),
 }
@@ -138,6 +140,8 @@ impl Tool {
             t::ASK_USER => Self::Ask(input(call)?),
             // Offered only when git is on; see `execute`.
             t::GIT => Self::Git(crate::git::parse(call)?),
+            // Offered only when the planner may call shell.output; see `execute`.
+            t::READ_OUTPUT => Self::Output(crate::output::parse(call)?),
             other => match tools.provided(other).filter(|_| tools.offers(role, false, other)) {
                 // The service checks the input against its schema; the API already held the model to it.
                 Some(tool) if call.input.is_object() => Self::Provided(tool.clone(), call.input.clone()),
@@ -163,6 +167,7 @@ impl Tool {
                 | Self::Fetch(_)
                 | Self::LoadSkill(_)
                 | Self::Git(_)
+                | Self::Output(_)
         ) || matches!(self, Self::Provided(tool, _) if tool.decl.read_only)
     }
 
@@ -205,6 +210,7 @@ impl Tool {
             Self::Ask(a) => format!("ask the user: {}", a.question),
             Self::Process(p) => p.detail(),
             Self::Git(q) => crate::git::detail(q),
+            Self::Output(o) => crate::output::detail(o),
             Self::Provided(tool, input) => format!("{} {input}", tool.decl.name),
         }
     }
@@ -250,6 +256,7 @@ impl Tool {
             Self::Ask(_) => t::ASK_USER,
             Self::Process(p) => p.name(),
             Self::Git(_) => t::GIT,
+            Self::Output(_) => t::READ_OUTPUT,
             Self::Provided(tool, _) => &tool.decl.name,
         }
     }
@@ -298,7 +305,7 @@ impl Tool {
             Self::Run(r) => {
                 let timeout_s = r.timeout_s.unwrap_or(RUN_TIMEOUT_S).clamp(1, MAX_RUN_TIMEOUT_S);
                 let resp = run_command(ctx, fork, &r.command, timeout_s * 1000).await?;
-                Ok(show_run(&resp, timeout_s))
+                Ok(show_run(&resp, timeout_s, ctx.outputs))
             }
             Self::FindSymbol(f) => {
                 let query = SymbolsRequest {
@@ -368,6 +375,7 @@ impl Tool {
             Self::Ask(_) => Err(Failure::Rejected("ask_user cannot be used here".into())),
             Self::Process(p) => Ok(p.run(ctx, fork).await?),
             Self::Git(q) => Ok(crate::git::run(ctx, fork, q).await?),
+            Self::Output(o) => Ok(crate::output::run(ctx, fork, o).await?),
             Self::Provided(tool, input) => {
                 let decl = &tool.decl;
                 let call = ToolCall { tool: decl.name.clone(), workspace, input };
@@ -481,6 +489,9 @@ pub(crate) async fn execute(
             Err(format!("There is no tool named {:?}.", call.name))
         } else if call.name == t::GIT && !(ctx.git && matches!(actor, Actor::Attempt { .. })) {
             // Only attempts read the history, and only when it is on.
+            Err(format!("There is no tool named {:?}.", call.name))
+        } else if call.name == t::READ_OUTPUT && !(ctx.outputs && matches!(actor, Actor::Attempt { .. })) {
+            // Only attempts read saved outputs, and only when the planner may.
             Err(format!("There is no tool named {:?}.", call.name))
         } else {
             Tool::parse(call, &ctx.tools, actor.role())
@@ -779,7 +790,8 @@ fn show_page(p: FetchResponse) -> String {
     out
 }
 
-fn show_run(r: &shell::RunResponse, timeout_s: u64) -> String {
+/// `outputs`: the model may read a cut output whole with `read_output`.
+fn show_run(r: &shell::RunResponse, timeout_s: u64, outputs: bool) -> String {
     let mut out = if r.timed_out {
         format!("Timed out after {timeout_s} s and was killed.")
     } else {
@@ -789,6 +801,9 @@ fn show_run(r: &shell::RunResponse, timeout_s: u64) -> String {
     };
     if r.truncated {
         out.push_str("\n[the output was cut in the middle]");
+        if outputs {
+            out.push_str(&crate::output::mention(&r.outputs, true));
+        }
     }
     for (name, text) in [("stdout", &r.stdout), ("stderr", &r.stderr)] {
         if !text.is_empty() {
@@ -869,8 +884,9 @@ mod tests {
             truncated: false,
             duration_ms: 3,
             offline_failure: false,
+            outputs: Vec::new(),
         };
-        assert_eq!(show_run(&run, 120), "Exit code 2\nstdout:\nout\n");
+        assert_eq!(show_run(&run, 120, false), "Exit code 2\nstdout:\nout\n");
     }
 
     #[test]
@@ -886,14 +902,15 @@ mod tests {
             truncated: false,
             duration_ms: 3,
             offline_failure: true,
+            outputs: Vec::new(),
         };
-        let shown = show_run(&run, 120);
+        let shown = show_run(&run, 120, false);
         assert_eq!(shown, format!("Exit code 101\nstderr:\n{stderr}\n{}", prompts::OFFLINE));
         assert!(prompts::OFFLINE.contains("--deps-cache cargo"));
         let check = prompts::check_failed("cargo test", &run);
         assert_eq!(check.matches(prompts::OFFLINE).count(), 1, "{check}");
         let quiet = shell::RunResponse { offline_failure: false, ..run };
-        assert!(!show_run(&quiet, 120).contains(prompts::OFFLINE));
+        assert!(!show_run(&quiet, 120, false).contains(prompts::OFFLINE));
         assert!(!prompts::check_failed("cargo test", &quiet).contains(prompts::OFFLINE));
     }
 

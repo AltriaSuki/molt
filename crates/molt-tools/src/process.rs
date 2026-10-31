@@ -8,7 +8,9 @@
 //! for it to exit, for its lifetime to end, for a stop, or for its
 //! workspace to go away (a dropped fork), and then kills its whole group.
 //! What it prints is kept in a ring of [`KEPT`] bytes; each read takes what
-//! came since the last.
+//! came since the last. Once it printed more than the ring holds, all of it
+//! is saved too (see `outputs`), so what fell out of the ring can still be
+//! read with `shell.output`.
 //!
 //! A process belongs to the caller and the workspace that started it, and
 //! every other call must name both: an id from another attempt's fork, or
@@ -23,8 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use molt_api::shell::{
-    ProcessState, ProcessStatus, ReadRequest, StartRequest, StopRequest, StopResponse, WriteRequest, MAX_INPUT,
-    MAX_READY,
+    OutputEnd, OutputStream, ProcessState, ProcessStatus, ReadRequest, StartRequest, StopRequest, StopResponse,
+    WriteRequest, MAX_INPUT, MAX_READY,
 };
 use molt_proto::{ErrorCode, RemoteError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -34,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cargo_cache::CargoCache;
 use crate::error::{failed, invalid};
+use crate::outputs::{self, Asker, Origin};
 use crate::shell::{self, lock, Group, Groups};
 use crate::{build_dir, Roots, SandboxPolicy};
 
@@ -112,6 +115,9 @@ struct Log {
     is_ready: Option<bool>,
     end: Option<End>,
     ended_at: Option<Instant>,
+    /// Where to save all of it, until the ring is about to drop some.
+    save: Option<(Arc<outputs::Store>, Arc<Origin>)>,
+    saving: Option<outputs::Writer>,
 }
 
 #[derive(Clone, Copy)]
@@ -132,6 +138,18 @@ impl Log {
                 self.ready = None;
                 self.is_ready = Some(true);
             }
+        }
+        match &mut self.saving {
+            Some(writer) => writer.write(bytes),
+            // Nothing fell out of the ring yet: it holds all of it.
+            None if self.total + bytes.len() as u64 > KEPT as u64 => {
+                if let Some((store, origin)) = self.save.take() {
+                    let mut first: Vec<u8> = self.kept.iter().copied().collect();
+                    first.extend_from_slice(bytes);
+                    self.saving = store.create(origin, OutputStream::Combined, &first);
+                }
+            }
+            None => {}
         }
         self.total += bytes.len() as u64;
         self.kept.extend(bytes);
@@ -180,6 +198,7 @@ impl Process {
             next,
             omitted,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
+            saved: log.saving.as_ref().map(|writer| writer.handle().saved()),
         }
     }
 
@@ -274,6 +293,8 @@ pub(crate) struct Ctx<'a> {
     pub sandbox: Option<(&'a SandboxPolicy, Option<Arc<CargoCache>>)>,
     /// The caller the kernel named; none when the service is called directly.
     pub caller: Option<&'a str>,
+    /// Where output is saved, and who asks.
+    pub outputs: Option<(&'a Arc<outputs::Store>, &'a Asker)>,
 }
 
 pub(crate) async fn start(
@@ -327,7 +348,9 @@ pub(crate) async fn start(
         let (mut child, group) = Group::spawn(&mut cmd, cx.groups, &cancel, guard.as_ref().map(|g| g.info.clone()))?;
         let id = format!("proc_{:032x}", rand::random::<u128>());
         let is_ready = ready.as_ref().map(|_| false);
-        let log = Log { ready: ready.map(String::into_bytes), is_ready, ..Log::default() };
+        let save =
+            cx.outputs.map(|(store, asker)| (store.clone(), Arc::new(asker.origin(&ws, &req.workspace, &req.command))));
+        let log = Log { ready: ready.map(String::into_bytes), is_ready, save, ..Log::default() };
         let process = Arc::new(Process {
             id: id.clone(),
             owner,
@@ -493,6 +516,15 @@ async fn supervise(
         let mut log = lock(&process.log);
         log.end = Some(End { status: how, exit_code, signal });
         log.ended_at = Some(Instant::now());
+        let end = OutputEnd {
+            exit_code,
+            signal,
+            timed_out: how == ProcessStatus::Expired,
+            cancelled: how == ProcessStatus::Stopped,
+        };
+        if let Some(writer) = &mut log.saving {
+            writer.close(Some(end));
+        }
     }
     drop(group);
     process.changed.notify_waiters();

@@ -148,6 +148,9 @@ pub(crate) struct Ctx {
     /// Attempts are offered `git`: the planner's starter turned it on and
     /// the planner holds a capability for `fs.git`.
     pub git: bool,
+    /// Attempts are offered `read_output`: the planner holds a capability
+    /// for `shell.output`, so a cut command result can name its whole output.
+    pub outputs: bool,
     /// The tools this run may offer: the built-ins, and the provided tools
     /// whose method the planner holds a capability for.
     pub tools: Arc<Registry>,
@@ -315,6 +318,7 @@ impl Ctx {
         let web = bus.holds(molt_api::web::FETCH);
         let processes = cfg.processes && bus.holds(molt_api::shell::START);
         let git = cfg.git && bus.holds(fs::GIT);
+        let outputs = bus.holds(molt_api::shell::OUTPUT);
         let tools = Arc::new(Registry::new(&cfg.tools, |target| bus.holds(target)));
         let budget_usd = req.budget_usd.unwrap_or(cfg.budget_usd);
         // The request was validated, which resolved its workflow.
@@ -342,6 +346,7 @@ impl Ctx {
             web,
             processes,
             git,
+            outputs,
             tools,
             web_health: Arc::default(),
             instructions: None,
@@ -603,8 +608,14 @@ impl Ctx {
             });
         }
         // A provided tool may take as long as a command, and stops with the attempt as one does.
-        let waits =
-            matches!(target, model::COMPLETE | molt_api::shell::RUN | molt_api::shell::START | molt_api::shell::READ);
+        let waits = matches!(
+            target,
+            model::COMPLETE
+                | molt_api::shell::RUN
+                | molt_api::shell::START
+                | molt_api::shell::READ
+                | molt_api::shell::OUTPUT
+        );
         let reply = if waits || self.tools.is_provided_target(target) {
             self.bus.call_cancellable(target, payload, budget, &self.trace, &self.cancel).await?
         } else {

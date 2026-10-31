@@ -66,6 +66,45 @@ The planner holds `shell.start`, `shell.read`, `shell.write` and
 command does not have: a command may already run for an hour in the same
 sandbox.
 
+## Saved outputs
+
+A `run` result keeps the first 8 KiB and the last 24 KiB of each stream,
+and a process the latest 1 MiB of what it printed. A failure in the middle
+of a long test log used to be lost with them. Now the shell service saves
+an output whole once it outgrows that, and the result names it by an id
+such as `out_1a2b…` (#238). Attempts get one more tool, last after the
+other built-ins, when the planner holds `shell.output`, as it does in the
+default setup:
+
+| Tool | Calls | What it does |
+| --- | --- | --- |
+| `read_output` | `shell.output` | Given `search`, the lines that hold the text (at most 40), each with its line number and byte offset. Given `offset`, about 16 KB from that byte, and where the next page starts. `wait_s` (at most 30) waits for a running process's output to grow. |
+
+The `run` result, the done-check's feedback and `read_process` say when
+part of an output was cut and under which id it is saved. Reading runs
+nothing: the command does not run again, so its side effects do not
+happen twice.
+
+An output belongs to the caller and the workspace whose command printed
+it. A read from another fork, or by another service, is refused (`denied`).
+Each saved output records the command, how it ended (exit code, signal,
+timeout, cancelled, or not known when the request was dropped), the bytes
+printed and the bytes saved, the SHA-256 of what was saved, and the trace
+and request id of the call that ran it. The reply that names it is in the
+audit log, so the log ties the output to its call.
+
+The service's bounds: 64 MiB per output, 512 MiB for all of them, 256
+outputs, and 256 MiB left free on the disk. When the quota is reached,
+the outputs whose commands ended longest ago are deleted first. When
+nothing can be deleted, the output stops growing, and the result says
+how much was saved and why the rest was not: the per-output limit, the
+quota, a nearly full disk, or a failed write. An output is kept for 2
+hours after its command ended, and never past the service's own run. A
+read of one that expired or was deleted says so, and an id the service
+never had, or had before it restarted, finds nothing. The files are in
+`<scratch>/.molt/output`, which no workspace can name and the sandbox
+does not mount.
+
 ## Git history
 
 A fork has no `.git`, so an attempt cannot run git. With `MOLT_GIT=on` in

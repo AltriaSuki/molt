@@ -183,24 +183,24 @@ impl Call {
                 let req = shell::StartRequest { workspace, command: s.command, lifetime_ms: None, ready, wait_ms };
                 let budget = Budget::new(0, wait_ms.unwrap_or(0) + CALL_MS, 0);
                 let state: ProcessState = ctx.call(shell::START, req, budget).await?;
-                Ok(format!("Started process {}.\n{}", state.id, show(&state)))
+                Ok(format!("Started process {}.\n{}", state.id, show(&state, ctx.outputs)))
             }
             Self::Read(r) => {
                 let wait_ms = r.wait_s.map(|s| s.min(MAX_WAIT_S) * 1000).filter(|&ms| ms > 0);
                 let req = shell::ReadRequest { workspace, id: r.id, wait_ms };
                 let budget = Budget::new(0, wait_ms.unwrap_or(0) + CALL_MS, 0);
-                Ok(show(&ctx.call::<ProcessState>(shell::READ, req, budget).await?))
+                Ok(show(&ctx.call::<ProcessState>(shell::READ, req, budget).await?, ctx.outputs))
             }
             Self::Write(w) => {
                 let req = shell::WriteRequest { workspace, id: w.id, input: w.input, close: w.close };
                 let state: ProcessState = ctx.call(shell::WRITE, req, Budget::new(0, CALL_MS, 0)).await?;
                 let closed = if w.close { " and closed its input" } else { "" };
-                Ok(format!("Wrote the input{closed}.\n{}", show(&state)))
+                Ok(format!("Wrote the input{closed}.\n{}", show(&state, ctx.outputs)))
             }
             Self::Stop(s) => {
                 let req = shell::StopRequest { workspace, id: Some(s.id) };
                 let stopped: StopResponse = ctx.call(shell::STOP, req, Budget::new(0, CALL_MS, 0)).await?;
-                Ok(stopped.stopped.iter().map(show).collect::<Vec<_>>().join("\n"))
+                Ok(stopped.stopped.iter().map(|p| show(p, ctx.outputs)).collect::<Vec<_>>().join("\n"))
             }
         }
     }
@@ -220,8 +220,9 @@ pub(crate) async fn stop_all(ctx: &Ctx, fork: &str) -> usize {
     }
 }
 
-/// A process's state as the model reads it.
-fn show(p: &ProcessState) -> String {
+/// A process's state as the model reads it; `outputs`: it may read what
+/// was not shown with `read_output`.
+fn show(p: &ProcessState, outputs: bool) -> String {
     let secs = p.elapsed_ms / 1000;
     let command = prompts::head(p.command.lines().next().unwrap_or(""), 80);
     let mut out = match p.status {
@@ -244,6 +245,13 @@ fn show(p: &ProcessState) -> String {
     }
     if p.omitted > 0 {
         out.push_str(&format!("\n[{} bytes of its output are not shown: they were cut or no longer kept]", p.omitted));
+        if let Some(saved) = p.saved.as_ref().filter(|_| outputs) {
+            out.push_str(&format!(
+                "\n[All of its output is saved as {} ({} bytes so far): read what is not shown with read_output, by \
+                 offset or with search]",
+                saved.id, saved.stored
+            ));
+        }
     }
     if p.output.is_empty() {
         out.push_str("\n(no new output)");
@@ -291,9 +299,10 @@ mod tests {
             next: 25,
             omitted: 0,
             elapsed_ms: 2500,
+            saved: None,
         };
         assert_eq!(
-            show(&state),
+            show(&state, false),
             "Process proc_1 (`npm run dev`) is running (2 s). Its ready text appeared.\nOutput (bytes 10 to 25):\n\
              ready on :3000\n"
         );
@@ -306,7 +315,7 @@ mod tests {
             ..state
         };
         assert_eq!(
-            show(&exited),
+            show(&exited, false),
             "Process proc_1 (`npm run dev`) exited with code 1 after 2 s. Its ready text never appeared.\n[7 bytes of \
              its output are not shown: they were cut or no longer kept]\n(no new output)"
         );

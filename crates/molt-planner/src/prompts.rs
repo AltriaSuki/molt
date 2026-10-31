@@ -1046,6 +1046,7 @@ mod tests {
             truncated: false,
             duration_ms: 1,
             offline_failure: false,
+            outputs: Vec::new(),
         };
         let out = output_tail(&run, 4000);
         assert!(out.len() < 4100);
