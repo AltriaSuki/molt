@@ -120,6 +120,8 @@ pass_env = [
 ]
 requests = [
   { target = "model.complete", budget = { tokens = 4000000000, calls = 1000000 } },
+  # What each model can take, asked before its first call; nothing is billed.
+  { target = "model.limits", budget = { calls = 1000000 } },
   # fs.* covers fs.git, the history git reads with MOLT_GIT=on.
   { target = "fs.*", budget = { calls = 10000000 } },
   { target = "shell.run", budget = { calls = 1000000 } },

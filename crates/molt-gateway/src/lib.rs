@@ -1320,7 +1320,10 @@ mod tests {
         // Over the bus, and nothing reached a provider.
         let reply = handle(&gw, envelope("model.limits", json!({"model":"small/s"}))).await.unwrap();
         assert_eq!(reply, json!({"route":"small/s","context_tokens":32768,"max_output_tokens":4096}));
-        assert_eq!(handle(&gw, envelope("model.limits", json!([]))).await.unwrap_err().code, ErrorCode::Invalid);
+        assert_eq!(
+            handle(&gw, envelope("model.limits", json!({"model": 1}))).await.unwrap_err().code,
+            ErrorCode::Invalid
+        );
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 }
