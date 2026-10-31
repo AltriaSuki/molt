@@ -692,6 +692,24 @@ enum EnvCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Prepare the workspace's locked dependencies for commands without
+    /// network: download the files a hash-pinned requirements.txt names,
+    /// only from the origins [prepare.python] in your user config allows,
+    /// check each against the lock, and install them offline, in the
+    /// sandbox, into a private environment that later commands get
+    /// read-only. Prepared before, it does nothing. Each preparation is
+    /// recorded in the data dir's deps/records.jsonl.
+    Prepare {
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        /// The trusted shell sandbox JSON policy, for its read-only mounts;
+        /// its network and variables are not used.
+        #[arg(long)]
+        sandbox_policy: Option<PathBuf>,
+        /// Print the outcome as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1128,6 +1146,9 @@ async fn main() -> anyhow::Result<ExitCode> {
             if deps_cache.iter().any(|kind| kind == "cargo") {
                 policy.cargo_cache = Some(molt_tools::host_cargo_home()?);
             }
+            let deps = molt::prepare::Deps::new(&cfg.kernel.data_dir, &cfg.prepare.python);
+            let mut user = cfg.environments.clone();
+            deps.add_profile(&mut user, &workspace);
             let mut readiness = cfg.readiness.clone();
             if build.is_some() {
                 readiness.build = build;
@@ -1135,11 +1156,12 @@ async fn main() -> anyhow::Result<ExitCode> {
             readiness.validate()?;
             let opts = molt::doctor::Options {
                 workspace: &workspace,
-                user: &cfg.environments,
+                user: &user,
                 policy,
                 readiness: &readiness,
                 cache: Some(molt::readiness::cache_path(&cfg.kernel.data_dir, &workspace)),
                 fresh,
+                deps: Some(deps),
             };
             let checked = molt::doctor::check(opts).await?;
             if json {
@@ -1148,6 +1170,31 @@ async fn main() -> anyhow::Result<ExitCode> {
                 print!("{}", checked.render());
             }
             return Ok(ExitCode::from(checked.report.exit_code()));
+        }
+        Cmd::Env { cmd: EnvCmd::Prepare { workspace, sandbox_policy, json } } => {
+            let workspace = workspace.canonicalize().with_context(|| format!("workspace {}", workspace.display()))?;
+            let cfg = agent::show_config(cli.config.as_deref(), &workspace, None, None, cli.profile.as_deref())?.config;
+            let policy = match sandbox_policy {
+                Some(path) => {
+                    let scratch = std::env::temp_dir().join("molt-env-prepare");
+                    molt_tools::SandboxPolicy::load(&path, &molt_tools::Roots { root: workspace.clone(), scratch })?
+                }
+                None => molt_tools::SandboxPolicy::default(),
+            };
+            let deps = molt::prepare::Deps::new(&cfg.kernel.data_dir, &cfg.prepare.python);
+            let opts = molt::prepare::Options {
+                workspace: &workspace,
+                deps: &deps,
+                user: &cfg.environments,
+                policy,
+                backoff: std::time::Duration::from_millis(500),
+            };
+            let prepared = molt::prepare::prepare(opts).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&prepared)?);
+            } else {
+                print!("{}", prepared.render());
+            }
         }
         Cmd::Bench { cmd } => return molt_bench::cli::main(cmd).await,
         Cmd::Prices { cmd } => return prices_cmd(cmd).await,

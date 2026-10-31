@@ -272,6 +272,11 @@ pub struct Config {
     /// readiness check, and whether runs check first (`docs/sandbox.md`).
     #[serde(default, skip_serializing_if = "crate::readiness::ReadinessSection::is_default")]
     pub readiness: crate::readiness::ReadinessSection,
+    /// `[prepare]`: the registries `molt env prepare` downloads from and the
+    /// packages whose build scripts may run (`docs/sandbox.md`). Only the
+    /// user's configuration sets it.
+    #[serde(default, skip_serializing_if = "crate::prepare::PrepareSection::is_default")]
+    pub prepare: crate::prepare::PrepareSection,
 }
 
 /// `[models]`: the user's endpoints, and which model each role's calls go
@@ -497,6 +502,7 @@ impl Config {
         config.tui.validate()?;
         config.improve.validate().context("in [improve]")?;
         config.readiness.validate()?;
+        config.prepare.validate()?;
         if !config.models.roles.is_empty() {
             molt_api::model::role_models(&serde_json::to_string(&config.models.roles)?)
                 .map_err(|e| anyhow::anyhow!("[models.roles]: {e}"))?;
@@ -624,6 +630,7 @@ impl Config {
             models: ModelsSection::default(),
             improve: Default::default(),
             readiness: Default::default(),
+            prepare: Default::default(),
         })
     }
 
@@ -1122,6 +1129,22 @@ mod tests {
         let glm = &cfg.models.endpoints["glm"];
         assert_eq!(glm.key_env, "GLM_API_KEY");
         assert!(!glm.models["glm-4.6"].output_schema);
+    }
+
+    #[test]
+    fn the_examples_commented_prepare_parses_once_uncommented_and_a_bad_origin_is_refused() {
+        let text = include_str!("../../../molt.example.toml");
+        let start = text.find("# [prepare.python]").unwrap();
+        let block = text[start..].split("\n\n").next().unwrap();
+        let uncommented: String =
+            block.lines().map(|l| l.trim_start_matches('#').trim_start()).collect::<Vec<_>>().join("\n");
+        let cfg = Config::parse(&uncommented).unwrap();
+        assert_eq!(
+            cfg.prepare.python,
+            crate::prepare::PythonPrepare { scripts: vec!["pyyaml".into()], ..Default::default() }
+        );
+        let err = Config::parse("[prepare.python]\nhosts = [\"https://cdn.example/path\"]\n").unwrap_err();
+        assert!(format!("{err:#}").contains("has a path"), "{err:#}");
     }
 
     #[test]
