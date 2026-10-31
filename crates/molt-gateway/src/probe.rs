@@ -49,6 +49,13 @@ pub struct Probed {
     /// What the probe's calls cost, when every one of them is known.
     #[serde(default)]
     pub cost_usd: Option<f64>,
+    /// The named endpoint the calls went to; `None` for a built-in one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// The tokens the probe's calls spent reasoning, when every one of them
+    /// said: unknown otherwise, never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
 }
 
 impl Probed {
@@ -242,12 +249,14 @@ impl Gateway {
     pub async fn probe(&self, plan: &Plan, now_ms: u64) -> Report {
         let mut findings = Vec::new();
         let mut costs = Some(0.0);
+        let mut reasoning = Some(0);
         let mut calls = 0;
         let mut stopped = None;
         for &check in &plan.checks {
             calls += 1;
-            let (finding, cost, fatal) = self.check(plan, check).await;
+            let (finding, cost, thought, fatal) = self.check(plan, check).await;
             costs = costs.zip(cost).map(|(a, b)| a + b);
+            reasoning = reasoning.zip(thought).map(|(a, b)| a + b);
             findings.push(finding);
             if let Some(why) = fatal {
                 stopped = Some(why);
@@ -265,13 +274,16 @@ impl Gateway {
             output_schema: found(|c| c == Check::OutputSchema),
             effort: found(|c| matches!(c, Check::Effort(_))),
             cost_usd: costs,
+            endpoint: plan.endpoint.clone(),
+            reasoning_tokens: reasoning,
         };
         Report { probed, findings, calls, stopped }
     }
 
-    /// One check: what it found, what it cost (`None`: unknown), and why to
-    /// stop probing, if this answer means every call would fail.
-    async fn check(&self, plan: &Plan, check: Check) -> (Finding, Option<f64>, Option<String>) {
+    /// One check: what it found, what it cost and the tokens it spent
+    /// reasoning (`None`: unknown), and why to stop probing, if this answer
+    /// means every call would fail.
+    async fn check(&self, plan: &Plan, check: Check) -> (Finding, Option<f64>, Option<u64>, Option<String>) {
         let mut req =
             CompleteRequest { model: Some(plan.qualified()), max_tokens: Some(MAX_TOKENS), ..Default::default() };
         match check {
@@ -312,8 +324,8 @@ impl Gateway {
                 let (works, fatal) = classify(check, &e);
                 let finding = Finding { check, works, detail: shorten(&e.message) };
                 // A refusal by status was not billed (see model::COMPLETE); anything else may have been.
-                let cost = matches!(e.code, ErrorCode::Invalid | ErrorCode::Denied).then_some(0.0);
-                return (finding, cost, fatal);
+                let unbilled = matches!(e.code, ErrorCode::Invalid | ErrorCode::Denied);
+                return (finding, unbilled.then_some(0.0), unbilled.then_some(0), fatal);
             }
         };
         let cost = reply.cost_usd;
@@ -336,7 +348,7 @@ impl Gateway {
             }
             Check::Effort(_) => (true, "took it".into()),
         };
-        (Finding { check, works: Some(works), detail }, cost, None)
+        (Finding { check, works: Some(works), detail }, cost, reply.usage.reasoning_tokens, None)
     }
 }
 
@@ -471,6 +483,8 @@ mod tests {
             output_schema: Some(false),
             effort: None,
             cost_usd: None,
+            endpoint: None,
+            reasoning_tokens: None,
         }
     }
 

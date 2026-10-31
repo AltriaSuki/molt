@@ -602,6 +602,7 @@ mod tests {
             output_tokens: 1_000_000,
             cache_creation_input_tokens: 1_000_000,
             cache_read_input_tokens: 1_000_000,
+            reasoning_tokens: None,
         };
         let (opus, _) = PriceTable::default().lookup("claude-opus-5-5").unwrap();
         assert!((opus.cost(&usage) - (4.0 + 20.0 + 5.0 + 0.20)).abs() < 1e-9);

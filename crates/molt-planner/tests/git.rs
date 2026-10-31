@@ -178,6 +178,7 @@ fn response(content: Vec<Value>, stop: &str) -> CompleteResponse {
         cost_usd: Some(0.125),
         price_source: None,
         context_tokens: None,
+        endpoint: None,
     }
 }
 

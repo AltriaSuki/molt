@@ -1402,6 +1402,101 @@ async fn a_reviewer_routed_to_a_named_endpoint_is_called_there_with_its_key_and_
 }
 
 #[tokio::test]
+async fn attempt_explorer_and_reviewer_on_three_named_endpoints_are_each_billed_and_counted_where_they_ran() {
+    // The run's default endpoint is left unused: every role goes to one of the user's.
+    let unused = fake_api(Fake::Greets).await;
+    let explores = Fake::GreetsWithCalls(vec![("explore", json!({ "question": "Where does the greeting go?" }))]);
+    let mut config = String::new();
+    let mut servers = Vec::new();
+    // Name, key, model and price per million input and output tokens of each endpoint.
+    for (name, key, model, price) in [
+        ("main", "main-key", MODEL, (4.0, 20.0)),
+        ("scout", "scout-key", "claude-haiku-4-5", (1.0, 5.0)),
+        ("judge", "judge-key", "claude-sonnet-5-5", (2.0, 10.0)),
+    ] {
+        let server = MockServer::start().await;
+        let keyed = Keyed { key, inner: FakeApi(explores.clone()) };
+        Mock::given(method("POST")).and(path("/v1/messages")).respond_with(keyed).mount(&server).await;
+        let price = format!("price = {{ input = {}, output = {} }}", price.0, price.1);
+        config += &named_endpoint(name, &server, &format!("{}_API_KEY", name.to_uppercase()), model, &price);
+        servers.push((name, key, model, server));
+    }
+    config += "\n[models.roles]\nexplorer = \"scout/claude-haiku-4-5\"\nreviewer = \"judge/claude-sonnet-5-5\"\n";
+    let (workspace, data, home) =
+        (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let model = format!("main/{MODEL}");
+    let args = ["--check", CHECK, "--attempts", "1", "--no-memory", "--json", "--model", &model];
+    let mut cmd = molt_do(&unused, workspace.path(), data.path(), &args);
+    cmd.env("XDG_CONFIG_HOME", user_config(home.path(), &config)).env("MOLT_EXPLORE", "on");
+    for (name, key, ..) in &servers {
+        cmd.env(format!("{}_API_KEY", name.to_uppercase()), key);
+    }
+    let out = tokio::time::timeout(RUN_LIMIT, cmd.output()).await.expect("molt do hung").unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["outcome"], "passed");
+    assert!(unused.received_requests().await.unwrap().is_empty(), "no call went to the default endpoint");
+
+    // Each role's calls reached its own endpoint, with that endpoint's key and model.
+    let offers =
+        |body: &Value, tool: &str| body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == tool));
+    let mut sent = std::collections::BTreeMap::new();
+    for (name, key, model, server) in &servers {
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty(), "{name} was called");
+        for req in &requests {
+            let body: Value = req.body_json().unwrap();
+            assert_eq!((body["model"].as_str(), req.headers["x-api-key"].to_str().unwrap()), (Some(*model), *key));
+            let role = match (offers(&body, "explore"), offers(&body, SUBMIT_REVIEW)) {
+                (true, _) => "main",
+                (_, true) => "judge",
+                _ => "scout",
+            };
+            assert_eq!(role, *name, "{body}");
+        }
+        sent.insert(name.to_string(), requests.len());
+    }
+
+    // And the audit log says, of each call, where it went and what it cost there.
+    let audit = molt_kernel::audit::read_all(&data.path().join("audit.jsonl")).await.unwrap();
+    let envelopes: Vec<&molt_proto::Envelope> = audit
+        .iter()
+        .filter_map(|e| match &e.event {
+            AuditEvent::Message { envelope } => Some(envelope),
+            _ => None,
+        })
+        .collect();
+    let roles: std::collections::HashMap<String, String> = envelopes
+        .iter()
+        .filter(|e| e.kind == Kind::Request && e.to.to_string() == COMPLETE)
+        .map(|e| (e.id.to_string(), e.payload["role"].as_str().unwrap_or("").to_owned()))
+        .collect();
+    let mut spent: std::collections::BTreeMap<String, (String, usize, u64, u64, f64)> = Default::default();
+    for reply in envelopes.iter().filter(|e| e.kind == Kind::Reply) {
+        let Some(role) = reply.reply_to.as_ref().and_then(|id| roles.get(id.as_str())) else { continue };
+        let endpoint = reply.payload["endpoint"].as_str().expect("each reply names its endpoint").to_owned();
+        let entry = spent.entry(role.clone()).or_insert((endpoint.clone(), 0, 0, 0, 0.0));
+        assert_eq!(entry.0, endpoint, "a role's calls all went to one endpoint");
+        entry.1 += 1;
+        entry.2 += reply.payload["usage"]["input_tokens"].as_u64().unwrap();
+        entry.3 += reply.payload["usage"]["output_tokens"].as_u64().unwrap();
+        entry.4 += reply.payload["cost_usd"].as_f64().expect("priced as its endpoint declares");
+        assert!(reply.payload["usage"].get("reasoning_tokens").is_none(), "the Messages API does not count them");
+    }
+    let roles: Vec<&str> = spent.keys().map(String::as_str).collect();
+    assert_eq!(roles, ["attempt", "explorer", "reviewer"]);
+    // Every call is 1000 tokens in and 100 out, priced per million as its endpoint declares.
+    for (role, endpoint, per_call) in
+        [("attempt", "main", 0.006), ("explorer", "scout", 0.0015), ("reviewer", "judge", 0.003)]
+    {
+        let (at, calls, input, output, cost) = &spent[role];
+        assert_eq!((at.as_str(), *calls), (endpoint, sent[endpoint]), "{role}");
+        assert_eq!((*input, *output), (1000 * *calls as u64, 100 * *calls as u64), "{role}");
+        assert!((cost - per_call * *calls as f64).abs() < 1e-9, "{role}: {cost}");
+    }
+}
+
+#[tokio::test]
 async fn molt_models_probe_reaches_a_named_endpoint_of_the_user_config_by_name() {
     let server = MockServer::start().await;
     let keyed = Keyed { key: "glm-key", inner: ThirdParty };

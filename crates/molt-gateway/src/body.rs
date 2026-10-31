@@ -21,6 +21,25 @@ pub(crate) struct Call {
     pub schema_tool: bool,
 }
 
+/// Leave out the reasoning a Chat Completions endpoint gave
+/// ([`molt_api::model::chat_reasoning`]): it has no signature, so the
+/// Messages API cannot take it as thinking, and it was that endpoint's
+/// state, not this one's. An assistant turn that held nothing else is left
+/// out with it, since the API refuses an empty one.
+fn strip_chat_reasoning(messages: &mut Vec<Value>) {
+    let mut changed = false;
+    for message in messages.iter_mut() {
+        if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+            let before = blocks.len();
+            blocks.retain(|b| molt_api::model::chat_reasoning(b).is_none());
+            changed |= blocks.len() != before;
+        }
+    }
+    if changed {
+        messages.retain(|m| m["role"] != "assistant" || m["content"].as_array().is_none_or(|c| !c.is_empty()));
+    }
+}
+
 /// Shape `req` for `model` (already resolved). Takes the request by value so
 /// a long conversation is moved into the body rather than copied.
 /// `probed` is what `molt models probe` found the model does on this
@@ -83,7 +102,9 @@ pub(crate) fn build(
             json!([{ "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }]),
         );
     }
-    body.insert("messages".into(), Value::Array(req.messages));
+    let mut messages = req.messages;
+    strip_chat_reasoning(&mut messages);
+    body.insert("messages".into(), Value::Array(messages));
     if !req.tools.is_empty() {
         body.insert("tools".into(), Value::Array(req.tools));
     }
@@ -221,6 +242,8 @@ mod tests {
             streaming: None,
             output_schema,
             effort,
+            endpoint: None,
+            reasoning_tokens: None,
             cost_usd: None,
         };
         let schema = json!({ "type": "object", "properties": { "ok": { "type": "boolean" } } });

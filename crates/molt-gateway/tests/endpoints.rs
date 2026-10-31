@@ -278,6 +278,8 @@ async fn a_probe_of_a_named_endpoint_records_an_ignored_output_schema_and_its_ca
         (Some(true), Some(true), Some(false), Some(false))
     );
     assert!(found.cost_usd.is_some_and(|c| c > 0.0), "priced as declared: {:?}", found.cost_usd);
+    // The record names the endpoint; the Messages API does not count reasoning tokens apart: unknown.
+    assert_eq!((found.endpoint.as_deref(), found.reasoning_tokens), (Some("glm"), None));
     let mut records = Records::default();
     records.put(report.probed);
     records.write(&file).unwrap();

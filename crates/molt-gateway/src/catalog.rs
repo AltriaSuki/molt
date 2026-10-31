@@ -179,6 +179,8 @@ mod tests {
             streaming: Some(true),
             output_schema: Some(false),
             effort: None,
+            endpoint: None,
+            reasoning_tokens: None,
             cost_usd: Some(0.001),
         });
         records.write(&file).unwrap();

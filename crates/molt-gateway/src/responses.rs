@@ -102,6 +102,8 @@ pub(crate) fn build(
                         "arguments":block["input"].to_string()}));
                 }
                 ("assistant", Some(REASONING)) => items.extend(reasoning_input(&block)?),
+                // Another endpoint's plain reasoning is that endpoint's state, not this one's.
+                ("assistant", Some("thinking")) if molt_api::model::chat_reasoning(&block).is_some() => {}
                 ("user", Some("tool_result")) => {
                     let id = block["tool_use_id"].as_str().ok_or_else(|| invalid("tool result id is missing"))?;
                     if !pending.remove(id) {
@@ -346,7 +348,8 @@ pub(crate) fn decode(value: Value) -> Result<Message, String> {
     serde_json::from_value(json!({"id":id,"model":model,"content":content,"stop_reason":stop,
         "stop_details":{"provider":"openai","protocol":"responses","status":status,"incomplete_reason":reason},
         "usage":{"input_tokens":input.map(|n| n - cached),"output_tokens":usage["output_tokens"],
-            "cache_read_input_tokens":cached,"cache_creation_input_tokens":0}}))
+            "cache_read_input_tokens":cached,"cache_creation_input_tokens":0,
+            "reasoning_tokens":usage["output_tokens_details"]["reasoning_tokens"].as_u64()}}))
     .map_err(|e| e.to_string())
 }
 

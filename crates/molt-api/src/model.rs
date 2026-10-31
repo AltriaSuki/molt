@@ -6,7 +6,9 @@
 //! back unmodified on the next turn. The OpenAI adapters translate unsigned
 //! text and function tools to this shared shape and reject native blocks;
 //! OpenAI Responses reasoning comes back as `openai_reasoning` blocks, to be
-//! passed back the same way.
+//! passed back the same way. A Chat Completions endpoint's `reasoning_content`
+//! (DeepSeek and the like) comes back as a `thinking` block with no signature
+//! and a `protocol` of [`CHAT_REASONING`]; see [`chat_reasoning`].
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -220,6 +222,13 @@ pub struct Usage {
     pub cache_creation_input_tokens: u64,
     #[serde(default, deserialize_with = "zero_if_null")]
     pub cache_read_input_tokens: u64,
+    /// Of `output_tokens`, those the model spent reasoning, when the
+    /// endpoint says (`completion_tokens_details.reasoning_tokens` and the
+    /// like). `None` is unknown, never zero: the Messages API does not count
+    /// them apart. A breakdown only: they are billed as output, already in
+    /// `output_tokens`. New: an older gateway leaves it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
 }
 
 fn zero_if_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
@@ -227,7 +236,17 @@ fn zero_if_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error>
 }
 
 impl Usage {
+    /// Add `other` in. The reasoning tokens of a sum are known only when
+    /// every call in it counted them; an empty `Usage` adds nothing.
     pub fn add(&mut self, other: &Usage) {
+        if *other == Usage::default() {
+            return;
+        }
+        self.reasoning_tokens = match (*self == Usage::default(), self.reasoning_tokens, other.reasoning_tokens) {
+            (true, _, theirs) => theirs,
+            (false, Some(a), Some(b)) => Some(a + b),
+            _ => None,
+        };
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
@@ -238,6 +257,22 @@ impl Usage {
     pub fn total(&self) -> u64 {
         self.input_tokens + self.output_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
     }
+}
+
+/// The `protocol` of a `thinking` block that holds a Chat Completions
+/// endpoint's reasoning, such as DeepSeek's `reasoning_content`.
+pub const CHAT_REASONING: &str = "openai_chat";
+
+/// The reasoning text of `block` and the response field it came in
+/// (`reasoning_content` or `reasoning`), when it is a Chat Completions
+/// endpoint's reasoning rather than signed Messages API thinking.
+pub fn chat_reasoning(block: &Value) -> Option<(&str, &'static str)> {
+    if block["type"] != "thinking" || block["protocol"] != CHAT_REASONING {
+        return None;
+    }
+    // Only the two fields these endpoints read; anything else goes back as the usual one.
+    let field = if block["field"] == "reasoning" { "reasoning" } else { "reasoning_content" };
+    Some((block["thinking"].as_str()?, field))
 }
 
 pub const STOP_END_TURN: &str = "end_turn";
@@ -270,6 +305,12 @@ pub struct CompleteResponse {
     /// conversations to it. New: an older gateway leaves it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
+    /// The endpoint the call went to: a named endpoint's name
+    /// (`[models.endpoints.NAME]`), or `anthropic` or `openai` for a
+    /// built-in one, so the audit log says where each call's usage and cost
+    /// were spent. New: an older gateway leaves it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 /// Which price a cost was worked out with, so that any charge can be checked later.
@@ -409,6 +450,27 @@ mod tests {
         // The thinking block survives untouched.
         assert_eq!(resp.as_turn()["content"][0]["signature"], "sig");
         assert_eq!(resp.usage.total(), 15);
+    }
+
+    #[test]
+    fn reasoning_tokens_add_up_only_while_every_call_counted_them() {
+        let call =
+            |reasoning| Usage { input_tokens: 10, output_tokens: 5, reasoning_tokens: reasoning, ..Default::default() };
+        let mut sum = Usage::default();
+        sum.add(&call(Some(3)));
+        sum.add(&Usage::default());
+        sum.add(&call(Some(2)));
+        assert_eq!((sum.output_tokens, sum.reasoning_tokens), (10, Some(5)));
+        sum.add(&call(None));
+        assert_eq!((sum.output_tokens, sum.reasoning_tokens), (15, None), "unknown, never a subtotal");
+        sum.add(&call(Some(1)));
+        assert_eq!(sum.reasoning_tokens, None);
+        // Left out of the wire when unknown, so an older peer reads the same usage.
+        assert!(serde_json::to_value(call(None)).unwrap().get("reasoning_tokens").is_none());
+        assert_eq!(serde_json::to_value(call(Some(3))).unwrap()["reasoning_tokens"], 3);
+        let chat = json!({ "type": "thinking", "thinking": "why", "protocol": CHAT_REASONING, "field": "reasoning" });
+        assert_eq!(chat_reasoning(&chat), Some(("why", "reasoning")));
+        assert_eq!(chat_reasoning(&json!({ "type": "thinking", "thinking": "x", "signature": "s" })), None);
     }
 
     #[test]

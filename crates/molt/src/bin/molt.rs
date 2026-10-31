@@ -2324,7 +2324,11 @@ async fn models_cmd(cmd: ModelsCmd) -> anyhow::Result<ExitCode> {
                 Some(usd) => format!("${usd:.4}"),
                 None => "unknown (some calls have no known price or may have been billed)".into(),
             };
-            println!("{} calls, cost {cost}", report.calls);
+            let reasoning = match report.probed.reasoning_tokens {
+                Some(n) => n.to_string(),
+                None => "unknown (the endpoint did not count them apart)".into(),
+            };
+            println!("{} calls, cost {cost}, reasoning tokens {reasoning}", report.calls);
             if let Some(why) = &report.stopped {
                 eprintln!("The probe stopped: {why}. Nothing was recorded; fix that and probe again.");
                 return Ok(ExitCode::FAILURE);
