@@ -28,6 +28,11 @@ pub enum ExecutionPolicy {
 pub struct SandboxPolicy {
     /// Share the host network only when explicitly enabled by trusted config.
     pub network: bool,
+    /// Without `network`, the commands and processes of one workspace share
+    /// a loopback network of their own, which no other workspace and no
+    /// host service is on (see [`LocalNet`]); off, each command has one of
+    /// its own. With `network` they have the host's.
+    pub local_network: bool,
     /// Additional read-only paths, mounted at their canonical host paths.
     pub read_only: Vec<PathBuf>,
     /// Environment names to pass in addition to PATH and locale variables.
@@ -56,6 +61,7 @@ impl Default for SandboxPolicy {
     fn default() -> Self {
         Self {
             network: false,
+            local_network: true,
             read_only: vec![],
             environment: vec![],
             memory_mb: 4096,
@@ -212,7 +218,7 @@ impl SandboxPolicy {
     /// One run of the probe: `None` when it passed, else why not and what
     /// bubblewrap said.
     fn probe_once(&self) -> anyhow::Result<Option<(Setup, String)>> {
-        let (mut command, guard) = self.command(Path::new("/bin/true"), None, None, None)?;
+        let (mut command, guard) = self.command(Path::new("/bin/true"), None, None, None, None)?;
         let command = command.as_std_mut();
         command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
         let mut child = match command.spawn() {
@@ -239,21 +245,7 @@ impl SandboxPolicy {
         if status.success() {
             return Ok(None);
         }
-        use std::io::Read;
-        use std::os::fd::AsRawFd;
-        let mut bytes = [0; 4096];
-        let n = if let Some(mut stderr) = child.stderr.take() {
-            // Never wait for EOF on a pipe retained by an executor or helper.
-            let fd = stderr.as_raw_fd();
-            unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFL);
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
-            stderr.read(&mut bytes).unwrap_or(0)
-        } else {
-            0
-        };
-        let said = String::from_utf8_lossy(&bytes[..n]).trim().to_owned();
+        let said = stderr_of(&mut child);
         // `/bin/true` changes nothing, so even a sandbox that got as far as its namespaces may start again.
         drop(guard);
         Ok(Some((resources::setup_failure("", &said).unwrap_or(Setup::Unsupported), said)))
@@ -269,7 +261,7 @@ impl SandboxPolicy {
     pub fn server_command(&self, program: &Path) -> anyhow::Result<(Command, Guard)> {
         self.validate()?;
         ensure!(program.is_absolute(), "the program to sandbox must be an absolute path");
-        self.command(program, None, None, None)
+        self.command(program, None, None, None, None)
     }
 
     /// A bus service run as a candidate an agent may replace (see
@@ -349,7 +341,7 @@ impl SandboxPolicy {
         let service = Service { args, env, state, keep };
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            linux::command(&policy, &program, None, None, None, Some(&service))
+            linux::command(&policy, &program, None, None, None, None, Some(&service))
         }
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         {
@@ -364,6 +356,7 @@ impl SandboxPolicy {
         workspace: &Path,
         program: &Path,
         build: &BuildDir,
+        net: Option<&LocalNet>,
     ) -> anyhow::Result<(Command, Guard)> {
         let base = fork::base(roots, &workspace.to_string_lossy())
             .context("isolated commands require an fs.fork workspace")?;
@@ -392,7 +385,38 @@ impl SandboxPolicy {
                 "the private build directory must be outside the project and the fork"
             );
         }
-        self.command(program, Some(workspace), Some(&base), Some(build))
+        self.command(program, Some(workspace), Some(&base), Some(build), net)
+    }
+
+    /// Whether commands of a workspace share a network of their own.
+    pub(crate) fn shares_local_network(&self) -> bool {
+        self.local_network && !self.network
+    }
+
+    /// Whether a command joins a [`LocalNet`] here: one starts, and
+    /// `/bin/true` runs in it. The shell service gives each command a
+    /// network of its own on a host where this fails, which isolates more,
+    /// never less.
+    pub fn probe_local_network(&self) -> anyhow::Result<()> {
+        self.validate()?;
+        let net = LocalNet::start(self)?;
+        let (mut command, _guard) = self.command(Path::new("/bin/true"), None, None, None, Some(&net))?;
+        let command = command.as_std_mut();
+        command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().context("starting /usr/bin/bwrap in the shared network")?;
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                ensure!(status.success(), "a command could not join the shared network: {}", stderr_of(&mut child));
+                return Ok(());
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(5) {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("a command did not start in the shared network within 5 s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     fn command(
@@ -401,17 +425,38 @@ impl SandboxPolicy {
         workspace: Option<&Path>,
         base: Option<&Path>,
         build: Option<&BuildDir>,
+        net: Option<&LocalNet>,
     ) -> anyhow::Result<(Command, Guard)> {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            linux::command(self, program, workspace, base, build, None)
+            linux::command(self, program, workspace, base, build, net, None)
         }
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         {
-            let _ = (program, workspace, base, build);
+            let _ = (program, workspace, base, build, net);
             anyhow::bail!("sandbox requires Linux x86_64; explicit unconfined mode is required on this platform")
         }
     }
+}
+
+/// What an exited child wrote on its piped stderr, up to 4 KiB, without
+/// waiting for EOF on a pipe an executor or helper may still hold.
+fn stderr_of(child: &mut std::process::Child) -> String {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let mut bytes = [0; 4096];
+    let n = match child.stderr.take() {
+        Some(mut stderr) => {
+            let fd = stderr.as_raw_fd();
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            stderr.read(&mut bytes).unwrap_or(0)
+        }
+        None => 0,
+    };
+    String::from_utf8_lossy(&bytes[..n]).trim().to_owned()
 }
 
 /// Pin every canonical path component. A directory or file replaced by a
@@ -497,6 +542,7 @@ pub struct Guard {
     pub(crate) info: std::sync::Arc<std::fs::File>,
     _seccomp: std::fs::File,
     _args: Option<std::fs::File>,
+    _hosts: Option<std::fs::File>,
 }
 
 impl Guard {
@@ -518,6 +564,86 @@ impl Guard {
             None => false,
         }
     }
+}
+
+/// A loopback network the commands and processes of one workspace share,
+/// so a test command reaches the server a process runs (#225), and that no
+/// other workspace and no host service is on. It has no route out.
+///
+/// A holder sandbox keeps a user and a network namespace: `cat` on a pipe
+/// only this value writes to, started once the sandbox is set up. A command joins both before its own sandbox
+/// starts, and still gets every other namespace of its own, user included.
+/// Dropping it closes the pipe and kills the holder; the network goes with
+/// the last command still in it.
+pub struct LocalNet {
+    holder: std::process::Child,
+    user: std::fs::File,
+    net: std::fs::File,
+    /// The holder's `/proc/<pid>/net`, which lists this network's sockets
+    /// while the holder lives, and nothing once it is gone.
+    sockets: std::fs::File,
+}
+
+impl LocalNet {
+    /// Start one, in the sandbox `policy` describes: its seccomp filter,
+    /// no host path but the system's, no capabilities.
+    pub fn start(policy: &SandboxPolicy) -> anyhow::Result<Self> {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            linux::holder(policy)
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            let _ = policy;
+            anyhow::bail!("sandbox requires Linux x86_64; a shared local network cannot be made on this platform")
+        }
+    }
+
+    /// Whether a socket listens on TCP `port` in it now.
+    pub fn listens(&self, port: u16) -> bool {
+        listens_in(&self.sockets, port)
+    }
+}
+
+impl Drop for LocalNet {
+    fn drop(&mut self) {
+        drop(self.holder.stdin.take());
+        let _ = self.holder.kill();
+        let _ = self.holder.wait();
+    }
+}
+
+/// Whether a TCP socket listens on `port` in the network whose
+/// `/proc/<pid>/net` directory `sockets` is.
+pub(crate) fn listens_in(sockets: &std::fs::File, port: u16) -> bool {
+    use std::os::fd::AsRawFd;
+    let dir = format!("/proc/self/fd/{}", sockets.as_raw_fd());
+    ["tcp", "tcp6"]
+        .iter()
+        .any(|table| std::fs::read_to_string(Path::new(&dir).join(table)).is_ok_and(|text| listed(&text, port)))
+}
+
+/// Whether the `/proc/net/tcp` table `text` has a socket listening on `port`.
+fn listed(text: &str, port: u16) -> bool {
+    const LISTEN: &str = "0A";
+    text.lines().skip(1).any(|line| {
+        let mut fields = line.split_whitespace();
+        let local = fields.nth(1);
+        let state = fields.nth(1);
+        state == Some(LISTEN)
+            && local
+                .and_then(|addr| addr.rsplit_once(':'))
+                .is_some_and(|(_, hex)| u16::from_str_radix(hex, 16) == Ok(port))
+    })
+}
+
+/// The `/proc/<pid>/net` directory of process `pid`, or of this process.
+pub(crate) fn sockets_of(pid: Option<libc::pid_t>) -> std::io::Result<std::fs::File> {
+    let path = match pid {
+        Some(pid) => format!("/proc/{pid}/net"),
+        None => "/proc/self/net".to_owned(),
+    };
+    std::fs::File::open(path)
 }
 
 /// The namespace init is a new session leader. TERM its group without
@@ -595,15 +721,10 @@ mod linux {
         workspace: Option<&Path>,
         base: Option<&Path>,
         build: Option<&BuildDir>,
+        net: Option<&LocalNet>,
         service: Option<&Service<'_>>,
     ) -> anyhow::Result<(Command, Guard)> {
-        let mut seccomp = memfd(c"molt-seccomp")?;
-        let filter = filter();
-        let bytes = unsafe {
-            std::slice::from_raw_parts(filter.as_ptr().cast::<u8>(), std::mem::size_of_val(filter.as_slice()))
-        };
-        seccomp.write_all(bytes)?;
-        seccomp.rewind()?;
+        let seccomp = seccomp()?;
         let info = Arc::new(memfd(c"molt-sandbox-info")?);
         let (filter_fd, info_fd) = (seccomp.as_raw_fd(), info.as_raw_fd());
         let mut command = Command::new("/usr/bin/bwrap");
@@ -616,22 +737,25 @@ mod linux {
             "--cap-drop",
             "ALL",
         ]);
-        if policy.network {
+        // The network joined before bubblewrap starts (see `pre_exec` below) is kept.
+        let net = net.filter(|_| !policy.network);
+        if policy.network || net.is_some() {
             command.arg("--share-net");
         }
-        for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64"] {
-            if Path::new(path).exists() {
-                command.args(["--ro-bind", path, path]);
-            }
-        }
-        for path in ["/etc/ld.so.cache", "/etc/ssl/certs", "/etc/alternatives"] {
-            if Path::new(path).exists() {
-                command.args(["--ro-bind", path, path]);
-            }
-        }
+        system(command.as_std_mut());
         if policy.network && Path::new("/etc/resolv.conf").exists() {
             command.args(["--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"]);
         }
+        // Without the host's network, `localhost` still names its own loopback.
+        let hosts = if policy.network {
+            None
+        } else {
+            let mut hosts = memfd(c"molt-hosts")?;
+            hosts.write_all(b"127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n")?;
+            hosts.rewind()?;
+            command.arg("--ro-bind-data").arg(hosts.as_raw_fd().to_string()).arg("/etc/hosts");
+            Some(hosts)
+        };
         command.args([
             "--proc",
             "/proc",
@@ -676,6 +800,8 @@ mod linux {
         // Keep loader and shell variables away from the host-side backend.
         command.env_clear().env("PATH", "/usr/bin:/bin").env("LC_ALL", "C");
         let mut keep = vec![filter_fd, info_fd];
+        keep.extend(hosts.as_ref().map(|hosts| hosts.as_raw_fd()));
+        let join = net.map(|net| (net.user.as_raw_fd(), net.net.as_raw_fd()));
         let mut service_args = None;
         if let Some(service) = service {
             // Its environment, the bus secret among it, goes to bwrap through a
@@ -743,6 +869,12 @@ mod linux {
         ];
         unsafe {
             command.pre_exec(move || {
+                // The user namespace first: only there may this process enter its network.
+                if let Some((user, net)) = join {
+                    if libc::setns(user, libc::CLONE_NEWUSER) != 0 || libc::setns(net, libc::CLONE_NEWNET) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 for &fd in &keep {
                     if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
                         return Err(std::io::Error::last_os_error());
@@ -757,7 +889,113 @@ mod linux {
                 Ok(())
             });
         }
-        Ok((command, Guard { info, _seccomp: seccomp, _args: service_args }))
+        Ok((command, Guard { info, _seccomp: seccomp, _args: service_args, _hosts: hosts }))
+    }
+
+    /// The seccomp filter, in a descriptor for bubblewrap's `--seccomp`.
+    fn seccomp() -> anyhow::Result<File> {
+        let mut seccomp = memfd(c"molt-seccomp")?;
+        let filter = filter();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(filter.as_ptr().cast::<u8>(), std::mem::size_of_val(filter.as_slice()))
+        };
+        seccomp.write_all(bytes)?;
+        seccomp.rewind()?;
+        Ok(seccomp)
+    }
+
+    /// The read-only system runtime every sandbox gets.
+    fn system(command: &mut std::process::Command) {
+        let paths =
+            ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/ld.so.cache", "/etc/ssl/certs", "/etc/alternatives"];
+        for path in paths {
+            if Path::new(path).exists() {
+                command.args(["--ro-bind", path, path]);
+            }
+        }
+    }
+
+    /// Start a [`LocalNet`]'s holder and open its namespaces.
+    pub(super) fn holder(policy: &SandboxPolicy) -> anyhow::Result<LocalNet> {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let sh = ["/bin/sh", "/usr/bin/sh"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .context("no sh in /bin or /usr/bin to hold the shared network")?;
+        let seccomp = seccomp()?;
+        let info = memfd(c"molt-net-info")?;
+        let (filter_fd, info_fd) = (seccomp.as_raw_fd(), info.as_raw_fd());
+        let mut command = std::process::Command::new("/usr/bin/bwrap");
+        // No --disable-userns: commands joining its user namespace make one of their own in it.
+        command.args(["--unshare-all", "--unshare-user", "--new-session", "--cap-drop", "ALL"]);
+        system(&mut command);
+        command.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", "/"]);
+        command.arg("--seccomp").arg(filter_fd.to_string()).arg("--info-fd").arg(info_fd.to_string());
+        // It says it is up only once bubblewrap set up all of its sandbox: bubblewrap reports
+        // its pid before the user namespace has its uid map, and a command that joined it then
+        // could not map its own.
+        command.args(["--", sh, "-c", "echo up && exec cat"]);
+        command.env_clear().env("PATH", "/usr/bin:/bin").env("LC_ALL", "C");
+        command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        let processes = policy.processes;
+        unsafe {
+            command.pre_exec(move || {
+                for fd in [filter_fd, info_fd] {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                let limit = libc::rlimit { rlim_cur: processes, rlim_max: processes };
+                if libc::setrlimit(libc::RLIMIT_NPROC, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut holder = match command.spawn() {
+            Ok(holder) => holder,
+            Err(e) => {
+                let setup = e.raw_os_error().and_then(Resource::of_errno).map_or(Setup::Unsupported, Setup::Short);
+                let message = format!("starting /usr/bin/bwrap for the shared network: {e}");
+                return Err(Unavailable { setup, message }.into());
+            }
+        };
+        let up = holder.stdout.take().map(|mut out| {
+            use std::io::Read;
+            let mut fds = libc::pollfd { fd: out.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: one valid descriptor, polled for at most 5 s.
+            let ready = unsafe { libc::poll(&mut fds, 1, 5_000) } > 0;
+            let mut said = [0; 3];
+            ready && out.read_exact(&mut said).is_ok() && &said == b"up\n"
+        });
+        let pid = namespace_group(&info).filter(|_| up == Some(true));
+        let Some(pid) = pid else {
+            let _ = holder.kill();
+            let status = holder.wait()?;
+            let said = super::stderr_of(&mut holder);
+            if status.signal() == Some(libc::SIGKILL) && said.is_empty() {
+                anyhow::bail!("the shared network's sandbox did not start within 5 s");
+            }
+            let setup = resources::setup_failure("", &said).unwrap_or(Setup::Unsupported);
+            let message = format!("the shared network's sandbox did not start: {said}");
+            return Err(Unavailable { setup, message }.into());
+        };
+        let open = |what: &str| {
+            File::open(format!("/proc/{pid}/{what}")).with_context(|| format!("opening the shared network's {what}"))
+        };
+        let opened = (|| anyhow::Ok((open("ns/user")?, open("ns/net")?, open("net")?)))();
+        let (user, net, sockets) = match opened {
+            Ok(opened) => opened,
+            Err(e) => {
+                let _ = holder.kill();
+                let _ = holder.wait();
+                return Err(e);
+            }
+        };
+        // Its stderr is read only when it failed to start.
+        drop(holder.stderr.take());
+        Ok(LocalNet { holder, user, net, sockets })
     }
 }
 
@@ -765,6 +1003,23 @@ mod linux {
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn a_port_listens_only_when_a_socket_in_the_listen_state_has_it_as_its_local_port() {
+        let tcp = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1F40 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1 1 0 100 0 0 10 0
+   1: 0100007F:1F41 0100007F:1F40 01 00000000:00000000 00:00000000 00000000     0        0 2 1 0 20 4 30 10 -1
+   2: 0100007F:1F42 00000000:0000 06 00000000:00000000 00:00000000 00000000     0        0 0 3 0
+";
+        assert!(listed(tcp, 8000), "a listening socket on 8000");
+        assert!(!listed(tcp, 8001), "a connected socket from 8001 does not listen");
+        assert!(!listed(tcp, 8002), "a socket in TIME_WAIT does not listen");
+        assert!(!listed(tcp, 0x40), "the remote port is not the local one");
+        let tcp6 = "  sl  local_address                         remote_address                        st
+   0: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000";
+        assert!(listed(tcp6, 8080));
+        assert!(!listed("", 8000) && !listed("header only", 8000));
+    }
 
     #[test]
     fn policy_checks_and_reads_the_opened_file_after_path_replacement() {

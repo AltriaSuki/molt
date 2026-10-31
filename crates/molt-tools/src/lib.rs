@@ -15,6 +15,7 @@ mod files;
 mod fork;
 mod git;
 mod matching;
+mod network;
 mod outputs;
 mod paths;
 mod process;
@@ -198,6 +199,8 @@ pub struct Shell {
     running: Arc<shell::Groups>,
     /// The processes started with `shell.start`, whose groups are in `running` too.
     processes: Arc<process::Processes>,
+    /// The network each workspace's commands and processes share.
+    networks: Arc<network::Networks>,
     policy: Option<Arc<SandboxPolicy>>,
     cargo: Option<Arc<cargo_cache::CargoCache>>,
     /// How many `shell.run` commands run at once, and wait.
@@ -219,8 +222,19 @@ impl Shell {
             ExecutionPolicy::Isolated => Some(SandboxPolicy::default()),
             ExecutionPolicy::Configured(policy) => Some(policy),
         };
-        if let Some(policy) = &policy {
+        let mut policy = policy;
+        if let Some(policy) = &mut policy {
             policy.probe()?;
+            if policy.shares_local_network() {
+                if let Err(e) = policy.probe_local_network() {
+                    // A network for each command isolates more: commands run as before, only apart.
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "commands of a workspace cannot share a network on this host; each gets its own"
+                    );
+                    policy.local_network = false;
+                }
+            }
         }
         let cargo = policy.as_ref().and_then(|p| p.cargo_cache.as_deref()).map(cargo_cache::CargoCache::open);
         let cargo = cargo.transpose()?.map(Arc::new);
@@ -232,6 +246,7 @@ impl Shell {
             program: shell::find_shell(),
             running: Arc::default(),
             processes: Arc::default(),
+            networks: Arc::default(),
             policy: policy.map(Arc::new),
             cargo,
             admission: Arc::default(),
@@ -266,6 +281,12 @@ impl Shell {
         self.running.terminate_all();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         self.kill_all();
+    }
+
+    /// How many workspace networks something still runs in (see
+    /// [`SandboxPolicy::local_network`]).
+    pub fn live_networks(&self) -> usize {
+        self.networks.live()
     }
 
     pub fn kill_all(&self) {
@@ -316,6 +337,7 @@ impl Shell {
             program: &self.program,
             groups: &self.running,
             processes: &self.processes,
+            networks: &self.networks,
             sandbox: policy.clone(),
             caller,
             outputs: Some((&self.outputs, asker)),
@@ -326,8 +348,18 @@ impl Shell {
                 let policy = policy.clone();
                 let out = shell::Out { sink, save: Some((self.outputs.clone(), asker.clone())) };
                 serde_json::to_value(
-                    shell::run(&self.roots, &self.program, &self.running, &self.admission, policy, req, cancel, out)
-                        .await?,
+                    shell::run(
+                        &self.roots,
+                        &self.program,
+                        &self.running,
+                        &self.admission,
+                        policy,
+                        &self.networks,
+                        req,
+                        cancel,
+                        out,
+                    )
+                    .await?,
                 )
             }
             "output" => {

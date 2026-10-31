@@ -15,7 +15,14 @@
 //! A process belongs to the caller and the workspace that started it, and
 //! every other call must name both: an id from another attempt's fork, or
 //! another service, finds nothing. The id is random, so it cannot be
-//! guessed either.
+//! guessed either. It belongs to the workspace's directory, too: once that
+//! is removed or replaced (a fork dropped and made again at its path), the
+//! process is stopped.
+//!
+//! In the sandbox without the network, a process and the commands of its
+//! workspace share a network of their own (see `network`), so a test
+//! command reaches the server a process runs. A start that names a
+//! [`StartRequest::port`] is ready once something listens on it there.
 
 use std::collections::{HashMap, VecDeque};
 use std::os::unix::process::ExitStatusExt;
@@ -36,7 +43,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cargo_cache::CargoCache;
 use crate::error::{failed, invalid};
+use crate::network::{self, Identity, Networks};
 use crate::outputs::{self, Asker, Origin};
+use crate::sandbox::{self, LocalNet};
 use crate::shell::{self, lock, Group, Groups};
 use crate::{build_dir, Roots, SandboxPolicy};
 
@@ -69,6 +78,8 @@ const TAIL: usize = 24 * 1024;
 const WRITE_MS: u64 = 5_000;
 /// How often a process's workspace is looked for.
 const GONE_EVERY: Duration = Duration::from_secs(1);
+/// How often a start looks for something listening on its port.
+const PORT_EVERY: Duration = Duration::from_millis(25);
 
 /// The processes the service started.
 #[derive(Default)]
@@ -92,6 +103,8 @@ struct Process {
     given: String,
     command: String,
     started: Instant,
+    /// The port whose listening socket means it is ready, and where to look.
+    port: Option<(u16, Sockets)>,
     log: Mutex<Log>,
     /// Woken when output arrives and when it ends.
     changed: Notify,
@@ -113,6 +126,8 @@ struct Log {
     ready: Option<Vec<u8>>,
     /// Whether it appeared; none without a ready text.
     is_ready: Option<bool>,
+    /// Something listened on the start's port while it ran.
+    listened: bool,
     end: Option<End>,
     ended_at: Option<Instant>,
     /// Where to save all of it, until the ring is about to drop some.
@@ -180,10 +195,52 @@ impl Log {
     }
 }
 
+/// Where a process's sockets are listed.
+enum Sockets {
+    /// This process's network: unconfined, or with the host's.
+    Host,
+    /// Its workspace's network, while anything runs in it.
+    Shared(std::sync::Weak<LocalNet>),
+    /// A network of its own, which its sandbox reports.
+    Own(Arc<std::fs::File>),
+}
+
+impl Sockets {
+    fn listens(&self, port: u16) -> bool {
+        match self {
+            Self::Host => sandbox::sockets_of(None).is_ok_and(|dir| sandbox::listens_in(&dir, port)),
+            Self::Shared(net) => net.upgrade().is_some_and(|net| net.listens(port)),
+            Self::Own(info) => sandbox::namespace_group(info)
+                .and_then(|pid| sandbox::sockets_of(Some(pid)).ok())
+                .is_some_and(|dir| sandbox::listens_in(&dir, port)),
+        }
+    }
+}
+
 impl Process {
+    /// Whether something listens on its port now; none without one, and
+    /// false once it ended.
+    fn listening(&self, log: &Log) -> Option<bool> {
+        self.port.as_ref().map(|(port, sockets)| log.end.is_none() && sockets.listens(*port))
+    }
+
+    /// Whether it is ready: its ready text appeared, and something listened
+    /// on its port; none when the start asked for neither.
+    fn ready(&self, log: &mut Log) -> Option<bool> {
+        if self.port.is_none() {
+            return log.is_ready;
+        }
+        if !log.listened && self.listening(log) == Some(true) {
+            log.listened = true;
+        }
+        Some(log.is_ready != Some(false) && log.listened)
+    }
+
     /// Its state, with the output since the last read.
     fn state(&self) -> ProcessState {
         let mut log = lock(&self.log);
+        let ready = self.ready(&mut log);
+        let listening = self.listening(&log);
         let (output, offset, next, omitted) = log.take();
         let end = log.end;
         ProcessState {
@@ -192,7 +249,8 @@ impl Process {
             status: end.map_or(ProcessStatus::Running, |e| e.status),
             exit_code: end.and_then(|e| e.exit_code),
             signal: end.and_then(|e| e.signal),
-            ready: log.is_ready,
+            ready,
+            listening,
             output,
             offset,
             next,
@@ -207,15 +265,15 @@ impl Process {
     }
 
     /// Wait until `done` says so, it ends, `wait` passes or `cancel` fires.
-    async fn wait_for(&self, wait: Duration, cancel: &CancellationToken, done: impl Fn(&Log) -> bool) {
+    async fn wait_for(&self, wait: Duration, cancel: &CancellationToken, done: impl Fn(&mut Log) -> bool) {
         let until = tokio::time::Instant::now() + wait;
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
             {
-                let log = lock(&self.log);
-                if log.end.is_some() || done(&log) {
+                let mut log = lock(&self.log);
+                if log.end.is_some() || done(&mut log) {
                     return;
                 }
             }
@@ -290,6 +348,7 @@ pub(crate) struct Ctx<'a> {
     pub program: &'a Path,
     pub groups: &'a Arc<Groups>,
     pub processes: &'a Arc<Processes>,
+    pub networks: &'a Arc<Networks>,
     pub sandbox: Option<(&'a SandboxPolicy, Option<Arc<CargoCache>>)>,
     /// The caller the kernel named; none when the service is called directly.
     pub caller: Option<&'a str>,
@@ -309,24 +368,19 @@ pub(crate) async fn start(
     if ready.as_ref().is_some_and(|r| r.len() > MAX_READY) {
         return Err(invalid(format!("ready is over {MAX_READY} bytes: give a short piece of the line it prints")));
     }
+    if req.port == Some(0) {
+        return Err(invalid("port is 0: give the port the process listens on, or leave it out"));
+    }
     let (policy, cargo) = match cx.sandbox {
         Some((policy, cargo)) => (Some(policy), cargo),
         None => (None, None),
     };
-    // Its build directory is its own until it ends, as a command's is.
-    let (ws, build) = {
-        let (roots, ws) = (cx.roots.clone(), req.workspace.clone());
-        tokio::task::spawn_blocking(move || {
-            let ws = roots.workspace(&ws)?;
-            let build = build_dir::acquire(&roots, &ws, cargo.as_ref())?;
-            Ok::<_, RemoteError>((ws, build))
-        })
-        .await
-        .map_err(|e| failed(format!("shell.start failed: {e}")))??
-    };
+    // Its build directory and network are its own until it ends, as a command's are.
+    let (ws, build, net) = shell::acquire(cx.roots, policy, cargo, cx.networks, &req.workspace, "shell.start").await?;
+    let identity = network::identity(&ws);
     let owner = Owner { caller: cx.caller.map(str::to_owned), ws: ws.clone() };
     let lifetime = Duration::from_millis(req.lifetime_ms.unwrap_or(DEFAULT_LIFETIME_MS).clamp(1, MAX_LIFETIME_MS));
-    let (mut cmd, guard) = shell::command(cx.roots, cx.program, policy, &ws, &build, &req.command)?;
+    let (mut cmd, guard) = shell::command(cx.roots, cx.program, policy, &ws, &build, net.as_deref(), &req.command)?;
     cmd.stdin(Stdio::piped());
 
     let process = {
@@ -351,12 +405,18 @@ pub(crate) async fn start(
         let save =
             cx.outputs.map(|(store, asker)| (store.clone(), Arc::new(asker.origin(&ws, &req.workspace, &req.command))));
         let log = Log { ready: ready.map(String::into_bytes), is_ready, save, ..Log::default() };
+        let sockets = match (&net, &guard) {
+            (Some(net), _) => Sockets::Shared(Arc::downgrade(net)),
+            (None, Some(guard)) if policy.is_some_and(|policy| !policy.network) => Sockets::Own(guard.info.clone()),
+            _ => Sockets::Host,
+        };
         let process = Arc::new(Process {
             id: id.clone(),
             owner,
             given: req.workspace.clone(),
             command: req.command.clone(),
             started: Instant::now(),
+            port: req.port.map(|port| (port, sockets)),
             log: Mutex::new(log),
             changed: Notify::new(),
             stdin: tokio::sync::Mutex::new(child.stdin.take()),
@@ -365,12 +425,26 @@ pub(crate) async fn start(
         });
         table.insert(id, process.clone());
         let outputs = (child.stdout.take(), child.stderr.take());
-        tokio::spawn(supervise(process.clone(), child, group, outputs, lifetime, ws, (guard, build)));
+        let held = Held { _guard: guard, _build: build, _net: net };
+        tokio::spawn(supervise(process.clone(), child, group, outputs, lifetime, (ws, identity), held));
         process
     };
 
     let wait = Duration::from_millis(req.wait_ms.unwrap_or(DEFAULT_WAIT_MS).min(MAX_START_WAIT_MS));
-    process.wait_for(wait, &cancel, |log| log.is_ready == Some(true)).await;
+    let until = tokio::time::Instant::now() + wait;
+    loop {
+        // A port is looked for again and again: nothing says when it starts listening.
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        let step = if process.port.is_some() { left.min(PORT_EVERY) } else { left };
+        process.wait_for(step, &cancel, |log| process.ready(log) == Some(true)).await;
+        let done = {
+            let mut log = lock(&process.log);
+            log.end.is_some() || process.ready(&mut log) == Some(true)
+        };
+        if done || cancel.is_cancelled() || tokio::time::Instant::now() >= until {
+            break;
+        }
+    }
     if cancel.is_cancelled() {
         // Nobody was told its id, so nobody else could stop it.
         process.halt().await;
@@ -388,7 +462,7 @@ pub(crate) async fn read(
     let process = cx.processes.find(cx.roots, cx.caller, &req.workspace, &req.id)?;
     let wait = Duration::from_millis(req.wait_ms.unwrap_or(0).min(MAX_READ_WAIT_MS));
     if !wait.is_zero() {
-        process.wait_for(wait, &cancel, Log::unread).await;
+        process.wait_for(wait, &cancel, |log| log.unread()).await;
     }
     Ok(process.state())
 }
@@ -469,16 +543,25 @@ pub(crate) async fn stop(cx: Ctx<'_>, req: StopRequest) -> Result<StopResponse, 
     Ok(StopResponse { stopped: vec![process.state()] })
 }
 
+/// What a process holds until it ends.
+struct Held {
+    _guard: Option<sandbox::Guard>,
+    _build: build_dir::BuildDir,
+    /// Its workspace's network, which lasts while something runs in it.
+    _net: Option<Arc<LocalNet>>,
+}
+
 /// Wait for the process to end or be stopped, then kill its group and say
-/// how it ended. `_held` is its sandbox guard and build directory.
+/// how it ended, and let go of what it `held`. Its workspace is gone once
+/// the directory `ws` is not the one it started in.
 async fn supervise(
     process: Arc<Process>,
     mut child: tokio::process::Child,
     group: Group,
     outputs: (Option<tokio::process::ChildStdout>, Option<tokio::process::ChildStderr>),
     lifetime: Duration,
-    ws: PathBuf,
-    _held: (Option<crate::sandbox::Guard>, build_dir::BuildDir),
+    (ws, identity): (PathBuf, Option<Identity>),
+    held: Held,
 ) {
     let mut readers = tokio::task::JoinSet::new();
     readers.spawn(drain(outputs.0, process.clone()));
@@ -487,7 +570,7 @@ async fn supervise(
         let mut every = tokio::time::interval(GONE_EVERY);
         loop {
             every.tick().await;
-            if !ws.is_dir() {
+            if identity.is_none() || network::identity(&ws) != identity {
                 return;
             }
         }
@@ -526,7 +609,7 @@ async fn supervise(
             writer.close(Some(end));
         }
     }
-    drop(group);
+    drop((group, held));
     process.changed.notify_waiters();
     process.ended.cancel();
 }
