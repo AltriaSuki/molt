@@ -200,3 +200,14 @@ requests = [
 # read_only = ["/opt/corepack"]
 # env = { NODE_OPTIONS = "--max-old-space-size=2048" }
 # probes = [{ command = "npm ls --depth=0", fix = "run `npm install` in the project" }]
+
+# The readiness check (`molt env doctor`, docs/sandbox.md): the project's own
+# build, run in the sandbox once the environment is ready, and variables its
+# commands need (only whether each is set and reaches them is checked). A
+# project's .molt/config.toml may set `build` and `env` too. With
+# `before_run`, `molt do` checks first and does not start when the
+# environment is blocked, and the interface shows the result when it starts.
+# [readiness]
+# build = "cargo build --offline"
+# env = ["DATABASE_URL"]
+# before_run = true

@@ -95,6 +95,17 @@ struct ProjectFile {
     ask_paths: Vec<String>,
     /// The instruction files the planner reads, in place of AGENTS.md and CLAUDE.md.
     instruction_files: Option<Vec<String>>,
+    /// The project's build and required variables for the readiness check.
+    readiness: Option<ProjectReadiness>,
+}
+
+/// `[readiness]` of a project: data only. Whether runs check first is the user's choice.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectReadiness {
+    build: Option<String>,
+    #[serde(default)]
+    env: Vec<String>,
 }
 
 /// A configuration with where each of its values comes from.
@@ -486,7 +497,7 @@ fn merge_project(
     }
     if let Some(key) = NOT_DATA.iter().find(|key| raw.contains_key(**key)) {
         bail!(
-            "{} defines `{key}`, which a project config may not: a project holds only data (check, ask_paths, \
+            "{} defines `{key}`, which a project config may not: a project holds only data (check, ask_paths, readiness, \
              instruction_files), since a service, hook, MCP server or environment there would run programs or \
              hand them your environment for whoever wrote the project. Put services, hooks, env, pass_env, \
              environment profiles and MCP servers in your user config, ~/.config/molt/config.toml",
@@ -522,6 +533,26 @@ fn merge_project(
             }
         }
         origins.insert("confirm.ask_paths".into(), origin.clone());
+    }
+    if let Some(ready) = project.readiness {
+        let section = crate::readiness::ReadinessSection { build: ready.build, env: ready.env, before_run: false };
+        section.validate().with_context(|| format!("in {}", path.display()))?;
+        let readiness = table.entry("readiness").or_insert_with(|| Value::Table(Table::new()));
+        let readiness = readiness.as_table_mut().context("readiness is not a table")?;
+        if let Some(build) = section.build {
+            readiness.insert("build".into(), Value::String(build));
+            origins.insert("readiness.build".into(), origin.clone());
+        }
+        if !section.env.is_empty() {
+            let names = readiness.entry("env").or_insert_with(|| Value::Array(Vec::new()));
+            let names = names.as_array_mut().context("readiness.env is not a list")?;
+            for name in section.env.into_iter().map(Value::String) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            origins.insert("readiness.env".into(), origin.clone());
+        }
     }
     if let Some(files) = project.instruction_files {
         anyhow::ensure!(

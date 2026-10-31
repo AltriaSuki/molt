@@ -662,15 +662,35 @@ struct SkillArgs {
 
 #[derive(Subcommand)]
 enum EnvCmd {
-    /// Say which environment profiles apply to the workspace, run their
-    /// probes in the sandbox as a run's commands would, and give a fix for
-    /// each that fails. Exits 1 when one fails.
+    /// Check the workspace is ready for its commands: which environment
+    /// profiles apply, their probes, the toolchain versions the project
+    /// declares, its dependencies and required variables, all in the sandbox
+    /// as a run's commands would see them, then the project's build if one is
+    /// given, with a fix for each that fails. Exits 1 when the environment is
+    /// blocked, 2 when it is ready and the build already fails, 3 when a
+    /// check could not tell.
     Doctor {
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
         /// The trusted shell sandbox JSON policy runs use, if any.
         #[arg(long)]
         sandbox_policy: Option<PathBuf>,
+        /// A variable commands are given, as with `molt do --pass-env` (repeatable).
+        #[arg(long, value_name = "NAME")]
+        pass_env: Vec<String>,
+        /// Build offline from this user's Cargo cache, as with `molt do --deps-cache cargo`.
+        #[arg(long, value_name = "KIND", value_parser = ["cargo"])]
+        deps_cache: Vec<String>,
+        /// The project's build, run in the sandbox once the environment is ready,
+        /// in place of `[readiness] build`.
+        #[arg(long, value_name = "COMMAND")]
+        build: Option<String>,
+        /// Check everything again, even when an earlier check of the same environment passed.
+        #[arg(long)]
+        fresh: bool,
+        /// Print the report as JSON, for CI.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1093,28 +1113,41 @@ async fn main() -> anyhow::Result<ExitCode> {
         Cmd::Apply(args) => return apply_cmd(cli.config.as_deref(), args).await,
         Cmd::Memory { cmd } => memory_cmd(cli.config.as_deref(), cmd).await?,
         Cmd::Project { cmd } => project_cmd(cmd)?,
-        Cmd::Env { cmd: EnvCmd::Doctor { workspace, sandbox_policy } } => {
+        Cmd::Env { cmd: EnvCmd::Doctor { workspace, sandbox_policy, pass_env, deps_cache, build, fresh, json } } => {
             let workspace = workspace.canonicalize().with_context(|| format!("workspace {}", workspace.display()))?;
-            // The profiles of the --config file if one is given, else the user config's.
-            let user = match cli.config.as_deref() {
-                Some(path) => Config::load(path)?.environments,
-                None => match molt::layers::user_path(&|name| std::env::var(name).ok()) {
-                    Some(path) if path.is_file() => Config::load(&path)?.environments,
-                    _ => Default::default(),
-                },
-            };
-            let policy = match sandbox_policy {
+            // The --config file if one is given, else the user config's and the project's, as a run reads them.
+            let cfg = agent::show_config(cli.config.as_deref(), &workspace, None, None, cli.profile.as_deref())?.config;
+            let mut policy = match sandbox_policy {
                 Some(path) => {
                     let scratch = std::env::temp_dir().join("molt-env-doctor");
                     molt_tools::SandboxPolicy::load(&path, &molt_tools::Roots { root: workspace.clone(), scratch })?
                 }
                 None => molt_tools::SandboxPolicy::default(),
             };
-            let (report, ok) = molt::doctor::run(&workspace, &user, policy).await?;
-            print!("{report}");
-            if !ok {
-                return Ok(ExitCode::FAILURE);
+            policy.environment.extend(pass_env);
+            if deps_cache.iter().any(|kind| kind == "cargo") {
+                policy.cargo_cache = Some(molt_tools::host_cargo_home()?);
             }
+            let mut readiness = cfg.readiness.clone();
+            if build.is_some() {
+                readiness.build = build;
+            }
+            readiness.validate()?;
+            let opts = molt::doctor::Options {
+                workspace: &workspace,
+                user: &cfg.environments,
+                policy,
+                readiness: &readiness,
+                cache: Some(molt::readiness::cache_path(&cfg.kernel.data_dir, &workspace)),
+                fresh,
+            };
+            let checked = molt::doctor::check(opts).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&checked.report)?);
+            } else {
+                print!("{}", checked.render());
+            }
+            return Ok(ExitCode::from(checked.report.exit_code()));
         }
         Cmd::Bench { cmd } => return molt_bench::cli::main(cmd).await,
         Cmd::Prices { cmd } => return prices_cmd(cmd).await,
@@ -1440,9 +1473,28 @@ async fn execute_as(
     for warning in agent::web_warnings(cfg).await? {
         eprintln!("{}", agent::printable(&format!("web DNS preflight: {warning}")));
     }
-    for missing in agent::dependency_warnings(cfg, Path::new(&workspace), molt_tools::host_cargo_home().ok().as_deref())
-    {
-        eprintln!("{}", agent::printable(&format!("dependency preflight: {missing}")));
+    // The readiness check when the user asks for one before runs, else the cheap file checks.
+    match agent::readiness_before_run(cfg, Path::new(&workspace)).await? {
+        Some(checked) => {
+            let report = &checked.report;
+            for problem in report.problems() {
+                eprintln!("{}", agent::printable(&format!("readiness: {problem}")));
+            }
+            eprintln!("{}", agent::printable(&report.summary()));
+            if report.status == molt::readiness::Status::Blocked {
+                eprintln!(
+                    "the run does not start, since its commands could not work here: fix what is blocked \
+                     (`molt env doctor` checks again), or set `before_run = false` under [readiness] in your user config"
+                );
+                return Ok(ExitCode::from(report.exit_code()));
+            }
+        }
+        None => {
+            let cargo_home = molt_tools::host_cargo_home().ok();
+            for missing in agent::dependency_warnings(cfg, Path::new(&workspace), cargo_home.as_deref()) {
+                eprintln!("{}", agent::printable(&format!("dependency preflight: {missing}")));
+            }
+        }
     }
     let checkpointed = req.checkpoint;
     let run = trace.to_string();

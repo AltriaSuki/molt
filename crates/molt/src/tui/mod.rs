@@ -182,10 +182,26 @@ async fn event_loop(
             text::Tone::Warn,
         ));
     }
-    for missing in
-        agent::dependency_warnings(&cfg, Path::new(&workspace), molt_tools::host_cargo_home().ok().as_deref())
-    {
-        app.log.extend(text::block(&format!("dependency preflight: {missing}"), "", text::Tone::Warn));
+    // The readiness check when the user asks for one before runs, else the cheap file checks.
+    match agent::readiness_before_run(&cfg, Path::new(&workspace)).await {
+        Ok(Some(checked)) => {
+            for problem in checked.report.problems() {
+                app.log.extend(text::block(&format!("readiness: {problem}"), "", text::Tone::Warn));
+            }
+            let tone = if checked.report.status == crate::readiness::Status::Ready {
+                text::Tone::Ok
+            } else {
+                text::Tone::Warn
+            };
+            app.log.extend(text::block(&checked.report.summary(), "", tone));
+        }
+        Ok(None) => {
+            let cargo_home = molt_tools::host_cargo_home().ok();
+            for missing in agent::dependency_warnings(&cfg, Path::new(&workspace), cargo_home.as_deref()) {
+                app.log.extend(text::block(&format!("dependency preflight: {missing}"), "", text::Tone::Warn));
+            }
+        }
+        Err(e) => app.log.extend(text::block(&format!("readiness: could not check: {e:#}"), "", text::Tone::Warn)),
     }
     let data_dir = cfg.kernel.data_dir.clone();
     let (lister, root) = (tx.clone(), PathBuf::from(&workspace));
