@@ -87,9 +87,19 @@ pub struct RunRequest {
     /// without `check`.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub verify: bool,
-    /// Parallel attempts, 1 to 8.
+    /// Parallel attempts, 1 to 8. Under [`Schedule::Adaptive`], the most
+    /// attempts the run starts in all.
     #[serde(default = "two")]
     pub attempts: u32,
+    /// How the run starts its attempts and picks their model (see
+    /// [`Schedule`]). `None`: the planner's own setting, else
+    /// [`Schedule::Fixed`]. New: an older planner ignores it and runs fixed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<Schedule>,
+    /// The models an adaptive run escalates through, cheapest first, in
+    /// place of the planner's own list. Ignored by a fixed run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub escalation_models: Vec<String>,
     /// Model for the attempts and the designer (`opus`, `sonnet`, `haiku` or an id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -285,6 +295,8 @@ impl RunRequest {
             judge_model: None,
             verify: true,
             attempts: two(),
+            schedule: None,
+            escalation_models: Vec::new(),
             model: None,
             effort: None,
             max_turns: None,
@@ -306,6 +318,130 @@ impl RunRequest {
             session: None,
         }
     }
+}
+
+/// How a run starts its attempts and which model each gets (#13).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Schedule {
+    /// Every attempt starts at once, on the run's model: the attempts a run
+    /// asks for are the attempts it pays for.
+    #[default]
+    Fixed,
+    /// One attempt starts, on the cheapest model the planner's escalation
+    /// list allows. Evidence (a failed attempt, a check that fails the same
+    /// way twice, tool calls that keep failing) and the budget left decide
+    /// whether another attempt starts, on the same model or the next one up,
+    /// at most [`RunRequest::attempts`] in all. Each decision is published as
+    /// [`crate::progress::Progress::Scheduled`], which the audit log keeps.
+    Adaptive,
+}
+
+impl std::fmt::Display for Schedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Schedule::Fixed => "fixed",
+            Schedule::Adaptive => "adaptive",
+        })
+    }
+}
+
+impl std::str::FromStr for Schedule {
+    type Err = String;
+
+    /// `fixed` or `adaptive`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "fixed" => Ok(Schedule::Fixed),
+            "adaptive" => Ok(Schedule::Adaptive),
+            other => Err(format!("{other:?} is not a schedule: use fixed or adaptive")),
+        }
+    }
+}
+
+/// The version of the adaptive policy's rules, in every decision it makes:
+/// a change to the rules changes it, so that decisions in the audit log can
+/// be read against the rules that made them.
+pub const ADAPTIVE_POLICY: &str = "adaptive/1";
+
+/// One decision of the adaptive schedule (see [`Schedule::Adaptive`]), with
+/// what it was based on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Scheduling {
+    /// The rules that made it: [`ADAPTIVE_POLICY`].
+    pub policy: String,
+    pub action: ScheduleAction,
+    /// The attempt it starts, for every action but [`ScheduleAction::Hold`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// The attempt whose evidence led to it; none for the first start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u32>,
+    /// The model the started attempt runs on; `None` leaves it to the
+    /// gateway's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Why, in a sentence.
+    pub reason: String,
+    /// What a new attempt was assumed to cost.
+    pub price: PriceAssumption,
+    /// The run's budget when it was made.
+    pub budget: BudgetState,
+    /// Escalations so far, this one included, and the most the run may make.
+    pub escalations: u32,
+    pub max_escalations: u32,
+}
+
+/// What an adaptive decision does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleAction {
+    /// The run's first attempt.
+    Start,
+    /// Another attempt alongside one that makes no progress, on the next
+    /// model up when there is one. An escalation.
+    Parallel,
+    /// A new attempt on the next model up, after one failed. An escalation.
+    Escalate,
+    /// A new attempt on the same model, with another approach and what the
+    /// failed ones did. Not an escalation, but it counts as an attempt.
+    Retry,
+    /// Nothing starts, although the evidence asked for it: `reason` says what
+    /// held it back (the budget, a cap, a cancel).
+    Hold,
+}
+
+/// What a scheduling decision assumed a new attempt costs. The planner
+/// learns prices only from the gateway's replies, so the estimate comes from
+/// what this run's attempts cost so far, not from a price list.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PriceAssumption {
+    /// `None` when nothing in the run gave a basis yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate_usd: Option<f64>,
+    /// Where the estimate comes from, and what it does not know.
+    pub basis: String,
+}
+
+/// A run's budget at one moment. The costs are the gateway's estimates, and
+/// the limit is checked before each model call, so a call already made can
+/// take the run past it: no exact ceiling is claimed.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BudgetState {
+    pub limit_usd: f64,
+    /// The known cost so far.
+    pub spent_usd: f64,
+    /// Held back for the model calls in flight, which will be billed.
+    pub reserved_usd: f64,
+    pub in_flight_calls: u32,
+    /// Calls whose cost is not known: unknown prices, replies without usage,
+    /// calls stopped locally that the provider may still bill, and calls a
+    /// stopped run left unanswered.
+    pub unknown_calls: u32,
+    /// What is left after the spend and the reserve; `None` while any call's
+    /// cost is unknown, since unknown is never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_usd: Option<f64>,
 }
 
 /// A change to a running run (see [`CONTROL`]).

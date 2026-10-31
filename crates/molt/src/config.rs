@@ -393,6 +393,9 @@ const PLANNER_ENV: &[&str] = &[
     "MOLT_PROCESSES",
     "MOLT_GIT",
     "MOLT_ROLE_MODELS",
+    "MOLT_SCHEDULE",
+    "MOLT_ESCALATION_MODELS",
+    "MOLT_MAX_ESCALATIONS",
 ];
 
 /// What the memory service reads from its environment (see `molt_memory::Config::from_env`).

@@ -19,6 +19,10 @@ impl App {
                 let line = agent::planned_line(&steps, edited);
                 self.log.push(Line::from(vec![span("◆ ", Tone::Shell), span(clean_line(&line), Tone::Dim)]));
             }
+            Progress::Scheduled { decision, .. } => {
+                let line = agent::scheduled_line(&decision);
+                self.log.push(Line::from(vec![span("◆ ", Tone::Shell), span(clean_line(&line), Tone::Dim)]));
+            }
             Progress::Step { step, steps, goal, fork, .. } => {
                 // A step is a run of its own: its check, lanes and spend start over.
                 task.step_starts();

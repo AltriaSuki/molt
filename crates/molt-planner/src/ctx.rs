@@ -38,6 +38,9 @@ pub(crate) struct Spend {
     pub usage: Usage,
     pub cost_usd: f64,
     pub unknown_calls: u32,
+    /// The most one known call cost: what each call in flight is assumed to
+    /// cost when budget is held back for it.
+    pub max_call_usd: f64,
 }
 
 impl Spend {
@@ -48,6 +51,7 @@ impl Spend {
         }
         // This is the known subtotal; unknown calls are reported separately.
         self.cost_usd += resp.cost_usd.unwrap_or(0.0);
+        self.max_call_usd = self.max_call_usd.max(resp.cost_usd.unwrap_or(0.0));
     }
 
     /// Count what another loop spent, such as an attempt's explorer, as this one's too.
@@ -55,6 +59,7 @@ impl Spend {
         self.usage.add(&other.usage);
         self.cost_usd += other.cost_usd;
         self.unknown_calls += other.unknown_calls;
+        self.max_call_usd = self.max_call_usd.max(other.max_call_usd);
     }
 }
 
@@ -169,6 +174,12 @@ pub(crate) struct Ctx {
     /// The run's model's context window, as the gateway last reported it
     /// (#106); 0 until it does.
     reported_context: Arc<std::sync::atomic::AtomicU32>,
+    /// Where an attempt of an adaptive run reports what the schedule decides
+    /// on (see [`crate::schedule`]); `None` in a fixed run.
+    pub signals: Option<tokio::sync::mpsc::UnboundedSender<crate::schedule::Signal>>,
+    /// What the attempts before this one tried and how they ended, for an
+    /// attempt an adaptive run started after them.
+    pub prior: Option<Arc<str>>,
 }
 
 /// A conversation that grows until it no longer fits a model call (see
@@ -337,6 +348,8 @@ impl Ctx {
             base: None,
             spoke: Arc::default(),
             reported_context: Arc::default(),
+            signals: None,
+            prior: None,
         }
     }
 
@@ -415,6 +428,48 @@ impl Ctx {
         let mut scoped = self.clone();
         scoped.cancel = cancel;
         Arc::new(scoped)
+    }
+
+    /// The context of an attempt an adaptive run starts: on `model` when
+    /// it names one, which then counts as the run's model for its window,
+    /// reporting to `signals`, and told `prior`.
+    pub fn attempt_scope(
+        &self,
+        cancel: CancellationToken,
+        model: Option<Option<String>>,
+        signals: tokio::sync::mpsc::UnboundedSender<crate::schedule::Signal>,
+        prior: Option<Arc<str>>,
+    ) -> Arc<Self> {
+        let mut scoped = self.clone();
+        scoped.cancel = cancel;
+        if let Some(model) = model.filter(|m| *m != self.model) {
+            scoped.model = model;
+            scoped.reported_context = Arc::default();
+        }
+        scoped.signals = Some(signals);
+        scoped.prior = prior;
+        Arc::new(scoped)
+    }
+
+    /// The run's budget as it stands: what is known spent, what is held back
+    /// for the calls in flight at the most one call has cost, and the calls
+    /// whose cost is unknown, which leave what is left unknown.
+    pub fn budget_state(&self) -> molt_api::planner::BudgetState {
+        let t = self.tally();
+        let unknown = t
+            .unsettled
+            .saturating_add(t.abandoned)
+            .saturating_add(t.spend.unknown_calls)
+            .saturating_add(self.carried_uncounted);
+        let reserved = f64::from(t.pending) * t.spend.max_call_usd;
+        molt_api::planner::BudgetState {
+            limit_usd: self.budget_usd,
+            spent_usd: t.spend.cost_usd,
+            reserved_usd: reserved,
+            in_flight_calls: t.pending,
+            unknown_calls: unknown,
+            remaining_usd: (unknown == 0).then(|| (self.budget_usd - t.spend.cost_usd - reserved).max(0.0)),
+        }
     }
 
     pub fn run_id(&self) -> String {

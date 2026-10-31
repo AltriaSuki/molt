@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Role, Usage};
-use crate::planner::{AttemptStatus, Requirement, RunState};
+use crate::planner::{AttemptStatus, Requirement, RunState, Scheduling};
 
 /// Identity and ordering of one model call's preview events. Sequence 0 is
 /// its start; gaps mean best-effort progress was omitted, not missing model
@@ -182,6 +182,14 @@ pub enum Progress {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fork: Option<String>,
     },
+    /// The adaptive schedule decided to start an attempt, or held one back
+    /// (see [`crate::planner::Schedule::Adaptive`]). New: an older reader
+    /// does not know it.
+    Scheduled {
+        run: String,
+        #[serde(flatten)]
+        decision: Scheduling,
+    },
     /// Output of a streamed `shell.run`, whose trace id `run` is: whole
     /// lines where it can, in the order read, numbered from 0 so a gap
     /// shows. `cut` is the last event of a command whose output went past
@@ -225,6 +233,7 @@ impl Progress {
             | Self::Routed { run, .. }
             | Self::Planned { run, .. }
             | Self::Step { run, .. }
+            | Self::Scheduled { run, .. }
             | Self::Output { run, .. } => run,
         }
     }
@@ -293,6 +302,37 @@ mod tests {
         let event: Progress = serde_json::from_str(old).unwrap();
         assert_eq!(event, Progress::AttemptStarted { run: "r".into(), attempt: 0, fork: None });
         assert_eq!(serde_json::to_string(&event).unwrap(), old);
+    }
+
+    #[test]
+    fn a_scheduling_decision_reads_back_with_its_reason_price_and_budget() {
+        use crate::planner::{BudgetState, PriceAssumption, ScheduleAction, Scheduling, ADAPTIVE_POLICY};
+        let event = Progress::Scheduled {
+            run: "r".into(),
+            decision: Scheduling {
+                policy: ADAPTIVE_POLICY.into(),
+                action: ScheduleAction::Escalate,
+                attempt: Some(1),
+                after: Some(0),
+                model: Some("sonnet".into()),
+                reason: "attempt 1 failed".into(),
+                price: PriceAssumption { estimate_usd: Some(0.5), basis: "observed".into() },
+                budget: BudgetState { limit_usd: 2.0, spent_usd: 0.5, unknown_calls: 1, ..Default::default() },
+                escalations: 1,
+                max_escalations: 2,
+            },
+        };
+        let text = serde_json::to_string(&event).unwrap();
+        assert!(
+            text.starts_with(r#"{"event":"scheduled","run":"r","policy":"adaptive/1","action":"escalate""#),
+            "{text}"
+        );
+        assert!(!text.contains("remaining_usd"), "unknown is left out, never zero: {text}");
+        assert_eq!(serde_json::from_str::<Progress>(&text).unwrap(), event);
+        // A request from an older caller has no schedule: the planner's own setting applies.
+        let old: crate::planner::RunRequest = serde_json::from_str(r#"{"task":"t","workspace":"/w"}"#).unwrap();
+        assert_eq!(old.schedule, None);
+        assert_eq!("adaptive".parse::<crate::planner::Schedule>(), Ok(crate::planner::Schedule::Adaptive));
     }
 
     #[test]

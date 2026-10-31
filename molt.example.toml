@@ -113,6 +113,10 @@ pass_env = [
   "MOLT_EXPLORE_MODEL", "MOLT_COMPACT", "MOLT_MAX_TOKENS", "MOLT_MODEL_TIMEOUT_S", "MOLT_CHECK_TIMEOUT_S", "MOLT_MAP_TOKENS", "MOLT_CONTEXT_TOKENS",
   "MOLT_INSTRUCTION_FILES", "MOLT_SYNTAX_CHECK",
   "MOLT_PROCESSES", "MOLT_GIT", "MOLT_ROLE_MODELS",
+  # The adaptive schedule (docs/do.md#adaptive-schedule): MOLT_SCHEDULE=adaptive
+  # starts one attempt and adds more on evidence; MOLT_ESCALATION_MODELS=haiku,sonnet,opus
+  # is the models it escalates through, cheapest first; MOLT_MAX_ESCALATIONS caps it (2).
+  "MOLT_SCHEDULE", "MOLT_ESCALATION_MODELS", "MOLT_MAX_ESCALATIONS",
 ]
 requests = [
   { target = "model.complete", budget = { tokens = 4000000000, calls = 1000000 } },
