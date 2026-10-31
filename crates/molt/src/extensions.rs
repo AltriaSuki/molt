@@ -13,6 +13,12 @@
 //! update whose grant has a line the approved one has not is approved
 //! again; one that asks for nothing more is not.
 //!
+//! A pack can also come from a git repository (`molt ext add URL#REF`,
+//! [`git`]): one commit is fetched, without running anything of the
+//! repository, and its files are staged and checked as a directory's. The
+//! commit approved is recorded, and `molt ext update NAME` fetches the
+//! reference again and goes through the same approval.
+//!
 //! The installed copy is in `~/.local/share/molt/extensions/NAME/`, outside
 //! every workspace. Only the user's layer of the configuration starts packs:
 //! a project config cannot name one, `--config` starts none, and nothing in
@@ -31,6 +37,9 @@ use sha2::{Digest, Sha256};
 use toml::Value;
 
 use crate::layers::user_path;
+
+mod git;
+pub use git::GitSource;
 
 /// The manifest at the top of a pack.
 pub const MANIFEST: &str = "molt-extension.toml";
@@ -348,6 +357,21 @@ pub struct Installed {
     pub installed_ms: u64,
     /// The [`grant`] lines the person approved.
     pub approved: Vec<String>,
+    /// For a pack fetched from git: where from, and the commit approved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<Pinned>,
+}
+
+/// The git repository a pack was fetched from, and the commit installed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pinned {
+    pub url: String,
+    /// The branch, tag or commit id given; none for the repository's `HEAD`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    /// The full id of the commit whose files were installed.
+    pub commit: String,
 }
 
 impl State {
@@ -646,6 +670,13 @@ pub enum Added {
     Refused,
 }
 
+/// Where a staged pack came from.
+struct Origin {
+    /// As shown and recorded.
+    shown: String,
+    git: Option<Pinned>,
+}
+
 /// Install the pack at `source` (a directory, or a `.tar`, `.tar.gz` or
 /// `.tgz` archive), or update the installed one of its name. Nothing it
 /// holds is run. A new pack, and an update that asks for anything the
@@ -653,16 +684,88 @@ pub enum Added {
 /// would get; the installed pack stays as it was otherwise.
 pub fn add(places: &Places, source: &Path, ask: &mut dyn Approve) -> anyhow::Result<Added> {
     let source = source.canonicalize().with_context(|| format!("{} does not exist", source.display()))?;
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&places.packs)?;
-    let stage = tempfile::Builder::new().prefix(".staging-").tempdir_in(&places.packs)?;
+    let stage = staging(places)?;
     let files = stage.path().join("files");
-    std::fs::create_dir(&files)?;
     if source.is_dir() {
         copy_tree(&source, &files)?;
     } else {
         unpack(&source, &files)?;
     }
-    let root = pack_root(&files)?;
+    install(places, &stage, Origin { shown: source.display().to_string(), git: None }, None, ask)
+}
+
+/// Install the pack at one commit of a git repository, as [`add`] does a
+/// directory's: nothing of the repository runs, its files are checked as a
+/// directory's, and the commit is recorded with the approval.
+pub fn add_git(places: &Places, source: &GitSource, ask: &mut dyn Approve) -> anyhow::Result<Added> {
+    let stage = staging(places)?;
+    let commit = git::fetch(source, stage.path(), &stage.path().join("files"))?;
+    install(places, &stage, git_origin(source, commit), None, ask)
+}
+
+fn git_origin(source: &GitSource, commit: String) -> Origin {
+    Origin { shown: source.shown(), git: Some(Pinned { url: source.url.clone(), rev: source.rev.clone(), commit }) }
+}
+
+/// Fetch the reference an installed pack was fetched at again and, when it
+/// moved, install that commit as [`add`] would: a grant with anything not
+/// approved is asked about, with the new lines marked `+`. A pack installed
+/// from a commit id, or from a path, is not looked at.
+pub fn update(places: &Places, name: &str, ask: &mut dyn Approve) -> anyhow::Result<Added> {
+    update_with(places, name, ask, git::SCHEMES)
+}
+
+fn update_with(places: &Places, name: &str, ask: &mut dyn Approve, schemes: &[&'static str]) -> anyhow::Result<Added> {
+    let state = State::load(&places.state)?;
+    let installed = state.packs.get(name).with_context(|| not_installed(name))?;
+    let Some(pin) = &installed.git else {
+        bail!(
+            "extension {name} was installed from {}, not from git: molt ext add it again to update it",
+            installed.source
+        )
+    };
+    let source = GitSource::checked(&pin.url, pin.rev.clone(), schemes)?;
+    if source.pinned() {
+        ask.say(&format!(
+            "extension {name} is pinned to commit {}, which does not move: molt ext add {}#REF fetches another",
+            short(&pin.commit),
+            pin.url
+        ));
+        return Ok(Added::Unchanged);
+    }
+    let stage = staging(places)?;
+    let commit = git::fetch(&source, stage.path(), &stage.path().join("files"))?;
+    if commit == pin.commit {
+        ask.say(&format!("extension {name}: {} is still at commit {}", source.rev_shown(), short(&commit)));
+        return Ok(Added::Unchanged);
+    }
+    ask.say(&format!(
+        "extension {name}: {} moved from commit {} to {}",
+        source.rev_shown(),
+        short(&pin.commit),
+        short(&commit)
+    ));
+    install(places, &stage, git_origin(&source, commit), Some(name), ask)
+}
+
+/// A private directory beside the installed packs, with an empty `files` in it.
+fn staging(places: &Places) -> anyhow::Result<tempfile::TempDir> {
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&places.packs)?;
+    let stage = tempfile::Builder::new().prefix(".staging-").tempdir_in(&places.packs)?;
+    std::fs::create_dir(stage.path().join("files"))?;
+    Ok(stage)
+}
+
+/// Check the pack staged in `stage`, show its grant, and once approved move
+/// it into place and record it. `expect` is the name an update is of.
+fn install(
+    places: &Places,
+    stage: &tempfile::TempDir,
+    origin: Origin,
+    expect: Option<&str>,
+    ask: &mut dyn Approve,
+) -> anyhow::Result<Added> {
+    let root = pack_root(&stage.path().join("files"))?;
     if !root.join(MANIFEST).is_file() {
         for note in import_claude_plugin(&root)? {
             ask.say(&format!("import: {note}"));
@@ -670,18 +773,35 @@ pub fn add(places: &Places, source: &Path, ask: &mut dyn Approve) -> anyhow::Res
     }
     let manifest = read_manifest(&root)?;
     let name = manifest.name.clone();
+    if let Some(expect) = expect {
+        ensure!(name == expect, "the update of extension {expect} is a pack named {name:?}; nothing was installed");
+    }
     let lines = grant(&manifest, &root)?;
     let sha = tree_hash(&root)?;
     let mut state = State::load(&places.state)?;
     collisions(places, &state, &manifest)?;
     let previous = state.packs.get(&name).cloned();
     let installed_dir = places.dir(&name);
-    if previous.as_ref().is_some_and(|p| p.sha256 == sha) && installed_dir.is_dir() {
+    let commit =
+        |pin: &Option<Pinned>| pin.as_ref().map(|p| format!(", commit {}", short(&p.commit))).unwrap_or_default();
+    if let Some(p) = previous.as_ref().filter(|p| p.sha256 == sha && installed_dir.is_dir()) {
         ask.say(&format!("extension {name} {} is installed already, with these files", manifest.version));
+        if p.git != origin.git || p.source != origin.shown {
+            // The same files from another commit or place: what they came from is recorded.
+            let entry = state.packs.get_mut(&name).expect("it was there");
+            entry.source = origin.shown;
+            entry.git = origin.git;
+            state.save(&places.state)?;
+        }
         return Ok(Added::Unchanged);
     }
-    let mut text =
-        format!("extension {name} {} (sha256 {}) from {}\n", manifest.version, short(&sha), source.display());
+    let mut text = format!(
+        "extension {name} {} (sha256 {}) from {}{}\n",
+        manifest.version,
+        short(&sha),
+        origin.shown,
+        commit(&origin.git)
+    );
     if !manifest.description.is_empty() {
         text.push_str(&format!("  {}\n", manifest.description));
     }
@@ -693,7 +813,13 @@ pub fn add(places: &Places, source: &Path, ask: &mut dyn Approve) -> anyhow::Res
         Some(p) => {
             let old: BTreeSet<&String> = p.approved.iter().collect();
             let new: Vec<&String> = lines.iter().filter(|l| !old.contains(l)).collect();
-            text.push_str(&format!("This updates {} to {}. ", p.version, manifest.version));
+            text.push_str(&format!(
+                "This updates {}{} to {}{}. ",
+                p.version,
+                commit(&p.git),
+                manifest.version,
+                commit(&origin.git)
+            ));
             if new.is_empty() {
                 text.push_str("It asks for nothing you have not approved:\n");
             } else {
@@ -741,10 +867,11 @@ pub fn add(places: &Places, source: &Path, ask: &mut dyn Approve) -> anyhow::Res
         Installed {
             version: manifest.version.clone(),
             sha256: sha,
-            source: source.display().to_string(),
+            source: origin.shown,
             enabled: previous.as_ref().is_none_or(|p| p.enabled),
             installed_ms: u64::try_from(installed_ms).unwrap_or(u64::MAX),
             approved: lines,
+            git: origin.git,
         },
     );
     state.save(&places.state)?;
@@ -909,9 +1036,9 @@ fn not_installed(name: &str) -> String {
 }
 
 /// Uninstall `name`: its files, its record and approval, and the tool
-/// lists of its MCP servers cached in the default data dirs. Returns what
-/// was removed.
-pub fn remove(places: &Places, name: &str) -> anyhow::Result<Vec<PathBuf>> {
+/// lists of its MCP servers cached in the default data dirs and in
+/// `data_dirs` (those chosen with `--data-dir`). Returns what was removed.
+pub fn remove(places: &Places, name: &str, data_dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     let mut state = State::load(&places.state)?;
     ensure!(state.packs.contains_key(name), "{}", not_installed(name));
     let dir = places.dir(name);
@@ -920,14 +1047,15 @@ pub fn remove(places: &Places, name: &str) -> anyhow::Result<Vec<PathBuf>> {
         Ok(m) => m.mcp.keys().map(|s| mcp_key(name, s)).collect(),
         Err(_) => Vec::new(),
     };
-    if let Some(cache) = &places.cache {
-        for data in std::fs::read_dir(cache).into_iter().flatten().filter_map(Result::ok) {
-            for key in &keys {
-                let file = data.path().join("mcp").join(format!("{key}.json"));
-                if std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file()) {
-                    std::fs::remove_file(&file)?;
-                    removed.push(file);
-                }
+    let defaults = places.cache.iter().flat_map(|cache| std::fs::read_dir(cache).into_iter().flatten());
+    let data: Vec<PathBuf> =
+        defaults.filter_map(Result::ok).map(|e| e.path()).chain(data_dirs.iter().cloned()).collect();
+    for data in data {
+        for key in &keys {
+            let file = data.join("mcp").join(format!("{key}.json"));
+            if std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file()) {
+                std::fs::remove_file(&file)?;
+                removed.push(file);
             }
         }
     }
@@ -944,7 +1072,7 @@ pub fn remove(places: &Places, name: &str) -> anyhow::Result<Vec<PathBuf>> {
 pub fn list(places: &Places) -> anyhow::Result<String> {
     let state = State::load(&places.state)?;
     if state.packs.is_empty() {
-        return Ok("no extension packs installed: molt ext add PATH installs one\n".into());
+        return Ok("no extension packs installed: molt ext add PATH or URL installs one\n".into());
     }
     let mut out = String::new();
     for (name, p) in &state.packs {
@@ -965,12 +1093,19 @@ pub fn show(places: &Places, name: &str) -> anyhow::Result<String> {
     let p = state.packs.get(name).with_context(|| not_installed(name))?;
     let on = if p.enabled { "enabled" } else { "disabled" };
     let mut out = format!(
-        "extension {name} {} ({on})\n  installed in {}\n  from {}\n  sha256 {}\nApproved:\n",
+        "extension {name} {} ({on})\n  installed in {}\n  from {}\n",
         p.version,
         places.dir(name).display(),
         p.source,
-        p.sha256
     );
+    if let Some(pin) = &p.git {
+        out.push_str(&format!(
+            "  commit {} (molt ext update {name} fetches {} again)\n",
+            pin.commit,
+            pin.rev.as_deref().unwrap_or("HEAD")
+        ));
+    }
+    out.push_str(&format!("  sha256 {}\nApproved:\n", p.sha256));
     for line in &p.approved {
         out.push_str(&format!("  {line}\n"));
     }
@@ -1153,12 +1288,16 @@ mod tests {
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join("tracker-issues.json"), "{}").unwrap();
         std::fs::write(cache.join("mine.json"), "{}").unwrap();
-        let removed = remove(&home.places, "tracker").unwrap();
-        assert_eq!(removed.len(), 2, "{removed:?}");
+        let chosen = home.dir.path().join("elsewhere");
+        std::fs::create_dir_all(chosen.join("mcp")).unwrap();
+        std::fs::write(chosen.join("mcp/tracker-issues.json"), "{}").unwrap();
+        let removed = remove(&home.places, "tracker", std::slice::from_ref(&chosen)).unwrap();
+        assert_eq!(removed.len(), 3, "{removed:?}");
+        assert!(!chosen.join("mcp/tracker-issues.json").exists(), "a --data-dir is swept too");
         assert!(!home.places.dir("tracker").exists() && !cache.join("tracker-issues.json").exists());
         assert!(cache.join("mine.json").exists(), "another server's list stays");
         assert!(State::load(&home.places.state).unwrap().packs.is_empty());
-        assert!(remove(&home.places, "tracker").is_err());
+        assert!(remove(&home.places, "tracker", &[]).is_err());
     }
 
     fn tar_with(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
@@ -1344,5 +1483,229 @@ mod tests {
         assert_eq!(commands["review"].description, "Review a change");
         assert_eq!(commands["review"].expand("#12"), "Review #12 carefully.");
         assert_eq!(packs[0].skills_dir(), Some(packs[0].dir.join("skills")));
+    }
+
+    /// Git for building a test's repository, reading no configuration of the machine's.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A repository with `files` committed, on branch main.
+    fn make_repo(home: &Home, name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = home.dir.path().join("repos").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        commit(&dir, files);
+        dir
+    }
+
+    fn commit(dir: &Path, files: &[(&str, &str)]) -> String {
+        for (path, text) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        }
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "--allow-empty", "-m", "change"]);
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    fn file_url(repo: &Path, rev: &str) -> GitSource {
+        let url =
+            format!("file://{}{}", repo.display(), if rev.is_empty() { String::new() } else { format!("#{rev}") });
+        GitSource::parse_with(&url, git::SCHEMES_AND_FILE).unwrap()
+    }
+
+    #[test]
+    fn a_pack_from_a_git_repository_is_installed_at_its_ref_and_pinned_to_the_commit() {
+        let home = Home::new();
+        let repo = make_repo(&home, "tracker", &[(MANIFEST, TRACKER), ("bin/issues", "v1")]);
+        git(&repo, &["tag", "v1"]);
+        let tagged = git(&repo, &["rev-parse", "v1^{commit}"]);
+        commit(&repo, &[("bin/issues", "v2")]);
+
+        let mut says = Says::yes();
+        assert_eq!(add_git(&home.places, &file_url(&repo, "v1"), &mut says).unwrap(), Added::Installed);
+        let asked = &says.asked[0];
+        assert!(asked.contains(&format!("#v1, commit {}", &tagged[..12])), "{asked}");
+        assert!(asked.contains("MCP server tracker-issues runs ${MOLT_EXTENSION_DIR}/bin/issues"), "{asked}");
+        let installed = &State::load(&home.places.state).unwrap().packs["tracker"];
+        let pin = installed.git.as_ref().unwrap();
+        assert_eq!((pin.rev.as_deref(), pin.commit.as_str()), (Some("v1"), tagged.as_str()));
+        assert!(installed.source.ends_with("/repos/tracker#v1"), "{}", installed.source);
+        let dir = home.places.dir("tracker");
+        assert_eq!(std::fs::read_to_string(dir.join("bin/issues")).unwrap(), "v1", "the tag's files, not main's");
+        assert!(!dir.join(".git").exists());
+        assert_eq!(installed.sha256, tree_hash(&dir).unwrap());
+        assert_eq!(active(&home.places).unwrap().len(), 1, "it starts as a directory's pack does");
+        let shown = show(&home.places, "tracker").unwrap();
+        assert!(shown.contains(&format!("commit {tagged}")), "{shown}");
+
+        // The remote's HEAD, and a commit id, are references too.
+        let home = Home::new();
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+        add_git(&home.places, &file_url(&repo, ""), &mut Says::yes()).unwrap();
+        assert_eq!(State::load(&home.places.state).unwrap().packs["tracker"].git.as_ref().unwrap().commit, head);
+        let home = Home::new();
+        add_git(&home.places, &file_url(&repo, &tagged), &mut Says::yes()).unwrap();
+        let mut says = Says::no();
+        assert_eq!(update_with(&home.places, "tracker", &mut says, git::SCHEMES_AND_FILE).unwrap(), Added::Unchanged);
+        assert!(says.said[0].contains("is pinned to commit"), "{:?}", says.said);
+    }
+
+    #[test]
+    fn nothing_in_a_fetched_repository_runs() {
+        let home = Home::new();
+        let marker = home.dir.path().join("ran");
+        let touch = format!("touch {}", marker.display());
+        let repo = make_repo(
+            &home,
+            "tracker",
+            &[
+                (MANIFEST, TRACKER),
+                (".gitattributes", "* filter=evil\n*.md filter=lfs diff=lfs merge=lfs -text\n"),
+                (
+                    ".gitmodules",
+                    &format!("[submodule \"x\"]\n\tpath = x\n\turl = ext::sh -c {}\n", touch.replace(' ', "% ")),
+                ),
+                ("hooks/post-checkout", &format!("#!/bin/sh\n{touch}\n")),
+                ("notes.md", "version https://git-lfs.github.com/spec/v1\n"),
+            ],
+        );
+        // The repository's own configuration and hooks, which a fetch from it must not use.
+        for (key, value) in [
+            ("filter.evil.smudge", touch.as_str()),
+            ("filter.evil.process", touch.as_str()),
+            ("core.fsmonitor", touch.as_str()),
+            ("core.sshCommand", touch.as_str()),
+            ("uploadpack.packObjectsHook", touch.as_str()),
+        ] {
+            git(&repo, &["config", key, value]);
+        }
+        for hook in ["pre-upload-pack", "post-checkout", "post-merge", "reference-transaction"] {
+            let path = repo.join(".git/hooks").join(hook);
+            std::fs::write(&path, format!("#!/bin/sh\n{touch}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(add_git(&home.places, &file_url(&repo, "main"), &mut Says::yes()).unwrap(), Added::Installed);
+        assert!(!marker.exists(), "nothing of the repository ran");
+        let dir = home.places.dir("tracker");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("notes.md")).unwrap(),
+            "version https://git-lfs.github.com/spec/v1\n",
+            "no filter or LFS step changed a file"
+        );
+        assert!(dir.join(".gitmodules").is_file() && !dir.join("x").exists(), "no submodule was fetched");
+
+        // A submodule in the tree, with an `ext::` URL, refuses the pack and fetches nothing.
+        let sub = make_repo(&home, "with-submodule", &[(MANIFEST, &TRACKER.replace("tracker", "subbed"))]);
+        let commit_id = git(&sub, &["rev-parse", "HEAD"]);
+        std::fs::write(
+            sub.join(".gitmodules"),
+            format!("[submodule \"x\"]\n\tpath = x\n\turl = ext::sh -c {}\n", touch.replace(' ', "% ")),
+        )
+        .unwrap();
+        git(&sub, &["update-index", "--add", "--cacheinfo", &format!("160000,{commit_id},x")]);
+        git(&sub, &["add", ".gitmodules"]);
+        git(&sub, &["commit", "-q", "-m", "submodule"]);
+        let err = format!("{:#}", add_git(&home.places, &file_url(&sub, "main"), &mut Says::yes()).unwrap_err());
+        assert!(err.contains("x is a submodule"), "{err}");
+        assert!(!marker.exists() && !home.places.dir("subbed").exists());
+
+        // An `ext::` URL is not fetched at all, even where `file` is allowed.
+        let err = GitSource::parse_with(&format!("ext::sh -c {}", touch.replace(' ', "% ")), git::SCHEMES_AND_FILE)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("transport syntax"), "{err:#}");
+        assert!(!marker.exists());
+        let left: Vec<_> = std::fs::read_dir(&home.places.packs)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(left.is_empty(), "the staging directories are gone: {left:?}");
+    }
+
+    #[test]
+    fn a_fetched_tree_with_a_symlink_is_refused_as_a_directory_is() {
+        let home = Home::new();
+        let repo = make_repo(&home, "tracker", &[(MANIFEST, TRACKER)]);
+        std::os::unix::fs::symlink("/etc/passwd", repo.join("notes.md")).unwrap();
+        commit(&repo, &[]);
+        let err = format!("{:#}", add_git(&home.places, &file_url(&repo, "main"), &mut Says::yes()).unwrap_err());
+        assert!(err.contains("notes.md is a symlink"), "{err}");
+        assert!(!home.places.dir("tracker").exists() && !home.places.state.exists());
+        let left: Vec<_> = std::fs::read_dir(&home.places.packs).unwrap().collect();
+        assert!(left.is_empty(), "the staging directory is gone: {left:?}");
+    }
+
+    #[test]
+    fn an_update_from_git_reports_the_ref_that_moved_and_asks_again_only_for_more() {
+        let home = Home::new();
+        let repo = make_repo(&home, "tracker", &[(MANIFEST, TRACKER), ("bin/issues", "v1")]);
+        let first = git(&repo, &["rev-parse", "HEAD"]);
+        add_git(&home.places, &file_url(&repo, "main"), &mut Says::yes()).unwrap();
+        let pinned =
+            |home: &Home| State::load(&home.places.state).unwrap().packs["tracker"].git.clone().unwrap().commit;
+        let again = |says: &mut Says| update_with(&home.places, "tracker", says, git::SCHEMES_AND_FILE).unwrap();
+
+        let mut says = Says::no();
+        assert_eq!(again(&mut says), Added::Unchanged);
+        assert!(says.said[0].contains(&format!("main is still at commit {}", &first[..12])), "{:?}", says.said);
+
+        // A commit with the same files is recorded, and nothing is asked or installed.
+        let empty = commit(&repo, &[]);
+        let mut says = Says::no();
+        assert_eq!(again(&mut says), Added::Unchanged);
+        assert!(says.asked.is_empty() && says.said.join("\n").contains("installed already"), "{:?}", says.said);
+        assert_eq!(pinned(&home), empty);
+        let first = empty;
+
+        // New code within the same grant goes in with a note.
+        let second = commit(&repo, &[("bin/issues", "v2")]);
+        let mut says = Says::no();
+        assert_eq!(again(&mut says), Added::Updated);
+        assert!(says.asked.is_empty(), "{:?}", says.asked);
+        let said = says.said.join("\n");
+        assert!(said.contains(&format!("main moved from commit {} to {}", &first[..12], &second[..12])), "{said}");
+        assert!(said.contains("It asks for nothing you have not approved"), "{said}");
+        assert_eq!(pinned(&home), second);
+        assert_eq!(std::fs::read_to_string(home.places.dir("tracker").join("bin/issues")).unwrap(), "v2");
+
+        // More asked for is shown with + and needs a yes; refused, the installed commit stays.
+        let third = commit(&repo, &[(MANIFEST, &TRACKER.replace("calls = 20", "calls = 20\nnetwork = true"))]);
+        let mut says = Says::no();
+        assert_eq!(again(&mut says), Added::Refused);
+        let asked = &says.asked[0];
+        assert!(asked.contains("  + MCP server tracker-issues has the network"), "{asked}");
+        assert!(asked.contains(&format!("commit {} to 1.0.0, commit {}", &second[..12], &third[..12])), "{asked}");
+        assert_eq!(pinned(&home), second);
+        assert!(!active(&home.places).unwrap()[0].manifest.mcp["issues"].network);
+        assert_eq!(again(&mut Says::yes()), Added::Updated);
+        assert_eq!(pinned(&home), third);
+        assert!(active(&home.places).unwrap()[0].manifest.mcp["issues"].network);
+
+        // A repository whose pack is renamed is not an update of this one.
+        commit(&repo, &[(MANIFEST, &TRACKER.replace("name = \"tracker\"", "name = \"other\""))]);
+        let err =
+            format!("{:#}", update_with(&home.places, "tracker", &mut Says::yes(), git::SCHEMES_AND_FILE).unwrap_err());
+        assert!(err.contains("is a pack named \"other\""), "{err}");
+
+        // What was recorded is checked again: a file:// URL is not fetched outside tests.
+        let err = format!("{:#}", update(&home.places, "tracker", &mut Says::yes()).unwrap_err());
+        assert!(err.contains("give the repository's directory"), "{err}");
+        // A pack from a directory has nothing to fetch.
+        let src = home.pack("plain", &TRACKER.replace("tracker", "plain"));
+        add(&home.places, &src, &mut Says::yes()).unwrap();
+        let err = format!("{:#}", update(&home.places, "plain", &mut Says::yes()).unwrap_err());
+        assert!(err.contains("not from git"), "{err}");
     }
 }

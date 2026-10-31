@@ -3,15 +3,17 @@
 An extension pack bundles what you would otherwise add to your
 configuration by hand: [MCP servers](mcp.md), [lifecycle
 hooks](config.md#trusted-lifecycle-hooks), [Agent Skills](skills.md) and
-[command templates](tui.md#project-task-commands). It is a directory, or a
-`.tar`, `.tar.gz` or `.tgz` archive of one, with a `molt-extension.toml` at
-the top. The design is RFC 0005,
+[command templates](tui.md#project-task-commands). It is a directory, a
+`.tar`, `.tar.gz` or `.tgz` archive of one, or a git repository, with a
+`molt-extension.toml` at the top. The design is RFC 0005,
 [rfc/0005-extension-packs.md](rfc/0005-extension-packs.md); the format is
 unstable until it has been used for a phase of the roadmap.
 
 ```sh
 molt ext add ./issue-tracker         # shows what it would get, then asks
 molt ext add issue-tracker.tgz --yes # the same, approved from a script
+molt ext add https://github.com/team/issue-tracker#v1.2.0   # one commit of a repository
+molt ext update issue-tracker        # that branch or tag again, if it moved
 molt ext list
 molt ext show issue-tracker          # where it is and what you approved
 molt ext disable issue-tracker       # off, still installed
@@ -140,6 +142,54 @@ the whole archive, before anything is installed. An archive of one
 directory is read as the pack in it. A pack holds at most 2048 files and
 directories, 64 MiB and 16 levels of directories.
 
+## From a git repository
+
+`molt ext add URL[#REF]` fetches one commit of a repository and installs
+its files as it would a directory's. `REF` is a branch, a tag or a full
+commit id; without one it is the repository's default branch (its `HEAD`).
+
+```text
+extension issue-tracker 1.2.0 (sha256 3f2a9c01d4be) from https://github.com/team/issue-tracker#v1.2.0, commit 8c41d07e9a2b
+It would get:
+  ...
+```
+
+- **Over https or ssh only.** `https://HOST/PATH`, `ssh://[USER@]HOST/PATH`
+  and `USER@HOST:PATH` are fetched. `http://` and `git://` are refused, as
+  anyone on the way could change what arrives; `file://` is refused (give
+  the directory instead: it is copied without its `.git`); and git's
+  `TRANSPORT::ADDRESS` forms, such as `ext::`, which run a program to reach
+  a repository, are never fetched. An https URL with a user or a token in
+  it is refused, as it would be recorded; a private repository is reached
+  with your ssh keys and agent, or a token in `~/.netrc`.
+- **Nothing of the repository runs.** Git runs with neither your nor the
+  system's git configuration, an environment emptied but for `PATH`,
+  `HOME`, `SSH_AUTH_SOCK` and the proxy and CA variables, no credential
+  helper or prompt (ssh runs with `BatchMode=yes`), no hooks, only the URL's
+  own protocol allowed, every object checked as it arrives, and no
+  submodule fetched. The commit is fetched into a new bare repository and
+  never checked out: its files are written from the commit's tree by Molt,
+  so no `.gitattributes` filter, smudge or LFS step applies, and a
+  `.gitmodules` is only a file.
+- **Checked as a directory.** A symlink in the tree, or a submodule,
+  refuses the pack. The files then go through the same checks, limits,
+  hash and grant as a directory's. The fetch stops after 120 seconds, or
+  once the fetched objects pass 128 MiB.
+- **Pinned to the commit you approved.** `extensions.toml` records the URL,
+  the reference and the full commit id beside the approval, and `molt ext
+  show` prints them. The installed files are checked against their hash at
+  each start, as any pack's.
+
+`molt ext update NAME` fetches the recorded branch or tag again. When it
+still names the installed commit it says so and changes nothing. When it
+moved, it says from which commit to which, and the new commit is installed
+as an update by `molt ext add` would be: an update whose grant has a line
+you have not approved lists it with `+` and needs your yes (at a terminal,
+or `--yes`), and refused, the installed commit stays; one that asks for
+nothing more goes in with a note. A pack installed at a commit id is not
+moved: `molt ext add URL#REF` installs another. A pack installed from a
+path is updated with `molt ext add` of the path.
+
 ## Disabling and removing
 
 `molt ext disable NAME` keeps the pack and its approval, and the next start
@@ -148,8 +198,10 @@ checks it as a start does and turns it back on.
 
 `molt ext remove NAME` deletes the installed files, the record and the
 approval, and the tool lists its servers left in the default data dirs
-(`~/.cache/molt/*/mcp/`). A data dir you chose with `--data-dir` keeps its
-cached list, which nothing reads once the server is gone.
+(`~/.cache/molt/*/mcp/`). A data dir you chose with `--data-dir` is swept
+too when you name it: `molt ext remove NAME --data-dir DIR` (repeatable).
+Otherwise it keeps its cached list, which nothing reads once the server is
+gone.
 
 ## Claude Code plugins
 
@@ -173,7 +225,8 @@ approved as any pack's.
 
 ## Not yet
 
-Installing from a git URL or a registry, services, environment profiles,
+Installing from a registry, fetching git submodules or LFS files, git
+fetches in a sandbox of their own, services, environment profiles,
 roles, prompts and workflows in a pack, importing a Claude Code plugin's
 hooks and agents, and evaluating a pack on the benchmark before it is
 enabled.

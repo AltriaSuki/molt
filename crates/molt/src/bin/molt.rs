@@ -132,9 +132,9 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PromptsCmd,
     },
-    /// Install, approve, disable and remove extension packs (docs/extensions.md):
-    /// MCP servers, hooks, skills and commands bundled in a directory or an
-    /// archive with a molt-extension.toml.
+    /// Install, approve, update, disable and remove extension packs
+    /// (docs/extensions.md): MCP servers, hooks, skills and commands bundled
+    /// in a directory, an archive or a git repository with a molt-extension.toml.
     Ext {
         #[command(subcommand)]
         cmd: ExtCmd,
@@ -143,14 +143,26 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ExtCmd {
-    /// Install a pack from a directory or a .tar, .tar.gz or .tgz archive,
-    /// or update the installed one of its name. It shows what the pack
-    /// would get and installs it only once you approve, at a terminal or
-    /// with --yes; an update that asks for nothing more needs no approval.
-    /// Nothing the pack holds is run. A Claude Code plugin is imported.
+    /// Install a pack from a directory, a .tar, .tar.gz or .tgz archive, or
+    /// a git repository (https://HOST/REPO or ssh, with #BRANCH, #TAG or
+    /// #COMMIT), or update the installed one of its name. It shows what the
+    /// pack would get and installs it only once you approve, at a terminal
+    /// or with --yes; an update that asks for nothing more needs no
+    /// approval. Nothing the pack holds is run. A Claude Code plugin is
+    /// imported.
     Add {
-        path: PathBuf,
+        /// A directory, an archive, or URL[#REF].
+        source: PathBuf,
         /// Approve what the pack would get without being asked, as from a script.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Fetch a pack installed from git again at its branch or tag, and
+    /// install the new commit as add does: anything it asks for that you
+    /// did not approve is shown with + and asked about.
+    Update {
+        name: String,
+        /// Approve what the update would get without being asked, as from a script.
         #[arg(long)]
         yes: bool,
     },
@@ -163,7 +175,12 @@ enum ExtCmd {
     /// Start a disabled pack again, as you approved it.
     Enable { name: String },
     /// Uninstall a pack: its files, its approval and its servers' cached tool lists.
-    Remove { name: String },
+    Remove {
+        name: String,
+        /// A data dir you chose with --data-dir, whose cached tool lists go too; may repeat.
+        #[arg(long)]
+        data_dir: Vec<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2247,10 +2264,24 @@ fn ext_cmd(cmd: ExtCmd) -> anyhow::Result<ExitCode> {
 
     let places = extensions::Places::from_env()?;
     match cmd {
-        ExtCmd::Add { path, yes } => match extensions::add(&places, &path, &mut Ask { yes })? {
-            Added::Installed => println!("installed; it starts with the next run (molt ext disable NAME turns it off)"),
+        ExtCmd::Add { source, yes } => {
+            let ask = &mut Ask { yes };
+            let added = match extensions::GitSource::from_arg(&source)? {
+                Some(git) => extensions::add_git(&places, &git, ask)?,
+                None => extensions::add(&places, &source, ask)?,
+            };
+            match added {
+                Added::Installed => {
+                    println!("installed; it starts with the next run (molt ext disable NAME turns it off)")
+                }
+                Added::Updated => println!("updated"),
+                Added::Unchanged => {}
+                Added::Refused => return Ok(ExitCode::FAILURE),
+            }
+        }
+        ExtCmd::Update { name, yes } => match extensions::update(&places, &name, &mut Ask { yes })? {
             Added::Updated => println!("updated"),
-            Added::Unchanged => {}
+            Added::Installed | Added::Unchanged => {}
             Added::Refused => return Ok(ExitCode::FAILURE),
         },
         ExtCmd::List => print!("{}", extensions::list(&places)?),
@@ -2263,8 +2294,8 @@ fn ext_cmd(cmd: ExtCmd) -> anyhow::Result<ExitCode> {
             extensions::set_enabled(&places, &name, true)?;
             println!("extension {name} is enabled");
         }
-        ExtCmd::Remove { name } => {
-            for path in extensions::remove(&places, &name)? {
+        ExtCmd::Remove { name, data_dir } => {
+            for path in extensions::remove(&places, &name, &data_dir)? {
                 println!("removed {}", path.display());
             }
             println!("extension {name} is uninstalled");
