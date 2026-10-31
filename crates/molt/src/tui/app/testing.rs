@@ -160,6 +160,7 @@ pub(super) fn passed(apply: bool, fork: Option<&str>) -> RunResponse {
                 note: String::new(),
                 requirements: 0,
                 dispute: None,
+                failure: None,
             },
             AttemptReport {
                 index: 1,
@@ -171,6 +172,7 @@ pub(super) fn passed(apply: bool, fork: Option<&str>) -> RunResponse {
                 note: String::new(),
                 requirements: 0,
                 dispute: None,
+                failure: None,
             },
         ],
         usage: Usage::default(),
@@ -230,6 +232,7 @@ pub(super) fn attempt(index: u32, status: AttemptStatus, note: &str) -> AttemptR
         note: note.into(),
         requirements: 0,
         dispute: None,
+        failure: None,
     }
 }
 

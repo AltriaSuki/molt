@@ -682,6 +682,104 @@ pub struct ReviewDetails {
     pub error: Option<String>,
 }
 
+/// What kind of failure stopped a command, a tool call or a model call, as
+/// the planner classified it from its exit code and output (#228). The
+/// class decides only whether another try can help; it never widens what
+/// a command may reach or resets what the run may spend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    /// A tool, package or toolchain is missing where commands run.
+    Environment,
+    /// The model endpoint refused the call: a credential, a model name or
+    /// the provider's service.
+    Endpoint,
+    /// A compiler, type checker or test runner found a fault in the code.
+    Code,
+    /// The sandbox or a capability refused it: it is not allowed here.
+    Policy,
+    /// Disk, memory or processes ran out.
+    Exhausted,
+    /// It may have taken effect before it was stopped.
+    OutcomeUnknown,
+    /// Nothing in it says which; also any class a newer planner names.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What a [`Failure`] suggests doing next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureAction {
+    /// Change the code: another try can fix it.
+    FixCode,
+    /// The user provides what is missing; trying again without it meets the same.
+    FixEnvironment,
+    /// The user fixes the configuration (a credential, a model, an endpoint).
+    FixConfig,
+    /// Do it another way, inside what is allowed.
+    ChangeApproach,
+    /// The same call may work later.
+    RetryLater,
+    /// Check whether it took effect before doing it again.
+    VerifyFirst,
+    /// No suggestion beyond the usual; also any action a newer planner names.
+    #[serde(other)]
+    None,
+}
+
+/// Where a [`Failure`] came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureSource {
+    /// The done-check.
+    Check,
+    /// A tool call of the model's.
+    Tool,
+    /// A model call.
+    Model,
+    #[serde(other)]
+    Other,
+}
+
+/// A classified failure: its class, where it came from, the line of output
+/// or error that decided it, and what to do next.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Failure {
+    pub class: FailureClass,
+    pub source: FailureSource,
+    pub action: FailureAction,
+    /// The line of the output or error that decided the class, verbatim (cut
+    /// to a few hundred bytes); the whole output stays where it was.
+    #[serde(default)]
+    pub evidence: String,
+    /// The command's exit code, when a command failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+impl Failure {
+    /// Another attempt would meet the same failure until the user changes
+    /// something: the environment or the configuration.
+    pub fn needs_user(&self) -> bool {
+        matches!(self.action, FailureAction::FixEnvironment | FailureAction::FixConfig)
+    }
+}
+
+impl FailureClass {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Environment => "environment",
+            Self::Endpoint => "model endpoint",
+            Self::Code => "code",
+            Self::Policy => "policy",
+            Self::Exhausted => "resources exhausted",
+            Self::OutcomeUnknown => "outcome unknown",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptStatus {
@@ -715,6 +813,10 @@ pub struct AttemptReport {
     /// an attempt is reported as cancelled, not failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispute: Option<CheckDispute>,
+    /// What kind of failure ended it, when it failed or erred and the
+    /// planner could tell (#228).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Failure>,
 }
 
 /// An attempt's claim that the done-check contradicts the task, with what a
@@ -1184,7 +1286,7 @@ mod tests {
     }
 
     #[test]
-    fn replies_without_a_dispute_read_and_write_as_before() {
+    fn replies_without_a_dispute_or_a_failure_read_and_write_as_before() {
         let report = serde_json::json!({
             "index": 0, "status": "failed", "turns": 1, "check_runs": 1, "usage": {}, "cost_usd": 0.5
         });
@@ -1199,11 +1301,22 @@ mod tests {
                 task_quote: "columns count Unicode characters".into(),
                 reproduce: "cargo test --test spec".into(),
             }),
-            ..read
+            ..read.clone()
         };
         let wire = serde_json::to_value(&disputed).unwrap();
         assert_eq!(wire["dispute"]["task_quote"], "columns count Unicode characters");
         assert_eq!(serde_json::from_value::<AttemptReport>(wire).unwrap(), disputed);
+        // A report from a planner before #228 has no failure; one from a newer planner may name a class this one
+        // does not know, which reads as unknown rather than refusing the report.
+        assert!(!serde_json::to_value(&read).unwrap().as_object().unwrap().contains_key("failure"));
+        let failure =
+            serde_json::json!({ "class": "quota_hit", "source": "sandbox", "action": "page_someone", "evidence": "x" });
+        let mut newer = serde_json::to_value(&read).unwrap();
+        newer["failure"] = failure;
+        let newer: AttemptReport = serde_json::from_value(newer).unwrap();
+        let f = newer.failure.unwrap();
+        assert_eq!((f.class, f.source, f.action), (FailureClass::Unknown, FailureSource::Other, FailureAction::None));
+        assert!(!f.needs_user());
     }
 
     #[test]

@@ -625,6 +625,42 @@ pub(crate) const OFFLINE: &str = "Commands here have no network, so missing depe
 retrying will not help: work with what is installed, or stop and tell the user they can run Molt with \
 `--deps-cache cargo` (Rust) or a `--sandbox-policy` that provides the dependencies.";
 
+/// After a done-check failure no change to the code can fix (#228).
+pub(crate) fn blocked(f: &molt_api::planner::Failure) -> String {
+    let what = match f.class {
+        molt_api::planner::FailureClass::Exhausted => "the machine running out of disk, memory or processes",
+        _ => "something missing from the environment",
+    };
+    format!(
+        "\n\nThis failure looks like {what}, not a fault in the code: `{}`. Commands here cannot install \
+         anything or reach the network, and Molt will not give them more access. If the code can avoid it (a file \
+         the project should have, a tool it already has), change that; otherwise reply now and say what is \
+         missing. If the check fails the same way again, the attempt stops.",
+        f.evidence
+    )
+}
+
+/// After a failed command that ran a program, package or toolchain that is not installed.
+pub(crate) fn missing(evidence: &str) -> String {
+    format!(
+        "\nThis looks like something missing from the environment, not a fault in the code: `{evidence}`. \
+         Commands here cannot install it, so running this again will fail the same way: use what is installed, \
+         or say in your reply what is missing."
+    )
+}
+
+/// After a tool call that may have changed something before it was stopped.
+pub(crate) const OUTCOME_UNKNOWN: &str = " It was stopped before it answered, so whether it took effect is not \
+known: check whether it did before you call it again, and do not simply repeat it.";
+
+/// After a tool call that failed exactly as the same call did `times - 1` times before.
+pub(crate) fn repeated_failure(times: u32) -> String {
+    format!(
+        "\n\n[This is the same call, with the same result, {times} times now. Making it again unchanged will not \
+         help: change its input or take another approach.]"
+    )
+}
+
 /// How a command ended, e.g. `exit code 1`.
 pub(crate) fn ending(run: &RunResponse) -> String {
     if run.timed_out {

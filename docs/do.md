@@ -93,6 +93,13 @@ another only when the evidence asks for it and the budget allows it:
   the same output) or is **stuck** (every tool call fails three turns in a
   row) gets one attempt alongside it, on the next model up when there is one
   (an escalation). A first failed check is fed back to the attempt as always.
+- An attempt that ended on a failure **only the user can fix** holds back new
+  attempts (see [Failures that another attempt cannot fix](#failures-that-another-attempt-cannot-fix)):
+  something missing from the environment, or out of disk or memory, holds
+  back every new attempt; a model endpoint that refused the credential or the
+  model holds back new attempts on that model, and the run escalates to the
+  next model up when there is one. A compiler error or a failing test goes on
+  as above.
 - **Nothing new starts** once an attempt passed, the run was stopped or its
   budget spent, its `--attempts` are all started, or the budget left is less
   than a new attempt is assumed to cost. That assumption is the most an
@@ -133,6 +140,53 @@ the escalations made so far.
 To compare the schedules on the benchmark, add an arm, such as
 `molt bench --arm molt --arm adaptive="--schedule adaptive --escalate haiku,sonnet,opus"`.
 How they compare on success, cost and time has not been measured yet.
+
+### Failures that another attempt cannot fix
+
+A done-check that fails because the code is wrong is what attempts are for.
+One that fails because `pytest` is not installed, or a model call refused for
+a bad API key, would fail the same way in every attempt, on every model, and
+each one costs. Molt classifies each failure from the exit code and the
+output (or the model call's error), and acts only on what is clear:
+
+| Class | Example | What happens |
+| --- | --- | --- |
+| `environment` | `sh: 1: pytest: not found` (exit 127), `/usr/bin/python3: No module named pytest`, `error: no such command: \`nextest\``, `Error: Cannot find module 'lodash'`, a dependency that needed the network | The attempt is told it is not the code's fault. The same failure at the next check run ends the attempt; no new attempt starts. |
+| `exhausted` | `No space left on device`, `Cannot allocate memory` | As for `environment`. |
+| `endpoint` | the gateway's 401 or 403 (`the credential was rejected: check ANTHROPIC_API_KEY`), a 404 for the model | No new attempt on that model; an adaptive run escalates to the next model up once, if there is one. A 429, 5xx or timeout the gateway already retried is not held back. |
+| `code` | `error[E0308]: mismatched types`, `FAILED tests/test_a.py::test_b`, `--- FAIL: TestAdd`, `main.c:3:5: error:`, `error TS2322` | As before: the output goes back to the attempt, which keeps all its check rounds, and new attempts start as the schedule decides. |
+| `policy` | `Read-only file system`, a capability the kernel refused | The model is told to do it inside what is allowed. |
+| `outcome_unknown` | a tool that changes things (one a service provides, not marked read-only) stopped by its deadline | The model is told the call may have taken effect, to check before calling it again and not to simply repeat it. Molt never makes the call again itself. |
+| `unknown` | anything else, such as a test that prints only `expected hi, got bye` | Nothing changes. |
+
+A project file that is missing is never the environment's: `sh: 1:
+./build.sh: not found`, `Cannot find module './parser'` and Python's
+`ModuleNotFoundError` (it may name the module the task asks for) are left to
+the attempt.
+
+The rules are bounded on both sides. An attempt stops on the environment only
+when two check runs in a row fail with the same line; a different failure
+(the attempt wrote the missing script, or the next missing program shows up)
+starts the count again. A class never gives a command more access, opens the
+network, or resets what the run may spend: it can only stop an attempt early
+or hold back a new one. Once you have fixed the cause, run the task again; a
+run saved with `--checkpoint` can instead go on with `molt resume RUN --retry`,
+which starts a new attempt despite the saved failure.
+
+When no attempt passed, the run's summary says each such failure once, with
+every attempt it stopped and what to do:
+
+```
+The environment, not the code, stopped attempt 1, attempt 2: `sh: 1: pytest: not found`. Provide it where commands run (`molt env doctor` shows what they get), then run the task again: another attempt without it would fail the same way.
+```
+
+Each attempt's report (`--json`, `attempts[].failure`) has the `class`, its
+`source` (`check`, `tool` or `model`), the suggested `action` (`fix_code`,
+`fix_environment`, `fix_config`, `change_approach`, `retry_later`,
+`verify_first`, `none`), the `evidence` line verbatim and the `exit_code`. The
+whole output stays in the attempt's `note`. Independently of the class, a
+tool call that fails with the same input and the same error as before is
+told how many times it has now, and that repeating it unchanged will not help.
 
 ### Tasks no command can check
 

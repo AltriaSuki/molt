@@ -13,6 +13,7 @@ mod control;
 mod ctx;
 mod designer;
 mod explore;
+mod failure;
 mod fit;
 mod git;
 pub mod hooks;

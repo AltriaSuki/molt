@@ -592,6 +592,7 @@ mod tests {
                 note: String::new(),
                 requirements: 0,
                 dispute: None,
+                failure: None,
             }],
             usage: Usage::default(),
             cost_usd: 0.2,
