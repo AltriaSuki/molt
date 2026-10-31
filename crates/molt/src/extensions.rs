@@ -36,7 +36,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, ensure, Context};
 use molt_mcp::McpServer;
-use molt_planner::hooks::Hook;
+use molt_planner::hooks::{Dialect, Event, Hook};
 use molt_proto::tool::{ProvidedTool, ToolDecl};
 use molt_proto::{CapRequest, Exec, ServiceId, Target, Tier, KERNEL};
 use serde::{Deserialize, Serialize};
@@ -382,6 +382,9 @@ pub fn grant(manifest: &Manifest, root: &Path) -> anyhow::Result<Vec<String>> {
             line.push_str(&format!(" for paths {}", hook.paths.join(", ")));
         }
         line.push_str(&format!(" runs `{}` in the workspace's sandbox", hook.command));
+        if hook.dialect == Dialect::ClaudeCode {
+            line.push_str(", told of tool calls in Claude Code's names");
+        }
         if hook.event.can_deny() {
             line.push_str(if hook.blocking { ", and denies when it fails" } else { ", and may deny" });
         }
@@ -1136,7 +1139,8 @@ fn collisions(places: &Places, state: &State, manifest: &Manifest) -> anyhow::Re
 /// Turn a Claude Code plugin at `root` into a pack, in place: its skills
 /// and commands stay where they are (a command keeps the front matter
 /// Molt reads), the stdio servers of its `.mcp.json` become MCP servers,
-/// and the manifest is written. What cannot be brought over is left out
+/// its hooks on events Molt has become hooks in Claude Code's [`Dialect`]
+/// (see [`claude_hooks`]), and the manifest is written. What cannot be brought over is left out
 /// and said in the notes.
 pub fn import_claude_plugin(root: &Path) -> anyhow::Result<Vec<String>> {
     let mut notes = Vec::new();
@@ -1193,16 +1197,204 @@ pub fn import_claude_plugin(root: &Path) -> anyhow::Result<Vec<String>> {
             std::fs::write(&path, text)?;
         }
     }
-    for (what, path) in [("hooks", "hooks"), ("agents", "agents")] {
-        if root.join(path).exists() || !plugin[what].is_null() {
-            notes.push(format!("its {what} are not imported yet"));
-        }
+    let hooks = claude_hooks(root, &plugin, &mut notes)?;
+    if root.join("agents").exists() || !plugin["agents"].is_null() {
+        notes.push("its agents are not imported: they are roles, which packs cannot bring yet".into());
     }
-    let manifest =
-        Manifest { schema: SCHEMA, name, version, description, mcp, hooks: Vec::new(), services: BTreeMap::new() };
+    let manifest = Manifest { schema: SCHEMA, name, version, description, mcp, hooks, services: BTreeMap::new() };
     manifest.validate()?;
     std::fs::write(root.join(MANIFEST), toml::to_string(&manifest)?)?;
     Ok(notes)
+}
+
+/// Claude Code's events that mean what one of Molt's does.
+const CLAUDE_EVENTS: &[(&str, Event)] =
+    &[("PreToolUse", Event::ToolBefore), ("PostToolUse", Event::ToolAfter), ("UserPromptSubmit", Event::PromptSubmit)];
+/// Where a Claude Code plugin keeps its hooks unless `plugin.json` says otherwise.
+const CLAUDE_HOOKS: &str = "hooks/hooks.json";
+/// The most hooks Molt accepts, the user's and the packs' together.
+const MAX_HOOKS: usize = 32;
+
+/// The hooks of a Claude Code plugin at `root` that Molt can run: those of
+/// `hooks/hooks.json` and of `plugin.json`'s `hooks` (files or inline), on
+/// an event Molt has, running a command, in Claude Code's [`Dialect`]. A
+/// command that runs one of the plugin's scripts gets the script written
+/// into it, since hooks run in the workspace's sandbox, which cannot see
+/// the pack. The rest are left out, each with why in `notes`.
+fn claude_hooks(root: &Path, plugin: &serde_json::Value, notes: &mut Vec<String>) -> anyhow::Result<Vec<Hook>> {
+    let mut files = Vec::new();
+    if root.join(CLAUDE_HOOKS).is_file() {
+        files.push(CLAUDE_HOOKS.to_owned());
+    }
+    let mut configs = Vec::new();
+    let listed: Vec<&serde_json::Value> = match &plugin["hooks"] {
+        serde_json::Value::Array(list) => list.iter().collect(),
+        serde_json::Value::Null => Vec::new(),
+        one => vec![one],
+    };
+    for entry in listed {
+        match entry {
+            serde_json::Value::String(path) => {
+                let rel = path.strip_prefix("./").unwrap_or(path);
+                if !plain(rel) || !root.join(rel).is_file() {
+                    notes.push(format!("plugin.json's hooks file {path} left out: it is not a file in the plugin"));
+                } else if !files.iter().any(|f| f == rel) {
+                    files.push(rel.to_owned());
+                }
+            }
+            serde_json::Value::Object(_) => configs.push(("plugin.json".to_owned(), entry.clone())),
+            _ => notes.push("plugin.json's hooks has an entry that is neither a file nor hooks; it is left out".into()),
+        }
+    }
+    for file in files {
+        let config = serde_json::from_slice(&std::fs::read(root.join(&file))?)
+            .with_context(|| format!("the plugin's {file} does not read"))?;
+        configs.push((file, config));
+    }
+    let mut hooks = Vec::new();
+    for (file, config) in configs {
+        let Some(events) = config["hooks"].as_object() else {
+            notes.push(format!("{file} has no hooks object; nothing of it is imported"));
+            continue;
+        };
+        for (event_name, groups) in events {
+            let Some(&(_, event)) = CLAUDE_EVENTS.iter().find(|(name, _)| name == event_name) else {
+                notes.push(format!("{event_name} hooks left out: Molt has no event that means the same"));
+                continue;
+            };
+            for group in groups.as_array().into_iter().flatten() {
+                let matcher = group["matcher"].as_str().filter(|m| !m.is_empty()).map(str::to_owned);
+                let about = match &matcher {
+                    Some(m) => format!("{event_name} hook for {m:?}"),
+                    None => format!("{event_name} hook"),
+                };
+                for spec in group["hooks"].as_array().into_iter().flatten() {
+                    let hook = claude_hook(root, event, matcher.clone(), spec);
+                    match hook {
+                        Ok(_) if hooks.len() == MAX_HOOKS => {
+                            notes.push(format!("{about} left out: Molt accepts at most {MAX_HOOKS} hooks"));
+                        }
+                        Ok((hook, note)) => {
+                            notes.extend(note.map(|n| format!("{about}: {n}")));
+                            hooks.push(hook);
+                        }
+                        Err(why) => notes.push(format!("{about} left out: {why}")),
+                    }
+                }
+            }
+        }
+    }
+    if !hooks.is_empty() {
+        notes.push(
+            "its hooks see Claude Code's tool names and inputs, run in the workspace's sandbox, and are told \
+             Molt's events: no session_id or transcript_path"
+                .into(),
+        );
+    }
+    Ok(hooks)
+}
+
+/// One hook of a Claude Code plugin as Molt's, with a note on what changed.
+fn claude_hook(
+    root: &Path,
+    event: Event,
+    matcher: Option<String>,
+    spec: &serde_json::Value,
+) -> Result<(Hook, Option<String>), String> {
+    match spec["type"].as_str() {
+        Some("command") => {}
+        Some(other) => return Err(format!("it is a {other:?} hook, and Molt's hooks run commands")),
+        None => return Err("it has no type".into()),
+    }
+    if matcher.as_deref().is_some_and(|m| m.contains("mcp__")) {
+        return Err("it matches MCP tools by Claude Code's names for them, which Molt's are not".into());
+    }
+    let command = spec["command"].as_str().ok_or("it has no command")?;
+    let (mut command, note) = if command.contains(CLAUDE_ROOT) {
+        let (command, script) = claude_script(root, command)?;
+        (command, Some(format!("the plugin's {script} is written into its command, as hooks cannot see the pack")))
+    } else {
+        (command.to_owned(), None)
+    };
+    if command.contains("CLAUDE_PROJECT_DIR") {
+        // The hook runs where the call works, which is the project as the run sees it.
+        command = format!("export CLAUDE_PROJECT_DIR=\"$PWD\"; {command}");
+    }
+    let timeout_ms = match spec.get("timeout") {
+        None => 60_000,
+        Some(t) => t.as_u64().filter(|t| (1..=600).contains(t)).ok_or("its timeout is not 1 to 600 seconds")? * 1000,
+    };
+    let hook = Hook { matcher, timeout_ms, dialect: Dialect::ClaudeCode, ..Hook::new(event, command) };
+    molt_planner::hooks::validate(std::slice::from_ref(&hook)).map_err(|e| e.to_string())?;
+    if hook.command.contains(CLAUDE_ROOT) || hook.command.contains(DIR_VAR) {
+        return Err("its command needs the plugin's directory, which hooks cannot see".into());
+    }
+    Ok((hook, note))
+}
+
+/// Interpreters a plugin's hook script may be run with, and how each takes a program as an argument.
+const INTERPRETERS: &[(&str, &str)] =
+    &[("sh", "-c"), ("bash", "-c"), ("zsh", "-c"), ("python3", "-c"), ("python", "-c"), ("node", "-e")];
+
+/// A hook command that only runs one of the plugin's scripts, such as
+/// `${CLAUDE_PLUGIN_ROOT}/hooks/check.sh` or `python3
+/// "${CLAUDE_PLUGIN_ROOT}/hooks/check.py"`, as a command with the script in
+/// it, and the script's path.
+fn claude_script(root: &Path, command: &str) -> Result<(String, String), String> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let (given, script) = match words.as_slice() {
+        [script] => (None, *script),
+        [interpreter, script] => (Some(*interpreter), *script),
+        _ => return Err("its command does more than run one script of the plugin".into()),
+    };
+    let unquoted = script.replace(['"', '\''], "");
+    let rel = unquoted
+        .strip_prefix(CLAUDE_ROOT)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|rel| plain(rel))
+        .ok_or("its command does more than run one script of the plugin")?;
+    let text = std::fs::read(root.join(rel))
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|text| !text.contains('\0'))
+        .ok_or_else(|| format!("its script {rel} is not a text file in the plugin"))?;
+    let interpreter = match given {
+        Some(given) => given,
+        None => {
+            let shebang = text.lines().next().and_then(|l| l.strip_prefix("#!")).unwrap_or_default();
+            let mut words = shebang.split_whitespace();
+            let program = words.next().map(|p| p.rsplit('/').next().unwrap_or(p)).unwrap_or_default();
+            if program == "env" {
+                words.next().unwrap_or_default()
+            } else {
+                program
+            }
+        }
+    };
+    let flag = INTERPRETERS.iter().find(|(name, _)| *name == interpreter).map(|(_, flag)| *flag).ok_or_else(|| {
+        format!(
+            "its script {rel} is not run by {}",
+            INTERPRETERS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+        )
+    })?;
+    for (marker, what) in [
+        ("CLAUDE_PLUGIN_ROOT", "the plugin's directory"),
+        ("BASH_SOURCE", "files beside itself"),
+        ("$0", "files beside itself"),
+        ("__file__", "files beside itself"),
+        ("__dirname", "files beside itself"),
+        ("import.meta", "files beside itself"),
+    ] {
+        if text.contains(marker) {
+            return Err(format!("its script {rel} uses {what} ({marker}), which hooks cannot see"));
+        }
+    }
+    Ok((format!("{interpreter} {flag} {}", quote_always(&text)), rel.to_owned()))
+}
+
+/// `arg` in single quotes, as a shell reads it back.
+fn quote_always(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 /// A Claude Code `.mcp.json` server as an MCP server of a pack.
@@ -1810,15 +2002,15 @@ mod tests {
             "---\nname: style\ndescription: House style.\n---\nBe terse.\n",
         )
         .unwrap();
-        std::fs::create_dir_all(src.join("hooks")).unwrap();
-        std::fs::write(src.join("hooks/hooks.json"), "{}").unwrap();
+        std::fs::create_dir_all(src.join("agents")).unwrap();
+        std::fs::write(src.join("agents/reviewer.md"), "---\nname: reviewer\n---\nReview.\n").unwrap();
 
         let mut says = Says::yes();
         assert_eq!(add(&home.places, &src, &mut says).unwrap(), Added::Installed);
         let said = says.said.join("\n");
         assert!(said.contains("MCP server remote left out: Molt bridges servers on stdio only"), "{said}");
         assert!(said.contains("command /review: allowed-tools, model left out"), "{said}");
-        assert!(said.contains("its hooks are not imported yet"), "{said}");
+        assert!(said.contains("its agents are not imported: they are roles"), "{said}");
         let asked = &says.asked[0];
         assert!(asked.contains("MCP server review-kit-lint runs ${MOLT_EXTENSION_DIR}/bin/lint --stdio"), "{asked}");
         assert!(asked.contains("gets your environment variable LINT_TOKEN"), "{asked}");
@@ -1831,6 +2023,102 @@ mod tests {
         assert_eq!(commands["review"].description, "Review a change");
         assert_eq!(commands["review"].expand("#12"), "Review #12 carefully.");
         assert_eq!(packs[0].skills_dir(), Some(packs[0].dir.join("skills")));
+    }
+
+    #[test]
+    fn a_claude_code_plugins_hooks_are_imported_with_their_scripts_and_the_rest_left_out_with_why() {
+        let home = Home::new();
+        let src = home.dir.path().join("src/guard-kit");
+        std::fs::create_dir_all(src.join(".claude-plugin")).unwrap();
+        std::fs::write(
+            src.join(".claude-plugin/plugin.json"),
+            r#"{"name": "guard-kit", "version": "1.0.0", "hooks": "./extra/hooks.json"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(src.join("hooks")).unwrap();
+        std::fs::write(
+            src.join("hooks/hooks.json"),
+            r#"{"hooks": {
+                "PreToolUse": [
+                    {"matcher": "Edit|Write", "hooks": [
+                        {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/no-env.sh", "timeout": 5}]},
+                    {"matcher": "Bash", "hooks": [
+                        {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/hooks/sibling.py"},
+                        {"type": "prompt", "prompt": "Is this safe?"}]},
+                    {"matcher": "mcp__plugin_guard-kit_db__.*", "hooks": [
+                        {"type": "command", "command": "true"}]}
+                ],
+                "Stop": [{"hooks": [{"type": "command", "command": "true"}]}]
+            }}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("hooks/no-env.sh"),
+            "#!/usr/bin/env bash\n# Never touch a .env file.\nif grep -q '\"file_path\": *\"[^\"]*\\.env\"'; then\n  \
+             echo \"don't touch .env files\" >&2\n  exit 2\nfi\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("hooks/sibling.py"), "import os\nopen(os.path.join(os.path.dirname(__file__), 'x'))\n")
+            .unwrap();
+        std::fs::create_dir_all(src.join("extra")).unwrap();
+        std::fs::write(
+            src.join("extra/hooks.json"),
+            r#"{"hooks": {"UserPromptSubmit": [{"hooks": [
+                {"type": "command", "command": "echo \"in $CLAUDE_PROJECT_DIR\""}]}]}}"#,
+        )
+        .unwrap();
+
+        let mut says = Says::yes();
+        assert_eq!(add(&home.places, &src, &mut says).unwrap(), Added::Installed);
+        let said = says.said.join("\n");
+        for note in [
+            "PreToolUse hook for \"Edit|Write\": the plugin's hooks/no-env.sh is written into its command",
+            "PreToolUse hook for \"Bash\" left out: its script hooks/sibling.py uses files beside itself (__file__)",
+            "PreToolUse hook for \"Bash\" left out: it is a \"prompt\" hook",
+            "PreToolUse hook for \"mcp__plugin_guard-kit_db__.*\" left out: it matches MCP tools by Claude Code's names",
+            "Stop hooks left out: Molt has no event that means the same",
+            "its hooks see Claude Code's tool names and inputs",
+        ] {
+            assert!(said.contains(note), "{note}\n{said}");
+        }
+        let asked = &says.asked[0];
+        assert!(
+            asked.contains("hook tool.before for tools matching \"Edit|Write\" runs `bash -c '#!/usr/bin/env bash")
+                && asked
+                    .contains("in the workspace's sandbox, told of tool calls in Claude Code's names, and may deny"),
+            "the script is in the grant, as the hook runs it: {asked}"
+        );
+        assert!(asked.contains("hook prompt.submit runs `export CLAUDE_PROJECT_DIR=\"$PWD\"; echo"), "{asked}");
+
+        let packs = active(&home.places).unwrap();
+        let hooks = &packs[0].manifest.hooks;
+        assert_eq!(hooks.len(), 2, "{hooks:?}");
+        let guard = hooks.iter().find(|h| h.event == Event::ToolBefore).unwrap();
+        assert_eq!((guard.timeout_ms, guard.dialect, guard.blocking), (5000, Dialect::ClaudeCode, false));
+        assert!(guard.matches(Some("edit_file"), &[]) && !guard.matches(Some("read_file"), &[]));
+        assert!(!guard.command.contains(CLAUDE_ROOT) && !guard.command.contains(DIR_VAR));
+
+        // The command runs the script as the plugin's would have, on what Claude Code's hook is told.
+        let told = |path: &str| {
+            let input = Dialect::ClaudeCode.input_out("edit_file", &serde_json::json!({ "path": path }));
+            serde_json::to_string_pretty(&serde_json::json!({ "tool_name": "Edit", "tool_input": input })).unwrap()
+        };
+        for (path, code) in [("app/.env", Some(2)), ("app/main.rs", Some(0))] {
+            let mut child = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&guard.command)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(told(path).as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert_eq!(out.status.code(), code, "{path}: {}", String::from_utf8_lossy(&out.stderr));
+            if code == Some(2) {
+                assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "don't touch .env files");
+            }
+        }
     }
 
     /// Git for building a test's repository, reading no configuration of the machine's.

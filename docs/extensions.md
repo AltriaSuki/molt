@@ -330,7 +330,35 @@ them once the pack is gone.
   becoming `${MOLT_EXTENSION_DIR}`; a variable set to `${NAME}` of its own
   name is passed from your environment, and a server reached by URL, or with
   a variable made from others, is left out;
-- hooks and agents are not imported yet.
+- hooks of `hooks/hooks.json` (and of `hooks` in `plugin.json`, files or
+  inline) on `PreToolUse`, `PostToolUse` and `UserPromptSubmit` become the
+  pack's `tool.before`, `tool.after` and `prompt.submit` hooks, with
+  `dialect = "claude-code"` (see below) and their `matcher` and `timeout`;
+- agents are not imported: they are roles, which packs cannot bring yet.
+
+A hook runs in the workspace's sandbox, which cannot see the pack, so a
+hook whose command runs one of the plugin's scripts
+(`${CLAUDE_PLUGIN_ROOT}/hooks/check.sh`, or `python3
+"${CLAUDE_PLUGIN_ROOT}/hooks/check.py"`) gets the script written into its
+command (`bash -c '…'`, by the script's `#!` line or the interpreter
+named: `sh`, `bash`, `zsh`, `python3`, `python` or `node`), and the grant
+shows it whole. A script that uses the plugin's directory or files beside
+itself (`$0`, `BASH_SOURCE`, `__file__`, `__dirname`, `import.meta`), a
+command that does more than run one script, a hook of another type than
+`command`, one matching MCP tools (Claude Code names a plugin's servers
+otherwise), and the events Molt has none of (`Stop`, `SessionStart`,
+`Notification`, …) are left out, each with why. `$CLAUDE_PROJECT_DIR` is
+the directory the hook runs in. At most 32 hooks are taken.
+
+A hook with `dialect = "claude-code"` is told of a tool call in Claude
+Code's names: `tool_name` is `Read`, `Write`, `Edit`, `Bash`, `Grep` or
+`WebFetch` for `read_file`, `write_file`, `edit_file`, `run`, `search` and
+`fetch_url`, its `matcher` is matched against that name, `tool_input` has
+`file_path` for `path` (and `timeout` in ms for `timeout_s`, `-i` for
+`case_insensitive`), and `hook_event_name` is `PreToolUse`, `PostToolUse`
+or `UserPromptSubmit`. An `updatedInput` it answers is read back into
+Molt's. Molt's other tools keep their names. The hook is told nothing of a
+Claude Code session (`session_id`, `transcript_path`).
 
 The manifest it writes is in the installed pack, and the grant is shown and
 approved as any pack's.
@@ -341,5 +369,5 @@ Signed registries or packs, fetching git submodules or LFS files, git
 fetches in a sandbox of their own, environment profiles, roles, prompts
 and workflows in a pack, a pack's service with the network or a mount
 beyond the pack, importing a Claude Code plugin's
-hooks and agents, and evaluating a pack on the benchmark before it is
+agents, or its hooks on events Molt does not have, and evaluating a pack on the benchmark before it is
 enabled.

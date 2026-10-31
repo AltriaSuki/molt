@@ -8,6 +8,7 @@
 //! [`Event`]; every hook runs through the shell service and its sandbox,
 //! and each decision is noted on the run's progress.
 use crate::{attempt::Check, control, ctx::Ctx, prompts, tools};
+use molt_api::planner::tools as t;
 use molt_api::shell::{self, RunResponse};
 use molt_proto::Budget;
 use regex::Regex;
@@ -126,9 +127,120 @@ pub struct Hook {
     /// one of the event's paths matches one of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
+    /// Whose names the hook speaks: Molt's, or Claude Code's for a hook
+    /// written for it (see [`Dialect`]).
+    #[serde(default, skip_serializing_if = "Dialect::is_molt")]
+    pub dialect: Dialect,
 }
 fn timeout() -> u64 {
     30_000
+}
+
+/// The names a hook reads and answers in. A Claude Code hook knows Molt's
+/// tools by Claude Code's names, and their inputs by its keys: `Edit` with
+/// `file_path`, not `edit_file` with `path`. In that dialect the hook's
+/// `matcher` is matched against, and `tool_name` and `tool_input` are,
+/// Claude Code's, `hook_event_name` is Claude Code's name of the event,
+/// and an input it answers with is taken back to Molt's. A tool Claude
+/// Code has no counterpart of keeps Molt's name and input.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Dialect {
+    #[default]
+    #[serde(rename = "molt")]
+    Molt,
+    #[serde(rename = "claude-code")]
+    ClaudeCode,
+}
+
+/// A Molt tool, Claude Code's name for it, and the input keys (Molt's, Claude Code's) it names otherwise.
+type ClaudeTool = (&'static str, &'static str, &'static [(&'static str, &'static str)]);
+
+/// Molt's tools as Claude Code names them.
+const CLAUDE_TOOLS: &[ClaudeTool] = &[
+    (t::READ_FILE, "Read", &[("path", "file_path")]),
+    (t::WRITE_FILE, "Write", &[("path", "file_path")]),
+    (t::EDIT_FILE, "Edit", &[("path", "file_path")]),
+    (t::RUN, "Bash", &[]),
+    (t::SEARCH, "Grep", &[("case_insensitive", "-i")]),
+    (t::FETCH_URL, "WebFetch", &[]),
+];
+
+impl Dialect {
+    fn is_molt(&self) -> bool {
+        *self == Self::Molt
+    }
+
+    fn claude(self, tool: &str) -> Option<&'static ClaudeTool> {
+        (self == Self::ClaudeCode).then(|| CLAUDE_TOOLS.iter().find(|(molt, ..)| *molt == tool)).flatten()
+    }
+
+    /// Molt's tool `tool` by this dialect's name.
+    pub fn tool_name(self, tool: &str) -> &str {
+        self.claude(tool).map_or(tool, |(_, name, _)| name)
+    }
+
+    /// The name of `event` in this dialect.
+    pub fn event_name(self, event: Event) -> &'static str {
+        match (self, event) {
+            (Self::ClaudeCode, Event::PromptSubmit) => "UserPromptSubmit",
+            (Self::ClaudeCode, Event::ToolBefore) => "PreToolUse",
+            (Self::ClaudeCode, Event::ToolAfter) => "PostToolUse",
+            _ => event.name(),
+        }
+    }
+
+    /// The input of a call of Molt's `tool`, as this dialect writes it.
+    pub fn input_out(self, tool: &str, input: &Value) -> Value {
+        let Some((molt, _, keys)) = self.claude(tool) else { return input.clone() };
+        let mut input = input.clone();
+        if let Some(map) = input.as_object_mut() {
+            for (ours, theirs) in *keys {
+                if let Some(v) = map.remove(*ours) {
+                    map.insert((*theirs).to_owned(), v);
+                }
+            }
+            if *molt == t::RUN {
+                if let Some(s) = map.remove("timeout_s").and_then(|v| v.as_u64()) {
+                    map.insert("timeout".into(), json!(s.saturating_mul(1000)));
+                }
+            }
+        }
+        input
+    }
+
+    /// An input this dialect wrote for a call of Molt's `tool`, as Molt's.
+    pub fn input_in(self, tool: &str, mut input: Value) -> Value {
+        let Some((molt, _, keys)) = self.claude(tool) else { return input };
+        if let Some(map) = input.as_object_mut() {
+            for (ours, theirs) in *keys {
+                if let Some(v) = map.remove(*theirs) {
+                    map.insert((*ours).to_owned(), v);
+                }
+            }
+            if *molt == t::RUN {
+                if let Some(ms) = map.remove("timeout").and_then(|v| v.as_u64()) {
+                    map.insert("timeout_s".into(), json!(ms.div_ceil(1000)));
+                }
+            }
+        }
+        input
+    }
+
+    /// What a hook of this dialect is told of `event`, given Molt's `payload`.
+    fn payload(self, payload: &Value, event: Event) -> Value {
+        let mut view = payload.clone();
+        if self.is_molt() {
+            return view;
+        }
+        view["hook_event_name"] = json!(self.event_name(event));
+        if let Some(tool) = payload.get("tool_name").and_then(Value::as_str) {
+            view["tool_name"] = json!(self.tool_name(tool));
+            if let Some(input) = payload.get("tool_input") {
+                view["tool_input"] = self.input_out(tool, input);
+            }
+        }
+        view
+    }
 }
 
 impl Hook {
@@ -141,11 +253,14 @@ impl Hook {
             timeout_ms: timeout(),
             matcher: None,
             paths: Vec::new(),
+            dialect: Dialect::Molt,
         }
     }
 
-    /// The hook is for a call of `tool` (on a tool event) touching `paths`.
+    /// The hook is for a call of Molt's `tool` (on a tool event) touching
+    /// `paths`; `matcher` is matched against the tool's name in the hook's dialect.
     pub fn matches(&self, tool: Option<&str>, paths: &[String]) -> bool {
+        let tool = tool.map(|t| self.dialect.tool_name(t));
         let named = match (self.matcher.as_deref().filter(|m| !matches!(*m, "" | "*")), tool) {
             (None, _) => true,
             (Some(_), None) => false,
@@ -440,7 +555,8 @@ pub async fn decide<H: Host + Sync>(
         if !hook.matches(tool, &paths) {
             continue;
         }
-        let ran = host.shell(&at, &hook.command, payload.to_string(), hook.timeout_ms).await;
+        let told = hook.dialect.payload(&payload, event);
+        let ran = host.shell(&at, &hook.command, told.to_string(), hook.timeout_ms).await;
         let mut got = match &ran {
             Ok(ran) => answer(ran),
             Err(e) => Answer { failed: Some(format!("it could not run: {e}")), ..Answer::default() },
@@ -458,6 +574,10 @@ pub async fn decide<H: Host + Sync>(
             ignored.push(format!("deny ({reason}), since a {event} hook cannot stop anything"));
         }
         if let Some(input) = got.tool_input.take() {
+            let input = match tool {
+                Some(tool) => hook.dialect.input_in(tool, input),
+                None => input,
+            };
             if event == Event::ToolBefore {
                 verdict.push(format!("modify the input to {}", prompts::head(&input.to_string(), 200)));
                 paths = input_paths(&input);
@@ -795,5 +915,72 @@ mod tests {
         }
         assert!(answer(&ran(1, "", "")).failed.is_some());
         assert!(answer(&RunResponse { timed_out: true, exit_code: None, ..ran(0, "", "") }).failed.is_some());
+    }
+
+    /// Runs the hook `guard` with one answer and any other with none, and
+    /// keeps what each was told.
+    struct Told {
+        stdin: std::sync::Mutex<Vec<Value>>,
+        reply: String,
+    }
+
+    impl Host for Told {
+        async fn shell(&self, _: &str, command: &str, stdin: String, _: u64) -> Result<RunResponse, String> {
+            self.stdin.lock().unwrap().push(serde_json::from_str(&stdin).unwrap());
+            Ok(ran(0, if command == "guard" { &self.reply } else { "" }, ""))
+        }
+        async fn fork(&self, from: &str) -> Result<String, String> {
+            Ok(from.to_owned())
+        }
+        async fn drop_fork(&self, _: &str) {}
+        async fn note(&self, _: String) {}
+    }
+
+    #[tokio::test]
+    async fn a_claude_code_hook_sees_and_answers_in_claude_codes_tool_names_and_inputs() {
+        let claude = Hook {
+            matcher: Some("Edit|Write".into()),
+            dialect: Dialect::ClaudeCode,
+            ..Hook::new(Event::ToolBefore, "guard")
+        };
+        assert!(claude.matches(Some(t::EDIT_FILE), &[]) && claude.matches(Some(t::WRITE_FILE), &[]));
+        assert!(!claude.matches(Some(t::READ_FILE), &[]));
+        let molt = Hook { matcher: Some("Edit".into()), ..Hook::new(Event::ToolBefore, "guard") };
+        assert!(!molt.matches(Some(t::EDIT_FILE), &[]), "Molt's own hooks keep Molt's names");
+
+        let host = Told {
+            stdin: Default::default(),
+            reply: r#"{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"file_path":"b.rs","old_string":"x","new_string":"y"}}}"#
+                .into(),
+        };
+        let input = json!({ "path": "a.rs", "old_string": "x", "new_string": "y" });
+        let payload = json!({ "tool_name": t::EDIT_FILE, "tool_input": input, "paths": ["a.rs"] });
+        let paths = vec!["a.rs".to_owned()];
+        let hooks = [claude, Hook { matcher: Some("edit_file".into()), ..Hook::new(Event::ToolBefore, "molt") }];
+        let decision =
+            decide(&host, &hooks, Event::ToolBefore, Place::In("fork"), Some(t::EDIT_FILE), &paths, payload).await;
+        assert_eq!(decision.tool_input, Some(json!({ "path": "b.rs", "old_string": "x", "new_string": "y" })));
+        let told = host.stdin.lock().unwrap();
+        assert_eq!(told.len(), 2, "{told:?}");
+        assert_eq!(
+            (&told[0]["hook_event_name"], &told[0]["tool_name"], &told[0]["tool_input"]["file_path"]),
+            (&json!("PreToolUse"), &json!("Edit"), &json!("a.rs"))
+        );
+        assert!(told[0]["tool_input"].get("path").is_none(), "{}", told[0]);
+        assert_eq!(
+            (&told[1]["hook_event_name"], &told[1]["tool_name"], &told[1]["tool_input"]["path"]),
+            (&json!("tool.before"), &json!("edit_file"), &json!("b.rs")),
+            "the next hook, of Molt's, sees the changed input in Molt's names"
+        );
+
+        let bash = Dialect::ClaudeCode.input_out(t::RUN, &json!({ "command": "ls", "timeout_s": 5 }));
+        assert_eq!(bash, json!({ "command": "ls", "timeout": 5000 }));
+        assert_eq!(Dialect::ClaudeCode.input_in(t::RUN, bash), json!({ "command": "ls", "timeout_s": 5 }));
+        assert_eq!(Dialect::ClaudeCode.tool_name("mcp__a__b"), "mcp__a__b");
+        let read: Hook =
+            serde_json::from_value(json!({ "event": "PostToolUse", "command": "x", "dialect": "claude-code" }))
+                .unwrap();
+        assert_eq!(read.dialect, Dialect::ClaudeCode);
+        assert!(!serde_json::to_string(&Hook::new(Event::ToolBefore, "x")).unwrap().contains("dialect"));
     }
 }
