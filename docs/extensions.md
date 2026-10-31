@@ -6,7 +6,8 @@ configuration by hand: [MCP servers](mcp.md), bus
 hooks](config.md#trusted-lifecycle-hooks), [Agent Skills](skills.md) and
 [command templates](tui.md#project-task-commands). It is a directory, a
 `.tar`, `.tar.gz` or `.tgz` archive of one, or a git repository, with a
-`molt-extension.toml` at the top. The design is RFC 0005,
+`molt-extension.toml` at the top, and can be found by its name in a
+[registry](#registries). The design is RFC 0005,
 [rfc/0005-extension-packs.md](rfc/0005-extension-packs.md); the format is
 unstable until it has been used for a phase of the roadmap.
 
@@ -15,6 +16,9 @@ molt ext add ./issue-tracker         # shows what it would get, then asks
 molt ext add issue-tracker.tgz --yes # the same, approved from a script
 molt ext add https://github.com/team/issue-tracker#v1.2.0   # one commit of a repository
 molt ext update issue-tracker        # that branch or tag again, if it moved
+molt ext registry add team https://github.com/team/molt-packs   # where names are looked up
+molt ext search issues               # what the registries list
+molt ext add issue-tracker           # by its name, from the registry that lists it
 molt ext list
 molt ext show issue-tracker          # where it is and what you approved
 molt ext disable issue-tracker       # off, still installed
@@ -242,6 +246,61 @@ nothing more goes in with a note. A pack installed at a commit id is not
 moved: `molt ext add URL#REF` installs another. A pack installed from a
 path is updated with `molt ext add` of the path.
 
+## Registries
+
+A registry is an index of packs by name: a git repository or a directory
+with a `molt-registry.toml` at its top.
+
+```toml
+schema = 1
+
+[pack.issue-tracker]
+description = "Read and file issues on the team tracker."
+git = "https://github.com/team/issue-tracker"
+rev = "v1.2.0"                # a branch, a tag or a whole commit id; HEAD without one
+
+[pack.notes]                  # only in a registry that is a directory:
+path = "packs/notes"          # a pack's directory or archive beside the index
+```
+
+```sh
+molt ext registry add team https://github.com/team/molt-packs#main
+molt ext registry add local /srv/molt-packs    # a directory, or its molt-registry.toml
+molt ext registry list
+molt ext search notes        # name or description, any case; marks what is installed
+molt ext add issue-tracker   # the pack a registry lists under that name
+molt ext add notes --registry local
+molt ext registry remove team
+```
+
+- **A registry says where; you still approve what.** `molt ext add NAME`
+  fetches what the registry lists and installs it as `molt ext add` of
+  that URL and reference, or of that path, would: the grant is shown, with
+  `(listed by registry team)` after the source, and nothing is installed
+  or run before your yes. An update the registry points to is approved as
+  any update: a line you have not approved is shown with `+`.
+- **The name is the pack's.** The pack fetched must have the name it was
+  listed under, or nothing is installed. A name two of your registries
+  list is refused until you choose one with `--registry`, and so is any
+  `molt ext add NAME` while one of your registries cannot be read, since it
+  might list the name too.
+- **A path wins.** `molt ext add notes` installs `./notes` when that
+  exists, as before registries; `--registry` looks the name up even then.
+- **Fetched as a pack is.** A registry in git is fetched as a pack's
+  repository is ([From a git repository](#from-a-git-repository)): over
+  https or ssh only, running nothing of it, each time it is read. Its
+  packs are git URLs under the same rules; a `path` is refused in it, and
+  in a directory's registry a `path` that leads out of the directory is.
+  An index is at most 1 MiB and 4096 packs, and unknown keys or a schema
+  other than 1 refuse it.
+- **Where they are kept.** `molt ext registry add` reads the index once to
+  check it, and records the URL or the directory in
+  `~/.config/molt/registries.toml`; a project's configuration cannot name
+  one. A pack installed from a registry is pinned as one installed from its
+  URL: `molt ext update NAME` follows its branch or tag, and `molt ext add
+  NAME` again follows what the registry lists now. Removing a registry
+  keeps the packs installed from it.
+
 ## Disabling and removing
 
 `molt ext disable NAME` keeps the pack and its approval, and the next start
@@ -278,7 +337,7 @@ approved as any pack's.
 
 ## Not yet
 
-Installing from a registry, fetching git submodules or LFS files, git
+Signed registries or packs, fetching git submodules or LFS files, git
 fetches in a sandbox of their own, environment profiles, roles, prompts
 and workflows in a pack, a pack's service with the network or a mount
 beyond the pack, importing a Claude Code plugin's

@@ -151,19 +151,29 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ExtCmd {
-    /// Install a pack from a directory, a .tar, .tar.gz or .tgz archive, or
-    /// a git repository (https://HOST/REPO or ssh, with #BRANCH, #TAG or
-    /// #COMMIT), or update the installed one of its name. It shows what the
-    /// pack would get and installs it only once you approve, at a terminal
-    /// or with --yes; an update that asks for nothing more needs no
-    /// approval. Nothing the pack holds is run. A Claude Code plugin is
-    /// imported.
+    /// Install a pack from a directory, a .tar, .tar.gz or .tgz archive, a
+    /// git repository (https://HOST/REPO or ssh, with #BRANCH, #TAG or
+    /// #COMMIT), or by its name from your registries, or update the
+    /// installed one of its name. It shows what the pack would get and
+    /// installs it only once you approve, at a terminal or with --yes; an
+    /// update that asks for nothing more needs no approval. Nothing the pack
+    /// holds is run. A Claude Code plugin is imported.
     Add {
-        /// A directory, an archive, or URL[#REF].
+        /// A directory, an archive, URL[#REF], or a pack's name that is not a path.
         source: PathBuf,
         /// Approve what the pack would get without being asked, as from a script.
         #[arg(long)]
         yes: bool,
+        /// Look SOURCE up as a pack's name in this registry only, even when a path of that name exists.
+        #[arg(long, value_name = "NAME")]
+        registry: Option<String>,
+    },
+    /// List the packs your registries name, those whose name or description holds TERM.
+    Search { term: Option<String> },
+    /// Add, list and remove the registries molt ext add NAME and search look packs up in.
+    Registry {
+        #[command(subcommand)]
+        cmd: RegistryCmd,
     },
     /// Fetch a pack installed from git again at its branch or tag, and
     /// install the new commit as add does: anything it asks for that you
@@ -189,6 +199,17 @@ enum ExtCmd {
         #[arg(long)]
         data_dir: Vec<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum RegistryCmd {
+    /// Take pack names from a registry: a directory with a molt-registry.toml, or a git
+    /// repository with one (URL[#REF], over https or ssh). Its index is read to check it.
+    Add { name: String, source: String },
+    /// List your registries.
+    List,
+    /// Stop looking names up in a registry. What was installed from it stays.
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -2373,11 +2394,21 @@ fn ext_cmd(cmd: ExtCmd) -> anyhow::Result<ExitCode> {
 
     let places = extensions::Places::from_env()?;
     match cmd {
-        ExtCmd::Add { source, yes } => {
+        ExtCmd::Add { source, yes, registry } => {
             let ask = &mut Ask { yes };
-            let added = match extensions::GitSource::from_arg(&source)? {
-                Some(git) => extensions::add_git(&places, &git, ask)?,
-                None => extensions::add(&places, &source, ask)?,
+            // A path that exists is a path; a pack's name that is not one is looked up in the registries.
+            let name = source.to_str().filter(|s| extensions::valid_name(s));
+            let added = match (registry.as_deref(), extensions::GitSource::from_arg(&source)?) {
+                (Some(registry), _) => {
+                    let name =
+                        name.context("--registry looks up a pack's name: lowercase letters, digits and hyphens")?;
+                    extensions::add_named(&places, name, Some(registry), ask)?
+                }
+                (None, Some(git)) => extensions::add_git(&places, &git, ask)?,
+                (None, None) => match name.filter(|_| std::fs::symlink_metadata(&source).is_err()) {
+                    Some(name) => extensions::add_named(&places, name, None, ask)?,
+                    None => extensions::add(&places, &source, ask)?,
+                },
             };
             match added {
                 Added::Installed => {
@@ -2393,6 +2424,16 @@ fn ext_cmd(cmd: ExtCmd) -> anyhow::Result<ExitCode> {
             Added::Installed | Added::Unchanged => {}
             Added::Refused => return Ok(ExitCode::FAILURE),
         },
+        ExtCmd::Search { term } => print!("{}", extensions::search(&places, term.as_deref())?),
+        ExtCmd::Registry { cmd: RegistryCmd::Add { name, source } } => {
+            let count = extensions::add_registry(&places, &name, &source)?;
+            println!("registry {name} lists {count} packs; molt ext search shows them, molt ext add NAME installs one");
+        }
+        ExtCmd::Registry { cmd: RegistryCmd::List } => print!("{}", extensions::registries(&places)?),
+        ExtCmd::Registry { cmd: RegistryCmd::Remove { name } } => {
+            extensions::remove_registry(&places, &name)?;
+            println!("registry {name} is removed; the packs installed from it stay");
+        }
         ExtCmd::List => print!("{}", extensions::list(&places)?),
         ExtCmd::Show { name } => print!("{}", extensions::show(&places, &name)?),
         ExtCmd::Disable { name } => {

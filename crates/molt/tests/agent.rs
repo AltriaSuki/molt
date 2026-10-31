@@ -4006,3 +4006,78 @@ async fn an_extension_pack_is_shown_approved_offered_disabled_kept_to_its_approv
     assert!(out.status.success(), "a run after removal starts: {}", String::from_utf8_lossy(&out.stderr));
     assert_requests_valid(&server).await;
 }
+
+/// Registries (#170) through the real binary: `molt ext registry add`
+/// records a directory with a `molt-registry.toml`, `molt ext search`
+/// finds a pack it lists, and `molt ext add NAME` installs it only once its
+/// grant is approved, while a path of that name in the working directory is
+/// still installed as a path unless `--registry` says otherwise.
+#[test]
+fn a_pack_is_found_by_name_in_a_registry_and_installed_as_its_path_would_be() {
+    let home = tempfile::tempdir().unwrap();
+    let ext = |cwd: &Path, args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+            .current_dir(cwd)
+            .arg("ext")
+            .args(args)
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_DATA_HOME", home.path().join("user-data"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        (out.status.success(), text(&out.stdout), text(&out.stderr))
+    };
+    let manifest = |name: &str, description: &str| {
+        format!("schema = 1\nname = \"{name}\"\nversion = \"1.0.0\"\ndescription = \"{description}\"\n")
+    };
+    let registry = home.path().join("registry");
+    std::fs::create_dir_all(registry.join("packs/notes/skills/tidy")).unwrap();
+    std::fs::write(registry.join("packs/notes/molt-extension.toml"), manifest("notes", "Team notes.")).unwrap();
+    std::fs::write(
+        registry.join("packs/notes/skills/tidy/SKILL.md"),
+        "---\nname: tidy\ndescription: Tidy notes.\n---\nTidy.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        registry.join("molt-registry.toml"),
+        "schema = 1\n[pack.notes]\ndescription = \"Team notes, kept tidy.\"\npath = \"packs/notes\"\n",
+    )
+    .unwrap();
+
+    let cwd = home.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let (ok, _, err) = ext(&cwd, &["add", "notes", "--yes"]);
+    assert!(!ok && err.contains("no registry to look it up in"), "{err}");
+    let (ok, out, err) = ext(&cwd, &["registry", "add", "team", registry.to_str().unwrap()]);
+    assert!(ok && out.contains("registry team lists 1 packs"), "{out}{err}");
+    let (ok, out, _) = ext(&cwd, &["search", "tidy"]);
+    assert!(ok && out.contains("notes (team: packs/notes)") && out.contains("Team notes, kept tidy."), "{out}");
+
+    // Without a terminal or --yes nothing is installed; the grant was shown with where it is from.
+    let (ok, _, err) = ext(&cwd, &["add", "notes"]);
+    assert!(!ok && err.contains("(listed by registry team)") && err.contains("skill tidy"), "{err}");
+    assert!(!home.path().join("user-data/molt/extensions/notes").exists());
+    let (ok, out, err) = ext(&cwd, &["add", "notes", "--yes"]);
+    assert!(ok && out.contains("installed"), "{out}{err}");
+    let (_, list, _) = ext(&cwd, &["list"]);
+    assert!(list.starts_with("notes 1.0.0 enabled"), "{list}");
+    let (_, out, _) = ext(&cwd, &["search"]);
+    assert!(out.contains("notes (team: packs/notes) installed"), "{out}");
+
+    // A directory named like the pack, where the command runs, is the path it means.
+    std::fs::create_dir_all(cwd.join("notes")).unwrap();
+    std::fs::write(cwd.join("notes/molt-extension.toml"), manifest("notes", "My own notes.")).unwrap();
+    let (ok, _, err) = ext(&cwd, &["add", "notes", "--yes"]);
+    assert!(ok && err.contains(&format!("from {}", cwd.join("notes").canonicalize().unwrap().display())), "{err}");
+    let (ok, _, err) = ext(&cwd, &["add", "notes", "--registry", "team", "--yes"]);
+    assert!(ok && err.contains("(listed by registry team)"), "{err}");
+
+    let (ok, out, _) = ext(&cwd, &["registry", "remove", "team"]);
+    assert!(ok && out.contains("the packs installed from it stay"), "{out}");
+    let (_, out, _) = ext(&cwd, &["registry", "list"]);
+    assert!(out.starts_with("no registries"), "{out}");
+    let (_, list, _) = ext(&cwd, &["list"]);
+    assert!(list.starts_with("notes 1.0.0 enabled"), "{list}");
+}
