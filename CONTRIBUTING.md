@@ -36,7 +36,8 @@ You need:
   use the Go release and NATS version in `.github/ci-versions.toml`, then
   `go install github.com/nats-io/nats-server/v2@v2.15.1` and
   `export MOLT_NATS_SERVER=$(go env GOPATH)/bin/nats-server`. Without it those
-  tests print a notice and pass; CI always runs them.
+  tests print a notice and pass; CI always runs them, and sets
+  `MOLT_REQUIRE_NATS_TESTS=1` so a missing server fails instead.
 - On Linux, `bubblewrap` 0.9+ and working unprivileged user namespaces for
   the shell isolation tests (`bwrap --unshare-all --ro-bind / / true` should
   succeed). Set `MOLT_REQUIRE_SANDBOX_TESTS=1` to make a missing backend fail

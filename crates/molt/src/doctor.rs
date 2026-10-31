@@ -296,10 +296,21 @@ impl Sandbox {
             ms: 0,
         };
         let shell = Shell::with_policy(roots.clone(), ExecutionPolicy::Configured(policy)).map_err(|e| {
-            blocked(
-                format!("The sandbox does not start here: {e:#}"),
-                "install bubblewrap 0.9 or newer, or choose --no-sandbox to run commands unconfined",
-            )
+            use molt_tools::resources::Setup;
+            let setup = e.downcast_ref::<molt_tools::sandbox::Unavailable>().map(|u| u.setup);
+            let fix = match setup {
+                // The host has a sandbox, and not the room to start one now (#230).
+                Some(Setup::Short(_)) => {
+                    "free what it names, or run fewer commands at once (the shell service's --jobs), then check \
+                     again; it is not a missing sandbox"
+                }
+                Some(Setup::Refused) => {
+                    "allow unprivileged user namespaces for this user (see CONTRIBUTING.md), or choose --no-sandbox \
+                     to run commands unconfined"
+                }
+                _ => "install bubblewrap 0.9 or newer, or choose --no-sandbox to run commands unconfined",
+            };
+            blocked(format!("The sandbox does not start here: {e:#}"), fix)
         })?;
         let forked = async {
             let files = Fs::new(roots)?;

@@ -32,6 +32,25 @@ pub const WRITE: &str = "shell.write";
 /// Stop a process, or all of a workspace's: [`StopRequest`], answered with a [`StopResponse`].
 pub const STOP: &str = "shell.stop";
 
+/// What the message of a `shell.run` or `shell.start` error starts with
+/// when the command never started because the host ran short of something
+/// it needs: processes, open files, memory or namespaces. The rest names
+/// the resource and what the host had. The service already tried again a
+/// few times; a change to the code cannot help, freeing the resource can.
+/// Answered with the error code `busy`.
+pub const SHORT_OF: &str = "short of host resources: ";
+/// What the message starts with when the command never started because the
+/// service already runs as many commands as it may and has as many waiting
+/// as it queues. Answered with the error code `busy`; it can work once
+/// others finish.
+pub const QUEUE_FULL: &str = "the shell's queue is full: ";
+/// What the message starts with when the command never started because
+/// this host cannot isolate commands (no bubblewrap, no user namespaces)
+/// or its security policy refuses to. Nothing falls back to running the
+/// command unconfined; only the user can change this. Answered with the
+/// error code `unavailable`.
+pub const NO_ISOLATION: &str = "isolation unavailable: ";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRequest {
     /// A directory inside one of the service's roots (a workspace or fork).

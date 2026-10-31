@@ -2200,6 +2200,10 @@ fn nats_server() -> Option<PathBuf> {
 #[tokio::test]
 async fn a_task_runs_over_nats_with_provisioned_secrets() {
     let Some(bin) = nats_server() else {
+        assert!(
+            std::env::var_os("MOLT_REQUIRE_NATS_TESTS").is_none(),
+            "MOLT_REQUIRE_NATS_TESTS is set, and nats-server was not found: set MOLT_NATS_SERVER"
+        );
         eprintln!("skipping: nats-server not found");
         return;
     };

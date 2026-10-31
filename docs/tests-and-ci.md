@@ -10,7 +10,16 @@ The NATS conformance and end-to-end tests need a `nats-server` binary. Set
 `MOLT_NATS_SERVER=/path/to/nats-server` or put it on `PATH`
 (`go install github.com/nats-io/nats-server/v2@v2.15.1`, using the Go version
 in `.github/ci-versions.toml`). Without it they print
-a notice and pass; CI always runs them.
+a notice and pass; CI always runs them. Set `MOLT_REQUIRE_NATS_TESTS=1`, as CI
+does, to make a missing server fail those tests instead, and
+`MOLT_REQUIRE_SANDBOX_TESTS=1` to do the same for a sandbox that does not start,
+so a skipped test is never counted as one that passed.
+
+CI runs the tests with `RUST_TEST_THREADS=4`, fixed rather than taken from the
+runner, and prints the host's process, open-file and namespace limits before the
+tests and again after a failure. A sandbox test that cannot start its sandbox for
+want of a resource says which, with what the host had (see
+[Linux command isolation](sandbox.md#commands-at-once-and-a-host-that-runs-short)).
 
 The Rust release and components are pinned in `rust-toolchain.toml`, and CI
 reads that file too. Go and nats-server are pinned in `.github/ci-versions.toml`;

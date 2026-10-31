@@ -2,7 +2,8 @@
 //!
 //! Needs a `nats-server` binary: set `MOLT_NATS_SERVER` to its path or put it
 //! on `PATH`. Without one these tests print a notice and pass, so plain
-//! `cargo test` works anywhere; CI installs the server and runs them for real.
+//! `cargo test` works anywhere, unless `MOLT_REQUIRE_NATS_TESTS` is set, as
+//! CI sets it: then they fail, so a skip is never counted as a pass.
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -131,6 +132,10 @@ macro_rules! nats_test {
         #[tokio::test]
         async fn $name() {
             if nats_bin().is_none() {
+                assert!(
+                    std::env::var_os("MOLT_REQUIRE_NATS_TESTS").is_none(),
+                    "MOLT_REQUIRE_NATS_TESTS is set, and nats-server was not found: set MOLT_NATS_SERVER"
+                );
                 eprintln!("skipping {}: nats-server not found", stringify!($name));
                 return;
             }

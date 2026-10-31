@@ -9,6 +9,7 @@ use tokio::process::Command;
 
 use crate::build_dir::BuildDir;
 use crate::cargo_cache::CargoCache;
+use crate::resources::{self, Resource, Setup};
 use crate::{fork, Roots};
 
 const MAX_POLICY_BYTES: usize = 64 * 1024;
@@ -179,12 +180,50 @@ impl SandboxPolicy {
         Ok(())
     }
 
+    /// Whether the sandbox starts here: it runs `/bin/true` in it. A start
+    /// the host could not afford for the moment (see `resources`) is tried
+    /// again a few times. A failure says why as an [`Unavailable`] when it
+    /// can tell: the host was short of a resource, cannot isolate, or
+    /// refuses to. Nothing ever falls back to unconfined.
     pub fn probe(&self) -> anyhow::Result<()> {
         self.validate()?;
-        let (mut command, _guard) = self.command(Path::new("/bin/true"), None, None, None)?;
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            match self.probe_once()? {
+                None => return Ok(()),
+                Some((Setup::Short(resource), said)) => match resources::BACKOFF.get(tries - 1) {
+                    Some(delay) => std::thread::sleep(*delay),
+                    None => {
+                        let message = resources::short_of(resource, &said, tries, Some(self)).message;
+                        return Err(Unavailable { setup: Setup::Short(resource), message }.into());
+                    }
+                },
+                Some((setup, said)) => {
+                    let message = format!(
+                        "Linux sandbox unavailable: {said}. Explicit --no-sandbox is required for unconfined execution"
+                    );
+                    return Err(Unavailable { setup, message }.into());
+                }
+            }
+        }
+    }
+
+    /// One run of the probe: `None` when it passed, else why not and what
+    /// bubblewrap said.
+    fn probe_once(&self) -> anyhow::Result<Option<(Setup, String)>> {
+        let (mut command, guard) = self.command(Path::new("/bin/true"), None, None, None)?;
         let command = command.as_std_mut();
         command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
-        let mut child = command.spawn().context("starting /usr/bin/bwrap; install bubblewrap 0.9 or newer")?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                if let Some(resource) = e.raw_os_error().and_then(Resource::of_errno) {
+                    return Ok(Some((Setup::Short(resource), format!("starting /usr/bin/bwrap: {e}"))));
+                }
+                return Err(anyhow::Error::new(e).context("starting /usr/bin/bwrap; install bubblewrap 0.9 or newer"));
+            }
+        };
         let started = std::time::Instant::now();
         let status = loop {
             if let Some(status) = child.try_wait()? {
@@ -197,27 +236,27 @@ impl SandboxPolicy {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
-        if !status.success() {
-            use std::io::Read;
-            use std::os::fd::AsRawFd;
-            let mut bytes = [0; 4096];
-            let n = if let Some(mut stderr) = child.stderr.take() {
-                // Never wait for EOF on a pipe retained by an executor or helper.
-                let fd = stderr.as_raw_fd();
-                unsafe {
-                    let flags = libc::fcntl(fd, libc::F_GETFL);
-                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                }
-                stderr.read(&mut bytes).unwrap_or(0)
-            } else {
-                0
-            };
-            anyhow::bail!(
-                "Linux sandbox unavailable: {}. Explicit --no-sandbox is required for unconfined execution",
-                String::from_utf8_lossy(&bytes[..n]).trim()
-            );
+        if status.success() {
+            return Ok(None);
         }
-        Ok(())
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let mut bytes = [0; 4096];
+        let n = if let Some(mut stderr) = child.stderr.take() {
+            // Never wait for EOF on a pipe retained by an executor or helper.
+            let fd = stderr.as_raw_fd();
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            stderr.read(&mut bytes).unwrap_or(0)
+        } else {
+            0
+        };
+        let said = String::from_utf8_lossy(&bytes[..n]).trim().to_owned();
+        // `/bin/true` changes nothing, so even a sandbox that got as far as its namespaces may start again.
+        drop(guard);
+        Ok(Some((resources::setup_failure("", &said).unwrap_or(Setup::Unsupported), said)))
     }
 
     /// A long-lived program, such as an MCP server, in the sandbox the
@@ -429,6 +468,22 @@ fn read_policy(file: std::fs::File) -> anyhow::Result<SandboxPolicy> {
     Ok(policy)
 }
 
+/// Why the sandbox could not start, as [`SandboxPolicy::probe`] tells it:
+/// downcast its error to read [`Unavailable::setup`].
+#[derive(Debug)]
+pub struct Unavailable {
+    pub setup: Setup,
+    message: String,
+}
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Unavailable {}
+
 /// What [`SandboxPolicy::service_command`] adds for a bus service.
 struct Service<'a> {
     args: &'a [String],
@@ -445,6 +500,15 @@ pub struct Guard {
 }
 
 impl Guard {
+    /// Whether the sandbox got as far as creating its namespaces: bubblewrap
+    /// reports its child there once it has. A sandbox that fails before
+    /// that never ran the command in it.
+    pub fn started(&self) -> bool {
+        use std::os::unix::fs::FileExt;
+        let mut byte = [0; 1];
+        self.info.read_at(&mut byte, 0).is_ok_and(|n| n > 0)
+    }
+
     /// SIGTERM to every process in the sandbox, through its session group;
     /// false when the sandbox has not reported it yet.
     pub fn terminate(&self) -> bool {

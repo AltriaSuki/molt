@@ -329,3 +329,38 @@ async fn a_process_runs_in_the_sandbox_and_stopping_it_tears_down_children_that_
     assert!(err.is_err());
     assert!(!env.roots.root.join("must-not-exist").exists());
 }
+
+#[test]
+fn a_sandbox_the_host_cannot_afford_names_the_resource_and_never_starts_unconfined() {
+    use molt_tools::resources::{Resource, Setup};
+    use molt_tools::sandbox::Unavailable;
+    if let Err(error) = SandboxPolicy::default().probe() {
+        assert!(std::env::var_os("MOLT_REQUIRE_SANDBOX_TESTS").is_none(), "required sandbox unavailable: {error:#}");
+        eprintln!("namespace integration test unavailable in this executor: {error:#}");
+        return;
+    }
+    // Six descriptors are too few for bubblewrap to set up a sandbox: a shortage that
+    // repeats on every host, as a host out of descriptors, processes or namespaces is.
+    let starved = SandboxPolicy { open_files: 6, ..SandboxPolicy::default() };
+    let started = std::time::Instant::now();
+    let error = starved.probe().unwrap_err();
+    let waited = started.elapsed();
+    let unavailable = error.downcast_ref::<Unavailable>().expect("the reason is told");
+    assert_eq!(unavailable.setup, Setup::Short(Resource::OpenFiles));
+    let said = format!("{error:#}");
+    assert!(said.starts_with("short of host resources: open files: "), "{said}");
+    assert!(said.contains("Too many open files") || said.contains("Error 24"), "{said}");
+    assert!(said.contains("(tried 5 times)") && said.contains("commands get the sandbox's `open_files`, 6"), "{said}");
+    assert!(!said.contains("--no-sandbox"), "a shortage is not a missing sandbox: {said}");
+    // Bounded: it waited between tries, and gave up.
+    assert!(waited >= Duration::from_millis(1500) && waited < Duration::from_secs(10), "{waited:?}");
+
+    // A shell service under that policy does not start, and nothing runs unconfined instead.
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir(tmp.path().join("project")).unwrap();
+    let roots = Roots { root: tmp.path().join("project"), scratch: tmp.path().join("scratch") };
+    let refused = Shell::with_policy(roots.clone(), ExecutionPolicy::Configured(starved)).err().unwrap();
+    assert!(format!("{refused:#}").starts_with("short of host resources: open files"), "{refused:#}");
+    // With what it needs again, it starts.
+    Shell::with_policy(roots, ExecutionPolicy::Configured(SandboxPolicy::default())).unwrap();
+}

@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cargo_cache::CargoCache;
 use crate::error::failed;
+use crate::resources::{self, Admission};
 use crate::{build_dir, sandbox, Roots, SandboxPolicy};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -72,6 +73,9 @@ pub(crate) struct Groups(Mutex<GroupState>);
 struct GroupState {
     stopping: bool,
     running: HashMap<libc::pid_t, Option<Arc<std::fs::File>>>,
+    /// Starts to fail as if the host had no process to spare, in tests.
+    #[cfg(test)]
+    short: usize,
 }
 
 impl Groups {
@@ -90,10 +94,12 @@ impl Groups {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // The service's parts a command uses, each borrowed for the call.
 pub(crate) async fn run(
     roots: &Arc<Roots>,
     program: &Path,
     groups: &Arc<Groups>,
+    admission: &Admission,
     sandbox: Option<(&SandboxPolicy, Option<Arc<CargoCache>>)>,
     req: RunRequest,
     cancel: CancellationToken,
@@ -103,6 +109,8 @@ pub(crate) async fn run(
         Some((policy, cargo)) => (Some(policy), cargo),
         None => (None, None),
     };
+    // A command waiting for its turn holds nothing else, not even a build directory.
+    let _turn = admission.enter(&cancel).await?;
     // Held until the command is done, so no other command builds into its directory.
     let (ws, build) = {
         let (roots, ws) = (roots.clone(), req.workspace.clone());
@@ -123,46 +131,39 @@ pub(crate) async fn run(
         return Err(RemoteError { code: ErrorCode::Invalid, message });
     }
 
-    let (mut cmd, guard) = command(roots, program, policy, &ws, &build, &req.command)?;
-    cmd.stdin(if req.stdin.is_some() { Stdio::piped() } else { Stdio::null() });
     let started = Instant::now();
-    let (mut child, group) = Group::spawn(&mut cmd, groups, &cancel, guard.as_ref().map(|guard| guard.info.clone()))?;
-
-    let stdout = Arc::new(Mutex::new(Capture::default()));
-    let stderr = Arc::new(Mutex::new(Capture::default()));
-    // JoinSet aborts its readers when this request future is dropped, too.
-    let mut readers = tokio::task::JoinSet::new();
-    readers.spawn(drain(child.stdout.take(), stdout.clone(), sink.clone().map(|s| (s, false))));
-    readers.spawn(drain(child.stderr.take(), stderr.clone(), sink.map(|s| (s, true))));
-    // Written on its own, so a command that reads none of it cannot hold up
-    // the call; closed when written, or when the request ends.
-    let mut writer = tokio::task::JoinSet::new();
-    if let (Some(mut pipe), Some(input)) = (child.stdin.take(), req.stdin) {
-        writer.spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            // A command that exits without reading it all closes the pipe: that is its choice.
-            let _ = pipe.write_all(input.as_bytes()).await;
-        });
-    }
-
-    // Prefer an already-finished command in a cancellation/completion tie.
-    let (status, timed_out, cancelled) = tokio::select! {
-        biased;
-        status = child.wait() => (status, false, false),
-        _ = cancel.cancelled() => (terminate(&group, &mut child).await, false, true),
-        _ = tokio::time::sleep(limit) => (terminate(&group, &mut child).await, true, false),
+    let mut tries = 0;
+    let (status, timed_out, cancelled, stdout, stderr) = loop {
+        tries += 1;
+        let (mut cmd, guard) = command(roots, program, policy, &ws, &build, &req.command)?;
+        let ran = once(&mut cmd, policy, guard, groups, &cancel, req.stdin.clone(), sink.clone(), limit).await;
+        let (resource, said) = match ran {
+            Once::Ran { status, timed_out, cancelled, stdout, stderr } => {
+                break (status, timed_out, cancelled, stdout, stderr)
+            }
+            Once::NotStarted { resource, said } => (resource, said),
+            Once::Refused(e) => return Err(e),
+        };
+        let Some(delay) = resources::BACKOFF.get(tries - 1) else {
+            return Err(resources::short_of(resource, &said, tries, policy));
+        };
+        tracing::debug!(resource = resource.name(), %said, "command could not start; trying again");
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err(RemoteError {
+                    code: ErrorCode::Cancelled,
+                    message: "command cancelled while it waited to start again; it never started".into(),
+                });
+            }
+            _ = tokio::time::sleep(*delay) => {}
+        }
     };
     let duration = started.elapsed();
-    group.kill();
-    writer.abort_all();
-    let status = status.map_err(|e| failed(format!("waiting for the command: {e}")))?;
-    let _ = tokio::time::timeout(GRACE, async { while readers.join_next().await.is_some() {} }).await;
-    // Whatever escaped the group (a daemon that called setsid) may still hold a pipe.
-    readers.abort_all();
-
     drop(build);
-    let (stdout, out_cut) = take(&stdout).finish();
-    let (stderr, err_cut) = take(&stderr).finish();
+    let status = status.map_err(|e| failed(format!("waiting for the command: {e}")))?;
+    let (stdout, out_cut) = stdout.finish();
+    let (stderr, err_cut) = stderr.finish();
     let success = status.code() == Some(0) && !timed_out && !cancelled;
     let offline_failure =
         policy.is_some_and(|policy| !policy.network) && !success && (looks_offline(&stdout) || looks_offline(&stderr));
@@ -177,6 +178,96 @@ pub(crate) async fn run(
         duration_ms: duration.as_millis() as u64,
         offline_failure,
     })
+}
+
+/// How one start of a command went.
+enum Once {
+    Ran {
+        status: std::io::Result<std::process::ExitStatus>,
+        timed_out: bool,
+        cancelled: bool,
+        stdout: Capture,
+        stderr: Capture,
+    },
+    /// It provably never started, for want of `resource`: it may be started again.
+    NotStarted { resource: resources::Resource, said: String },
+    /// It did not start, and starting it again would not help.
+    Refused(RemoteError),
+}
+
+/// Start `cmd` once, with `stdin`, and wait for it, at most `limit`.
+#[allow(clippy::too_many_arguments)] // One start's parts, each borrowed or moved for it.
+async fn once(
+    cmd: &mut Command,
+    policy: Option<&SandboxPolicy>,
+    guard: Option<sandbox::Guard>,
+    groups: &Arc<Groups>,
+    cancel: &CancellationToken,
+    stdin: Option<String>,
+    sink: Option<Sink>,
+    limit: Duration,
+) -> Once {
+    cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+    let info = guard.as_ref().map(|guard| guard.info.clone());
+    let (mut child, group) = match Group::try_spawn(cmd, groups, cancel, info) {
+        Ok(spawned) => spawned,
+        Err(Spawn::Short(resource, said)) => return Once::NotStarted { resource, said },
+        Err(Spawn::Error(e)) => return Once::Refused(e),
+    };
+
+    let stdout = Arc::new(Mutex::new(Capture::default()));
+    let stderr = Arc::new(Mutex::new(Capture::default()));
+    // JoinSet aborts its readers when this request future is dropped, too.
+    let mut readers = tokio::task::JoinSet::new();
+    // A sandbox that could not start says so on stderr, streamed like any output: the reply tells.
+    readers.spawn(drain(child.stdout.take(), stdout.clone(), sink.clone().map(|s| (s, false))));
+    readers.spawn(drain(child.stderr.take(), stderr.clone(), sink.map(|s| (s, true))));
+    // Written on its own, so a command that reads none of it cannot hold up
+    // the call; closed when written, or when the request ends.
+    let mut writer = tokio::task::JoinSet::new();
+    if let (Some(mut pipe), Some(input)) = (child.stdin.take(), stdin) {
+        writer.spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            // A command that exits without reading it all closes the pipe: that is its choice.
+            let _ = pipe.write_all(input.as_bytes()).await;
+        });
+    }
+
+    // Prefer an already-finished command in a cancellation/completion tie.
+    let (status, timed_out, cancelled) = tokio::select! {
+        biased;
+        status = child.wait() => (status, false, false),
+        _ = cancel.cancelled() => (terminate(&group, &mut child).await, false, true),
+        _ = tokio::time::sleep(limit) => (terminate(&group, &mut child).await, true, false),
+    };
+    group.kill();
+    writer.abort_all();
+    let _ = tokio::time::timeout(GRACE, async { while readers.join_next().await.is_some() {} }).await;
+    // Whatever escaped the group (a daemon that called setsid) may still hold a pipe.
+    readers.abort_all();
+    let (stdout, stderr) = (take(&stdout), take(&stderr));
+    if let (Some(guard), Ok(status)) = (&guard, &status) {
+        if !timed_out && !cancelled && status.code() == Some(1) {
+            let (out, err) = (stdout.peek(), stderr.peek());
+            let started = guard.started();
+            // Once the sandbox's namespaces exist, a namespace that cannot be created is one the
+            // command asked for (a bwrap of its own, which the sandbox refuses): its output.
+            let inner = started && err.to_lowercase().contains("new namespace");
+            match resources::setup_failure(&out, &err).filter(|_| !inner) {
+                // Before its namespaces, the sandbox never ran the command.
+                Some(resources::Setup::Short(resource)) if !started => {
+                    return Once::NotStarted { resource, said: err.trim().to_owned() };
+                }
+                // After them it failed before the command too, but that is not proven: not started again.
+                Some(resources::Setup::Short(resource)) => {
+                    return Once::Refused(resources::short_of(resource, &err, 1, policy));
+                }
+                Some(setup) => return Once::Refused(resources::no_isolation(setup, &err)),
+                None => {}
+            }
+        }
+    }
+    Once::Ran { status, timed_out, cancelled, stdout, stderr }
 }
 
 /// `command` under `program -c` in the canonical workspace `ws`, in the
@@ -264,6 +355,13 @@ fn child_env() -> Vec<(OsString, OsString)> {
     env
 }
 
+/// Why a command did not start.
+enum Spawn {
+    /// The host was short of a resource: it never started, and may be started again.
+    Short(resources::Resource, String),
+    Error(RemoteError),
+}
+
 /// A command's process group, listed in [`Groups`] while it lives. Killed
 /// when dropped too, so a cancelled request does not leave its command running.
 pub(crate) struct Group {
@@ -280,16 +378,43 @@ impl Group {
         cancel: &CancellationToken,
         info: Option<Arc<std::fs::File>>,
     ) -> Result<(tokio::process::Child, Self), RemoteError> {
+        Self::try_spawn(command, groups, cancel, info).map_err(|e| match e {
+            Spawn::Short(resource, said) => resources::short_of(resource, &said, 1, None),
+            Spawn::Error(e) => e,
+        })
+    }
+
+    /// [`Group::spawn`], telling a start the host could not afford from other failures.
+    fn try_spawn(
+        command: &mut Command,
+        groups: &Arc<Groups>,
+        cancel: &CancellationToken,
+        info: Option<Arc<std::fs::File>>,
+    ) -> Result<(tokio::process::Child, Self), Spawn> {
         // Admission, spawning and registration share the shutdown lock.
         // Shutdown therefore either sees this child or prevents it starting.
         let mut state = lock(&groups.0);
         if state.stopping {
-            return Err(RemoteError { code: ErrorCode::Unavailable, message: "shell service is shutting down".into() });
+            let message = "shell service is shutting down".into();
+            return Err(Spawn::Error(RemoteError { code: ErrorCode::Unavailable, message }));
         }
         if cancel.is_cancelled() {
-            return Err(RemoteError { code: ErrorCode::Cancelled, message: "command cancelled before start".into() });
+            let message = "command cancelled before start".into();
+            return Err(Spawn::Error(RemoteError { code: ErrorCode::Cancelled, message }));
         }
-        let child = command.spawn().map_err(|e| failed(format!("could not start command: {e}")))?;
+        #[cfg(test)]
+        if state.short > 0 {
+            state.short -= 1;
+            let said = "could not start the command: Resource temporarily unavailable (os error 11)".into();
+            return Err(Spawn::Short(resources::Resource::Processes, said));
+        }
+        let child = command.spawn().map_err(|e| match e.raw_os_error().and_then(resources::Resource::of_errno) {
+            Some(resource) => Spawn::Short(resource, format!("could not start the command: {e}")),
+            None if info.is_some() && e.kind() == std::io::ErrorKind::NotFound => Spawn::Error(
+                resources::no_isolation(resources::Setup::Unsupported, &format!("could not start /usr/bin/bwrap: {e}")),
+            ),
+            None => Spawn::Error(failed(format!("could not start command: {e}"))),
+        })?;
         let pgid = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()).filter(|&p| p > 0);
         if let Some(pgid) = pgid {
             state.running.insert(pgid, info.clone());
@@ -477,6 +602,13 @@ impl Capture {
         self.tail.drain(..excess);
     }
 
+    /// What it holds so far, as text, without the marker.
+    fn peek(&self) -> String {
+        let mut bytes = self.head.clone();
+        bytes.extend(self.tail.iter());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
     /// The text, with a marker where bytes were dropped, and whether any were.
     fn finish(self) -> (String, bool) {
         let omitted = self.total - (self.head.len() + self.tail.len()) as u64;
@@ -492,6 +624,81 @@ impl Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Host {
+        _tmp: tempfile::TempDir,
+        roots: Arc<Roots>,
+        ws: PathBuf,
+        groups: Arc<Groups>,
+        admission: Admission,
+    }
+
+    impl Host {
+        /// Unconfined commands in `ws`, the first `short` of whose starts fail for want of processes.
+        fn new(short: usize) -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("root");
+            std::fs::create_dir_all(root.join("ws")).unwrap();
+            let roots = Roots { root: root.clone(), scratch: tmp.path().join("scratch") }.canonical().unwrap();
+            let groups = Arc::new(Groups::default());
+            lock(&groups.0).short = short;
+            let ws = roots.root.join("ws");
+            Self { _tmp: tmp, roots: Arc::new(roots), ws, groups, admission: Admission::new(1, 1) }
+        }
+
+        async fn run(&self, command: &str, cancel: CancellationToken) -> Result<RunResponse, RemoteError> {
+            let req = RunRequest {
+                workspace: "ws".into(),
+                command: command.into(),
+                timeout_ms: None,
+                stream: false,
+                stdin: None,
+            };
+            run(&self.roots, &find_shell(), &self.groups, &self.admission, None, req, cancel, None).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_start_the_host_could_not_afford_is_made_again_after_a_bounded_wait() {
+        // Two starts fail, the third goes: the command runs once.
+        let host = Host::new(2);
+        let started = Instant::now();
+        let ran = host.run("echo ran >> once", CancellationToken::new()).await.unwrap();
+        assert_eq!(ran.exit_code, Some(0), "{ran:?}");
+        assert!(started.elapsed() >= BACKOFF_FIRST_TWO, "it waited before each new start");
+        assert_eq!(std::fs::read_to_string(host.ws.join("once")).unwrap(), "ran\n");
+        assert_eq!(lock(&host.groups.0).short, 0);
+
+        // Never: refused after five starts, naming the resource, and it never ran.
+        let host = Host::new(usize::MAX);
+        let started = Instant::now();
+        let e = host.run("touch ran", CancellationToken::new()).await.unwrap_err();
+        let waited = started.elapsed();
+        assert_eq!(e.code, ErrorCode::Busy);
+        assert!(e.message.starts_with("short of host resources: processes: could not start"), "{}", e.message);
+        assert!(e.message.contains("(tried 5 times)") && e.message.contains("This user runs "), "{}", e.message);
+        assert!(waited >= resources::BACKOFF.iter().sum::<Duration>() && waited < Duration::from_secs(5), "{waited:?}");
+        assert_eq!(lock(&host.groups.0).short, usize::MAX - 5, "five starts, no more");
+        assert!(!host.ws.join("ran").exists());
+        assert_eq!(host.admission.running(), 0, "its turn went back");
+
+        // Cancelled while it waits to start again: it stops at once and never runs.
+        let host = Host::new(usize::MAX);
+        let cancel = CancellationToken::new();
+        let started = Instant::now();
+        let (e, ()) = tokio::join!(host.run("touch ran", cancel.clone()), async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            cancel.cancel();
+        });
+        let e = e.unwrap_err();
+        assert_eq!(e.code, ErrorCode::Cancelled, "{}", e.message);
+        assert!(started.elapsed() < Duration::from_millis(1000), "{:?}", started.elapsed());
+        assert_eq!(lock(&host.groups.0).short, usize::MAX - 2);
+        assert!(!host.ws.join("ran").exists());
+    }
+
+    /// The first two waits of [`resources::BACKOFF`].
+    const BACKOFF_FIRST_TWO: Duration = Duration::from_millis(300);
 
     #[test]
     fn registry_and_network_failures_are_recognized_and_other_failures_are_not() {
