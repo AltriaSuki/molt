@@ -1845,6 +1845,140 @@ async fn sigterm_and_sighup_stop_molt_do_like_ctrl_c() {
     }
 }
 
+/// `molt runs` lists what `molt do` ran, from the project's own data dir:
+/// its result and cost as `molt do --json` said them, an interrupted run as
+/// interrupted, the runs of a session together, and the same list again
+/// once its index is deleted.
+#[tokio::test]
+async fn molt_runs_lists_the_projects_runs_by_session_and_builds_the_same_list_again_from_the_log() {
+    let server = fake_api(Fake::Greets).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    // No --data-dir anywhere: each command finds the project's data dir in the cache.
+    let cache = home.path().join("cache");
+    let molt_here = |server: &MockServer, args: &[&str]| {
+        let mut cmd = molt_in(server, workspace.path(), home.path());
+        cmd.env("XDG_CACHE_HOME", &cache).args(args);
+        cmd
+    };
+    let run = |out: std::process::Output| {
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}", out.status);
+        (stdout.into_owned(), stderr.into_owned())
+    };
+    let task = "Write a greeting into greeting.txt.";
+    let mut done = Vec::new();
+    for extra in [&["--no-apply"][..], &[]] {
+        let mut args = vec!["do", task, "--check", CHECK, "--attempts", "1", "--session", "greeting", "--json"];
+        args.extend(extra);
+        let out = tokio::time::timeout(RUN_LIMIT, molt_here(&server, &args).output()).await.expect("molt do hung");
+        done.push(serde_json::from_str::<Value>(&run(out.unwrap()).0).unwrap());
+    }
+    // A third run, outside the session, stopped while its attempt waits on a command.
+    let pids = tempfile::tempdir().unwrap();
+    let pidfile = pids.path().join("sleep.pid");
+    let hangs = fake_api(Fake::Hangs(pidfile.clone())).await;
+    let args = ["do", "Wait for it.", "--check", CHECK, "--attempts", "1", "--no-sandbox"];
+    let child = molt_here(&hangs, &args).spawn().unwrap();
+    let pid = tokio::time::timeout(RUN_LIMIT, wait_for_pid(&pidfile)).await.expect("the command never started");
+    // SAFETY: plain syscall.
+    assert_eq!(unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGTERM) }, 0);
+    let out = tokio::time::timeout(RUN_LIMIT, child.wait_with_output()).await.expect("molt do hung").unwrap();
+    assert_eq!(out.status.code(), Some(143), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(exits(pid).await);
+
+    let (json, _) = run(molt_here(&server, &["runs", "--json"]).output().await.unwrap());
+    let listed: Value = serde_json::from_str(&json).unwrap();
+    let listed = listed.as_array().unwrap();
+    assert_eq!(listed.len(), 3, "{json}");
+    for (run, done) in listed.iter().zip(&done) {
+        assert_eq!(run["run"], done["run"], "{json}");
+        assert_eq!(run["result"], done["outcome"], "{json}");
+        assert_eq!(run["cost_usd"], done["cost_usd"], "{json}");
+        assert!(run["cost_usd"].as_f64().unwrap() > 0.0, "{json}");
+        assert_eq!((&run["task"], &run["session"]), (&json!(task), &json!("greeting")));
+        assert_eq!(run["learning"]["status"], "answered", "{json}");
+        assert!(run["duration_ms"].as_u64().is_some(), "{json}");
+    }
+    assert_eq!(listed[0]["learning"]["notes"][0]["text"], LEARNED_TEXT, "{json}");
+    assert_eq!(listed[1]["learning"]["reinforced"], 1, "the second run bore the note out: {json}");
+    assert_eq!((&listed[0]["applied"], &listed[0]["fork"]), (&json!("kept"), &done[0]["fork"]));
+    assert_eq!(listed[1]["applied"], "workspace");
+    // Stopped, it is interrupted, not failed; the planner still said what it had spent.
+    let stopped = &listed[2];
+    assert_eq!((&stopped["result"], &stopped["task"]), (&json!("interrupted"), &json!("Wait for it.")), "{json}");
+    assert!(stopped["cost_usd"].as_f64().is_some_and(|c| c > 0.0) && stopped.get("session").is_none(), "{stopped}");
+
+    let (table, _) = run(molt_here(&server, &["runs"]).output().await.unwrap());
+    let rows: Vec<&str> = table.lines().collect();
+    assert_eq!(rows.len(), 4, "{table}");
+    assert!(rows[0].starts_with("RUN ") && rows[1].contains("passed") && rows[1].contains("kept"), "{table}");
+    assert!(rows[1].contains("1 note") && rows[2].contains("workspace") && rows[2].contains("nothing"), "{table}");
+    assert!(rows[3].contains("interrupted") && rows[3].contains("Wait for it."), "{table}");
+
+    // Deleted, the index is built again from the audit log, to the same list.
+    let data: Vec<PathBuf> =
+        std::fs::read_dir(cache.join("molt")).unwrap().map(|e| e.unwrap().path()).filter(|p| p.is_dir()).collect();
+    let [data] = data.as_slice() else { panic!("one data dir: {data:?}") };
+    std::fs::remove_file(data.join(molt::runs::INDEX)).unwrap();
+    assert_eq!(run(molt_here(&server, &["runs", "--json"]).output().await.unwrap()).0, json);
+    assert!(data.join(molt::runs::INDEX).is_file());
+
+    // By session: the session's two runs together, then the one outside any.
+    let (grouped, _) = run(molt_here(&server, &["runs", "--session", "--json"]).output().await.unwrap());
+    let grouped: Value = serde_json::from_str(&grouped).unwrap();
+    let shape: Vec<(Value, usize)> = grouped
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["session"].clone(), s["runs"].as_array().unwrap().len()))
+        .collect();
+    assert_eq!(shape, [(json!("greeting"), 2), (Value::Null, 1)]);
+    let total = done[0]["cost_usd"].as_f64().unwrap() + done[1]["cost_usd"].as_f64().unwrap();
+    assert!((grouped[0]["cost_usd"].as_f64().unwrap() - total).abs() < 1e-12, "{grouped}");
+    let (named, _) = run(molt_here(&server, &["runs", "--session", "greeting"]).output().await.unwrap());
+    assert_eq!(named.lines().count(), 3, "{named}");
+    let (text, _) = run(molt_here(&server, &["runs", "--session"]).output().await.unwrap());
+    assert!(text.starts_with("session greeting · 2 runs · $") && text.contains("\nno session · 1 run"), "{text}");
+
+    // One run in full, by the start of its id.
+    let id = done[1]["run"].as_str().unwrap();
+    let (shown, _) = run(molt_here(&server, &["runs", "show", &id[..12]]).output().await.unwrap());
+    for part in [
+        &format!("run {id}\n"),
+        &format!("task:\n  {task}\n"),
+        "result: passed (verification: command), cost $",
+        &format!("check: {CHECK}\n"),
+        "attempts:\n  1: passed after ",
+        "added    greeting.txt",
+        "applied to ",
+        "memory gave it: 1 note in ",
+        " lesson 0.90\n",
+        &format!("\n        {LEARNED_TEXT}\n"),
+        "memory learned: 0 new, 1 confirmed",
+    ] {
+        assert!(shown.contains(part), "{part:?} in:\n{shown}");
+    }
+    let first = done[0]["run"].as_str().unwrap();
+    let (shown, _) = run(molt_here(&server, &["runs", "show", first]).output().await.unwrap());
+    let kept = format!("not applied; the result was kept in {}", done[0]["fork"].as_str().unwrap());
+    for part in [
+        &kept,
+        &"memory gave it: 0 notes".to_owned(),
+        &"memory learned: 1 new".to_owned(),
+        &format!("+ [lesson] {LEARNED_TEXT}"),
+    ] {
+        assert!(shown.contains(part), "{part:?} in:\n{shown}");
+    }
+
+    // Another data dir has none of them.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let args = ["runs", "--data-dir", elsewhere.path().to_str().unwrap()];
+    let (none, said) = run(molt_here(&server, &args).output().await.unwrap());
+    assert!(none.is_empty() && said.starts_with("no runs in "), "{said}");
+    assert_requests_valid(&server).await;
+}
+
 fn nats_server() -> Option<PathBuf> {
     std::env::var_os("MOLT_NATS_SERVER").map(PathBuf::from).or_else(|| {
         std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join("nats-server")).find(|p| p.is_file())
@@ -2628,6 +2762,15 @@ async fn a_script_runs_a_task_through_molt_serve_and_applies_the_result() {
     assert!(!socket.exists(), "the socket goes with the server");
     setup.assert_forks_dropped();
     assert_requests_valid(&server).await;
+
+    // The run is listed, in the session the server gave its client, with its result kept in its fork.
+    let out = molt(&server, &workspace, setup.data.path(), &["runs", "--json"]).output().await.unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let listed: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let run = &listed[0];
+    assert_eq!((&run["run"], &run["result"], &run["applied"]), (&json!(trace), &json!("passed"), &json!("kept")));
+    assert_eq!(run["fork"], fork.as_str());
+    assert!(run["session"].as_str().is_some_and(|s| s.starts_with("sess_")), "{run}");
 }
 
 /// The interface's Esc, through the protocol: `task.stop` cuts the run off,

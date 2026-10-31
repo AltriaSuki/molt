@@ -153,6 +153,7 @@ impl App {
         req.keep_cancelled_forks = true;
         req.workflow = Some(settings.workflow.clone().unwrap_or_else(|| workflow::AUTO.to_owned()));
         req.continues = continues;
+        req.session = Some(self.run_session.clone());
         // So that a task the interface stopped in (a quit, a crash) can go on: `/runs resume`.
         req.checkpoint = runs::checkpoints(req.workflow.as_deref());
         // Only a workflow that designs a check stops for it; `auto` may pick one that does.

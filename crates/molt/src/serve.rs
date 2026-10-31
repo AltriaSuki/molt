@@ -47,6 +47,10 @@ pub struct Options {
     pub web_resolver: Option<String>,
     /// The `[profile.NAME]` of the config to take defaults from.
     pub profile: Option<String>,
+    /// The session the runs belong to (`--session`); without one, the
+    /// interface names one for each time it is opened, and `molt serve` one
+    /// for each client.
+    pub session: Option<String>,
 }
 
 /// The config of `opts`, the workspace it is for and its project.
@@ -91,11 +95,19 @@ pub struct Server {
     workspace: String,
     /// A connection has a session open or starting.
     in_use: Arc<AtomicBool>,
+    /// The session of a run whose request names none; `None`: one of its
+    /// own for each connection.
+    session: Option<String>,
 }
 
 impl Server {
     pub fn new(cfg: Config, workspace: String) -> Arc<Self> {
-        Arc::new(Self { cfg: Arc::new(cfg), workspace, in_use: Arc::default() })
+        Self::named(cfg, workspace, None)
+    }
+
+    /// A server whose runs that name no session go into `session`.
+    pub fn named(cfg: Config, workspace: String, session: Option<String>) -> Arc<Self> {
+        Arc::new(Self { cfg: Arc::new(cfg), workspace, in_use: Arc::default(), session })
     }
 
     /// Serve one client on `input` and `output` until it goes, or `stop`.
@@ -136,6 +148,7 @@ impl Server {
         });
         let (sessions, mut started) = mpsc::unbounded_channel();
         let mut conn = Connection {
+            run_session: self.session.clone().unwrap_or_else(crate::runs::new_session),
             server: self.clone(),
             tx: outbox.clone(),
             sessions,
@@ -263,6 +276,8 @@ type Started = (Option<Id>, Result<Arc<Session>, String>);
 
 struct Connection {
     server: Arc<Server>,
+    /// The session of the runs this client asks for that name none.
+    run_session: String,
     tx: Outbox,
     sessions: UnboundedSender<Started>,
     session: Option<Arc<Session>>,
@@ -605,6 +620,12 @@ impl Connection {
             )));
         }
         req.workspace = ours.clone();
+        req.session = match req.session.take() {
+            None => Some(self.run_session.clone()),
+            Some(name) => Some(
+                crate::runs::session_name(&name).map_err(|e| Dispatch::Error(Error::new(code::INVALID_PARAMS, e)))?,
+            ),
+        };
         Ok(())
     }
 
@@ -1082,6 +1103,10 @@ pub(crate) mod tests {
             let reply = raw.call(3, "task.submit", json!({"trace": "trace_1", "request": req})).await;
             assert_eq!(reply["error"]["code"], code::NO_SESSION, "{workspace}: {reply}");
         }
+        // A session it names must be a name.
+        let req = RunRequest { session: Some("a\u{1b}b".into()), ..RunRequest::new("t", "") };
+        let refused = raw.call(4, "task.submit", json!({"trace": "trace_1", "request": req})).await;
+        assert_eq!(refused["error"]["code"], code::INVALID_PARAMS, "{refused}");
     }
 
     #[tokio::test]

@@ -10,9 +10,16 @@ transport = "unix"        # "unix" for one host, "nats" for many
 nats_url = "nats://127.0.0.1:4222"
 fsync = true
 
+# A candidate service: one an agent may replace, so it runs in the Linux
+# sandbox (bubblewrap) with no network, no host files but its own program,
+# its private state in <data_dir>/state/echo and only the capabilities in its
+# requests. Molt does not start when the sandbox is unavailable. A service
+# without `isolation` is "native": a trusted host process with your files and
+# network, which only you can change (docs/services.md).
 [[service]]
 name = "echo"
 tier = "mutable"
+isolation = "sandbox"
 exec = { command = "molt-echo" }   # `cargo install --path crates/molt` puts it on PATH
 memory_mb = 256
 max_restarts = 5

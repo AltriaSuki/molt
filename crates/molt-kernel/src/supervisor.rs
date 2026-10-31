@@ -2,11 +2,19 @@
 //! restarts it with exponential backoff when it exits, and stops it with a
 //! drain deadline.
 //!
+//! A service runs in one of two ways ([`Execution`]): natively, as a host
+//! process with the user's files and network, which only trusted code may;
+//! or confined by a [`Backend`], which a candidate service an agent may
+//! replace must be (see `docs/services.md`). A confined service is never
+//! started any other way: when its backend cannot confine it, the start
+//! fails and is retried like any other failed start.
+//!
 //! It reports what happens as [`Event`]s; the kernel logs them and fails any
 //! request still waiting on a service that went down.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use molt_proto::{Exec, ServiceId};
@@ -94,10 +102,83 @@ pub const BASELINE_ENV: &[&str] = &[
 pub struct Spec {
     pub id: ServiceId,
     pub exec: Exec,
-    /// Set on top of [`BASELINE_ENV`]; later entries win.
+    /// Set on top of [`BASELINE_ENV`]; later entries win. A confined
+    /// service gets these alone, without the baseline.
     pub env: Vec<(String, String)>,
     pub limits: Limits,
     pub restart: RestartPolicy,
+    pub execution: Execution,
+}
+
+/// How the supervisor runs a service's process.
+#[derive(Clone, Debug, Default)]
+pub enum Execution {
+    /// A host process: it can read and write whatever the user can and use
+    /// the network, whatever capabilities it holds on the bus. Only for
+    /// code the user trusts.
+    #[default]
+    Native,
+    /// Confined by a backend, with the bus as its only way out.
+    Confined(Confinement),
+}
+
+/// What a confined service is run with.
+#[derive(Clone)]
+pub struct Confinement {
+    pub backend: Arc<dyn Backend>,
+    /// The service's endpoint socket on the Unix transport. The supervisor
+    /// connects to it for each start and hands the process the connection,
+    /// so the process needs no socket path and no socket of its own.
+    pub endpoint: PathBuf,
+    /// The service's private state directory, the one host directory it
+    /// may write.
+    pub state: PathBuf,
+}
+
+impl std::fmt::Debug for Confinement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Confinement")
+            .field("backend", &self.backend.name())
+            .field("endpoint", &self.endpoint)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+/// One start of a confined service, as its backend is asked to run it.
+pub struct ConfinedStart<'a> {
+    pub service: &'a ServiceId,
+    pub exec: &'a Exec,
+    /// Exactly the environment the process gets, the bus address
+    /// (`fd:<bus_fd>`), identity, secret and capabilities included.
+    pub env: &'a [(String, String)],
+    /// The descriptor of its bus connection, which must stay open in the
+    /// process under the same number.
+    pub bus_fd: i32,
+    pub state: &'a Path,
+    pub limits: &'a Limits,
+}
+
+/// Something that runs a process confined: what it may read, write, call
+/// and connect to is fixed by the backend and the [`ConfinedStart`], not
+/// by the process.
+pub trait Backend: Send + Sync + 'static {
+    /// A short name for logs and error messages, such as `linux-sandbox`.
+    fn name(&self) -> &str;
+    /// Whether the backend can confine a process on this host now; the
+    /// reason when it cannot.
+    fn probe(&self) -> Result<(), String>;
+    /// The command for one start, and what must stay alive while it runs.
+    fn command(&self, start: &ConfinedStart<'_>) -> Result<(Command, Box<dyn Contained>), String>;
+}
+
+/// What a backend keeps alive for a running confined process.
+pub trait Contained: Send + Sync {
+    /// Ask every process in the confinement to stop (SIGTERM). False when
+    /// the backend cannot, so the supervisor signals the process it started.
+    fn terminate(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,36 +231,111 @@ impl Supervisor {
     }
 }
 
-fn command(spec: &Spec) -> Command {
-    let mut cmd = Command::new(&spec.exec.command);
-    cmd.env_clear();
-    for key in BASELINE_ENV {
-        if let Some(value) = std::env::var_os(key) {
-            cmd.env(key, value);
+/// One start of a service, before it is spawned.
+struct Prepared {
+    cmd: Command,
+    /// What a confined service's backend keeps alive while it runs.
+    contained: Option<Box<dyn Contained>>,
+    /// The supervisor's copy of a confined service's bus connection, closed
+    /// once the process is spawned with its own, so the kernel sees the
+    /// connection end when the process does.
+    #[cfg(unix)]
+    bus: Option<std::os::unix::net::UnixStream>,
+}
+
+fn command(spec: &Spec) -> Result<Prepared, String> {
+    let mut prepared = match &spec.execution {
+        Execution::Native => {
+            let mut cmd = Command::new(&spec.exec.command);
+            cmd.env_clear();
+            for key in BASELINE_ENV {
+                if let Some(value) = std::env::var_os(key) {
+                    cmd.env(key, value);
+                }
+            }
+            cmd.args(&spec.exec.args).envs(spec.env.iter().cloned());
+            limit(&mut cmd, &spec.limits);
+            Prepared {
+                cmd,
+                contained: None,
+                #[cfg(unix)]
+                bus: None,
+            }
         }
-    }
-    cmd.args(&spec.exec.args).envs(spec.env.iter().cloned()).kill_on_drop(true).stdin(std::process::Stdio::null());
+        // The backend sets the resource limits itself, from `spec.limits`.
+        Execution::Confined(confinement) => confined(spec, confinement)?,
+    };
+    prepared.cmd.kill_on_drop(true).stdin(std::process::Stdio::null());
+    die_with_kernel(&mut prepared.cmd);
+    Ok(prepared)
+}
+
+/// A confined start: a fresh connection to the service's endpoint, which
+/// the backend passes on as the process's bus.
+fn confined(spec: &Spec, confinement: &Confinement) -> Result<Prepared, String> {
     #[cfg(unix)]
     {
-        let limits = spec.limits.clone();
-        #[cfg(target_os = "linux")]
+        use std::os::fd::AsRawFd;
+        let bus = std::os::unix::net::UnixStream::connect(&confinement.endpoint)
+            .map_err(|e| format!("connecting to the endpoint of {}: {e}", spec.id))?;
+        let bus_fd = bus.as_raw_fd();
+        let mut env: Vec<(String, String)> =
+            spec.env.iter().filter(|(k, _)| k != molt_transport::ENV_ADDRESS).cloned().collect();
+        env.push((molt_transport::ENV_ADDRESS.to_owned(), format!("fd:{bus_fd}")));
+        let start = ConfinedStart {
+            service: &spec.id,
+            exec: &spec.exec,
+            env: &env,
+            bus_fd,
+            state: &confinement.state,
+            limits: &spec.limits,
+        };
+        let backend = &confinement.backend;
+        let (cmd, contained) =
+            backend.command(&start).map_err(|e| format!("{} cannot confine it: {e}", backend.name()))?;
+        Ok(Prepared { cmd, contained: Some(contained), bus: Some(bus) })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (spec, confinement);
+        Err("confined services need a Unix host".into())
+    }
+}
+
+/// A kernel killed outright runs no shutdown, and a service on NATS would
+/// not notice it is gone, so the service (or a confined service's backend
+/// process) gets SIGTERM when the kernel dies.
+fn die_with_kernel(cmd: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
         let kernel = std::process::id() as libc::pid_t;
-        // SAFETY: only async-signal-safe calls (setrlimit, prctl, getppid, _exit) run between fork and exec.
+        // SAFETY: only async-signal-safe calls (prctl, getppid, _exit) run between fork and exec.
         unsafe {
             cmd.pre_exec(move || {
-                // A kernel killed outright runs no shutdown, and a service on NATS would not notice it is gone,
-                // so the service gets SIGTERM when the kernel dies. Linux sends it when the spawning thread
-                // exits; spawns run on the runtime's long-lived threads.
-                #[cfg(target_os = "linux")]
-                {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    // The kernel died before the signal was armed.
-                    if libc::getppid() != kernel {
-                        libc::_exit(1);
-                    }
+                // Linux sends it when the spawning thread exits; spawns run on the runtime's long-lived threads.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) != 0 {
+                    return Err(std::io::Error::last_os_error());
                 }
+                // The kernel died before the signal was armed.
+                if libc::getppid() != kernel {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
+}
+
+/// The rlimits of a native service.
+fn limit(cmd: &mut Command, limits: &Limits) {
+    #[cfg(unix)]
+    {
+        let limits = limits.clone();
+        // SAFETY: only async-signal-safe calls (setrlimit) run between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || {
                 let set = |res, v: u64| {
                     let lim = libc::rlimit { rlim_cur: v as libc::rlim_t, rlim_max: v as libc::rlim_t };
                     if libc::setrlimit(res, &lim) != 0 {
@@ -197,14 +353,21 @@ fn command(spec: &Spec) -> Command {
             });
         }
     }
-    cmd
+    #[cfg(not(unix))]
+    let _ = (cmd, limits);
 }
 
 async fn run(spec: Spec, mut stop: watch::Receiver<bool>, events: mpsc::Sender<Event>) {
     let mut restarts = 0u32;
     let mut backoff = spec.restart.backoff_initial;
     loop {
-        let mut child = match command(&spec).spawn() {
+        let spawned = command(&spec).and_then(|mut prepared| {
+            let child = prepared.cmd.spawn().map_err(|e| e.to_string())?;
+            #[cfg(unix)]
+            drop(prepared.bus.take());
+            Ok((child, prepared.contained))
+        });
+        let (mut child, contained) = match spawned {
             Ok(c) => c,
             Err(e) => {
                 let _ =
@@ -219,7 +382,7 @@ async fn run(spec: Spec, mut stop: watch::Receiver<bool>, events: mpsc::Sender<E
         let status = tokio::select! {
             s = child.wait() => s,
             _ = stopped(&mut stop) => {
-                terminate(&mut child, spec.restart.drain).await;
+                terminate(&mut child, contained.as_deref(), spec.restart.drain).await;
                 let _ = events.send(Event::Exited { service: spec.id.clone(), status: "stopped".into() }).await;
                 return;
             }
@@ -260,12 +423,14 @@ async fn wait_backoff(
     }
 }
 
-async fn terminate(child: &mut tokio::process::Child, drain: Duration) {
+async fn terminate(child: &mut tokio::process::Child, contained: Option<&dyn Contained>, drain: Duration) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
-        // SAFETY: plain syscall on a pid we own.
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        if !contained.is_some_and(|c| c.terminate()) {
+            // SAFETY: plain syscall on a pid we own.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
         }
         if tokio::time::timeout(drain, child.wait()).await.is_ok() {
             return;
@@ -302,6 +467,7 @@ mod tests {
             env: vec![],
             limits: Limits::default(),
             restart: quick(2),
+            execution: Execution::Native,
         });
         let mut started = 0;
         loop {
@@ -328,6 +494,7 @@ mod tests {
             env: vec![],
             limits: Limits::default(),
             restart: quick(5),
+            execution: Execution::Native,
         });
         assert!(matches!(rx.recv().await.unwrap(), Event::Started { .. }));
         tokio::time::timeout(Duration::from_secs(5), sup.stop(&id)).await.expect("stop within the drain deadline");
@@ -350,6 +517,7 @@ mod tests {
                     env: vec![],
                     limits: Limits::default(),
                     restart: quick(0),
+                    execution: Execution::Native,
                 });
                 let Some(Event::Started { pid: Some(pid), .. }) = rx.recv().await else { panic!("no start") };
                 std::mem::forget(sup);
@@ -390,6 +558,7 @@ mod tests {
             env: vec![],
             limits,
             restart: quick(0),
+            execution: Execution::Native,
         });
         let mut statuses = vec![];
         while let Some(ev) = rx.recv().await {

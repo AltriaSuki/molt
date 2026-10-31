@@ -69,3 +69,40 @@ pub fn code(r: Result<serde_json::Value, SdkError>) -> ErrorCode {
 pub fn echo(svc: Service) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move { svc.serve(|req| async move { Ok(req.payload) }).await })
 }
+
+/// A backend for the kernel's own rules on confined services, which only
+/// says whether it is available: it confines nothing, so it starts nothing
+/// (the services it is used for have no `exec`).
+#[derive(Default)]
+pub struct FakeBackend {
+    pub unavailable: std::sync::atomic::AtomicBool,
+}
+
+impl molt_kernel::supervisor::Backend for FakeBackend {
+    fn name(&self) -> &str {
+        "fake"
+    }
+
+    fn probe(&self) -> Result<(), String> {
+        match self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
+            true => Err("no namespaces here".into()),
+            false => Ok(()),
+        }
+    }
+
+    fn command(
+        &self,
+        _: &molt_kernel::supervisor::ConfinedStart<'_>,
+    ) -> Result<(tokio::process::Command, Box<dyn molt_kernel::supervisor::Contained>), String> {
+        Err("the fake backend starts nothing".into())
+    }
+}
+
+impl World {
+    /// Make the live version of `name` run confined by `backend`.
+    pub async fn confine(&self, name: &str, backend: &Arc<FakeBackend>) {
+        let restart = molt_kernel::supervisor::RestartPolicy::default();
+        let backend: Arc<dyn molt_kernel::supervisor::Backend> = backend.clone();
+        self.kernel.launch_confined(&sid(name), None, Default::default(), restart, Vec::new(), backend).await.unwrap();
+    }
+}

@@ -34,7 +34,7 @@ use tokio::task::JoinHandle;
 use crate::audit::{self, AuditError, AuditEvent, AuditLog, Receipt};
 use crate::caps::CapTable;
 use crate::registry::{Authority, Registry, RegistryError};
-use crate::supervisor::{self, Limits, RestartPolicy, Supervisor};
+use crate::supervisor::{self, Backend, Confinement, Execution, Limits, RestartPolicy, Supervisor};
 
 /// Environment variable holding the service's capabilities as a JSON object
 /// of `target -> cap id`.
@@ -81,6 +81,9 @@ pub enum KernelError {
     NoLiveVersion(ServiceId),
     #[error("the transport's inbound stream was already taken")]
     InboundTaken,
+    /// A service cannot be run confined; it is not run at all.
+    #[error("{0}")]
+    Confinement(String),
 }
 
 /// What the supervisor has reported about a service since it was last
@@ -123,6 +126,9 @@ struct Inner {
     late: Mutex<HashMap<MsgId, (ServiceId, Instant)>>,
     topics: Mutex<HashMap<String, HashMap<ServiceId, CapId>>>,
     status: Mutex<HashMap<ServiceId, ServiceStatus>>,
+    /// The services last launched confined, by the backend that confines
+    /// them. Only these may be promoted by a gate.
+    confined: Mutex<HashMap<ServiceId, Arc<dyn Backend>>>,
     /// `kernel.audit.read`s scanning the log at once. Each holds a blocking
     /// thread, so readers cannot crowd out the audit writer.
     audit_reads: Arc<tokio::sync::Semaphore>,
@@ -169,6 +175,7 @@ impl Kernel {
             late: Mutex::default(),
             topics: Mutex::default(),
             status: Mutex::default(),
+            confined: Mutex::default(),
             audit_reads: Arc::new(tokio::sync::Semaphore::new(AUDIT_READS)),
         });
         let tasks = vec![tokio::spawn(dispatcher(inner.clone(), inbound)), tokio::spawn(reaper(inner.clone()))];
@@ -199,6 +206,12 @@ impl Kernel {
         budget: Budget,
         ttl: Option<Duration>,
     ) -> Result<CapId, KernelError> {
+        if self.inner.is_confined(holder) && grants_promotion(&target) {
+            return Err(KernelError::Confinement(format!(
+                "{holder} runs confined and may be replaced by an agent: it cannot hold {target}, \
+                 or it could approve its own versions"
+            )));
+        }
         let cap = self.inner.caps.grant(holder.clone(), target.clone(), budget, ttl);
         self.inner
             .audit
@@ -247,6 +260,9 @@ impl Kernel {
         version: &VersionId,
         by: &Authority,
     ) -> Result<Option<VersionId>, KernelError> {
+        if let Authority::Gate(gate) = by {
+            self.inner.gate_may_promote(gate, service).await.map_err(KernelError::Confinement)?;
+        }
         let previous = self.inner.registry.promote(service, expected, version, by)?;
         self.inner
             .audit
@@ -284,6 +300,65 @@ impl Kernel {
         restart: RestartPolicy,
         extra_env: Vec<(String, String)>,
     ) -> Result<Launched, KernelError> {
+        self.inner.confined.lock().unwrap().remove(service);
+        self.launch_as(service, secret, limits, restart, extra_env, Execution::Native).await
+    }
+
+    /// [`Kernel::launch_with_env`] for a service that runs confined by
+    /// `backend`: a candidate an agent may replace. Its process gets only
+    /// `extra_env` and the bus variables, its private state directory
+    /// (`<data dir>/state/<service>`) and its connection to the bus, which
+    /// the supervisor opens for it. Nothing else is granted to it, and it is
+    /// never run unconfined: when the backend is unavailable, or the kernel
+    /// is not on the Unix transport, this fails and nothing is started.
+    pub async fn launch_confined(
+        &self,
+        service: &ServiceId,
+        secret: Option<Secret>,
+        limits: Limits,
+        restart: RestartPolicy,
+        extra_env: Vec<(String, String)>,
+        backend: Arc<dyn Backend>,
+    ) -> Result<Launched, KernelError> {
+        let refuse = |why: String| KernelError::Confinement(format!("{service} is not started: {why}"));
+        let Some(sockets) = self.inner.transport.address().strip_prefix("unix:").map(std::path::PathBuf::from) else {
+            return Err(refuse(
+                "a confined service reaches the bus through a Unix endpoint; on NATS it would need the network".into(),
+            ));
+        };
+        let version = self.inner.registry.live(service).ok_or_else(|| KernelError::NoLiveVersion(service.clone()))?;
+        let manifest =
+            self.inner.registry.manifest(&version).ok_or_else(|| KernelError::NoLiveVersion(service.clone()))?;
+        if let Some(req) = manifest.requests.iter().find(|r| grants_promotion(&r.target)) {
+            return Err(refuse(format!(
+                "it requests {}, and a service an agent may replace cannot hold a right to approve versions",
+                req.target
+            )));
+        }
+        probe(&backend).await.map_err(|e| refuse(format!("the {} backend is unavailable: {e}", backend.name())))?;
+        let state = self.inner.config.data_dir.join("state").join(service.as_str());
+        private_dir(&state).map_err(|e| refuse(format!("its state directory {}: {e}", state.display())))?;
+        let state = state.canonicalize().map_err(|e| refuse(format!("its state directory: {e}")))?;
+        let endpoint = molt_transport::unix::UnixTransport::socket_path(&sockets, service);
+        self.inner.confined.lock().unwrap().insert(service.clone(), backend.clone());
+        let confinement = Confinement { backend, endpoint, state };
+        let launched =
+            self.launch_as(service, secret, limits, restart, extra_env, Execution::Confined(confinement)).await;
+        if launched.is_err() {
+            self.inner.confined.lock().unwrap().remove(service);
+        }
+        launched
+    }
+
+    async fn launch_as(
+        &self,
+        service: &ServiceId,
+        secret: Option<Secret>,
+        limits: Limits,
+        restart: RestartPolicy,
+        extra_env: Vec<(String, String)>,
+        execution: Execution,
+    ) -> Result<Launched, KernelError> {
         let version = self.inner.registry.live(service).ok_or_else(|| KernelError::NoLiveVersion(service.clone()))?;
         let manifest =
             self.inner.registry.manifest(&version).ok_or_else(|| KernelError::NoLiveVersion(service.clone()))?;
@@ -307,7 +382,14 @@ impl Kernel {
                 (ENV_VERSION.to_owned(), version.to_string()),
             ]);
             self.inner.status.lock().unwrap().remove(service);
-            self.inner.supervisor.start(supervisor::Spec { id: service.clone(), exec, env, limits, restart });
+            self.inner.supervisor.start(supervisor::Spec {
+                id: service.clone(),
+                exec,
+                env,
+                limits,
+                restart,
+                execution,
+            });
         }
         Ok(Launched { version, caps })
     }
@@ -366,6 +448,44 @@ impl Kernel {
         }
         self.inner.audit.close().await;
     }
+}
+
+/// Whether a capability for `target` would let its holder store or promote
+/// service versions.
+fn grants_promotion(target: &Target) -> bool {
+    ["kernel.registry.propose", "kernel.registry.promote"]
+        .iter()
+        .any(|method| target.covers(&method.parse().expect("a valid target")))
+}
+
+/// Probe a backend off the async threads; it may start a process.
+async fn probe(backend: &Arc<dyn Backend>) -> Result<(), String> {
+    let backend = backend.clone();
+    tokio::task::spawn_blocking(move || backend.probe()).await.map_err(|e| e.to_string())?
+}
+
+/// Create `dir` readable by its owner only, and check an existing one is a
+/// directory of this user's that no one else can write.
+fn private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut dirs = std::fs::DirBuilder::new();
+    dirs.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut dirs, 0o700);
+    dirs.create(dir)?;
+    let meta = std::fs::symlink_metadata(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+            return Err(std::io::Error::other("not a private directory of this user"));
+        }
+    }
+    #[cfg(not(unix))]
+    if !meta.is_dir() {
+        return Err(std::io::Error::other("not a directory"));
+    }
+    Ok(())
 }
 
 impl Drop for Kernel {
@@ -513,6 +633,28 @@ struct PromoteArgs {
 }
 
 impl Inner {
+    fn is_confined(&self, service: &ServiceId) -> bool {
+        self.confined.lock().unwrap().contains_key(service)
+    }
+
+    /// A gate may promote only a service it is not, that runs confined, and
+    /// whose backend can confine it now: a version a gate approves is never
+    /// run as a host process, and when the backend is gone it is not
+    /// approved for a run without it. The registry then applies the tier and
+    /// capability rules.
+    async fn gate_may_promote(&self, gate: &ServiceId, service: &ServiceId) -> Result<(), String> {
+        if gate == service {
+            return Err(format!("{gate} cannot promote itself"));
+        }
+        let backend = self.confined.lock().unwrap().get(service).cloned();
+        let Some(backend) = backend else {
+            return Err(format!("{service} runs as a trusted host process, not confined; only a human can promote it"));
+        };
+        probe(&backend).await.map_err(|e| {
+            format!("the {} backend is unavailable, so no version of {service} is promoted: {e}", backend.name())
+        })
+    }
+
     async fn register(&self, id: &ServiceId, secret: Secret) -> Result<(), KernelError> {
         self.transport.open(id, &secret).await?;
         self.services.lock().unwrap().insert(id.clone(), secret);
@@ -888,6 +1030,9 @@ impl Inner {
                 if !self.services.lock().unwrap().contains_key(&a.to) {
                     return Err((ErrorCode::Invalid, format!("{} is not registered", a.to)));
                 }
+                if self.is_confined(&a.to) && grants_promotion(&a.target) {
+                    return Err((ErrorCode::Denied, format!("{} runs confined and cannot hold {}", a.to, a.target)));
+                }
                 let cap = self
                     .caps
                     .delegate(
@@ -933,6 +1078,7 @@ impl Inner {
             "registry.promote" => {
                 self.caps.verify(msg.cap.as_ref(), from, &msg.to).map_err(|e| denied(&e))?;
                 let a: PromoteArgs = serde_json::from_value(msg.payload.clone()).map_err(invalid)?;
+                self.gate_may_promote(from, &a.service).await.map_err(|e| (ErrorCode::Denied, e))?;
                 let by = Authority::Gate(from.clone());
                 let previous =
                     self.registry.promote(&a.service, a.expected.as_ref(), &a.version, &by).map_err(|e| denied(&e))?;
