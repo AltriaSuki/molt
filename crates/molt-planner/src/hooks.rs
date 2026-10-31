@@ -812,6 +812,7 @@ mod tests {
             truncated: false,
             duration_ms: 3,
             offline_failure: false,
+            outputs: Vec::new(),
         }
     }
 

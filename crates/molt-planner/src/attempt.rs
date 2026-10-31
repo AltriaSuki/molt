@@ -365,6 +365,7 @@ impl Attempt {
         let max_turns = seat.max_turns.unwrap_or(ctx.max_turns);
         let tools = if self.processes() { process::with_processes(tools) } else { tools };
         let tools = if self.reads_history() { git::with_git(tools) } else { tools };
+        let tools = if self.reads_outputs() { crate::output::with_outputs(tools) } else { tools };
         // Last, after ask_user: without it the list is what it was.
         let tools = if self.explores() { explore::with_explore(tools) } else { tools };
         // A final reply the model gave before the run stopped, still to be checked.
@@ -632,6 +633,9 @@ impl Attempt {
                 ),
                 None => {
                     let mut feedback = prompts::check_failed(&check.command, &ran);
+                    if self.reads_outputs() {
+                        feedback.push_str(&crate::output::mention(&ran.outputs, ran.truncated));
+                    }
                     if let Some(f) = failed.as_ref().filter(|f| f.needs_user() && !ran.offline_failure) {
                         feedback.push_str(&prompts::blocked(f));
                     }
@@ -727,6 +731,12 @@ impl Attempt {
         let seats = self.ctx.seats();
         let seat = if self.read_only { &seats.explorer } else { &seats.attempt };
         self.ctx.git && seat.allows(molt_api::planner::tools::GIT)
+    }
+
+    /// It is offered `read_output`: the planner may read saved outputs, it
+    /// runs commands, and its role may have the tool.
+    fn reads_outputs(&self) -> bool {
+        !self.read_only && self.ctx.outputs && self.ctx.seats().attempt.allows(molt_api::planner::tools::READ_OUTPUT)
     }
 
     /// It is offered `explore`: its workflow explores, it changes files,

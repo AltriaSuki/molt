@@ -95,6 +95,7 @@ fn check(command: &str, files: &Files) -> shell::RunResponse {
         truncated: false,
         duration_ms: 1,
         offline_failure: false,
+        outputs: Vec::new(),
     }
 }
 

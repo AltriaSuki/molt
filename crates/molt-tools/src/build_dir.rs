@@ -145,7 +145,7 @@ fn origin(roots: &Roots, ws: &Path) -> PathBuf {
 
 /// Create `path` with mode 0700 if missing; refuse one that is a symlink,
 /// another user's, or open to others.
-fn private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn private_dir(path: &Path) -> io::Result<()> {
     match DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}

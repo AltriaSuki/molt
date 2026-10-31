@@ -19,6 +19,15 @@
 //! started it: a call naming it from another workspace, or by another
 //! caller, is told there is no such process. The service bounds how many
 //! run, how long each may, and how much of its output it keeps.
+//!
+//! Output longer than a reply carries is saved whole, up to the service's
+//! quota (#238): [`RunResponse::outputs`] and [`ProcessState::saved`] name
+//! it by an opaque id, and [`OUTPUT`] reads it a page at a time, searches
+//! it for a text, or follows a process's as it grows. A saved output
+//! belongs to the caller and the workspace whose command printed it, as a
+//! process does, and reading it runs nothing. What could not be saved is
+//! said to be cut, with why; an output that expired or was evicted says so,
+//! and is never read back as if it were whole.
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +40,8 @@ pub const READ: &str = "shell.read";
 pub const WRITE: &str = "shell.write";
 /// Stop a process, or all of a workspace's: [`StopRequest`], answered with a [`StopResponse`].
 pub const STOP: &str = "shell.stop";
+/// Read, search or follow a saved output: [`OutputRequest`], answered with an [`OutputPage`].
+pub const OUTPUT: &str = "shell.output";
 
 /// What the message of a `shell.run` or `shell.start` error starts with
 /// when the command never started because the host ran short of something
@@ -89,6 +100,11 @@ pub struct RunResponse {
     /// like a dependency it could not download.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub offline_failure: bool,
+    /// The streams that were cut in the reply, saved whole (or as far as
+    /// the quota allowed) for [`OUTPUT`]. A cut stream that is not here was
+    /// not saved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<SavedOutput>,
 }
 
 /// The most input one [`WriteRequest`] may give.
@@ -194,6 +210,173 @@ pub struct ProcessState {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub omitted: u64,
     pub elapsed_ms: u64,
+    /// Its whole output, saved once it printed more than the service keeps
+    /// in memory, for [`OUTPUT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved: Option<SavedOutput>,
+}
+
+/// Which output of a command a saved output holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+    /// A process's standard output and error together, as they were read.
+    Combined,
+}
+
+impl OutputStream {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+            Self::Combined => "output",
+        }
+    }
+}
+
+/// Why a saved output holds less than the command printed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputCut {
+    /// It reached the most one output may keep.
+    OutputLimit,
+    /// The service's outputs together reached their quota, and none it
+    /// could give up made room.
+    QuotaFull,
+    /// The disk had less free space than the service leaves.
+    DiskLow,
+    /// Writing it failed.
+    WriteFailed,
+}
+
+impl OutputCut {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::OutputLimit => "it reached the most one saved output may hold",
+            Self::QuotaFull => "the shell service's saved outputs reached their disk quota",
+            Self::DiskLow => "the disk is nearly full",
+            Self::WriteFailed => "writing it to disk failed",
+        }
+    }
+}
+
+/// How the command whose output was saved ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputEnd {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timed_out: bool,
+    /// It was cancelled, or stopped before it ended by itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
+}
+
+/// An output the service saved, as it stood when the reply was made.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedOutput {
+    /// Opaque, and good only in the workspace and for the caller whose
+    /// command printed it.
+    pub id: String,
+    pub stream: OutputStream,
+    pub command: String,
+    /// Bytes the command printed on the stream so far.
+    pub total: u64,
+    /// Bytes saved: the first `stored` of `total`.
+    pub stored: u64,
+    /// Why `stored` is less than `total`, once it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut: Option<OutputCut>,
+    /// More may still come: the process runs on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub open: bool,
+    /// How the command ended; none while it runs, and when that is not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<OutputEnd>,
+    /// SHA-256 of the saved bytes, in hex, once no more come.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// The trace and the id of the request that ran the command, to find
+    /// it in the audit log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+    /// How long it is kept after no more comes, in seconds.
+    pub kept_s: u64,
+}
+
+impl SavedOutput {
+    /// All the command printed is saved.
+    pub fn whole(&self) -> bool {
+        self.cut.is_none() && self.stored == self.total
+    }
+}
+
+/// The most text one [`OutputRequest`] returns.
+pub const MAX_OUTPUT_PAGE: u32 = 64 << 10;
+/// The most matches one search returns.
+pub const MAX_OUTPUT_MATCHES: u32 = 100;
+/// The longest search text.
+pub const MAX_OUTPUT_SEARCH: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputRequest {
+    /// The workspace the command ran in.
+    pub workspace: String,
+    pub id: String,
+    /// The byte to start at: to read from, or to search from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    /// Most bytes of text to return, at most [`MAX_OUTPUT_PAGE`]; a
+    /// default set by the service when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Find the lines holding this text instead of reading, at most
+    /// [`MAX_OUTPUT_SEARCH`] bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub case_insensitive: bool,
+    /// Most matches, at most [`MAX_OUTPUT_MATCHES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_matches: Option<u32>,
+    /// While it is open, how long to wait for output past `offset` when
+    /// there is none yet; none answers at once. The maximum is set by the service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+}
+
+/// A page of a saved output, or the lines a search found in it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputPage {
+    pub output: SavedOutput,
+    /// Where `text`, or the search, starts.
+    pub offset: u64,
+    /// Where the next page, or the rest of the search, starts.
+    pub next: u64,
+    /// The bytes from `offset` to `next`; empty for a search.
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matches: Vec<OutputMatch>,
+    /// The search stopped at its most matches: more may follow from `next`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub more: bool,
+}
+
+/// A line a search found.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputMatch {
+    /// From 1.
+    pub line: u64,
+    /// Where the line starts.
+    pub offset: u64,
+    /// The line, cut when long.
+    pub text: String,
 }
 
 fn is_zero(n: &u64) -> bool {

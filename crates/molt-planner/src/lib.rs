@@ -20,6 +20,7 @@ pub mod hooks;
 mod instructions;
 mod judge;
 mod memory;
+mod output;
 pub mod pack;
 mod plan;
 mod process;

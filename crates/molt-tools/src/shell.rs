@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use molt_api::progress::{self, Progress};
-use molt_api::shell::{RunRequest, RunResponse};
+use molt_api::shell::{OutputEnd, OutputStream, RunRequest, RunResponse, SavedOutput};
 use molt_proto::{ErrorCode, RemoteError, TraceId};
 use molt_sdk::Service;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cargo_cache::CargoCache;
 use crate::error::failed;
+use crate::outputs::{self, Asker, Origin};
 use crate::resources::{self, Admission};
 use crate::{build_dir, sandbox, Roots, SandboxPolicy};
 
@@ -103,8 +104,9 @@ pub(crate) async fn run(
     sandbox: Option<(&SandboxPolicy, Option<Arc<CargoCache>>)>,
     req: RunRequest,
     cancel: CancellationToken,
-    sink: Option<Sink>,
+    out: Out,
 ) -> Result<RunResponse, RemoteError> {
+    let Out { sink, save } = out;
     let (policy, cargo) = match sandbox {
         Some((policy, cargo)) => (Some(policy), cargo),
         None => (None, None),
@@ -131,12 +133,14 @@ pub(crate) async fn run(
         return Err(RemoteError { code: ErrorCode::Invalid, message });
     }
 
+    let save = save.map(|(store, asker)| (store, Arc::new(asker.origin(&ws, &req.workspace, &req.command))));
     let started = Instant::now();
     let mut tries = 0;
     let (status, timed_out, cancelled, stdout, stderr) = loop {
         tries += 1;
         let (mut cmd, guard) = command(roots, program, policy, &ws, &build, &req.command)?;
-        let ran = once(&mut cmd, policy, guard, groups, &cancel, req.stdin.clone(), sink.clone(), limit).await;
+        let keep = (sink.clone(), save.clone());
+        let ran = once(&mut cmd, policy, guard, groups, &cancel, req.stdin.clone(), keep, limit).await;
         let (resource, said) = match ran {
             Once::Ran { status, timed_out, cancelled, stdout, stderr } => {
                 break (status, timed_out, cancelled, stdout, stderr)
@@ -162,8 +166,9 @@ pub(crate) async fn run(
     let duration = started.elapsed();
     drop(build);
     let status = status.map_err(|e| failed(format!("waiting for the command: {e}")))?;
-    let (stdout, out_cut) = stdout.finish();
-    let (stderr, err_cut) = stderr.finish();
+    let end = OutputEnd { exit_code: status.code(), signal: status.signal(), timed_out, cancelled };
+    let (stdout, out_cut, out_saved) = stdout.finish(end);
+    let (stderr, err_cut, err_saved) = stderr.finish(end);
     let success = status.code() == Some(0) && !timed_out && !cancelled;
     let offline_failure =
         policy.is_some_and(|policy| !policy.network) && !success && (looks_offline(&stdout) || looks_offline(&stderr));
@@ -177,8 +182,12 @@ pub(crate) async fn run(
         truncated: out_cut || err_cut,
         duration_ms: duration.as_millis() as u64,
         offline_failure,
+        outputs: out_saved.into_iter().chain(err_saved).collect(),
     })
 }
+
+/// Where a command's outputs are saved, and whose they are.
+type SaveTo = (Arc<outputs::Store>, Arc<Origin>);
 
 /// How one start of a command went.
 enum Once {
@@ -204,7 +213,7 @@ async fn once(
     groups: &Arc<Groups>,
     cancel: &CancellationToken,
     stdin: Option<String>,
-    sink: Option<Sink>,
+    (sink, save): (Option<Sink>, Option<SaveTo>),
     limit: Duration,
 ) -> Once {
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
@@ -215,8 +224,10 @@ async fn once(
         Err(Spawn::Error(e)) => return Once::Refused(e),
     };
 
-    let stdout = Arc::new(Mutex::new(Capture::default()));
-    let stderr = Arc::new(Mutex::new(Capture::default()));
+    let saving =
+        |stream| Capture { save: save.clone().map(|(store, origin)| (store, origin, stream)), ..Capture::default() };
+    let stdout = Arc::new(Mutex::new(saving(OutputStream::Stdout)));
+    let stderr = Arc::new(Mutex::new(saving(OutputStream::Stderr)));
     // JoinSet aborts its readers when this request future is dropped, too.
     let mut readers = tokio::task::JoinSet::new();
     // A sandbox that could not start says so on stderr, streamed like any output: the reply tells.
@@ -268,6 +279,14 @@ async fn once(
         }
     }
     Once::Ran { status, timed_out, cancelled, stdout, stderr }
+}
+
+/// Where a command's output goes besides its reply: published as it comes,
+/// and saved whole once the reply has to cut it.
+#[derive(Default)]
+pub(crate) struct Out {
+    pub sink: Option<Sink>,
+    pub save: Option<(Arc<outputs::Store>, Asker)>,
 }
 
 /// `command` under `program -c` in the canonical workspace `ws`, in the
@@ -581,16 +600,34 @@ fn take(capture: &Mutex<Capture>) -> Capture {
     std::mem::take(&mut *lock(capture))
 }
 
-/// The first [`HEAD_BYTES`] and last [`TAIL_BYTES`] of a stream.
+/// The first [`HEAD_BYTES`] and last [`TAIL_BYTES`] of a stream, and all
+/// of it saved once that is not all of it.
 #[derive(Default)]
 struct Capture {
     head: Vec<u8>,
     tail: VecDeque<u8>,
     total: u64,
+    /// Where to save it, until it is.
+    save: Option<(Arc<outputs::Store>, Arc<Origin>, OutputStream)>,
+    /// Boxed: a hash state and a file are more than the rest of a capture.
+    saving: Option<Box<outputs::Writer>>,
 }
 
 impl Capture {
     fn push(&mut self, mut data: &[u8]) {
+        match &mut self.saving {
+            Some(writer) => writer.write(data),
+            // Nothing was dropped yet: what is kept is all of it.
+            None if self.total + data.len() as u64 > (HEAD_BYTES + TAIL_BYTES) as u64 => {
+                if let Some((store, origin, stream)) = self.save.take() {
+                    let mut first = self.head.clone();
+                    first.extend(&self.tail);
+                    first.extend_from_slice(data);
+                    self.saving = store.create(origin, stream, &first).map(Box::new);
+                }
+            }
+            None => {}
+        }
         self.total += data.len() as u64;
         if self.head.len() < HEAD_BYTES {
             let n = (HEAD_BYTES - self.head.len()).min(data.len());
@@ -609,15 +646,20 @@ impl Capture {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    /// The text, with a marker where bytes were dropped, and whether any were.
-    fn finish(self) -> (String, bool) {
+    /// The text, with a marker where bytes were dropped, whether any were,
+    /// and where all of it was saved, closed with how the command ended.
+    fn finish(mut self, end: OutputEnd) -> (String, bool, Option<SavedOutput>) {
+        let saved = self.saving.take().map(|mut writer| {
+            writer.close(Some(end));
+            writer.handle().saved()
+        });
         let omitted = self.total - (self.head.len() + self.tail.len()) as u64;
-        let mut bytes = self.head;
+        let mut bytes = std::mem::take(&mut self.head);
         if omitted > 0 {
             bytes.extend_from_slice(format!("\n[... {omitted} bytes omitted ...]\n").as_bytes());
         }
-        bytes.extend(self.tail);
-        (String::from_utf8_lossy(&bytes).into_owned(), omitted > 0)
+        bytes.extend(std::mem::take(&mut self.tail));
+        (String::from_utf8_lossy(&bytes).into_owned(), omitted > 0, saved)
     }
 }
 
@@ -654,7 +696,7 @@ mod tests {
                 stream: false,
                 stdin: None,
             };
-            run(&self.roots, &find_shell(), &self.groups, &self.admission, None, req, cancel, None).await
+            run(&self.roots, &find_shell(), &self.groups, &self.admission, None, req, cancel, Out::default()).await
         }
     }
 
@@ -719,7 +761,7 @@ mod tests {
     fn capture_keeps_head_and_tail() {
         let mut c = Capture::default();
         c.push(b"short");
-        assert_eq!(c.finish(), ("short".to_owned(), false));
+        assert_eq!(c.finish(OutputEnd::default()), ("short".to_owned(), false, None));
 
         let mut c = Capture::default();
         c.push(&vec![b'h'; HEAD_BYTES]);
@@ -727,7 +769,7 @@ mod tests {
             c.push(&vec![b'm'; 10_000]);
         }
         c.push(&vec![b't'; TAIL_BYTES]);
-        let (text, cut) = c.finish();
+        let (text, cut, _) = c.finish(OutputEnd::default());
         assert!(cut);
         assert!(text.starts_with(&"h".repeat(HEAD_BYTES)));
         assert!(text.ends_with(&"t".repeat(TAIL_BYTES)));
