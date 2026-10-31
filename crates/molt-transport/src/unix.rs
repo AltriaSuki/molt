@@ -217,6 +217,28 @@ pub struct UnixLink {
 impl UnixLink {
     pub async fn connect(dir: &Path, id: &ServiceId, secret: &Secret) -> Result<Self, TransportError> {
         let stream = UnixStream::connect(UnixTransport::socket_path(dir, id)).await?;
+        Self::over(stream, secret).await
+    }
+
+    /// Use a connection to the endpoint socket that the supervisor opened
+    /// and handed to this process as descriptor `fd`. A confined service
+    /// reaches the kernel this way: it can see no socket path and cannot
+    /// create a Unix socket of its own. It still presents its secret.
+    pub async fn from_fd(fd: i32, secret: &Secret) -> Result<Self, TransportError> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        // Take over only a socket that is not one of the standard streams.
+        // SAFETY: fstat only reads the descriptor's metadata into `stat`.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if fd <= 2 || unsafe { libc::fstat(fd, &mut stat) } != 0 || stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+            return Err(TransportError::Address(format!("fd:{fd}")));
+        }
+        // SAFETY: the descriptor is open and handed to this process to own.
+        let std = std::os::unix::net::UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        std.set_nonblocking(true)?;
+        Self::over(UnixStream::from_std(std)?, secret).await
+    }
+
+    async fn over(stream: UnixStream, secret: &Secret) -> Result<Self, TransportError> {
         let (rd, wr) = stream.into_split();
         let mut tx = FramedWrite::new(wr, codec());
         let hello = serde_json::to_vec(&Hello { secret: secret.expose().to_owned() })?;
@@ -241,5 +263,35 @@ impl Link for UnixLink {
                 Err(e) => tracing::warn!(error = %e, "dropped a malformed frame from the kernel"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use molt_proto::{CapId, Target, TraceId};
+    use serde_json::json;
+    use std::os::fd::IntoRawFd;
+
+    #[tokio::test]
+    async fn a_service_handed_a_connected_descriptor_is_stamped_with_its_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = UnixTransport::new(dir.path().join("sock")).unwrap();
+        let id = ServiceId::new("confined").unwrap();
+        let secret = Secret::random();
+        transport.open(&id, &secret).await.unwrap();
+        let mut inbound = transport.inbound().unwrap();
+        let stream =
+            std::os::unix::net::UnixStream::connect(UnixTransport::socket_path(&dir.path().join("sock"), &id)).unwrap();
+        let link = crate::connect(&format!("fd:{}", stream.into_raw_fd()), &id, &secret).await.unwrap();
+        let msg = Envelope::request(TraceId::random(), "x.y".parse::<Target>().unwrap(), CapId::random(), json!(1));
+        link.send(&msg).await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), inbound.next()).await.unwrap().unwrap();
+        assert_eq!(got.from, id);
+        // Anything that is not a socket descriptor is refused.
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let err = crate::connect(&format!("fd:{}", file.into_raw_fd()), &id, &secret).await.err().unwrap();
+        assert!(matches!(err, TransportError::Address(_)), "{err}");
+        assert!(crate::connect("fd:1", &id, &secret).await.is_err());
     }
 }

@@ -215,6 +215,73 @@ impl SandboxPolicy {
         self.command(program, None, None, None)
     }
 
+    /// A bus service run as a candidate an agent may replace (see
+    /// `docs/services.md`): the sandbox [`SandboxPolicy::server_command`]
+    /// gives, never with the network, plus `state` read-write at `/state`.
+    /// Its environment is exactly `env`, with `PATH=/usr/bin:/bin`, the
+    /// private `HOME` and `TMPDIR`, and `MOLT_STATE_DIR=/state`; nothing is
+    /// read from this process's environment. Descriptor `keep` (its bus
+    /// connection) stays open in it under the same number. The policy's
+    /// `read_only`, `environment`, `set_env` and `cargo_cache` are not used.
+    pub fn service_command(
+        &self,
+        program: &Path,
+        args: &[String],
+        env: &[(String, String)],
+        state: &Path,
+        keep: std::os::fd::RawFd,
+    ) -> anyhow::Result<(Command, Guard)> {
+        let mut policy = self.clone();
+        policy.network = false;
+        policy.read_only.clear();
+        policy.environment.clear();
+        policy.set_env.clear();
+        policy.cargo_cache = None;
+        policy.validate()?;
+        ensure!(program.is_absolute(), "the program to sandbox must be an absolute path");
+        let program = program.canonicalize().with_context(|| format!("the program {}", program.display()))?;
+        let meta = std::fs::metadata(&program)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            ensure!(meta.is_file() && meta.permissions().mode() & 0o111 != 0, "the program must be an executable file");
+        }
+        let system = ["/usr", "/bin", "/sbin", "/lib", "/lib64"].iter().any(|dir| program.starts_with(dir));
+        if !system {
+            check_mount(&program)?;
+            ensure!(!program.starts_with(state), "the program cannot be in the state directory it may write");
+            policy.read_only.push(program.clone());
+        }
+        ensure!(
+            state.is_absolute() && state.canonicalize()? == state && std::fs::metadata(state)?.is_dir(),
+            "the state directory must be a canonical absolute directory"
+        );
+        check_mount(state)?;
+        ensure!(keep > 2, "the descriptor to keep cannot be a standard stream");
+        for (name, value) in env {
+            ensure!(
+                !name.is_empty()
+                    && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                    && !name.as_bytes()[0].is_ascii_digit()
+                    && !value.contains('\0'),
+                "invalid environment variable {name:?}"
+            );
+            ensure!(
+                !["HOME", "TMPDIR", "PATH", "MOLT_STATE_DIR"].contains(&name.as_str()),
+                "{name} is set by the sandbox"
+            );
+        }
+        let service = Service { args, env, state, keep };
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            linux::command(&policy, &program, None, None, None, Some(&service))
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            let _ = service;
+            anyhow::bail!("sandbox requires Linux x86_64; a candidate service cannot run on this platform")
+        }
+    }
+
     pub(crate) fn prepare(
         &self,
         roots: &Roots,
@@ -252,7 +319,7 @@ impl SandboxPolicy {
     ) -> anyhow::Result<(Command, Guard)> {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            linux::command(self, program, workspace, base, build)
+            linux::command(self, program, workspace, base, build, None)
         }
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         {
@@ -316,10 +383,31 @@ fn read_policy(file: std::fs::File) -> anyhow::Result<SandboxPolicy> {
     Ok(policy)
 }
 
+/// What [`SandboxPolicy::service_command`] adds for a bus service.
+struct Service<'a> {
+    args: &'a [String],
+    env: &'a [(String, String)],
+    state: &'a Path,
+    keep: std::os::fd::RawFd,
+}
+
 /// What a sandboxed process needs kept open while it runs.
 pub struct Guard {
     pub(crate) info: std::sync::Arc<std::fs::File>,
     _seccomp: std::fs::File,
+    _args: Option<std::fs::File>,
+}
+
+impl Guard {
+    /// SIGTERM to every process in the sandbox, through its session group;
+    /// false when the sandbox has not reported it yet.
+    pub fn terminate(&self) -> bool {
+        match namespace_group(&self.info) {
+            // SAFETY: plain syscall on the sandbox's own process group.
+            Some(group) => unsafe { libc::killpg(group, libc::SIGTERM) == 0 },
+            None => false,
+        }
+    }
 }
 
 /// The namespace init is a new session leader. TERM its group without
@@ -397,6 +485,7 @@ mod linux {
         workspace: Option<&Path>,
         base: Option<&Path>,
         build: Option<&BuildDir>,
+        service: Option<&Service<'_>>,
     ) -> anyhow::Result<(Command, Guard)> {
         let mut seccomp = memfd(c"molt-seccomp")?;
         let filter = filter();
@@ -467,41 +556,71 @@ mod linux {
         for path in build.iter().flat_map(|b| b.mounts()) {
             command.arg("--bind").arg(path).arg(path);
         }
+        if let Some(service) = service {
+            command.arg("--bind").arg(service.state).arg("/state");
+        }
         command.arg("--seccomp").arg(filter_fd.to_string()).arg("--info-fd").arg(info_fd.to_string());
         // Keep loader and shell variables away from the host-side backend.
-        // The env helper runs only after entering every isolation boundary.
         command.env_clear().env("PATH", "/usr/bin:/bin").env("LC_ALL", "C");
-        command.args(["--", "/usr/bin/env", "-i"]);
-        // Before the passed variables, so a variable the user passes wins.
-        for (name, value) in build.iter().flat_map(|b| b.env()) {
-            let mut entry = std::ffi::OsString::from(format!("{name}="));
-            entry.push(value);
-            command.arg(entry);
-        }
-        for name in
-            ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"].iter().map(|s| s.to_string()).chain(policy.environment.clone())
-        {
-            if let Some(value) = std::env::var_os(&name) {
+        let mut keep = vec![filter_fd, info_fd];
+        let mut service_args = None;
+        if let Some(service) = service {
+            // Its environment, the bus secret among it, goes to bwrap through a
+            // descriptor rather than its command line, which other processes
+            // can read. bwrap sets it only for the program it starts.
+            let mut args = memfd(c"molt-service-args")?;
+            let mut entries = vec!["--clearenv".to_owned()];
+            let fixed =
+                [("PATH", "/usr/bin:/bin"), ("HOME", "/home/molt"), ("TMPDIR", "/tmp"), ("MOLT_STATE_DIR", "/state")];
+            let fixed = fixed.iter().map(|(name, value)| (name.to_string(), value.to_string()));
+            for (name, value) in service.env.iter().cloned().chain(fixed) {
+                entries.extend(["--setenv".to_owned(), name, value]);
+            }
+            for entry in entries {
+                args.write_all(entry.as_bytes())?;
+                args.write_all(b"\0")?;
+            }
+            args.rewind()?;
+            command.arg("--args").arg(args.as_raw_fd().to_string());
+            keep.extend([args.as_raw_fd(), service.keep]);
+            command.arg("--").arg(program).args(service.args);
+            service_args = Some(args);
+        } else {
+            // The env helper runs only after entering every isolation boundary.
+            command.args(["--", "/usr/bin/env", "-i"]);
+            // Before the passed variables, so a variable the user passes wins.
+            for (name, value) in build.iter().flat_map(|b| b.env()) {
                 let mut entry = std::ffi::OsString::from(format!("{name}="));
                 entry.push(value);
                 command.arg(entry);
             }
-        }
-        if let (Some(ws), Some(build)) = (workspace, build) {
-            let path = std::env::var_os("PATH").unwrap_or_default();
-            for (name, value) in &policy.set_env {
-                let value = value
-                    .replace("$WORKSPACE", &ws.to_string_lossy())
-                    .replace("$BUILD", &build.dir().to_string_lossy())
-                    .replace("$PATH", &path.to_string_lossy());
+            for name in ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]
+                .iter()
+                .map(|s| s.to_string())
+                .chain(policy.environment.clone())
+            {
+                if let Some(value) = std::env::var_os(&name) {
+                    let mut entry = std::ffi::OsString::from(format!("{name}="));
+                    entry.push(value);
+                    command.arg(entry);
+                }
+            }
+            if let (Some(ws), Some(build)) = (workspace, build) {
+                let path = std::env::var_os("PATH").unwrap_or_default();
+                for (name, value) in &policy.set_env {
+                    let value = value
+                        .replace("$WORKSPACE", &ws.to_string_lossy())
+                        .replace("$BUILD", &build.dir().to_string_lossy())
+                        .replace("$PATH", &path.to_string_lossy());
+                    command.arg(format!("{name}={value}"));
+                }
+            }
+            command.args(["HOME=/home/molt", "TMPDIR=/tmp"]);
+            for (name, value) in crate::shell::FIXED_ENV {
                 command.arg(format!("{name}={value}"));
             }
+            command.arg(program);
         }
-        command.args(["HOME=/home/molt", "TMPDIR=/tmp"]);
-        for (name, value) in crate::shell::FIXED_ENV {
-            command.arg(format!("{name}={value}"));
-        }
-        command.arg(program);
         let limits = [
             (libc::RLIMIT_AS, policy.memory_mb * 1024 * 1024),
             (libc::RLIMIT_CPU, policy.cpu_secs),
@@ -511,7 +630,7 @@ mod linux {
         ];
         unsafe {
             command.pre_exec(move || {
-                for fd in [filter_fd, info_fd] {
+                for &fd in &keep {
                     if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
                         return Err(std::io::Error::last_os_error());
                     }
@@ -525,7 +644,7 @@ mod linux {
                 Ok(())
             });
         }
-        Ok((command, Guard { info, _seccomp: seccomp }))
+        Ok((command, Guard { info, _seccomp: seccomp, _args: service_args }))
     }
 }
 

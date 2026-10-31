@@ -129,6 +129,11 @@ async fn only_humans_promote_protected_and_kernel_components() {
     let eval_v1 = w.kernel.install(manifest("evaluator", Tier::Protected, &[])).await.unwrap();
     let bus_v1 = w.kernel.install(manifest("bus", Tier::Kernel, &[])).await.unwrap();
     let plan_v1 = w.kernel.install(manifest("planner", Tier::Mutable, &[("memory.recall", 100)])).await.unwrap();
+    // A gate promotes only a confined service; the tier rules hold for those too.
+    let backend = std::sync::Arc::new(FakeBackend::default());
+    for name in ["evaluator", "bus", "planner"] {
+        w.confine(name, &backend).await;
+    }
 
     let store = |m: Manifest| {
         let gate = &gate;

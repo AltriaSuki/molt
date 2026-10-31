@@ -130,10 +130,17 @@ pub trait Link: Send + Sync + 'static {
     async fn recv(&self) -> Option<Envelope>;
 }
 
-/// Connect a service to the kernel at `address` (`unix:<dir>` or `nats://…`).
+/// Connect a service to the kernel at `address` (`unix:<dir>`, `fd:<n>` or
+/// `nats://…`). `fd:<n>` is a connection to the service's Unix endpoint
+/// that the supervisor opened for a confined service and passed as
+/// descriptor `n`.
 pub async fn connect(address: &str, id: &ServiceId, secret: &Secret) -> Result<Box<dyn Link>, TransportError> {
     if let Some(dir) = address.strip_prefix("unix:") {
         return Ok(Box::new(unix::UnixLink::connect(dir.as_ref(), id, secret).await?));
+    }
+    if let Some(fd) = address.strip_prefix("fd:") {
+        let fd = fd.parse().map_err(|_| TransportError::Address(address.to_owned()))?;
+        return Ok(Box::new(unix::UnixLink::from_fd(fd, secret).await?));
     }
     #[cfg(feature = "nats")]
     if address.starts_with("nats://") || address.starts_with("tls://") {
