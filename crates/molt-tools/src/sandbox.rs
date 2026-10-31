@@ -570,13 +570,15 @@ impl Guard {
 /// so a test command reaches the server a process runs (#225), and that no
 /// other workspace and no host service is on. It has no route out.
 ///
-/// A holder sandbox keeps a user and a network namespace: `cat` on a pipe
-/// only this value writes to, started once the sandbox is set up. A command joins both before its own sandbox
+/// A holder sandbox keeps a network namespace: `cat` on a pipe only this
+/// value writes to, started once the sandbox is set up. A command joins the
+/// network, and the user namespace that owns it, before its own sandbox
 /// starts, and still gets every other namespace of its own, user included.
 /// Dropping it closes the pipe and kills the holder; the network goes with
 /// the last command still in it.
 pub struct LocalNet {
     holder: std::process::Child,
+    /// The user namespace that owns `net`.
     user: std::fs::File,
     net: std::fs::File,
     /// The holder's `/proc/<pid>/net`, which lists this network's sockets
@@ -984,7 +986,18 @@ mod linux {
         let open = |what: &str| {
             File::open(format!("/proc/{pid}/{what}")).with_context(|| format!("opening the shared network's {what}"))
         };
-        let opened = (|| anyhow::Ok((open("ns/user")?, open("ns/net")?, open("net")?)))();
+        let opened = (|| {
+            let net = open("ns/net")?;
+            // The user namespace that owns the network, which only it lets a process enter. That
+            // is not the holder's own when bubblewrap runs unprivileged: it puts the sandbox in a
+            // second user namespace nested in the first, which owns the others.
+            // SAFETY: an ioctl on a descriptor of ours, answered with a new descriptor or -1.
+            let user = unsafe { libc::ioctl(net.as_raw_fd(), libc::NS_GET_USERNS) };
+            ensure!(user >= 0, "finding the shared network's user namespace: {}", std::io::Error::last_os_error());
+            // SAFETY: the kernel just opened it for us, and nothing else owns it.
+            let user = unsafe { File::from_raw_fd(user) };
+            anyhow::Ok((user, net, open("net")?))
+        })();
         let (user, net, sockets) = match opened {
             Ok(opened) => opened,
             Err(e) => {
