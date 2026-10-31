@@ -37,7 +37,7 @@ error.
 The adapter converts unsigned text and function tool histories, preserving
 call IDs, tool errors and tool results. Signed thinking, native citations,
 media and other provider-native blocks cannot cross providers; start a new
-conversation instead. OpenAI text/tool replies use the same planner blocks,
+conversation instead. A reasoning model's own reasoning is kept ([below](#reasoning-on-chat-completions)). OpenAI text/tool replies use the same planner blocks,
 with provider and native finish reason in `stop_details`. Streaming buffers tool
 JSON until completion, requires `[DONE]` and final usage, and never retries a
 partial response. Cached prompt tokens are separated from uncached tokens for
@@ -45,6 +45,40 @@ pricing; an unknown returned model or missing usage is never charged as zero.
 The spending limit remains a best-effort pre-call limit, not a guaranteed hard
 remote billing cap. Cancellation stops local HTTP and leaves remote billing
 unknown, as on the Anthropic path.
+
+### Reasoning on Chat Completions
+
+A reasoning model on a Chat Completions endpoint, such as DeepSeek's
+`deepseek-reasoner` on a named endpoint ([models.md](models.md#named-endpoints)),
+sends its reasoning beside the answer as `reasoning_content` (some
+endpoints call it `reasoning`), streamed or whole. It comes back first in
+the reply, as a `thinking` block with no signature that names its protocol
+and the field it came in:
+
+```json
+{"type":"thinking","thinking":"I should read a.rs first.","protocol":"openai_chat","field":"reasoning_content"}
+```
+
+It is never previewed. Passed back unchanged, as the planner does with
+every assistant turn, it goes back verbatim, in that field of its
+assistant message, for as long as the user's turn it was given in lasts:
+through that turn's tool calls and their results, as these endpoints
+require of a model that reasons between calls. A user message that holds
+no tool result starts a new turn, and the reasoning of every turn before
+it is left out, as they ask; so is reasoning in turns a long task left out
+or put in its record ([do.md](do.md#long-tasks)), which never holds
+thinking. Another protocol never gets it: the Messages and Responses
+adapters leave it out (and an assistant turn that held nothing else), since
+it was that endpoint's state. Signed Anthropic thinking is still refused
+on Chat Completions. Reasoning that is not text is refused as an unreadable
+reply.
+
+When the endpoint counts reasoning tokens apart
+(`completion_tokens_details.reasoning_tokens`), the reply's usage carries
+them as `reasoning_tokens`: a breakdown of `output_tokens`, which already
+holds them and is what they are billed as. A reply without the breakdown,
+and any Messages API reply, leaves it out: unknown, never zero, and a sum
+holds it only while every call in it counted them.
 
 ### OpenAI Responses
 

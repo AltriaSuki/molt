@@ -370,14 +370,17 @@ impl Gateway {
             let category = msg.stop_details.as_ref().and_then(|d| d.get("category")).cloned().unwrap_or(Value::Null);
             tracing::info!(model = %msg.model, %category, "the model declined the request");
         }
+        let endpoint = route.endpoint.clone().unwrap_or_else(|| provider.to_string());
         tracing::info!(
             requested = %model,
             model = %msg.model,
+            %endpoint,
             stop_reason = msg.stop_reason.as_deref().unwrap_or(""),
             input_tokens = usage.input_tokens,
             output_tokens = usage.output_tokens,
             cache_write_tokens = usage.cache_creation_input_tokens,
             cache_read_tokens = usage.cache_read_input_tokens,
+            reasoning_tokens = usage.reasoning_tokens,
             ?cost_usd,
             price_source = priced.as_ref().map(|(_, s)| s.source.as_str()),
             price_entry = priced.as_ref().map(|(_, s)| s.entry.as_str()),
@@ -398,6 +401,7 @@ impl Gateway {
                     .then(|| self.cfg.providers.capabilities(&model).ok().and_then(|c| c.context))
                     .flatten(),
             },
+            endpoint: Some(endpoint),
         })
     }
 }

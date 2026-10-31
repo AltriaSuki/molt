@@ -1,9 +1,20 @@
 //! OpenAI Chat Completions adapter. Only unsigned text and function-tool
 //! conversations can cross providers; native thinking/media are refused.
+//!
+//! The one native state it keeps is a reasoning model's own reasoning, which
+//! DeepSeek-style endpoints send as `reasoning_content` (some as
+//! `reasoning`). It comes back as a `thinking` block with no signature and a
+//! `protocol` of [`CHAT_REASONING`], naming the field it came in. On a later
+//! call it goes back verbatim, in that field of its assistant message, while
+//! the user's turn it was given in lasts: through the tool calls and results
+//! of that turn, as those endpoints require. A user message with no tool
+//! result starts a new turn, and the reasoning of every turn before it is
+//! left out, as they ask. Another protocol's endpoint never gets it (see
+//! `body::strip_chat_reasoning`).
 
 use std::collections::{BTreeMap, HashSet};
 
-use molt_api::model::{CompleteRequest, Effort};
+use molt_api::model::{chat_reasoning, CompleteRequest, Effort, CHAT_REASONING};
 use molt_proto::RemoteError;
 use serde_json::{json, Value};
 
@@ -60,7 +71,9 @@ pub(crate) fn build(
     }
     let mut pending = HashSet::new();
     let mut used = HashSet::new();
-    for message in req.messages {
+    // Where the user's current turn starts: its last message that is not tool results.
+    let turn = req.messages.iter().rposition(|m| m["role"] == "user" && !has_tool_result(m)).unwrap_or(0);
+    for (index, message) in req.messages.into_iter().enumerate() {
         let role = message["role"].as_str().ok_or_else(|| invalid("message role is missing"))?;
         if role != "user" && role != "assistant" {
             return Err(invalid("only user and assistant messages can be translated"));
@@ -73,7 +86,16 @@ pub(crate) fn build(
         let mut text = Vec::new();
         let mut calls = Vec::new();
         let mut results = Vec::new();
+        let mut reasoning: Option<(String, &'static str)> = None;
         for block in blocks {
+            if role == "assistant" {
+                if let Some((thought, field)) = chat_reasoning(&block) {
+                    if index > turn {
+                        reasoning.get_or_insert_with(|| (String::new(), field)).0.push_str(thought);
+                    }
+                    continue;
+                }
+            }
             match block["type"].as_str() {
                 Some("text") => {
                     if block.get("citations").is_some() { return Err(invalid("native citations cannot be translated to OpenAI")); }
@@ -114,6 +136,9 @@ pub(crate) fn build(
         if !text.is_empty() || !calls.is_empty() {
             let content = (!text.is_empty()).then(|| text.join("\n\n"));
             let mut message = json!({"role":role,"content":content});
+            if let Some((thought, field)) = reasoning {
+                message[field] = json!(thought);
+            }
             if !calls.is_empty() {
                 for call in &calls {
                     pending.insert(call["id"].as_str().unwrap().to_owned());
@@ -166,6 +191,28 @@ pub(crate) fn build(
     Ok(Call { body, fallbacks: false, max_tokens, schema_tool: false })
 }
 
+fn has_tool_result(message: &Value) -> bool {
+    message["content"].as_array().is_some_and(|c| c.iter().any(|b| b["type"] == "tool_result"))
+}
+
+/// The reasoning in a message or a delta, and the field it is in:
+/// `reasoning_content` first, else `reasoning`. `Err` when it is not text.
+fn reasoning_of(value: &Value) -> Result<Option<(&str, &'static str)>, String> {
+    for field in ["reasoning_content", "reasoning"] {
+        match &value[field] {
+            Value::Null => {}
+            Value::String(s) => return Ok(Some((s, field))),
+            _ => return Err(format!("{field} is not text")),
+        }
+    }
+    Ok(None)
+}
+
+/// The block that keeps `thought`, to be sent back as `field`.
+fn reasoning_block(thought: &str, field: &str) -> Value {
+    json!({"type":"thinking","thinking":thought,"protocol":CHAT_REASONING,"field":field})
+}
+
 pub(crate) fn decode(value: Value) -> Result<Message, String> {
     let bad = |s: &str| s.to_owned();
     let choices = value["choices"].as_array().ok_or_else(|| bad("choices missing"))?;
@@ -176,7 +223,7 @@ pub(crate) fn decode(value: Value) -> Result<Message, String> {
     if message["role"] != "assistant" {
         return Err(bad("not an assistant message"));
     }
-    for field in ["audio", "function_call", "reasoning_content", "reasoning", "annotations"] {
+    for field in ["audio", "function_call", "annotations"] {
         if message.get(field).is_some_and(|v| !v.is_null() && v != &json!([])) {
             return Err(format!("unsupported native output {field}"));
         }
@@ -194,7 +241,11 @@ pub(crate) fn decode(value: Value) -> Result<Message, String> {
         }
     };
     let mut content = Vec::new();
+    let reasoning = reasoning_of(message)?;
     if !refused {
+        if let Some((thought, field)) = reasoning.filter(|(t, _)| !t.is_empty()) {
+            content.push(reasoning_block(thought, field));
+        }
         match &message["content"] {
             Value::String(s) if !s.is_empty() => content.push(json!({"type":"text","text":s})),
             Value::String(_) | Value::Null => {}
@@ -251,7 +302,8 @@ pub(crate) fn decode(value: Value) -> Result<Message, String> {
     serde_json::from_value(json!({"id":id,"model":model,"content":content,"stop_reason":stop,
         "stop_details":{"provider":"openai","finish_reason":reason},
         "usage":{"input_tokens":prompt.map(|p| p-cache),"output_tokens":usage["completion_tokens"],
-            "cache_read_input_tokens":cached,"cache_creation_input_tokens":write}}))
+            "cache_read_input_tokens":cached,"cache_creation_input_tokens":write,
+            "reasoning_tokens":usage["completion_tokens_details"]["reasoning_tokens"].as_u64()}}))
     .map_err(|e| e.to_string())
 }
 
@@ -260,6 +312,9 @@ pub(crate) struct Accumulator {
     id: Option<String>,
     model: Option<String>,
     text: String,
+    /// The reasoning streamed so far, and the field it came in first.
+    reasoning: String,
+    reasoning_field: Option<&'static str>,
     refusal: String,
     tools: BTreeMap<u64, Value>,
     finish: Option<String>,
@@ -311,10 +366,15 @@ impl Accumulator {
         if delta.get("role").is_some_and(|r| r != "assistant") {
             return Err("invalid delta role".into());
         }
-        for field in ["audio", "function_call", "reasoning_content", "reasoning"] {
+        for field in ["audio", "function_call"] {
             if delta.get(field).is_some_and(|v| !v.is_null()) {
                 return Err(format!("unsupported native delta {field}"));
             }
+        }
+        // Reasoning is never previewed: it stays in the final reply, as signed thinking does.
+        if let Some((thought, field)) = reasoning_of(delta)? {
+            self.reasoning.push_str(thought);
+            self.reasoning_field.get_or_insert(field);
         }
         let text = delta["content"].as_str().unwrap_or("");
         if !delta["content"].is_null() && !delta["content"].is_string() {
@@ -369,6 +429,9 @@ impl Accumulator {
         if !self.refusal.is_empty() {
             message["refusal"] = json!(self.refusal);
         }
+        if let Some(field) = self.reasoning_field {
+            message[field] = json!(self.reasoning);
+        }
         decode(
             json!({"id":self.id,"model":self.model,"choices":[{"index":0,"finish_reason":reason,"message":message}],"usage":usage}),
         )
@@ -417,10 +480,16 @@ mod tests {
     #[test]
     fn native_output_and_impossible_cache_counts_are_refused() {
         let base = json!({"id":"c","model":"gpt-4.1","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":2}});
-        for field in ["audio", "function_call", "reasoning_content"] {
+        for field in ["audio", "function_call"] {
             let mut value = base.clone();
             value["choices"][0]["message"][field] = json!("native");
             assert!(decode(value).is_err());
+        }
+        // Reasoning that is not text is refused; text is kept (see the next test).
+        for field in ["reasoning_content", "reasoning"] {
+            let mut value = base.clone();
+            value["choices"][0]["message"][field] = json!({"text":"x"});
+            assert_eq!(decode(value).unwrap_err(), format!("{field} is not text"));
         }
         let mut value = base.clone();
         value["usage"]["prompt_tokens_details"] = json!({"cached_tokens":2});
@@ -428,5 +497,66 @@ mod tests {
         let mut value = base;
         value["usage"]["prompt_tokens_details"] = json!({"cached_tokens":u64::MAX,"cache_write_tokens":1});
         assert!(decode(value).is_err());
+    }
+    #[test]
+    fn reasoning_in_either_field_is_kept_as_unsigned_thinking_that_names_it_and_goes_back_in_it() {
+        let reply = |message: Value| {
+            json!({"id":"c","model":"r1","choices":[{"index":0,"finish_reason":"stop","message":message}],
+                "usage":{"prompt_tokens":3,"completion_tokens":9,"completion_tokens_details":{"reasoning_tokens":7}}})
+        };
+        let m = decode(reply(json!({"role":"assistant","content":"x","reasoning":"why"}))).unwrap();
+        assert_eq!(
+            m.content[0],
+            json!({"type":"thinking","thinking":"why","protocol":CHAT_REASONING,"field":"reasoning"})
+        );
+        assert_eq!(molt_api::model::Usage::from(m.usage).reasoning_tokens, Some(7));
+        // An empty reasoning is no block, and a reply without the breakdown has unknown reasoning tokens.
+        let mut value = reply(json!({"role":"assistant","content":"x","reasoning_content":""}));
+        value["usage"] = json!({"prompt_tokens":3,"completion_tokens":9});
+        let m = decode(value).unwrap();
+        assert_eq!(m.content, [json!({"type":"text","text":"x"})]);
+        assert_eq!(molt_api::model::Usage::from(m.usage).reasoning_tokens, None);
+
+        // Streamed as `reasoning`, it is put back together and never previewed.
+        let mut acc = Accumulator::default();
+        let chunk = |delta: Value, finish: Value| {
+            json!({"id":"c","model":"r1","object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":delta,"finish_reason":finish}]})
+        };
+        assert_eq!(acc.event(chunk(json!({"role":"assistant","reasoning":"wh"}), Value::Null)).unwrap(), None);
+        assert_eq!(acc.event(chunk(json!({"reasoning":"y"}), Value::Null)).unwrap(), None);
+        assert_eq!(acc.event(chunk(json!({"content":"ok"}), json!("stop"))).unwrap().as_deref(), Some("ok"));
+        let usage = json!({"id":"c","model":"r1","object":"chat.completion.chunk","choices":[],
+            "usage":{"prompt_tokens":1,"completion_tokens":2}});
+        acc.event(usage).unwrap();
+        acc.event(json!({"type":"openai_done"})).unwrap();
+        let m = acc.finish().unwrap();
+        assert_eq!(m.content[0]["thinking"], "why");
+        assert_eq!(m.content[0]["field"], "reasoning");
+
+        // It goes back in the field it came in, within its user's turn.
+        let mut cfg = crate::Config::from_vars(|n| (n == "OPENAI_API_KEY").then(|| "k".to_owned())).unwrap();
+        let caps = crate::provider::Capabilities {
+            tools: true,
+            streaming: true,
+            output_schema: false,
+            efforts: vec![],
+            max_output: 100,
+            protocol: Default::default(),
+            context: None,
+        };
+        cfg.providers.openai_models.insert("r1".into(), caps);
+        let route = cfg.providers.resolve("openai/r1").unwrap();
+        let messages = vec![
+            molt_api::model::user_text("hi"),
+            json!({"role":"assistant","content":m.content}),
+            molt_api::model::user_text("go on"),
+        ];
+        let req = CompleteRequest { model: Some("openai/r1".into()), messages: messages.clone(), ..Default::default() };
+        let call = build(&cfg, &route, req, None).unwrap();
+        assert!(call.body["messages"][1].get("reasoning").is_none(), "an earlier turn's is left out");
+        let req = CompleteRequest { messages: messages[..2].to_vec(), ..Default::default() };
+        let call = build(&cfg, &route, req, None).unwrap();
+        assert_eq!(call.body["messages"][1], json!({"role":"assistant","content":"ok","reasoning":"why"}));
     }
 }

@@ -576,7 +576,13 @@ async fn content_comes_back_exactly_as_the_api_sent_it() {
     assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
     assert_eq!(
         resp.usage,
-        Usage { input_tokens: 7, output_tokens: 3, cache_creation_input_tokens: 0, cache_read_input_tokens: 100 }
+        Usage {
+            input_tokens: 7,
+            output_tokens: 3,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 100,
+            reasoning_tokens: None
+        }
     );
 
     // The next turn sends that content back untouched.

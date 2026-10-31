@@ -554,6 +554,7 @@ mod tests {
                 cost_usd: None,
                 price_source: None,
                 context_tokens: None,
+                endpoint: None,
             };
             self.push(req.reply(serde_json::to_value(resp).unwrap()));
         }

@@ -122,7 +122,11 @@ and says what to fix. Any other failure (a 429, a timeout) leaves that
 feature unknown. Haiku takes no effort, and an OpenAI model or a model on
 a named endpoint only what is declared for it, so the probe does not ask
 for what the gateway never sends. It prints what each call cost; a call with no known price
-makes the total unknown, never zero.
+makes the total unknown, never zero. It prints, and records with the
+endpoint's name, the tokens the calls spent reasoning when the endpoint
+counts them apart (`completion_tokens_details.reasoning_tokens` on Chat
+Completions, `output_tokens_details.reasoning_tokens` on Responses); the
+Messages API does not, so there they are unknown.
 
 What it finds is kept in `~/.local/share/molt/models.json`
 (`$XDG_DATA_HOME/molt` when set; `MOLT_MODELS_FILE` names another file),
@@ -182,3 +186,9 @@ such as `{"reviewer":"haiku"}`; set in the environment, that is used
 instead of `[models.roles]`. Only your own config has it: a project's
 `.molt/config.toml` cannot choose models. A routed model needs a price
 like any other, or a run stops after its first call.
+
+Every reply names the endpoint the call went to (`"endpoint": "glm"`, or
+`anthropic` or `openai` for a built-in one) beside its usage and cost, so
+the audit log says what each role spent where: an attempt on one endpoint,
+its explorer on a second and the reviewer on a third are each priced as
+their own endpoint declares.

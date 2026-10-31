@@ -169,6 +169,7 @@ mod tests {
             cost_usd: None,
             price_source: None,
             context_tokens: None,
+            endpoint: None,
         };
         let a = json!({ "type": "tool_use", "id": "a", "name": "run", "input": {} });
         let b = json!({ "type": "tool_use", "id": "b", "name": "write_file", "input": { "path": "x" } });
