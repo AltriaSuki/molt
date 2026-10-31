@@ -13,6 +13,7 @@ pub mod git;
 pub mod improve;
 pub mod layers;
 mod lock;
+pub mod prepare;
 pub mod project;
 pub mod prompts;
 pub mod protocol;

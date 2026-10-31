@@ -355,6 +355,17 @@ pub fn deps_cache(cfg: &mut Config, kinds: &[String]) -> anyhow::Result<()> {
 /// Hand the config's environment profiles to the standard shell, which
 /// applies them with the built-in ones.
 pub fn environments(cfg: &mut Config) -> anyhow::Result<()> {
+    // The environment `molt env prepare` made for the workspace's lock, if any.
+    let root = cfg
+        .service("shell")
+        .and_then(|shell| shell.exec.as_ref())
+        .filter(|exec| standard_shell(exec))
+        .and_then(|exec| exec.args.windows(2).find(|w| w[0] == "--root").map(|w| PathBuf::from(&w[1])))
+        .and_then(|root| root.canonicalize().ok());
+    if let Some(root) = root {
+        let deps = crate::prepare::Deps::new(&cfg.kernel.data_dir, &cfg.prepare.python);
+        deps.add_profile(&mut cfg.environments, &root);
+    }
     if cfg.environments.is_empty() {
         return Ok(());
     }
@@ -411,7 +422,7 @@ pub fn dependency_warnings(cfg: &Config, workspace: &Path, cargo_home: Option<&P
     if profiles.get("rust").is_some_and(|rust| rust.cargo_cache) {
         cargo |= cargo_home.is_some_and(|home| home.join("registry").is_dir());
     }
-    missing_dependencies(workspace, cargo)
+    missing_dependencies(workspace, cargo, cfg.environments.contains_key(crate::prepare::PROFILE))
 }
 
 /// The sandbox policy the standard shell's commands run under, with the
@@ -468,14 +479,16 @@ pub async fn readiness_before_run(cfg: &Config, workspace: &Path) -> anyhow::Res
         readiness: &cfg.readiness,
         cache: Some(cache),
         fresh: false,
+        deps: Some(crate::prepare::Deps::new(&cfg.kernel.data_dir, &cfg.prepare.python)),
     };
     Ok(Some(crate::doctor::check(opts).await?))
 }
 
 /// The dependencies of the project in `workspace` that commands without
 /// network cannot get, as one line each with what to do. `cargo` is whether
-/// they can build from a Cargo cache.
-pub fn missing_dependencies(workspace: &Path, cargo: bool) -> Vec<String> {
+/// they can build from a Cargo cache, `python_env` whether they get an
+/// environment `molt env prepare` made.
+pub fn missing_dependencies(workspace: &Path, cargo: bool, python_env: bool) -> Vec<String> {
     let read = |name: &str| std::fs::read_to_string(workspace.join(name)).ok();
     let dir = |name: &str| workspace.join(name).is_dir();
     let mut missing = Vec::new();
@@ -527,11 +540,12 @@ pub fn missing_dependencies(workspace: &Path, cargo: bool) -> Vec<String> {
             .is_some_and(|d| !d.is_empty())
     });
     let venv = [".venv", "venv"].iter().any(|name| workspace.join(name).join("pyvenv.cfg").is_file());
-    if (requirements || pyproject) && !venv {
+    if (requirements || pyproject) && !venv && !python_env {
         missing.push(
             "Python: the project lists packages and has no virtual environment (.venv), and commands cannot install \
-             them without network, so only packages installed system-wide are there. Create .venv in the project \
-             and install into it first, or choose --no-sandbox to run commands unconfined."
+             them without network, so only packages installed system-wide are there. With a hash-pinned \
+             requirements.txt, run `molt env prepare`; otherwise create .venv in the project and install into it \
+             first, or choose --no-sandbox to run commands unconfined."
                 .to_owned(),
         );
     }
@@ -1090,6 +1104,7 @@ pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::
         mcp: Default::default(),
         models: cfg.models.clone(),
         readiness: cfg.readiness.clone(),
+        prepare: cfg.prepare.clone(),
         improve: cfg.improve.clone(),
     };
     let running = crate::start(&alone).await?;
@@ -1661,29 +1676,31 @@ mod tests {
     fn the_preflight_names_each_kind_of_dependency_commands_cannot_get_and_how_to_fix_it() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
-        assert!(missing_dependencies(ws, false).is_empty(), "an empty project needs nothing");
+        assert!(missing_dependencies(ws, false, false).is_empty(), "an empty project needs nothing");
         let lock = "[[package]]\nname = \"memchr\"\nversion = \"2.7.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
         std::fs::write(ws.join("Cargo.lock"), lock).unwrap();
         std::fs::write(ws.join("go.sum"), "golang.org/x/text v0.3.0 h1:abc=\n").unwrap();
         std::fs::write(ws.join("package.json"), r#"{"dependencies": {"left-pad": "1"}}"#).unwrap();
         std::fs::write(ws.join("requirements.txt"), "# pinned\nrequests==2.0\n").unwrap();
-        let missing = missing_dependencies(ws, false);
+        let missing = missing_dependencies(ws, false, false);
         assert_eq!(missing.len(), 4, "{missing:#?}");
         assert!(missing[0].starts_with("Rust:") && missing[0].contains("cargo fetch"), "{}", missing[0]);
         assert!(missing[1].starts_with("Go:") && missing[1].contains("go mod vendor"), "{}", missing[1]);
         assert!(missing[2].starts_with("Node:") && missing[2].contains("npm install"), "{}", missing[2]);
-        assert!(missing[3].starts_with("Python:") && missing[3].contains(".venv"), "{}", missing[3]);
+        assert!(missing[3].starts_with("Python:") && missing[3].contains("molt env prepare"), "{}", missing[3]);
+        let prepared = missing_dependencies(ws, false, true);
+        assert!(prepared.len() == 3 && !prepared[2].starts_with("Python:"), "a prepared environment has its packages");
         // With the cache, or each kind's dependencies in the project, nothing is missing.
         std::fs::create_dir_all(ws.join("vendor")).unwrap();
         std::fs::write(ws.join("vendor/modules.txt"), "").unwrap();
         std::fs::create_dir(ws.join("node_modules")).unwrap();
         std::fs::create_dir(ws.join(".venv")).unwrap();
         std::fs::write(ws.join(".venv/pyvenv.cfg"), "home = /usr/bin\n").unwrap();
-        assert!(missing_dependencies(ws, true).is_empty());
-        assert_eq!(missing_dependencies(ws, false).len(), 1);
+        assert!(missing_dependencies(ws, true, false).is_empty());
+        assert_eq!(missing_dependencies(ws, false, false).len(), 1);
         // Path-only crates need nothing.
         std::fs::write(ws.join("Cargo.lock"), "[[package]]\nname = \"local\"\nversion = \"0.1.0\"\n").unwrap();
-        assert!(missing_dependencies(ws, false).is_empty());
+        assert!(missing_dependencies(ws, false, false).is_empty());
     }
 
     #[test]

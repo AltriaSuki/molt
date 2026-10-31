@@ -44,6 +44,11 @@ pub struct SandboxPolicy {
     /// `$BUILD` and `$PATH` in a value are replaced (see `env_profile`).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub set_env: BTreeMap<String, String>,
+    /// Directories mounted read-write at their own paths, outside the
+    /// project and the fork: the private environment `molt env prepare`
+    /// installs into. Only Molt sets them; a policy file cannot.
+    #[serde(skip)]
+    pub writable: Vec<PathBuf>,
 }
 
 impl Default for SandboxPolicy {
@@ -59,6 +64,7 @@ impl Default for SandboxPolicy {
             processes: 2048,
             cargo_cache: None,
             set_env: BTreeMap::new(),
+            writable: Vec::new(),
         }
     }
 }
@@ -127,6 +133,18 @@ impl SandboxPolicy {
             check_mount(path)?;
             let meta = std::fs::metadata(path)?;
             ensure!(meta.is_dir() || meta.is_file(), "dependencies must be regular files or directories");
+        }
+        ensure!(self.writable.len() <= 4, "at most 4 writable directories");
+        for path in &self.writable {
+            ensure!(
+                path.is_absolute() && path.canonicalize()? == *path && std::fs::metadata(path)?.is_dir(),
+                "writable paths must be canonical absolute directories"
+            );
+            check_mount(path)?;
+            ensure!(
+                !self.read_only.iter().any(|ro| ro.starts_with(path) || path.starts_with(ro)),
+                "a writable directory cannot hold or be inside a read-only one"
+            );
         }
         ensure!(self.set_env.len() <= 32, "at most 32 variables to set");
         for name in self.environment.iter().chain(self.set_env.keys()) {
@@ -241,6 +259,7 @@ impl SandboxPolicy {
         policy.environment.clear();
         policy.set_env.clear();
         policy.cargo_cache = None;
+        policy.writable.clear();
         policy.validate()?;
         ensure!(program.is_absolute(), "the program to sandbox must be an absolute path");
         let program = program.canonicalize().with_context(|| format!("the program {}", program.display()))?;
@@ -317,6 +336,15 @@ impl SandboxPolicy {
             ensure!(
                 !workspace.starts_with(path) && !path.starts_with(workspace),
                 "dependency mounts cannot overlap the writable fork"
+            );
+        }
+        for path in &self.writable {
+            ensure!(
+                !path.starts_with(&base)
+                    && !base.starts_with(path)
+                    && !workspace.starts_with(path)
+                    && !path.starts_with(workspace),
+                "a writable directory must be outside the project and the fork"
             );
         }
         for path in build.mounts() {
@@ -574,6 +602,9 @@ mod linux {
         for path in build.iter().flat_map(|b| b.mounts()) {
             command.arg("--bind").arg(path).arg(path);
         }
+        for path in &policy.writable {
+            command.arg("--bind").arg(path).arg(path);
+        }
         if let Some(service) = service {
             command.arg("--bind").arg(service.state).arg("/state");
         }
@@ -700,6 +731,23 @@ mod tests {
         std::fs::remove_file(&resolved).unwrap();
         std::os::unix::fs::symlink(project.join("policy.json"), &resolved).unwrap();
         assert!(open_policy(&resolved).is_err(), "file replacement must not redirect the read");
+    }
+
+    #[test]
+    fn a_policy_file_cannot_name_a_writable_directory_and_molts_must_be_canonical_and_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let err = serde_json::from_str::<SandboxPolicy>(&format!("{{\"writable\":[{:?}]}}", dir)).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+        let policy = SandboxPolicy { writable: vec![dir.clone()], ..SandboxPolicy::default() };
+        policy.validate().unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("alias")).unwrap();
+        let alias = SandboxPolicy { writable: vec![dir.join("alias")], ..SandboxPolicy::default() };
+        assert!(alias.validate().is_err());
+        std::fs::create_dir(dir.join("ro")).unwrap();
+        let overlap =
+            SandboxPolicy { writable: vec![dir.clone()], read_only: vec![dir.join("ro")], ..SandboxPolicy::default() };
+        assert!(overlap.validate().is_err());
     }
 
     #[test]

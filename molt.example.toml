@@ -211,3 +211,14 @@ requests = [
 # build = "cargo build --offline"
 # env = ["DATABASE_URL"]
 # before_run = true
+
+# Dependency preparation (`molt env prepare`, docs/sandbox.md): the package
+# index a hash-pinned requirements.txt is downloaded from, the other origins
+# its files and redirects may come from, the packages that may be built from
+# source (running their build scripts in the sandbox), and the download
+# cache's quota. Only your user config sets it, never a project's.
+# [prepare.python]
+# index = "https://pypi.org/simple/"
+# hosts = ["https://files.pythonhosted.org"]
+# scripts = ["pyyaml"]
+# max_mb = 2048

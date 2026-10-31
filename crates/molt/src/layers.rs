@@ -495,6 +495,14 @@ fn merge_project(
             path.display()
         );
     }
+    if raw.contains_key("prepare") {
+        bail!(
+            "{} defines `prepare`, which a project config may not: which registries dependencies are downloaded \
+             from and which packages may run build scripts is yours to choose, in your user config, \
+             ~/.config/molt/config.toml",
+            path.display()
+        );
+    }
     if let Some(key) = NOT_DATA.iter().find(|key| raw.contains_key(**key)) {
         bail!(
             "{} defines `{key}`, which a project config may not: a project holds only data (check, ask_paths, readiness, \
@@ -811,6 +819,7 @@ mod tests {
             "pass_env = [\"ANTHROPIC_API_KEY\"]\n",
             "[environment.rust]\nnetwork = true\n",
             "[mcp.evil]\ncommand = \"sh\"\n",
+            "[prepare.python]\nindex = \"https://evil.example/simple\"\nscripts = [\"setup-runs-anything\"]\n",
         ] {
             home.project(text);
             let err = format!("{:#}", home.build(None).unwrap_err());

@@ -41,6 +41,8 @@ pub struct Options<'a> {
     pub cache: Option<PathBuf>,
     /// Check everything again, whatever is kept.
     pub fresh: bool,
+    /// What `molt env prepare` made, to say whether the lock is prepared.
+    pub deps: Option<crate::prepare::Deps>,
 }
 
 /// A profile that applies, what matched, and what it could not provide.
@@ -168,9 +170,13 @@ pub async fn check(opts: Options<'_>) -> anyhow::Result<Checked> {
                     ms: ran.duration_ms,
                 });
             }
+            // Whether `molt env prepare` made the lock's environment, or it changed since.
+            let prepared = opts.deps.as_ref().and_then(|deps| deps.readiness(workspace));
             if !policy.network {
                 let cargo = policy.cargo_cache.is_some() || policy.environment.iter().any(|n| n == "CARGO_HOME");
-                for missing in crate::agent::missing_dependencies(workspace, cargo) {
+                let python_env =
+                    prepared.is_some() || found.iter().any(|(name, _, _)| *name == crate::prepare::PROFILE);
+                for missing in crate::agent::missing_dependencies(workspace, cargo, python_env) {
                     let (name, detail) = missing.split_once(": ").unwrap_or(("dependencies", &missing));
                     items.push(Item {
                         kind: Kind::Dependency,
@@ -182,6 +188,7 @@ pub async fn check(opts: Options<'_>) -> anyhow::Result<Checked> {
                     });
                 }
             }
+            items.extend(prepared);
             for (name, set) in &present {
                 items.push(readiness::env_item(name, &policy.set_env, &policy.environment, *set));
             }
@@ -270,7 +277,7 @@ fn elapsed(started: Instant) -> u64 {
 }
 
 /// The sandbox and a fork of the workspace that the checks run in.
-struct Sandbox {
+pub(crate) struct Sandbox {
     shell: Shell,
     files: Fs,
     fork: String,
@@ -278,7 +285,7 @@ struct Sandbox {
 
 impl Sandbox {
     /// Or the check that says the sandbox does not start, with its fix.
-    async fn start(workspace: &Path, scratch: &Path, policy: SandboxPolicy) -> Result<Self, Item> {
+    pub(crate) async fn start(workspace: &Path, scratch: &Path, policy: SandboxPolicy) -> Result<Self, Item> {
         let roots = Roots { root: workspace.to_path_buf(), scratch: scratch.to_path_buf() };
         let blocked = |detail: String, fix: &str| Item {
             kind: Kind::Sandbox,
@@ -307,7 +314,7 @@ impl Sandbox {
         Ok(Self { shell, files, fork })
     }
 
-    async fn run(&self, command: &str, timeout_ms: u64) -> anyhow::Result<RunResponse> {
+    pub(crate) async fn run(&self, command: &str, timeout_ms: u64) -> anyhow::Result<RunResponse> {
         let ran = self
             .shell
             .handle("run", json!({ "workspace": self.fork, "command": command, "timeout_ms": timeout_ms }))
@@ -317,7 +324,7 @@ impl Sandbox {
         Ok(serde_json::from_value(ran)?)
     }
 
-    async fn drop_fork(self) {
+    pub(crate) async fn drop_fork(self) {
         let _ = self.files.handle("drop", json!({ "fork": self.fork })).await;
     }
 }
