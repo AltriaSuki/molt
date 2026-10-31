@@ -123,6 +123,10 @@ pub struct ServiceSection {
     /// replace.
     #[serde(default, skip_serializing_if = "Isolation::is_native")]
     pub isolation: Isolation,
+    /// Host paths a sandboxed service may read, mounted read-only at their
+    /// own paths. Never the data dir or a directory holding it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<PathBuf>,
 }
 
 /// How a service's process runs.
@@ -165,6 +169,7 @@ impl ServiceSection {
             pass_env: Vec::new(),
             tools: Vec::new(),
             isolation: Isolation::Native,
+            mounts: Vec::new(),
         }
     }
 
@@ -173,7 +178,16 @@ impl ServiceSection {
     /// the model credentials or what the sandbox sets.
     pub(crate) fn validate_isolation(&self) -> anyhow::Result<()> {
         if self.isolation != Isolation::Sandbox {
+            anyhow::ensure!(
+                self.mounts.is_empty(),
+                "service {}: mounts are for a sandboxed service; a native one reads what you can",
+                self.name
+            );
             return Ok(());
+        }
+        anyhow::ensure!(self.mounts.len() <= 32, "service {}: at most 32 mounts", self.name);
+        if let Some(path) = self.mounts.iter().find(|p| !p.is_absolute()) {
+            anyhow::bail!("service {}: the mount {} must be an absolute path", self.name, path.display());
         }
         anyhow::ensure!(self.exec.is_some(), "service {}: a sandboxed service needs exec", self.name);
         for name in self.env.keys().chain(&self.pass_env) {
@@ -1123,6 +1137,17 @@ mod tests {
         // A native service may still be given them: it is trusted.
         assert!(Config::parse("[[service]]\nname = \"c\"\npass_env = [\"ANTHROPIC_API_KEY\"]\n").is_ok());
         assert!(Config::parse("[[service]]\nname = \"c\"\nisolation = \"wasm\"\n").is_err());
+    }
+
+    #[test]
+    fn only_a_sandboxed_service_has_mounts_and_each_is_an_absolute_path() {
+        let sandboxed = "[[service]]\nname = \"c\"\nisolation = \"sandbox\"\nexec = { command = \"/usr/bin/c\" }\n";
+        let cfg = Config::parse(&format!("{sandboxed}mounts = [\"/opt/c-data\"]\n")).unwrap();
+        assert_eq!(cfg.services[0].mounts, [PathBuf::from("/opt/c-data")]);
+        let err = Config::parse(&format!("{sandboxed}mounts = [\"c-data\"]\n")).unwrap_err().to_string();
+        assert!(err.contains("must be an absolute path"), "{err}");
+        let err = Config::parse("[[service]]\nname = \"c\"\nmounts = [\"/opt\"]\n").unwrap_err().to_string();
+        assert!(err.contains("mounts are for a sandboxed service"), "{err}");
     }
 
     #[test]

@@ -6,7 +6,8 @@
 //!    `$XDG_CONFIG_HOME`): trusted, so it may add or change services, hooks
 //!    and defaults, and define profiles; then the MCP servers, hooks and
 //!    skills of the extension packs the user installed, approved and
-//!    enabled ([`crate::extensions`]);
+//!    enabled ([`crate::extensions`]), and their services, each a
+//!    candidate in the sandbox;
 //! 3. the profile picked with `--profile`;
 //! 4. the project's `.molt/config.toml` in the workspace: data only, since
 //!    anyone who wrote the project wrote it;
@@ -200,6 +201,19 @@ impl Layered {
             }
         }
         config.extensions = crate::extensions::command_dirs(&packs);
+        // The calls the planner may make to the packs' services, so that their tools are offered.
+        for pack in &packs {
+            for (server, service) in pack.manifest.services.iter().filter(|(_, s)| s.calls > 0 && !s.tools.is_empty()) {
+                let id = crate::extensions::service_id(&pack.name, server);
+                let target: molt_proto::Target = format!("{id}.*").parse()?;
+                if let Some(planner) =
+                    config.service_mut("planner").filter(|p| !p.requests.iter().any(|r| r.target == target))
+                {
+                    planner.requests.push(CapRequest { target, budget: Budget::new(0, 0, service.calls) });
+                    origins.insert("service.planner.requests".into(), Origin::Extension(pack.name.clone()));
+                }
+            }
+        }
         // The user's skills, for the planner: from this layer only, as the pack.
         if let Some(dir) = crate::agent_skills::for_workspace(workspace, var)? {
             let env = molt_planner::skills::SKILLS_ENV;
@@ -316,9 +330,9 @@ fn merge_user(
     Ok(())
 }
 
-/// The MCP servers and hooks of the enabled extension `packs` into
-/// `table`, after the user's own; the packs' skill directories. A server
-/// with the name of one already there is refused, and so is a pack
+/// The MCP servers, services and hooks of the enabled extension `packs`
+/// into `table`, after the user's own; the packs' skill directories. A
+/// server or service with the name of one already there is refused, and so is a pack
 /// installed inside the workspace, where the agent's changes are applied.
 fn merge_extensions(
     table: &mut Table,
@@ -348,6 +362,18 @@ fn merge_extensions(
             );
             servers.insert(key.clone(), Value::try_from(server)?);
             origins.insert(format!("mcp.{key}"), origin.clone());
+        }
+        for service in pack.services()? {
+            let id = service.name.to_string();
+            let services = table.entry("service").or_insert_with(|| Value::Array(Vec::new()));
+            let services = services.as_array_mut().context("service is not a list")?;
+            anyhow::ensure!(
+                !services.iter().any(|s| s.get("name").and_then(Value::as_str) == Some(id.as_str())),
+                "extension {}'s service would be {id}, which is there already: rename yours, or remove the pack",
+                pack.name
+            );
+            services.push(Value::try_from(service)?);
+            origins.insert(format!("service.{id}"), origin.clone());
         }
         if !pack.manifest.hooks.is_empty() {
             let hooks = table.entry("hooks").or_insert_with(|| Value::Array(Vec::new()));
@@ -959,6 +985,59 @@ mod tests {
             .unwrap()
             .env
             .contains_key(molt_planner::skills::EXTENSION_SKILLS_ENV));
+    }
+
+    #[test]
+    fn an_enabled_packs_service_joins_as_a_sandboxed_candidate_the_planner_may_call() {
+        struct Yes;
+        impl crate::extensions::Approve for Yes {
+            fn approve(&mut self, _: &str) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            fn say(&mut self, _: &str) {}
+        }
+        let home = Home::new();
+        let data = home.dir.path().join("data");
+        let env = [("XDG_DATA_HOME", data.to_str().unwrap())];
+        let var = |name: &str| match name {
+            "XDG_CONFIG_HOME" => Some(home.dir.path().join("config").display().to_string()),
+            "XDG_DATA_HOME" => Some(data.display().to_string()),
+            _ => None,
+        };
+        let places = crate::extensions::Places::from_vars(&var).unwrap();
+        let src = home.dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join(crate::extensions::MANIFEST),
+            "schema = 1\nname = \"tracker\"\nversion = \"1\"\n[service.notes]\ncommand = \"/opt/notes\"\n\
+             calls = 7\n[[service.notes.tools]]\nname = \"find_note\"\ndescription = \"Find.\"\n\
+             input_schema = { type = \"object\" }\ntarget = \"ext-tracker-notes.find\"\n",
+        )
+        .unwrap();
+        crate::extensions::add(&places, &src, &mut Yes).unwrap();
+
+        let layered = home.build_with(None, &env).unwrap();
+        let svc = layered.config.service("ext-tracker-notes").expect("the pack's service");
+        assert_eq!((svc.tier, svc.isolation), (Tier::Mutable, crate::config::Isolation::Sandbox));
+        assert_eq!(svc.mounts, [places.packs.join("tracker").canonicalize().unwrap()]);
+        assert_eq!(layered.origin("service.ext-tracker-notes.exec"), &Origin::Extension("tracker".into()));
+        let planner = layered.config.service("planner").unwrap();
+        let call = planner.requests.iter().find(|r| r.target.to_string() == "ext-tracker-notes.*").unwrap();
+        assert_eq!(call.budget, Budget::new(0, 0, 7));
+        let tools = layered.config.provided_tools().unwrap();
+        assert!(tools.iter().any(|t| t.decl.name == "find_note" && t.service.as_str() == "ext-tracker-notes"));
+
+        // A user service of the same name is refused rather than shadowed.
+        home.user("[[service]]\nname = \"ext-tracker-notes\"\nexec = { command = \"/opt/mine\" }\n");
+        let err = format!("{:#}", home.build_with(None, &env).unwrap_err());
+        assert!(err.contains("would be ext-tracker-notes, which is there already"), "{err}");
+        home.user("");
+
+        crate::extensions::set_enabled(&places, "tracker", false).unwrap();
+        let layered = home.build_with(None, &env).unwrap();
+        assert!(layered.config.service("ext-tracker-notes").is_none(), "a disabled pack runs no service");
+        let planner = layered.config.service("planner").unwrap();
+        assert!(!planner.requests.iter().any(|r| r.target.to_string().starts_with("ext-")));
     }
 
     #[test]

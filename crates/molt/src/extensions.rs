@@ -1,12 +1,13 @@
 //! Extension packs (issue #170, RFC 0005): a directory or a tar archive
-//! with a `molt-extension.toml` that bundles MCP servers, lifecycle hooks,
-//! Agent Skills and command templates, installed with `molt ext add`.
+//! with a `molt-extension.toml` that bundles MCP servers, bus services
+//! (always candidates in the sandbox), lifecycle hooks, Agent Skills and
+//! command templates, installed with `molt ext add`.
 //!
 //! A pack gets nothing it was not approved for. Installing it reads and
 //! copies files and runs none of them; it lists what the pack would get
 //! (its [`grant`]: the programs it runs, their network, host paths and
-//! environment variables, how often the agent may call them, its hooks'
-//! commands, its skills and commands) and records the person's approval of
+//! environment variables, the capabilities its services request, how often
+//! the agent may call them, its hooks' commands, its skills and commands) and records the person's approval of
 //! those lines in `~/.config/molt/extensions.toml`. Each start checks the
 //! installed copy against the content hash it was installed with and its
 //! grant against what was approved, and refuses to start otherwise. An
@@ -32,10 +33,13 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{bail, ensure, Context};
 use molt_mcp::McpServer;
 use molt_planner::hooks::Hook;
+use molt_proto::tool::{ProvidedTool, ToolDecl};
+use molt_proto::{CapRequest, Exec, ServiceId, Target, Tier, KERNEL};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use toml::Value;
 
+use crate::config::{Isolation, ServiceSection};
 use crate::layers::user_path;
 
 mod git;
@@ -70,7 +74,6 @@ const MAX_NAME: usize = 24;
 
 /// What a manifest may not hold yet, with what to do instead.
 const NOT_YET: &[(&str, &str)] = &[
-    ("service", "services of their own"),
     ("environment", "environment profiles"),
     ("role", "roles"),
     ("workflow", "workflows"),
@@ -96,6 +99,72 @@ pub struct Manifest {
     /// Lifecycle hooks, as in the user config's `[[hooks]]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hooks: Vec<Hook>,
+    /// Bus services, each run as `ext-PACK-SERVICE` (`ext-PACK` for one
+    /// named as the pack): always a candidate in the Linux sandbox, with no
+    /// network, the pack's files to read and the capabilities it requests.
+    #[serde(default, rename = "service", skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, PackService>,
+}
+
+/// A service of a pack, `[service.NAME]`: what the user config's
+/// `[[service]]` would say, less what a pack may not choose. Its tier is
+/// `mutable`, its isolation `sandbox`, and it provides its own name's
+/// methods (`ext-PACK-NAME.*`) and nothing else.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackService {
+    /// An absolute path, a name looked up on `PATH`, or `${MOLT_EXTENSION_DIR}/PATH`.
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// The capabilities it asks for, each with its budget. Never a kernel method.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requests: Vec<CapRequest>,
+    /// Variables set for it; [`DIR_VAR`] in a value is the installed directory.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// The user's variables it is given when they are set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pass_env: Vec<String>,
+    /// Tools on its methods, offered to the planner's model as a service's are (RFC 0002).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDecl>,
+    /// Calls the planner may make to it in a run; 0 offers none of its tools.
+    #[serde(default = "default_calls")]
+    pub calls: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_secs: Option<u64>,
+}
+
+fn default_calls() -> u64 {
+    molt_mcp::DEFAULT_CALLS
+}
+
+/// The prefix of a pack's services, which neither Molt's own services nor
+/// the MCP bridges (`mcp-NAME`) have.
+pub const SERVICE_PREFIX: &str = "ext-";
+
+/// The service a pack's service `server` runs as.
+pub fn service_id(pack: &str, server: &str) -> String {
+    format!("{SERVICE_PREFIX}{}", mcp_key(pack, server))
+}
+
+/// `command` is one a pack may name: absolute, a name looked up on `PATH`,
+/// or a plain path under [`DIR_VAR`].
+fn check_command(what: &str, command: &str) -> anyhow::Result<()> {
+    if let Some(rest) = command.strip_prefix(DIR_VAR) {
+        let rest = rest.strip_prefix('/').unwrap_or(rest);
+        ensure!(plain(rest), "{what}: the command {command} must name a file in the pack, without `..`");
+    } else {
+        ensure!(
+            !command.contains(DIR_VAR) && (Path::new(command).is_absolute() || !command.contains('/')),
+            "{what}: the command {command:?} must be absolute, a name looked up on PATH, or {DIR_VAR}/PATH for a \
+             program in the pack"
+        );
+    }
+    Ok(())
 }
 
 impl Manifest {
@@ -110,6 +179,21 @@ impl Manifest {
         }
         if let Some((key, what)) = NOT_YET.iter().find(|(key, _)| raw.contains_key(*key)) {
             bail!("{MANIFEST} has `{key}`: extension packs cannot bring {what} yet");
+        }
+        if let Some(services) = raw.get("service") {
+            let Value::Table(services) = services else {
+                bail!("{MANIFEST}: write each service as a [service.NAME] table, not [[service]]")
+            };
+            for (name, service) in services {
+                let tools = service.get("tools").and_then(Value::as_array).into_iter().flatten();
+                for key in tools.filter_map(Value::as_table).flat_map(|t| t.keys()) {
+                    ensure!(
+                        ToolDecl::FIELDS.contains(&key.as_str()),
+                        "service {name}: a tool has the unknown key {key:?}; a tool takes {}",
+                        ToolDecl::FIELDS.join(", ")
+                    );
+                }
+            }
         }
         let manifest: Self = toml::from_str(text)?;
         manifest.validate()?;
@@ -131,21 +215,31 @@ impl Manifest {
         for (server, settings) in &self.mcp {
             let key = mcp_key(&self.name, server);
             settings.validate(&key).map_err(anyhow::Error::msg)?;
-            let command = &settings.command;
-            if let Some(rest) = command.strip_prefix(DIR_VAR) {
-                let rest = rest.strip_prefix('/').unwrap_or(rest);
-                ensure!(
-                    plain(rest),
-                    "MCP server {server}: the command {command} must name a file in the pack, without `..`"
-                );
-            } else {
-                ensure!(
-                    !command.contains(DIR_VAR) && (Path::new(command).is_absolute() || !command.contains('/')),
-                    "MCP server {server}: the command {command:?} must be absolute, a name looked up on PATH, or \
-                     {DIR_VAR}/PATH for a program in the pack"
+            check_command(&format!("MCP server {server}"), &settings.command)?;
+        }
+        let mut tools = Vec::new();
+        for (server, s) in &self.services {
+            ensure!(
+                valid_name(server),
+                "service {server:?}: its name must be 1 to {MAX_NAME} lowercase letters, digits and single hyphens, \
+                 starting with a letter"
+            );
+            check_command(&format!("service {server}"), &s.command)?;
+            let section = s.section(&self.name, server, Path::new("/"))?;
+            section.validate_isolation()?;
+            if let Some(req) = s.requests.iter().find(|r| r.target.service().is_some_and(|t| t.as_str() == KERNEL)) {
+                bail!(
+                    "service {server} requests {}: a pack's service holds no kernel capability, as it is a \
+                     candidate an agent may replace",
+                    req.target
                 );
             }
+            section.manifest()?.validate_tools().map_err(|e| {
+                anyhow::anyhow!("{e} (the service is {}, so its tools target {}.METHOD)", section.name, section.name)
+            })?;
+            tools.extend(s.tools.iter().map(|decl| ProvidedTool { service: section.name.clone(), decl: decl.clone() }));
         }
+        molt_planner::validate_tools(&tools)?;
         molt_planner::hooks::validate(&self.hooks)?;
         if let Some(hook) = self.hooks.iter().find(|h| h.command.contains(DIR_VAR) || h.command.contains(CLAUDE_ROOT)) {
             bail!(
@@ -155,6 +249,28 @@ impl Manifest {
             );
         }
         Ok(())
+    }
+}
+
+impl PackService {
+    /// The user config's `[[service]]` this service of pack `pack` is, with
+    /// [`DIR_VAR`] made `dir`, the installed directory, which it may read.
+    pub fn section(&self, pack: &str, server: &str, dir: &Path) -> anyhow::Result<ServiceSection> {
+        let id = service_id(pack, server);
+        let dir_text = dir.to_str().context("the pack's directory is not UTF-8")?;
+        let expand = |s: &String| s.replace(DIR_VAR, dir_text);
+        let exec = Exec { command: expand(&self.command), args: self.args.iter().map(expand).collect() };
+        let provides: Target = format!("{id}.*").parse()?;
+        let mut section = ServiceSection::new(ServiceId::new(&id)?, Tier::Mutable, exec, vec![provides]);
+        section.isolation = Isolation::Sandbox;
+        section.requests = self.requests.clone();
+        section.env = self.env.iter().map(|(k, v)| (k.clone(), expand(v))).collect();
+        section.pass_env = self.pass_env.clone();
+        section.tools = self.tools.clone();
+        section.memory_mb = self.memory_mb;
+        section.cpu_secs = self.cpu_secs;
+        section.mounts = vec![dir.to_path_buf()];
+        Ok(section)
     }
 }
 
@@ -214,6 +330,41 @@ pub fn grant(manifest: &Manifest, root: &Path) -> anyhow::Result<Vec<String>> {
             let roles = roles.iter().map(|r| r.trim_matches('"')).collect::<Vec<_>>().join(", ");
             let reads = if t.read_only { ", as a tool that only reads" } else { "" };
             lines.insert(format!("MCP server {key}'s tool {tool} is offered to {roles}{reads}"));
+        }
+    }
+    for (server, s) in &manifest.services {
+        let id = service_id(&manifest.name, server);
+        let run: Vec<String> = std::iter::once(&s.command).chain(&s.args).map(|a| quote(a)).collect();
+        lines.insert(format!(
+            "service {id} runs {} in a candidate's sandbox that sees the pack's files, without the network",
+            run.join(" ")
+        ));
+        for req in &s.requests {
+            let b = req.budget;
+            lines.insert(format!(
+                "service {id} may use {} within {} calls, {} tokens and {} ms",
+                req.target, b.calls, b.tokens, b.ms
+            ));
+        }
+        for var in &s.pass_env {
+            lines.insert(format!("service {id} gets your environment variable {var}"));
+        }
+        for (var, value) in &s.env {
+            lines.insert(format!("service {id} is given {var}={}", quote(value)));
+        }
+        if s.calls == 0 || s.tools.is_empty() {
+            continue;
+        }
+        lines.insert(format!("the agent may call service {id} {} times a run ({id}.*)", s.calls));
+        for t in &s.tools {
+            let roles: Vec<String> = t.roles.iter().map(|r| serde_json::to_string(r).unwrap_or_default()).collect();
+            let roles = roles.iter().map(|r| r.trim_matches('"')).collect::<Vec<_>>().join(", ");
+            let reads = if t.read_only { ", as a tool that only reads" } else { "" };
+            let trust = match t.trust {
+                molt_proto::tool::ResultTrust::Workspace => ", its results believed as the workspace is",
+                _ => "",
+            };
+            lines.insert(format!("service {id}'s tool {} ({}) is offered to {roles}{reads}{trust}", t.name, t.target));
         }
     }
     for hook in &manifest.hooks {
@@ -424,6 +575,11 @@ impl Active {
                 (mcp_key(&self.name, server), s)
             })
             .collect())
+    }
+
+    /// Its services, as the user config's `[[service]]` would declare them.
+    pub fn services(&self) -> anyhow::Result<Vec<ServiceSection>> {
+        self.manifest.services.iter().map(|(server, s)| s.section(&self.name, server, &self.dir)).collect()
     }
 
     /// Its skills directory, when it has one.
@@ -843,7 +999,7 @@ fn install(
             text.push_str(&format!("  {line}\n"));
         }
         if lines.is_empty() {
-            text.push_str("  nothing: it has no servers, hooks, skills or commands\n");
+            text.push_str("  nothing: it has no servers, services, hooks, skills or commands\n");
         }
     }
     if previous.is_none() || !new.is_empty() {
@@ -878,8 +1034,9 @@ fn install(
     Ok(if previous.is_some() { Added::Updated } else { Added::Installed })
 }
 
-/// Refuse a pack whose MCP servers would be bridged under a name another
-/// pack's, or the user config's, already has.
+/// Refuse a pack whose MCP servers would be bridged, or whose services run,
+/// under a name another pack's, or the user config's, already has, or
+/// whose services' tools have the name of another pack's.
 fn collisions(places: &Places, state: &State, manifest: &Manifest) -> anyhow::Result<()> {
     let user = places.state.parent().map(|d| d.join("config.toml"));
     let user: BTreeSet<String> = match user.map(std::fs::read_to_string) {
@@ -889,11 +1046,47 @@ fn collisions(places: &Places, state: &State, manifest: &Manifest) -> anyhow::Re
             .unwrap_or_default(),
         _ => BTreeSet::new(),
     };
+    let user_services: BTreeSet<String> = match places.state.parent().map(|d| d.join("config.toml")) {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str::<toml::Table>(&text)
+                .ok()
+                .and_then(|t| t.get("service").and_then(Value::as_array).cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|s| s.get("name").and_then(Value::as_str).map(str::to_owned))
+                .collect(),
+            Err(_) => BTreeSet::new(),
+        },
+        None => BTreeSet::new(),
+    };
+    let others: Vec<(&String, Manifest)> = state
+        .packs
+        .keys()
+        .filter(|n| **n != manifest.name)
+        .filter_map(|n| Some((n, read_manifest(&places.dir(n)).ok()?)))
+        .collect();
+    for (server, s) in &manifest.services {
+        let id = service_id(&manifest.name, server);
+        ensure!(!user_services.contains(&id), "the pack's service {server} would be {id}, which your config has");
+        for (other, theirs) in &others {
+            ensure!(
+                !theirs.services.keys().any(|t| service_id(other, t) == id),
+                "the pack's service {server} would be {id}, as one of extension {other} is"
+            );
+            let names: BTreeSet<&str> =
+                theirs.services.values().flat_map(|t| &t.tools).map(|t| t.name.as_str()).collect();
+            if let Some(tool) = s.tools.iter().find(|t| names.contains(t.name.as_str())) {
+                bail!(
+                    "the pack's service {server} declares a tool {:?}, as extension {other} does: rename one",
+                    tool.name
+                );
+            }
+        }
+    }
     for server in manifest.mcp.keys() {
         let key = mcp_key(&manifest.name, server);
         ensure!(!user.contains(&key), "the pack's MCP server {server} would be [mcp.{key}], which your config has");
-        for (other, _) in state.packs.iter().filter(|(n, _)| **n != manifest.name) {
-            let Ok(theirs) = read_manifest(&places.dir(other)) else { continue };
+        for (other, theirs) in &others {
             ensure!(
                 !theirs.mcp.keys().any(|s| mcp_key(other, s) == key),
                 "the pack's MCP server {server} would be bridged as {key}, as one of extension {other} is"
@@ -968,7 +1161,8 @@ pub fn import_claude_plugin(root: &Path) -> anyhow::Result<Vec<String>> {
             notes.push(format!("its {what} are not imported yet"));
         }
     }
-    let manifest = Manifest { schema: SCHEMA, name, version, description, mcp, hooks: Vec::new() };
+    let manifest =
+        Manifest { schema: SCHEMA, name, version, description, mcp, hooks: Vec::new(), services: BTreeMap::new() };
     manifest.validate()?;
     std::fs::write(root.join(MANIFEST), toml::to_string(&manifest)?)?;
     Ok(notes)
@@ -1036,16 +1230,19 @@ fn not_installed(name: &str) -> String {
 }
 
 /// Uninstall `name`: its files, its record and approval, and the tool
-/// lists of its MCP servers cached in the default data dirs and in
-/// `data_dirs` (those chosen with `--data-dir`). Returns what was removed.
+/// lists of its MCP servers cached and its services' private state kept in
+/// the default data dirs and in `data_dirs` (those chosen with
+/// `--data-dir`). Returns what was removed.
 pub fn remove(places: &Places, name: &str, data_dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     let mut state = State::load(&places.state)?;
     ensure!(state.packs.contains_key(name), "{}", not_installed(name));
     let dir = places.dir(name);
     let mut removed = Vec::new();
-    let keys: Vec<String> = match read_manifest(&dir) {
-        Ok(m) => m.mcp.keys().map(|s| mcp_key(name, s)).collect(),
-        Err(_) => Vec::new(),
+    let (keys, services): (Vec<String>, Vec<String>) = match read_manifest(&dir) {
+        Ok(m) => {
+            (m.mcp.keys().map(|s| mcp_key(name, s)).collect(), m.services.keys().map(|s| service_id(name, s)).collect())
+        }
+        Err(_) => (Vec::new(), Vec::new()),
     };
     let defaults = places.cache.iter().flat_map(|cache| std::fs::read_dir(cache).into_iter().flatten());
     let data: Vec<PathBuf> =
@@ -1056,6 +1253,13 @@ pub fn remove(places: &Places, name: &str, data_dirs: &[PathBuf]) -> anyhow::Res
             if std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file()) {
                 std::fs::remove_file(&file)?;
                 removed.push(file);
+            }
+        }
+        for id in &services {
+            let state = data.join("state").join(id);
+            if std::fs::symlink_metadata(&state).is_ok_and(|m| m.is_dir()) {
+                std::fs::remove_dir_all(&state).with_context(|| format!("removing {}", state.display()))?;
+                removed.push(state);
             }
         }
     }
@@ -1401,13 +1605,89 @@ mod tests {
         assert!(err.contains("notes.md is a symlink"), "{err}");
     }
 
+    const NOTES: &str = "schema = 1\nname = \"tracker\"\nversion = \"1.0.0\"\n\
+        [service.notes]\ncommand = \"${MOLT_EXTENSION_DIR}/bin/notes\"\nargs = [\"--db\", \"${MOLT_EXTENSION_DIR}/notes.db\"]\n\
+        requests = [{ target = \"memory.search\", budget = { calls = 30 } }]\n\
+        pass_env = [\"NOTES_TOKEN\"]\ncalls = 40\nmemory_mb = 128\n\
+        [[service.notes.tools]]\nname = \"find_note\"\ndescription = \"Find a note.\"\n\
+        target = \"ext-tracker-notes.find\"\nread_only = true\nroles = [\"attempt\", \"reviewer\"]\n\
+        input_schema = { type = \"object\" }\n";
+
+    #[test]
+    fn a_packs_service_is_shown_with_what_it_may_use_and_runs_only_as_a_sandboxed_candidate() {
+        let home = Home::new();
+        let src = home.pack("tracker", NOTES);
+        std::fs::create_dir_all(src.join("bin")).unwrap();
+        std::fs::write(src.join("bin/notes"), "#!/bin/sh\ntouch /tmp/never\n").unwrap();
+
+        let mut no = Says::no();
+        assert_eq!(add(&home.places, &src, &mut no).unwrap(), Added::Refused);
+        let asked = &no.asked[0];
+        for want in [
+            "service ext-tracker-notes runs ${MOLT_EXTENSION_DIR}/bin/notes --db ${MOLT_EXTENSION_DIR}/notes.db in a \
+             candidate's sandbox that sees the pack's files, without the network",
+            "service ext-tracker-notes may use memory.search within 30 calls, 0 tokens and 0 ms",
+            "service ext-tracker-notes gets your environment variable NOTES_TOKEN",
+            "the agent may call service ext-tracker-notes 40 times a run (ext-tracker-notes.*)",
+            "service ext-tracker-notes's tool find_note (ext-tracker-notes.find) is offered to attempt, reviewer, as \
+             a tool that only reads",
+        ] {
+            assert!(asked.contains(want), "{want:?} in\n{asked}");
+        }
+        assert!(!home.places.dir("tracker").exists(), "a no installs nothing");
+
+        assert_eq!(add(&home.places, &src, &mut Says::yes()).unwrap(), Added::Installed);
+        let packs = active(&home.places).unwrap();
+        let services = packs[0].services().unwrap();
+        let [svc] = services.as_slice() else { panic!("one service: {services:?}") };
+        let dir = &packs[0].dir;
+        assert_eq!(svc.name.as_str(), "ext-tracker-notes");
+        assert_eq!((svc.tier, svc.isolation), (Tier::Mutable, Isolation::Sandbox));
+        assert_eq!(svc.provides, ["ext-tracker-notes.*".parse::<Target>().unwrap()]);
+        let exec = svc.exec.as_ref().unwrap();
+        assert_eq!(exec.command, format!("{}/bin/notes", dir.display()));
+        assert_eq!(exec.args, ["--db".to_owned(), format!("{}/notes.db", dir.display())]);
+        assert_eq!(svc.mounts, std::slice::from_ref(dir), "it reads its own files and nothing else of the host");
+        assert_eq!(svc.memory_mb, Some(128));
+        assert_eq!(svc.requests[0].target, "memory.search".parse::<Target>().unwrap());
+
+        // More budget for what it may use is a new line, approved again; refused, the pack stays.
+        std::fs::write(src.join(MANIFEST), NOTES.replace("calls = 30", "calls = 300")).unwrap();
+        let mut no = Says::no();
+        assert_eq!(add(&home.places, &src, &mut no).unwrap(), Added::Refused);
+        assert!(
+            no.asked[0].contains("  + service ext-tracker-notes may use memory.search within 300 calls"),
+            "{}",
+            no.asked[0]
+        );
+        // A second pack cannot take its tool's name.
+        let other = home.pack(
+            "other",
+            &NOTES
+                .replace("name = \"tracker\"", "name = \"other\"")
+                .replace("ext-tracker-notes.find", "ext-other-notes.find"),
+        );
+        let err = format!("{:#}", add(&home.places, &other, &mut Says::yes()).unwrap_err());
+        assert!(err.contains("declares a tool \"find_note\", as extension tracker does"), "{err}");
+
+        // Removing it takes the service's private state from the data dirs too.
+        let data = home.dir.path().join("data-dir");
+        std::fs::create_dir_all(data.join("state/ext-tracker-notes")).unwrap();
+        std::fs::write(data.join("state/ext-tracker-notes/notes.db"), "kept by the service").unwrap();
+        std::fs::create_dir_all(data.join("state/echo")).unwrap();
+        let removed = remove(&home.places, "tracker", std::slice::from_ref(&data)).unwrap();
+        assert!(removed.contains(&data.join("state/ext-tracker-notes")), "{removed:?}");
+        assert!(!data.join("state/ext-tracker-notes").exists() && data.join("state/echo").exists());
+    }
+
     #[test]
     fn a_manifest_is_refused_for_what_a_pack_cannot_have() {
         for (text, says) in [
             ("name = \"x\"\nversion = \"1\"\n", "no `schema`"),
             ("schema = 2\nname = \"x\"\nversion = \"1\"\n", "reads schema 1"),
             ("schema = 1\nname = \"X\"\nversion = \"1\"\n", "lowercase"),
-            ("schema = 1\nname = \"x\"\nversion = \"1\"\n[[service]]\nname = \"s\"\n", "cannot bring services"),
+            ("schema = 1\nname = \"x\"\nversion = \"1\"\n[[service]]\nname = \"s\"\n", "[service.NAME]"),
+            ("schema = 1\nname = \"x\"\nversion = \"1\"\n[environment.e]\n", "cannot bring environment profiles"),
             ("schema = 1\nname = \"x\"\nversion = \"1\"\nenv = { A = \"1\" }\n", "cannot bring variables"),
             ("schema = 1\nname = \"x\"\nversion = \"1\"\nextra = 1\n", "unknown field"),
             ("schema = 1\nname = \"x\"\nversion = \"1\"\n[mcp.s]\ncommand = \"bin/s\"\n", "must be absolute"),
@@ -1425,9 +1705,40 @@ mod tests {
                 "cannot reach",
             ),
         ] {
-            let err = format!("{:#}", Manifest::parse(text).unwrap_err());
+            let err = format!("{:#}", Manifest::parse(text).expect_err(text));
             assert!(err.contains(says), "{text}: {err}");
         }
+    }
+
+    #[test]
+    fn a_packs_service_cannot_choose_its_tier_isolation_methods_or_kernel_rights() {
+        let svc = |extra: &str| {
+            format!("schema = 1\nname = \"x\"\nversion = \"1\"\n[service.s]\ncommand = \"/opt/s\"\n{extra}")
+        };
+        let tool = |name: &str, target: &str| {
+            format!(
+                "[[service.s.tools]]\nname = \"{name}\"\ndescription = \"D.\"\ninput_schema = {{ type = \"object\" }}\n\
+                 target = \"{target}\"\n"
+            )
+        };
+        for (extra, says) in [
+            ("tier = \"protected\"\n".to_owned(), "unknown field `tier`"),
+            ("isolation = \"native\"\n".into(), "unknown field `isolation`"),
+            ("provides = [\"model.*\"]\n".into(), "unknown field `provides`"),
+            ("requests = [{ target = \"kernel.registry.promote\" }]\n".into(), "no kernel capability"),
+            ("requests = [{ target = \"kernel.*\" }]\n".into(), "no kernel capability"),
+            ("pass_env = [\"ANTHROPIC_API_KEY\"]\n".into(), "cannot be given ANTHROPIC_API_KEY"),
+            ("env = { MOLT_CAPS = \"{}\" }\n".into(), "cannot be given MOLT_CAPS"),
+            (tool("steal", "fs.write"), "does not provide"),
+            (tool("read_file", "ext-x-s.read"), "the planner's own tools"),
+            (tool("own", "ext-x-s.own") + "trust = \"user\"\n", "the user's trust"),
+            (tool("own", "ext-x-s.own") + "strange = 1\n", "unknown key \"strange\""),
+        ] {
+            let text = svc(&extra);
+            let err = format!("{:#}", Manifest::parse(&text).expect_err(&text));
+            assert!(err.contains(says), "{text}: {err}");
+        }
+        assert!(Manifest::parse(&svc(&tool("own", "ext-x-s.own"))).is_ok());
     }
 
     #[test]

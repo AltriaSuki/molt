@@ -28,6 +28,7 @@ provides = ["echo.*"]
 requests = [{ target = "notes.add", budget = { calls = 100 } }]
 memory_mb = 256
 env = { GREETING = "hi" }
+mounts = ["/opt/echo-data"]        # host paths it may read; optional
 ```
 
 A project's `.molt/config.toml` cannot have services at all, as before.
@@ -63,7 +64,11 @@ service:
   survives restarts. No other host path is writable.
 - **Read-only**: the system directories (`/usr`, `/bin`, `/sbin`, `/lib`,
   `/lib64`), the loader cache, the certificate directory, `/etc/alternatives`,
-  and its own program file when it is outside them. Not the rest of `/etc`,
+  its own program file when it is outside them, and each of its `mounts`, at
+  its own path. A mount must be absolute, and one that is the data dir,
+  holds it or lies in it stops the start, as it would show the registry,
+  the audit log and the other services' state; `mounts` on a native
+  service is refused, since it reads what you can. Not the rest of `/etc`,
   your home, the project, the data dir (the audit log, the registry, the
   sockets, other services' databases and state), or Molt's configuration.
 - **No network**: a network namespace of its own with only a loopback
@@ -133,6 +138,10 @@ a person changes them:
   forks and their databases; `web`; and each MCP bridge (`mcp-NAME`), which
   runs its server in the sandbox ([MCP servers](mcp.md));
 - every service you configure without `isolation = "sandbox"`.
+
+A service an [extension pack](extensions.md#services) brings is never
+trusted: it is always a candidate, `ext-PACK-NAME`, in the sandbox above,
+with the pack's directory as its one mount.
 
 `fs`, `memory` and `planner` are `mutable` tier, which marks what may
 become agent-replaceable; while they run natively, a gate cannot promote them.
