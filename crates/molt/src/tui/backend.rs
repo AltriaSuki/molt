@@ -296,6 +296,7 @@ fn request(action: Action) -> anyhow::Result<Option<(&'static str, Value, Handle
         | Action::Alert { .. }
         | Action::ListFiles
         | Action::ReadAudit { .. }
+        | Action::RunHistory
         | Action::Export { .. }
         | Action::Changes
         | Action::FileDiff { .. }

@@ -69,6 +69,10 @@ enum Cmd {
     /// finished, from its last checkpoint. Its attempts keep their forks and
     /// conversations, and the cost so far counts against its budget.
     Resume(ResumeArgs),
+    /// List the runs of a project from its audit log, oldest first: what each
+    /// was asked, how it ended, what it cost and took, what memory learned
+    /// from it and where its result went. `molt runs show RUN` shows one run.
+    Runs(RunsArgs),
     /// Take back the commit `molt do --commit` made for a run, with a new
     /// commit that puts its files back, and have memory no longer count
     /// what the run showed.
@@ -322,6 +326,11 @@ struct RunArgs {
     /// Print the result as JSON.
     #[arg(long)]
     json: bool,
+    /// The session the run belongs to, a name that groups the runs of one
+    /// piece of work in `molt runs --session`. For `molt resume`, it
+    /// replaces the stopped run's.
+    #[arg(long, value_name = "NAME", value_parser = session_name)]
+    session: Option<String>,
     /// Show model text previews on stderr while replies are generated.
     #[arg(long)]
     stream: bool,
@@ -374,6 +383,39 @@ struct RunArgs {
 }
 
 #[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct RunsArgs {
+    #[command(subcommand)]
+    cmd: Option<RunsCmd>,
+    /// Group the runs by session; with a NAME, list only that session's runs.
+    #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+    session: Option<String>,
+    /// Only the newest N runs.
+    #[arg(short = 'n', long, value_name = "N")]
+    last: Option<usize>,
+    /// Print the runs as JSON.
+    #[arg(long)]
+    json: bool,
+    #[command(flatten)]
+    at: MemoryAt,
+}
+
+#[derive(Subcommand)]
+enum RunsCmd {
+    /// One run: its task and check, each attempt, the files it changed,
+    /// the notes memory gave it and the notes memory learned from it.
+    Show {
+        /// The run's id, or enough of its start to tell it from the others.
+        run: String,
+        /// Print the run, its request and its reply as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        at: MemoryAt,
+    },
+}
+
+#[derive(Args)]
 struct ResumeArgs {
     /// The stopped run to go on with, as `--list` shows it. Default: the one
     /// in the workspace that stopped last.
@@ -416,6 +458,11 @@ struct UiArgs {
     /// using a DNS JSON HTTPS endpoint such as Cloudflare's 1.1.1.1.
     #[arg(long, value_name = "RESOLVER")]
     web_resolver: Option<String>,
+    /// The session the runs belong to (`molt runs --session`). Default: a
+    /// new one each time the interface is opened, or for each client of
+    /// `molt serve`.
+    #[arg(long, value_name = "NAME", value_parser = session_name)]
+    session: Option<String>,
 }
 
 #[derive(Args)]
@@ -705,6 +752,11 @@ fn env_name(name: &str) -> Result<String, String> {
     Ok(name.to_owned())
 }
 
+/// A name `--session` may give: see [`molt::runs::session_name`].
+fn session_name(name: &str) -> Result<String, String> {
+    molt::runs::session_name(name)
+}
+
 #[derive(Subcommand)]
 enum ProjectCmd {
     /// Register a project called NAME, for the directory --path or, without
@@ -810,6 +862,7 @@ fn serve_options(config: Option<PathBuf>, profile: Option<String>, args: UiArgs)
         allow_web: args.allow_web,
         web_resolver: args.web_resolver,
         profile,
+        session: args.session,
     }
 }
 
@@ -824,6 +877,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             Cmd::Do(_)
                 | Cmd::Ask(_)
                 | Cmd::Resume(_)
+                | Cmd::Runs(_)
                 | Cmd::Undo(_)
                 | Cmd::Apply(_)
                 | Cmd::Memory { .. }
@@ -894,9 +948,10 @@ async fn main() -> anyhow::Result<ExitCode> {
         Cmd::UiBackend => molt::tui::serve_backend().await?,
         Cmd::Serve(args) => {
             let stop = molt::stop_signal()?;
+            let session = args.at.session.clone();
             let (cfg, workspace, _) = molt::serve::configure(serve_options(cli.config, cli.profile, args.at))?;
             let socket = args.socket.unwrap_or_else(|| cfg.kernel.data_dir.join(molt::protocol::SOCKET));
-            let server = molt::serve::Server::new(cfg, workspace);
+            let server = molt::serve::Server::named(cfg, workspace, session);
             if args.stdio {
                 molt::serve::stdio(server, stop).await?;
             } else {
@@ -928,6 +983,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         Cmd::Do(args) => return do_task(cli.config.as_deref(), cli.profile.as_deref(), args).await,
         Cmd::Ask(args) => return ask(cli.config.as_deref(), cli.profile.as_deref(), args).await,
         Cmd::Resume(args) => return resume_task(cli.config.as_deref(), cli.profile.as_deref(), args).await,
+        Cmd::Runs(args) => return runs_cmd(cli.config.as_deref(), args),
         Cmd::Undo(args) => return undo_cmd(cli.config.as_deref(), args).await,
         Cmd::Apply(args) => return apply_cmd(cli.config.as_deref(), args).await,
         Cmd::Memory { cmd } => memory_cmd(cli.config.as_deref(), cmd).await?,
@@ -1184,6 +1240,7 @@ async fn do_task(config: Option<&Path>, profile: Option<&str>, args: DoArgs) -> 
     req.checkpoint = args.checkpoint;
     req.review = !args.common.no_review;
     req.workflow = args.workflow.filter(|w| !w.trim().is_empty());
+    req.session = args.common.session.clone();
     let plan = (args.plan || !args.step.is_empty()).then_some(args.step);
     execute_as(&cfg, req, plan, TraceId::random(), &args.common, stop).await
 }
@@ -1200,6 +1257,7 @@ async fn ask(config: Option<&Path>, profile: Option<&str>, args: AskArgs) -> any
     req.budget_usd = args.common.budget_usd.or(cfg.tui.budget);
     req.apply = !args.common.no_apply;
     req.stream = args.common.stream;
+    req.session = args.common.session.clone();
     execute(&cfg, req, TraceId::random(), &args.common, stop).await
 }
 
@@ -1243,6 +1301,7 @@ async fn resume_task(config: Option<&Path>, profile: Option<&str>, args: ResumeA
     req.stream = args.common.stream;
     req.budget_usd = args.common.budget_usd.or(req.budget_usd);
     req.design_budget_usd = args.common.design_budget_usd.or(req.design_budget_usd);
+    req.session = args.common.session.clone().or(req.session);
     eprintln!("resuming run {run}: {}", agent::printable(req.task.lines().next().unwrap_or_default()));
     execute(&cfg, req, TraceId::from_raw(&run), &args.common, stop).await
 }
@@ -1507,6 +1566,241 @@ async fn apply_kept(session: &molt::session::Session, args: &ApplyArgs) -> anyho
     Ok(ExitCode::SUCCESS)
 }
 
+/// The data dir `molt do` uses where `at` says, and the workspace.
+fn runs_at(config: Option<&Path>, at: &MemoryAt) -> anyhow::Result<(PathBuf, PathBuf, Option<molt::project::Project>)> {
+    let (workspace, project) = agent::locate(at.project.as_deref(), &at.workspace, config.is_some())?;
+    let dir = agent::data_dir_for(config, &workspace, at.data_dir.as_deref(), project.as_ref())?;
+    Ok((dir, workspace, project))
+}
+
+fn runs_cmd(config: Option<&Path>, args: RunsArgs) -> anyhow::Result<ExitCode> {
+    use molt::runs;
+    if let Some(RunsCmd::Show { run, json, at }) = args.cmd {
+        return show_run(config, &run, json, &at);
+    }
+    let (dir, workspace, _) = runs_at(config, &args.at)?;
+    let mut listed = runs::list(&dir)?;
+    let grouped = match args.session.as_deref() {
+        None => false,
+        Some("") => true,
+        Some(name) => {
+            let name = runs::session_name(name).map_err(anyhow::Error::msg)?;
+            listed.retain(|r| r.session.as_deref() == Some(name.as_str()));
+            false
+        }
+    };
+    if let Some(n) = args.last {
+        listed.drain(..listed.len().saturating_sub(n));
+    }
+    if listed.is_empty() && !args.json {
+        let what = match args.session.as_deref() {
+            Some(name) if !name.is_empty() => format!("no runs of session {name}"),
+            _ => "no runs".to_owned(),
+        };
+        eprintln!("{}", agent::printable(&format!("{what} in {} (data dir {})", workspace.display(), dir.display())));
+        return Ok(ExitCode::SUCCESS);
+    }
+    if grouped {
+        let sessions = runs::sessions(listed);
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&sessions)?);
+            return Ok(ExitCode::SUCCESS);
+        }
+        for (i, session) in sessions.iter().enumerate() {
+            if i > 0 {
+                println!();
+            }
+            let name = session.session.as_deref().map_or_else(|| "no session".to_owned(), |s| format!("session {s}"));
+            let count = match session.runs.len() {
+                1 => "1 run".to_owned(),
+                n => format!("{n} runs"),
+            };
+            let unknown = match session.unknown_cost {
+                0 => String::new(),
+                n => format!(" known, {n} runs' cost not known"),
+            };
+            let heading = format!(
+                "{name} · {count} · ${:.4}{unknown} · from {} UTC",
+                session.cost_usd,
+                runs::when(session.started_ms)
+            );
+            println!("{}", agent::printable(&heading));
+            for line in runs::table(&session.runs).lines() {
+                println!("  {}", agent::printable(line));
+            }
+        }
+    } else if args.json {
+        println!("{}", serde_json::to_string_pretty(&listed)?);
+    } else {
+        print!("{}", agent::printable(&runs::table(&listed)));
+        if listed.iter().any(|r| r.resumable) {
+            eprintln!("*: stopped with a checkpoint; `molt resume RUN` goes on with it");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn show_run(config: Option<&Path>, id: &str, json: bool, at: &MemoryAt) -> anyhow::Result<ExitCode> {
+    use molt::runs;
+    let (dir, workspace, project) = runs_at(config, at)?;
+    let detail = runs::detail(&dir, id)?;
+    let run = &detail.run;
+    // The notes memory gave the run, as `molt memory used` has them; none when memory has nothing here.
+    let recalled = agent::memory_config(config, &workspace, at.data_dir.as_deref(), project.as_ref())
+        .ok()
+        .and_then(|cfg| open_memory(&cfg, &workspace, project.as_ref()).ok())
+        .and_then(|db| {
+            let key = project.as_ref().map_or_else(|| workspace.to_string_lossy().into_owned(), |p| p.id.clone());
+            molt_memory::recall_snapshots(&db, &key, &run.run).ok()
+        })
+        .unwrap_or_default();
+    if json {
+        let mut response = serde_json::to_value(&detail.response)?;
+        if let Some(out) = response.as_object_mut() {
+            out.remove("conversation");
+        }
+        let out = serde_json::json!({
+            "run": run,
+            "request": detail.request,
+            "response": response,
+            "plan": detail.plan,
+            "recalled": recalled,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut lines = vec![format!("run {}", run.run)];
+    let task = detail.request.as_ref().map_or(run.task.as_str(), |r| r.task.as_str());
+    lines.push("task:".to_owned());
+    lines.extend(task.lines().map(|l| format!("  {l}")));
+    let mut when = format!("started {} UTC, took {}", runs::when(run.started_ms), runs::duration(run.duration_ms));
+    if let Some(session) = &run.session {
+        when.push_str(&format!(", session {session}"));
+    }
+    if let Some(workflow) = &run.workflow {
+        when.push_str(&format!(", workflow {workflow}"));
+    }
+    lines.push(when);
+    let mut result = format!("result: {}", run.result.name());
+    if let Some(level) = run.verification {
+        result.push_str(&format!(" (verification: {level})"));
+    }
+    result.push_str(&format!(", cost {}", runs::cost(run.cost_usd, run.uncounted_calls)));
+    lines.push(result);
+    if run.resumable {
+        lines.push(format!("stopped with a checkpoint: `molt resume {}` goes on with it", run.run));
+    }
+    let check = detail.response.as_ref().and_then(|r| r.check.as_ref()).map(|c| (c.command.clone(), c.designed));
+    let check = check.or_else(|| detail.request.as_ref().and_then(|r| r.check.clone()).map(|c| (c, false)));
+    match check {
+        Some((command, designed)) => {
+            lines.push(format!("check: {command}{}", if designed { " (designed by the planner)" } else { "" }))
+        }
+        None => {
+            let rubric = detail.response.as_ref().map(|r| &r.rubric).filter(|r| !r.is_empty());
+            let rubric = rubric.or(detail.request.as_ref().map(|r| &r.rubric)).filter(|r| !r.is_empty());
+            match rubric {
+                Some(rubric) => {
+                    lines.push("criteria:".to_owned());
+                    lines.extend(rubric.iter().map(|c| format!("  - {}", c.text)));
+                }
+                None if detail.request.as_ref().is_some_and(|r| !r.verify) => lines.push("check: none".to_owned()),
+                None => {}
+            }
+        }
+    }
+    if let Some(resp) = &detail.response {
+        if !resp.attempts.is_empty() {
+            lines.push("attempts:".to_owned());
+        }
+        for a in &resp.attempts {
+            let winner = if resp.winner == Some(a.index) { ", its result was taken" } else { "" };
+            let mut line = format!(
+                "  {}: {} after {} turns and {} check runs, ${:.4}{winner}",
+                a.index + 1,
+                agent::status_name(a.status),
+                a.turns,
+                a.check_runs,
+                a.cost_usd
+            );
+            if let Some(note) = a.note.lines().find(|l| !l.trim().is_empty()) {
+                line.push_str(&format!("\n     {}", note.trim()));
+            }
+            lines.push(line);
+        }
+        if resp.changes.is_empty() {
+            lines.push("changes: none".to_owned());
+        } else {
+            lines.push("changes:".to_owned());
+            lines.extend(resp.changes.iter().map(|c| format!("  {:<9}{}", agent::change_name(c.kind), c.path)));
+        }
+    }
+    match (run.applied, &run.fork) {
+        (runs::Applied::Workspace, _) => lines.push(format!("applied to {}", run.workspace)),
+        (runs::Applied::Kept, Some(fork)) => lines.push(format!("not applied; the result was kept in {fork}")),
+        _ => {}
+    }
+    if !run.summary.trim().is_empty() {
+        let summary = detail.response.as_ref().map_or(run.summary.as_str(), |r| r.summary.as_str());
+        lines.push("summary:".to_owned());
+        lines.extend(summary.trim().lines().map(|l| format!("  {l}")));
+    }
+    let given: usize = recalled.iter().map(|s| s.notes.len()).sum();
+    let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    lines.push(format!(
+        "memory gave it: {} in {}",
+        count(given, "note", "notes"),
+        count(recalled.len(), "context", "contexts")
+    ));
+    let mut out = agent::printable(&(lines.join("\n") + "\n"));
+    for snapshot in &recalled {
+        if !snapshot.notes.is_empty() {
+            out.push_str(&agent::printable(&format!("  for {}: {}\n", snapshot.purpose, snapshot.query)));
+            for line in show_notes(&snapshot.notes).lines() {
+                out.push_str(&format!("    {}\n", agent::printable(line)));
+            }
+        }
+    }
+    let learned = match &run.learning {
+        None => "memory learned: not asked to learn from it".to_owned(),
+        Some(runs::Learning::Unanswered) => "memory learned: it was asked, and did not answer".to_owned(),
+        Some(runs::Learning::Failed { error }) => format!("memory learned: nothing; {error}"),
+        Some(runs::Learning::Answered { notes, reinforced, contradicted, skipped, cost_usd, uncounted_calls }) => {
+            let mut line = format!(
+                "memory learned: {} new, {reinforced} confirmed, {contradicted} disputed, cost {}",
+                notes.len(),
+                runs::cost(Some(*cost_usd), *uncounted_calls)
+            );
+            if let Some(why) = skipped.as_deref().filter(|_| notes.is_empty()) {
+                line.push_str(&format!(" ({why})"));
+            }
+            for note in notes {
+                line.push_str(&format!("\n  + [{}] {} ({})", note.kind.as_str(), note.text, note.id));
+            }
+            line
+        }
+    };
+    out.push_str(&agent::printable(&(learned + "\n")));
+    print!("{out}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Memory's database for `workspace`, its project's notes adopted.
+fn open_memory(
+    cfg: &Config,
+    workspace: &Path,
+    project: Option<&molt::project::Project>,
+) -> anyhow::Result<molt_memory::Db> {
+    let db = agent::memory_db(cfg).context("the memory service has no --db")?;
+    anyhow::ensure!(db.is_file(), "memory has nothing yet ({} does not exist)", db.display());
+    let db = molt_memory::Db::open(&db)?;
+    if let Some(project) = project {
+        let paths = if project.paths.is_empty() { vec![workspace.to_path_buf()] } else { project.paths.clone() };
+        molt_memory::adopt(&db, &molt_memory::Project { id: project.id.clone(), paths })?;
+    }
+    Ok(db)
+}
+
 async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()> {
     let at = match &cmd {
         MemoryCmd::Show { at, .. }
@@ -1522,16 +1816,7 @@ async fn memory_cmd(config: Option<&Path>, cmd: MemoryCmd) -> anyhow::Result<()>
     // Notes about a project are kept under its id; the service maps the path to it.
     let key = project.as_ref().map_or_else(|| path.clone(), |p| p.id.clone());
     let cfg = agent::memory_config(config, &workspace, at.data_dir.as_deref(), project.as_ref())?;
-    let open = || -> anyhow::Result<molt_memory::Db> {
-        let db = agent::memory_db(&cfg).context("the memory service has no --db")?;
-        anyhow::ensure!(db.is_file(), "memory has nothing yet ({} does not exist)", db.display());
-        let db = molt_memory::Db::open(&db)?;
-        if let Some(project) = &project {
-            let paths = if project.paths.is_empty() { vec![workspace.clone()] } else { project.paths.clone() };
-            molt_memory::adopt(&db, &molt_memory::Project { id: project.id.clone(), paths })?;
-        }
-        Ok(db)
-    };
+    let open = || open_memory(&cfg, &workspace, project.as_ref());
     match cmd {
         MemoryCmd::Show { words, n, json, .. } => {
             let req = RecallRequest {
