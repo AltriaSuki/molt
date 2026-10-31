@@ -159,6 +159,8 @@ impl Check {
 pub struct Plan {
     pub named: String,
     pub provider: Provider,
+    /// The user's endpoint it is on; `None` for the built-in one of `provider`.
+    pub endpoint: Option<String>,
     pub model: String,
     pub base_url: String,
     /// The calls, in order.
@@ -191,26 +193,26 @@ pub struct Report {
 impl Gateway {
     /// The calls a probe of `named` (an alias or a model id) would make.
     pub fn probe_plan(&self, named: &str) -> Result<Plan, RemoteError> {
-        let (provider, model) = self.cfg.providers.resolve(named)?;
-        let base_url = self.base_url(provider).to_owned();
-        if self.api(provider).is_none() {
-            return Err(RemoteError {
-                code: ErrorCode::Invalid,
-                message: format!("no credential configured for {provider}"),
-            });
-        }
+        let route = self.cfg.providers.resolve(named)?;
+        let base_url = self.base_url(&route).to_owned();
+        self.api(&route)?;
+        let (provider, model) = (route.provider, route.model.clone());
         let mut checks = vec![Check::Tools, Check::Streaming, Check::OutputSchema];
         let mut skipped = Vec::new();
-        match provider {
-            Provider::Anthropic => {
+        let declared = match (provider, self.cfg.providers.declared(&route)) {
+            (Provider::Anthropic, None) => None,
+            // A model on a named endpoint is probed for what its declaration says it does, as an OpenAI one.
+            _ => Some(self.cfg.providers.openai_capabilities(&route)?),
+        };
+        match declared {
+            None => {
                 if crate::profile::profile(&model).effort {
                     checks.push(Check::Effort(Effort::Low));
                 } else {
                     skipped.push(format!("effort: {model} takes none, so the gateway never sends one"));
                 }
             }
-            Provider::Openai => {
-                let caps = self.cfg.providers.capabilities(&model)?;
+            Some(caps) => {
                 checks.retain(|c| match c {
                     Check::Tools => caps.tools,
                     Check::Streaming => caps.streaming,
@@ -230,7 +232,7 @@ impl Gateway {
                 }
             }
         }
-        Ok(Plan { named: named.to_owned(), provider, model, base_url, checks, skipped })
+        Ok(Plan { named: named.to_owned(), provider, endpoint: route.endpoint, model, base_url, checks, skipped })
     }
 
     /// Make the calls of `plan`, one at a time, with no retries and at most
@@ -270,11 +272,8 @@ impl Gateway {
     /// One check: what it found, what it cost (`None`: unknown), and why to
     /// stop probing, if this answer means every call would fail.
     async fn check(&self, plan: &Plan, check: Check) -> (Finding, Option<f64>, Option<String>) {
-        let mut req = CompleteRequest {
-            model: Some(format!("{}/{}", plan.provider, plan.model)),
-            max_tokens: Some(MAX_TOKENS),
-            ..Default::default()
-        };
+        let mut req =
+            CompleteRequest { model: Some(plan.qualified()), max_tokens: Some(MAX_TOKENS), ..Default::default() };
         match check {
             Check::Tools => {
                 req.messages = vec![user_text("Call the record_number tool with n = 7. Do not answer in text.")];
@@ -339,12 +338,13 @@ impl Gateway {
         };
         (Finding { check, works: Some(works), detail }, cost, None)
     }
+}
 
-    pub(crate) fn base_url(&self, provider: Provider) -> &str {
-        match provider {
-            Provider::Anthropic => &self.cfg.base_url,
-            Provider::Openai => &self.cfg.providers.openai_base_url,
-        }
+impl Plan {
+    /// How a call names the probed model and nothing else.
+    pub fn qualified(&self) -> String {
+        crate::provider::Route { provider: self.provider, endpoint: self.endpoint.clone(), model: self.model.clone() }
+            .qualified()
     }
 }
 

@@ -118,6 +118,7 @@ impl Layered {
         use_profile(&mut table, profile, &mut origins)?;
         let mut config = into_config(&table)?;
         config.route_roles(&|name| std::env::var(name).ok())?;
+        config.route_endpoints(&|name| std::env::var(name).ok())?;
         Ok(Self { config, origins, base: Origin::File(path.to_path_buf()), env: Vec::new() })
     }
 
@@ -155,13 +156,21 @@ impl Layered {
         env.extend(yield_to_env(&mut table, &mut origins, var));
         let mut config = into_config(&table)?;
         // The user's role models, for the planner and memory, unless the environment sets them.
-        let routed = origins.iter().find(|(key, _)| key.starts_with("models.")).map(|(_, origin)| origin.clone());
+        let routed = origins.iter().find(|(key, _)| key.starts_with("models.roles")).map(|(_, origin)| origin.clone());
         let routes = molt_api::model::ROLE_MODELS_ENV;
         if let Some(origin) = routed.filter(|_| var(routes).is_none_or(|v| v.trim().is_empty())) {
             config.route_roles(var)?;
             for name in ["planner", "memory"] {
                 origins.entry(format!("service.{name}.env.{routes}")).or_insert_with(|| origin.clone());
             }
+        }
+        // The user's named endpoints, for the gateway, unless the environment sets them; their keys go to it alone.
+        let endpoints = molt_gateway::provider::ENDPOINTS_VAR;
+        let declared =
+            origins.iter().find(|(key, _)| key.starts_with("models.endpoints")).map(|(_, origin)| origin.clone());
+        config.route_endpoints(var)?;
+        if let Some(origin) = declared.filter(|_| var(endpoints).is_none_or(|v| v.trim().is_empty())) {
+            origins.entry(format!("service.model.env.{endpoints}")).or_insert(origin);
         }
         // A web service the user added is one the planner may call, as with --allow-web.
         if let Some(origin) = origins.get(&format!("service.{WEB}")).cloned() {
@@ -661,6 +670,51 @@ mod tests {
         assert!(err.contains("--model"), "{err}");
         // Projects cannot choose models for the roles.
         home.user("").project("[models.roles]\nreviewer = \"opus\"\n");
+        assert!(home.build(None).is_err());
+    }
+
+    const GLM: &str = "[models.endpoints.glm]\nprotocol = \"anthropic\"\n\
+        base_url = \"https://open.bigmodel.cn/api/anthropic\"\nkey_env = \"GLM_API_KEY\"\n\
+        [models.endpoints.glm.models.\"glm-4.6\"]\ntools = true\nstreaming = true\noutput_schema = false\n\
+        max_output = 32000\nprice = { input = 0.6, output = 2.2 }\n";
+
+    #[test]
+    fn the_users_endpoints_reach_the_gateway_alone_and_only_it_is_given_their_keys() {
+        let home = Home::new();
+        home.user(&format!("{GLM}\n[models.roles]\nreviewer = \"glm/glm-4.6\"\n"));
+        let layered = home.build(None).unwrap();
+        let model = layered.config.service("model").unwrap();
+        let endpoints = molt_gateway::provider::parse_endpoints(&model.env["MOLT_ENDPOINTS"]).unwrap();
+        assert_eq!(endpoints, layered.config.models.endpoints);
+        assert_eq!(endpoints["glm"].models["glm-4.6"].price.unwrap().input, 0.6);
+        assert!(matches!(layered.origin("service.model.env.MOLT_ENDPOINTS"), Origin::User(_)));
+        assert_eq!(layered.config.service("planner").unwrap().env["MOLT_ROLE_MODELS"], r#"{"reviewer":"glm/glm-4.6"}"#);
+        // The key reaches the gateway's process and no other.
+        let host = |name: &str| (name == "GLM_API_KEY").then(|| "glm-secret".to_owned());
+        for service in &layered.config.services {
+            let got = service.launch_env_from(host).iter().any(|(_, v)| v == "glm-secret");
+            assert_eq!(got, service.name.as_str() == "model", "{}", service.name);
+            assert!(!service.env.values().any(|v| v.contains("glm-secret")), "{}", service.name);
+        }
+        // Set in the environment, MOLT_ENDPOINTS is used instead, and its keys are the ones passed.
+        let other = r#"{"ds":{"protocol":"chat_completions","base_url":"https://api.deepseek.com","key_env":"DS_KEY",
+            "models":{"deepseek-chat":{"tools":true,"streaming":true,"output_schema":false,"max_output":8192}}}}"#;
+        let layered = home.build_with(None, &[("MOLT_ENDPOINTS", other)]).unwrap();
+        let model = layered.config.service("model").unwrap();
+        assert!(!model.env.contains_key("MOLT_ENDPOINTS"));
+        assert!(model.pass_env.iter().any(|v| v == "DS_KEY") && !model.pass_env.iter().any(|v| v == "GLM_API_KEY"));
+
+        // Another service given the key is refused, and so is a bad endpoint.
+        home.user(&format!("{GLM}\n[[service]]\nname = \"shell\"\npass_env = [\"GLM_API_KEY\"]\n"));
+        let err = format!("{:#}", home.build(None).unwrap_err());
+        assert!(err.contains("service shell is given GLM_API_KEY") && err.contains("only the model gateway"), "{err}");
+        home.user(&GLM.replace("https://open.bigmodel.cn/api/anthropic", "https://open.bigmodel.cn/api/v1"));
+        let err = format!("{:#}", home.build(None).unwrap_err());
+        assert!(err.contains("[models.endpoints.glm]") && err.contains("remove the trailing /v1"), "{err}");
+        home.user(&GLM.replace("tools = true", "tools = true\ntool = true"));
+        assert!(format!("{:#}", home.build(None).unwrap_err()).contains("unknown field `tool`"));
+        // A project cannot declare an endpoint.
+        home.user("").project(GLM);
         assert!(home.build(None).is_err());
     }
 

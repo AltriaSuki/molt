@@ -16,6 +16,9 @@ pub struct Catalog {
     pub aliases: Vec<(String, String)>,
     /// OpenAI models declared in `MOLT_OPENAI_MODELS`.
     pub declared: Vec<String>,
+    /// The user's named endpoints, one line each: name, protocol, where,
+    /// which variable holds the key and whether it is set, the models.
+    pub endpoints: Vec<String>,
     pub probed: Records,
     providers: Providers,
     anthropic_base_url: String,
@@ -25,6 +28,8 @@ pub struct Catalog {
 /// One model, as [`Catalog::entry`] finds it.
 pub struct Entry {
     pub provider: Provider,
+    /// The user's endpoint it is on; `None` for the built-in one of `provider`.
+    pub endpoint: Option<String>,
     pub model: String,
     pub base_url: String,
     /// What the gateway itself knows the model does, in words.
@@ -43,10 +48,27 @@ impl Catalog {
         let mut aliases: Vec<(String, String)> =
             ["opus", "sonnet", "haiku"].iter().map(|a| ((*a).to_owned(), crate::resolve_model(a))).collect();
         aliases.extend(providers.aliases.iter().map(|(a, t)| (a.clone(), t.clone())));
+        let endpoints = providers
+            .endpoints
+            .iter()
+            .map(|(name, e)| {
+                let protocol = serde_json::to_value(e.protocol).unwrap_or_default();
+                let set = if providers.endpoint_keys.contains_key(name) { "set" } else { "not set" };
+                let models: Vec<String> = e.models.keys().map(|m| format!("{name}/{m}")).collect();
+                format!(
+                    "{name}: {} at {}, key in {} ({set}): {}",
+                    protocol.as_str().unwrap_or(""),
+                    e.origin(),
+                    e.key_env,
+                    models.join(", ")
+                )
+            })
+            .collect();
         Ok(Self {
             default_model: crate::default_model(&get),
             aliases,
             declared: providers.openai_models.keys().cloned().collect(),
+            endpoints,
             probed: Records::from_vars(get)?,
             anthropic_base_url: get("ANTHROPIC_BASE_URL")
                 .unwrap_or_else(|| crate::DEFAULT_BASE_URL.into())
@@ -59,21 +81,24 @@ impl Catalog {
 
     /// Where calls naming `named` go and what is known of that model.
     pub fn entry(&self, named: &str) -> Result<Entry, RemoteError> {
-        let (provider, model) = self.providers.resolve(named)?;
-        let base_url = match provider {
-            Provider::Anthropic => self.anthropic_base_url.clone(),
-            Provider::Openai => self.providers.openai_base_url.clone(),
-        };
-        let known = match provider {
-            Provider::Anthropic => known_anthropic(&model),
-            Provider::Openai => match self.providers.capabilities(&model) {
+        let route = self.providers.resolve(named)?;
+        let (provider, model) = (route.provider, route.model.clone());
+        let base_url = self.providers.base_url(&route, &self.anthropic_base_url).to_owned();
+        let known = match (provider, &route.endpoint) {
+            (Provider::Anthropic, None) => known_anthropic(&model),
+            (_, endpoint) => match self.providers.openai_capabilities(&route) {
                 Ok(c) => {
-                    let declared =
-                        if self.providers.openai_models.contains_key(&model) { "declared" } else { "built in" };
+                    let declared = match endpoint {
+                        Some(name) => format!("declared on endpoint {name}"),
+                        None if self.providers.openai_models.contains_key(&model) => "declared".into(),
+                        None => "built in".into(),
+                    };
+                    let context = c.context.map(|n| format!(", a context of {n} tokens")).unwrap_or_default();
                     let efforts: Vec<String> =
                         c.efforts.iter().map(|e| serde_json::to_value(e).unwrap_or_default().to_string()).collect();
                     format!(
-                        "{declared}: tools {}, streaming {}, output_schema {}, efforts [{}], at most {} output tokens",
+                        "{declared}: tools {}, streaming {}, output_schema {}, efforts [{}], at most {} output \
+                         tokens{context}",
                         yes(c.tools),
                         yes(c.streaming),
                         yes(c.output_schema),
@@ -85,8 +110,12 @@ impl Catalog {
             },
         };
         let probed = self.probed.lookup(provider, &base_url, &model).cloned();
-        let price = self.prices.lookup(&model);
-        Ok(Entry { provider, model, base_url, known, probed, price })
+        let declared_price = self.providers.declared(&route).and_then(|d| d.price).map(|p| {
+            let source = PriceSource { entry: route.qualified(), source: route.place(), ..Default::default() };
+            (Prices::stated(p.input, p.output, p.cache_write, p.cache_read), source)
+        });
+        let price = declared_price.or_else(|| self.prices.lookup(&model));
+        Ok(Entry { provider, endpoint: route.endpoint, model, base_url, known, probed, price })
     }
 }
 

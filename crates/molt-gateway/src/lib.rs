@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::prices::PriceTable;
+use crate::prices::{PriceSource, PriceTable};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 /// Kept back from a caller's deadline so the reply reaches it before the
@@ -111,6 +111,8 @@ impl Config {
     /// | `MOLT_FALLBACKS` | `1` (`0` turns them off) |
     /// | `MOLT_MODEL_PRICES`, `MOLT_PRICES_FILE` | see [`prices`] |
     /// | `MOLT_MODELS_FILE` | see [`probe::records_path`] |
+    /// | `MOLT_ENDPOINTS` | the user's named endpoints, see [`provider::Endpoint`] |
+    /// | each endpoint's `key_env` | that endpoint's key |
     ///
     /// An empty variable counts as unset. `MOLT_MAX_TOKENS`,
     /// `MOLT_MODEL_TIMEOUT_S` and `MOLT_MODEL_CONCURRENCY` must be above 0:
@@ -119,7 +121,8 @@ impl Config {
         Self::from_vars(|name| std::env::var(name).ok())
     }
 
-    fn from_vars(var: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+    /// [`Config::from_env`] with the variables `var` reads.
+    pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
         let get = |name: &str| var(name).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
         let parse = |name: &str, default: u64| -> anyhow::Result<u64> {
             get(name).map_or(Ok(default), |v| v.parse().with_context(|| format!("{name}={v:?} is not a number")))
@@ -128,8 +131,11 @@ impl Config {
         let api_key = get("ANTHROPIC_API_KEY").unwrap_or_default();
         let auth_token = get("ANTHROPIC_AUTH_TOKEN");
         ensure!(
-            !api_key.is_empty() || auth_token.is_some() || providers.openai_key.is_some(),
-            "ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or OPENAI_API_KEY is not set"
+            !api_key.is_empty()
+                || auth_token.is_some()
+                || providers.openai_key.is_some()
+                || !providers.endpoint_keys.is_empty(),
+            "ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or OPENAI_API_KEY is not set, nor the key_env of a named endpoint"
         );
         let base_url = get("ANTHROPIC_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.into());
         let effort = match get("MOLT_EFFORT") {
@@ -188,7 +194,7 @@ pub fn resolved_model(var: impl Fn(&str) -> Option<String>, named: Option<&str>)
     let get = |name: &str| var(name).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
     let providers = provider::Providers::from_vars(&get).ok()?;
     let named = named.map(str::trim).filter(|m| !m.is_empty()).map_or_else(|| default_model(&get), str::to_owned);
-    providers.resolve(&named).ok().map(|(_, id)| id)
+    providers.resolve(&named).ok().map(|route| route.model)
 }
 
 pub fn resolve_model(name: &str) -> String {
@@ -212,6 +218,8 @@ pub struct Gateway {
     cfg: Config,
     anthropic: Option<api::Api>,
     openai: Option<api::Api>,
+    /// The user's named endpoints whose key is set, by name.
+    endpoints: std::collections::BTreeMap<String, api::Api>,
 }
 
 impl Gateway {
@@ -225,11 +233,25 @@ impl Gateway {
             .then(|| api::Api::new(&cfg))
             .transpose()?;
         let openai = cfg.providers.openai_key.as_ref().map(|key| api::Api::openai(&cfg, key)).transpose()?;
+        let mut endpoints = std::collections::BTreeMap::new();
+        for (name, endpoint) in &cfg.providers.endpoints {
+            match cfg.providers.endpoint_keys.get(name) {
+                Some(key) => {
+                    endpoints.insert(name.clone(), api::Api::endpoint(&cfg, name, endpoint, key)?);
+                }
+                None => tracing::warn!(
+                    endpoint = %name,
+                    key_env = %endpoint.key_env,
+                    "the endpoint's key_env is not set; calls to it are refused"
+                ),
+            }
+        }
         ensure!(
-            anthropic.is_some() || openai.is_some(),
-            "no model provider credential: set ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or OPENAI_API_KEY"
+            anthropic.is_some() || openai.is_some() || !endpoints.is_empty(),
+            "no model provider credential: set ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, OPENAI_API_KEY or the \
+             key_env of a named endpoint"
         );
-        Ok(Self { cfg, anthropic, openai })
+        Ok(Self { cfg, anthropic, openai, endpoints })
     }
 
     /// One Messages API call, with retries.
@@ -273,13 +295,12 @@ impl Gateway {
         // A deadline too far off to represent is no deadline.
         let deadline = within.and_then(|d| Instant::now().checked_add(d));
         let named = req.model.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or(&self.cfg.default_model).to_owned();
-        let (provider, model) = self.cfg.providers.resolve(&named)?;
-        let api = self.api(provider).ok_or_else(|| RemoteError {
-            code: ErrorCode::Invalid,
-            message: format!("no credential configured for {provider}"),
-        })?;
+        let route = self.cfg.providers.resolve(&named)?;
+        let api = self.api(&route)?;
+        let (provider, model) = (route.provider, route.model.clone());
         let messages = req.messages.len();
-        let probed = self.cfg.probed.lookup(provider, self.base_url(provider), &model);
+        let probed = self.cfg.probed.lookup(provider, self.base_url(&route), &model);
+        let declared = self.cfg.providers.declared(&route);
         let mut req = req;
         if req.stream.is_some() && probed.is_some_and(|p| p.streaming == Some(false)) {
             // The reply stays whole; only its previews are lost.
@@ -287,8 +308,14 @@ impl Gateway {
             req.stream = None;
         }
         let call = match provider {
-            provider::Provider::Anthropic => body::build(&self.cfg, &model, req, probed)?,
-            provider::Provider::Openai => openai::build(&self.cfg, &model, req, probed)?,
+            provider::Provider::Anthropic => {
+                if req.stream.is_some() && declared.is_some_and(|d| !d.streaming) {
+                    tracing::debug!(%model, "not streaming: its endpoint declares streaming = false");
+                    req.stream = None;
+                }
+                body::build(&self.cfg, &model, req, probed, declared)?
+            }
+            provider::Provider::Openai => openai::build(&self.cfg, &route, req, probed)?,
         };
         tracing::debug!(
             %provider,
@@ -315,11 +342,17 @@ impl Gateway {
             probe::tool_as_answer(&mut msg.content, &mut msg.stop_reason);
         }
         let usage = Usage::from(msg.usage);
+        // A price declared with the endpoint is that model's there, whatever the reply names.
+        let declared_price = declared.and_then(|d| d.price).map(|p| {
+            let source = PriceSource { entry: route.qualified(), source: route.place(), ..Default::default() };
+            (prices::Prices::stated(p.input, p.output, p.cache_write, p.cache_read), source)
+        });
         // After a fallback or a router's choice another model answered, and its prices apply.
-        let priced =
-            self.cfg.prices.lookup(&msg.model).or_else(|| {
-                (provider == provider::Provider::Anthropic).then(|| self.cfg.prices.lookup(&model)).flatten()
-            });
+        let priced = declared_price.or_else(|| self.cfg.prices.lookup(&msg.model)).or_else(|| {
+            (provider == provider::Provider::Anthropic || route.endpoint.is_some())
+                .then(|| self.cfg.prices.lookup(&model))
+                .flatten()
+        });
         if priced.is_none() {
             let mut looked_for = prices::names(&msg.model);
             for name in prices::names(&model) {
@@ -359,19 +392,41 @@ impl Gateway {
             usage,
             cost_usd,
             price_source: priced.map(|(_, s)| s),
-            context_tokens: (provider == provider::Provider::Openai)
-                .then(|| self.cfg.providers.capabilities(&model).ok().and_then(|c| c.context))
-                .flatten(),
+            context_tokens: match declared {
+                Some(d) => d.context,
+                None => (provider == provider::Provider::Openai)
+                    .then(|| self.cfg.providers.capabilities(&model).ok().and_then(|c| c.context))
+                    .flatten(),
+            },
         })
     }
 }
 
 impl Gateway {
-    fn api(&self, provider: provider::Provider) -> Option<&api::Api> {
-        match provider {
-            provider::Provider::Anthropic => self.anthropic.as_ref(),
-            provider::Provider::Openai => self.openai.as_ref(),
-        }
+    /// The client for `route`'s endpoint; `invalid` when its credential is not set.
+    fn api(&self, route: &provider::Route) -> Result<&api::Api, RemoteError> {
+        let api = match &route.endpoint {
+            Some(name) => self.endpoints.get(name),
+            None => match route.provider {
+                provider::Provider::Anthropic => self.anthropic.as_ref(),
+                provider::Provider::Openai => self.openai.as_ref(),
+            },
+        };
+        api.ok_or_else(|| RemoteError {
+            code: ErrorCode::Invalid,
+            message: match &route.endpoint {
+                Some(name) => format!(
+                    "no credential for endpoint {name}: set {}",
+                    self.cfg.providers.endpoints.get(name).map_or("its key_env", |e| e.key_env.as_str())
+                ),
+                None => format!("no credential configured for {}", route.provider),
+            },
+        })
+    }
+
+    /// The origin `route`'s calls go to.
+    pub(crate) fn base_url(&self, route: &provider::Route) -> &str {
+        self.cfg.providers.base_url(route, &self.cfg.base_url)
     }
 
     /// For a refused call that names a model which is no alias but is one
