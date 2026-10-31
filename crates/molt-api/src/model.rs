@@ -20,6 +20,35 @@ use serde_json::{json, Value};
 /// the call's cost unknown.
 pub const COMPLETE: &str = "model.complete";
 
+/// `model.limits`: what one model call to a model can take, as the
+/// gateway's trusted configuration says, so a caller can fit its first
+/// request before it has made one. Nothing is sent to a provider and
+/// nothing is billed. New: an older gateway answers it with an `invalid`
+/// error, and a caller then falls back to its own guess.
+pub const LIMITS: &str = "model.limits";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitsRequest {
+    /// The model as a call names it; `None` asks for the gateway's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitsResponse {
+    /// Where a call naming it goes, as `place/model`: `glm/glm-4.6`.
+    #[serde(default)]
+    pub route: String,
+    /// The context window in tokens, the reply included, when the gateway
+    /// knows it; `None` leaves it to the caller's own setting or guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
+    /// The most `max_tokens` a call to it may ask for; a larger one is
+    /// lowered to it. `None`: the gateway sets no cap of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+}
+
 /// Who in a run makes a model call, so previews, retries and transcripts can
 /// say whose turn it was. An attempt's index is given apart, where there is
 /// one. A role this build does not know reads as [`Role::Other`].
@@ -404,6 +433,16 @@ pub fn tool_result(tool_use_id: &str, content: impl Into<String>, is_error: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_limits_reply_reads_with_fields_left_out_and_writes_only_what_is_known() {
+        let empty: LimitsResponse = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty, LimitsResponse::default());
+        let known =
+            LimitsResponse { route: "glm/glm-4.6".into(), context_tokens: Some(32_768), max_output_tokens: None };
+        assert_eq!(serde_json::to_value(&known).unwrap(), json!({"route":"glm/glm-4.6","context_tokens":32768}));
+        assert_eq!(serde_json::to_value(LimitsRequest::default()).unwrap(), json!({}));
+    }
 
     #[test]
     fn role_models_name_routed_roles_only_and_never_the_attempts() {

@@ -634,7 +634,7 @@ impl Attempt {
         kept.known = conv.known;
         kept.compacted = conv.compacted.clone();
         kept.standing = conv.standing.clone();
-        let limits = self.ctx.limits();
+        let limits = self.ctx.limits_of(&self.ctx.model_of(conv));
         let bound = crate::fit::Limits { tokens: limits.tokens, bytes: self.ctx.cfg.frame_bytes / 4 };
         if let Err(why) = kept.fit(bound) {
             tracing::warn!(run = %self.ctx.trace, attempt = self.index, %why, "its conversation is not kept");

@@ -344,9 +344,26 @@ the review findings and names the kept fork for inspection.
 ### Long tasks
 
 Before each model call, the planner checks that the conversation fits: the
-model's input (`MOLT_CONTEXT_TOKENS` less `MOLT_MAX_TOKENS` for the reply,
-counted from what the model measured on the last call) and the bus frame
-(8 MiB for the whole request). When it would not, the oldest turns are left
+input of the model that call goes to (its context window less the room kept
+for the reply, counted from what the model measured on the last call, tool
+definitions included) and the bus frame (8 MiB for the whole request). Each
+model has its own: a reviewer or explorer routed to a model with a smaller
+window ([Role models](models.md#role-models)) is fitted to that window, from
+its first call, while the attempts keep the run's. Before the first call to a
+model the planner asks the gateway what it declares for it (`model.limits`,
+which sends nothing to the provider and costs nothing): the context window
+(`context` of a [named endpoint](models.md#named-endpoints)'s model or of
+`MOLT_OPENAI_MODELS`) and the most it writes (`max_output`, or the built-in
+cap of a Claude model). The room kept for the reply is `MOLT_MAX_TOKENS`,
+lowered to that cap, and the call asks for no more. `MOLT_CONTEXT_TOKENS`,
+when set, is every model's window. A model whose window nobody declares is
+fitted to a guess from its name, `200000` tokens for Claude models and
+`128000` for others, and progress says so once a run for any other model,
+with how to declare it. When a reply reports a window other than the one its
+call was fitted to, progress says so once, and the reply's window is used
+from then on (`MOLT_CONTEXT_TOKENS` still wins). Routing a role to another
+model never changes the run's budget: every call counts against the one
+budget, whichever model made it. When it would not, the oldest turns are left
 out, always a whole round trip, so no tool call loses its result and no
 assistant turn is changed. A single result too big to fit even alone is cut
 down, and says so. Progress notes each time this happens, and the full

@@ -599,6 +599,8 @@ impl Config {
         // to each request; the planner enforces the run's own limits.
         planner.requests = vec![
             request(molt_api::model::COMPLETE, Budget::new(4_000_000_000, 0, 1_000_000))?,
+            // What each model can take, asked once a model before its first call; nothing is billed.
+            request(molt_api::model::LIMITS, Budget::new(0, 0, 1_000_000))?,
             request("fs.*", Budget::new(0, 0, 10_000_000))?,
             request(molt_api::shell::RUN, Budget::new(0, 0, 1_000_000))?,
             request(&format!("topic:publish:{}", molt_api::progress::TOPIC), Budget::new(0, 0, 10_000_000))?,
@@ -1296,6 +1298,7 @@ mod tests {
             targets,
             [
                 "model.complete",
+                "model.limits",
                 "fs.*",
                 "shell.run",
                 "topic:publish:progress",

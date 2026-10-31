@@ -48,10 +48,19 @@ impl Limits {
     /// The context window of `model`, as the planner names it (an alias, a
     /// full id, or `None` for the gateway's default, which is Claude).
     pub fn context_of(model: Option<&str>) -> u32 {
+        if Self::guessed(model) {
+            128_000
+        } else {
+            200_000
+        }
+    }
+
+    /// [`Limits::context_of`] is only a guess for `model`: its name is not one
+    /// whose window is known, so it should be declared.
+    pub fn guessed(model: Option<&str>) -> bool {
         match model {
-            None | Some("opus" | "sonnet" | "haiku") => 200_000,
-            Some(id) if id.starts_with("claude-") => 200_000,
-            Some(_) => 128_000,
+            None | Some("opus" | "sonnet" | "haiku") => false,
+            Some(id) => !id.strip_prefix("anthropic/").unwrap_or(id).starts_with("claude-"),
         }
     }
 }
@@ -440,6 +449,8 @@ mod tests {
         conv.push(added);
         assert_eq!(conv.tokens(), 1050 + more);
         assert!(Limits::context_of(Some("gpt-5")) < Limits::context_of(Some("claude-opus-5-5")));
+        assert!(Limits::guessed(Some("glm/glm-4.6")) && !Limits::guessed(Some("anthropic/claude-opus-5-5")));
+        assert!(!Limits::guessed(None) && !Limits::guessed(Some("haiku")));
         assert_eq!(Limits::new(200_000, 32_000, 1 << 20).tokens, 168_000);
     }
 }

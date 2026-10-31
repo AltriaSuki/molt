@@ -407,6 +407,32 @@ impl Gateway {
 }
 
 impl Gateway {
+    /// What a call naming `named` (`None`: the default model) can take, from
+    /// the trusted configuration alone: nothing is sent and nothing billed.
+    /// The same window a reply's `context_tokens` reports, and the cap its
+    /// `max_tokens` is lowered to. A model a call would be refused for is
+    /// refused here the same way.
+    pub fn limits(&self, named: Option<&str>) -> Result<molt_api::model::LimitsResponse, RemoteError> {
+        let named = named.map(str::trim).filter(|m| !m.is_empty()).unwrap_or(&self.cfg.default_model);
+        let route = self.cfg.providers.resolve(named)?;
+        let (context_tokens, max_output_tokens) = match route.provider {
+            provider::Provider::Anthropic => {
+                let cap = profile::profile(&route.model).max_output;
+                match self.cfg.providers.declared(&route) {
+                    Some(d) => (d.context, Some(cap.map_or(d.max_output, |cap| cap.min(d.max_output)))),
+                    None => (None, cap),
+                }
+            }
+            provider::Provider::Openai => {
+                let caps = self.cfg.providers.openai_capabilities(&route)?;
+                (caps.context, Some(caps.max_output))
+            }
+        };
+        Ok(molt_api::model::LimitsResponse { route: route.qualified(), context_tokens, max_output_tokens })
+    }
+}
+
+impl Gateway {
     /// The client for `route`'s endpoint; `invalid` when its credential is not set.
     fn api(&self, route: &provider::Route) -> Result<&api::Api, RemoteError> {
         let api = match &route.endpoint {
@@ -480,7 +506,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
     row[b.len()]
 }
 
-/// Serve `model.complete` on `svc` until its link closes. A request's
+/// Serve `model.complete` and `model.limits` on `svc` until its link closes. A request's
 /// `budget.ms` is how long its caller waits (0: no deadline), and the call
 /// stops in time to answer within it.
 pub async fn serve(svc: Arc<Service>, gateway: Arc<Gateway>) {
@@ -667,6 +693,13 @@ async fn handle_observed(
             };
             serde_json::to_value(response?)
                 .map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("encoding the response: {e}") })
+        }
+        "limits" => {
+            let request: molt_api::model::LimitsRequest = serde_json::from_value(req.payload).map_err(|e| {
+                RemoteError { code: ErrorCode::Invalid, message: format!("bad model.limits request: {e}") }
+            })?;
+            serde_json::to_value(gateway.limits(request.model.as_deref())?)
+                .map_err(|e| RemoteError { code: ErrorCode::Failed, message: format!("encoding the limits: {e}") })
         }
         other => Err(RemoteError { code: ErrorCode::Invalid, message: format!("no method {other:?}") }),
     }
@@ -1245,5 +1278,49 @@ mod tests {
         assert!(result["settlement"]["usage"].is_null() && result["settlement"]["cost_usd"].is_null());
         assert!(result["settlement"]["remote_cancel_confirmed"].is_null());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_limits_of_each_model_come_from_its_declaration_without_a_call() {
+        let server = MockServer::start().await;
+        let endpoints = r#"{"small":{"protocol":"chat_completions","base_url":"https://small.example","key_env":"SMALL_KEY",
+            "models":{"s":{"tools":true,"streaming":true,"output_schema":false,"max_output":4096,"context":32768}}},
+            "near":{"protocol":"anthropic","base_url":"https://near.example","key_env":"NEAR_KEY",
+            "models":{"n":{"tools":true,"streaming":true,"output_schema":false,"max_output":8000}}}}"#;
+        let models = r#"{"r":{"tools":true,"streaming":true,"output_schema":true,"max_output":100,"protocol":"responses","context":400000}}"#;
+        let mut cfg = from(&[
+            ("ANTHROPIC_API_KEY", "a"),
+            ("OPENAI_API_KEY", "o"),
+            ("SMALL_KEY", "s"),
+            ("NEAR_KEY", "n"),
+            ("MOLT_ENDPOINTS", endpoints),
+            ("MOLT_OPENAI_MODELS", models),
+        ])
+        .unwrap();
+        cfg.base_url = server.uri();
+        let gw = Gateway::new(cfg).unwrap();
+        let limits = |model: Option<&str>| gw.limits(model).unwrap();
+        let small = limits(Some("small/s"));
+        assert_eq!(
+            (small.route.as_str(), small.context_tokens, small.max_output_tokens),
+            ("small/s", Some(32_768), Some(4096))
+        );
+        // Declared without a window: the cap is known, the window is left to the caller.
+        let near = limits(Some("near/n"));
+        assert_eq!((near.context_tokens, near.max_output_tokens), (None, Some(8000)));
+        assert_eq!(limits(Some("openai/r")).context_tokens, Some(400_000));
+        // The default model is the one a call without a model goes to.
+        let default = limits(None);
+        assert_eq!(default.route, "anthropic/claude-opus-5-5");
+        assert_eq!(default.max_output_tokens, Some(128_000));
+        assert_eq!(limits(Some(" ")).route, default.route);
+        // A model a call would be refused for is refused here too.
+        assert_eq!(gw.limits(Some("openai/unknown")).unwrap_err().code, ErrorCode::Invalid);
+        assert_eq!(gw.limits(Some("small/other")).unwrap_err().code, ErrorCode::Invalid);
+        // Over the bus, and nothing reached a provider.
+        let reply = handle(&gw, envelope("model.limits", json!({"model":"small/s"}))).await.unwrap();
+        assert_eq!(reply, json!({"route":"small/s","context_tokens":32768,"max_output_tokens":4096}));
+        assert_eq!(handle(&gw, envelope("model.limits", json!([]))).await.unwrap_err().code, ErrorCode::Invalid);
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }
