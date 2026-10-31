@@ -14,6 +14,7 @@ use molt_proto::RemoteError;
 use regex::RegexBuilder;
 
 use crate::error::invalid;
+use crate::matching::{self, Lines};
 use crate::paths::{self, shown};
 use crate::{walk, Roots};
 
@@ -213,30 +214,57 @@ pub(crate) fn edit(roots: &Roots, req: EditRequest) -> Result<EditResponse, Remo
     }
     let old =
         String::from_utf8(fs::read(&path).map_err(io)?).map_err(|_| invalid(format!("{name} is a binary file")))?;
-    let count = old.matches(&req.old).count();
-    match count {
-        0 => return Err(invalid(format!("old text not found in {name}"))),
-        1 => {}
-        n if !req.replace_all => {
-            return Err(invalid(format!(
-                "old text occurs {n} times in {name}; add surrounding context to make it unique, or set replace_all"
-            )))
+    let lines = Lines::new(&old);
+    if let Some(anchor) = &req.anchor {
+        if req.replace_all {
+            return Err(invalid("anchor picks one match; leave it out to set replace_all"));
         }
-        _ => {}
+        if let Some(why) = matching::check_anchor(name, &lines, anchor) {
+            return Err(invalid(why));
+        }
     }
+    let (tolerance, mut spans) = matching::find(&lines, &req.old);
+    if spans.is_empty() {
+        return Err(invalid(matching::miss(name, &lines, &req.old)));
+    }
+    if let Some(anchor) = &req.anchor {
+        let all = spans.clone();
+        spans.retain(|s| s.line == anchor.line);
+        if spans.is_empty() {
+            return Err(invalid(matching::off_anchor(name, &lines, tolerance, &all, anchor.line)));
+        }
+    }
+    if spans.len() > 1 && !req.replace_all {
+        return Err(invalid(matching::ambiguous(name, &lines, tolerance, &spans)));
+    }
+    // Each replacement takes the line ending of the line it starts on, so a
+    // CRLF file stays CRLF whatever endings the model wrote. There are only
+    // two versions of it, so a million replacements cost no more memory.
+    let (lf, crlf) = matching::with_endings(&req.new);
+    let news: Vec<&str> =
+        spans.iter().map(|s| if lines.crlf_at(s.start) { crlf.as_str() } else { lf.as_str() }).collect();
     // Sized before it is built, so an edit far over the limit costs no memory.
-    // Matches do not overlap, so they cover at most the whole file.
-    let edits = if req.replace_all { count } else { 1 };
-    let size = (old.len() - edits * req.old.len()).saturating_add(edits.saturating_mul(req.new.len()));
+    let removed: usize = spans.iter().map(|s| s.end - s.start).sum();
+    let size = (old.len() - removed).saturating_add(news.iter().map(|n| n.len()).sum());
     if size > MAX_WRITE_BYTES {
         return Err(invalid(format!("the edited {name} would be {size} bytes; the limit is {MAX_WRITE_BYTES}")));
     }
-    let new = if req.replace_all { old.replace(&req.old, &req.new) } else { old.replacen(&req.old, &req.new, 1) };
+    let mut new = String::with_capacity(size);
+    let mut at = 0;
+    for (span, text) in spans.iter().zip(news) {
+        new.push_str(&old[at..span.start]);
+        new.push_str(text);
+        at = span.end;
+    }
+    new.push_str(&old[at..]);
+    if new == old {
+        return Err(invalid("the edit changes nothing: the new text is what is there already"));
+    }
     let syntax = syntax_report(req.syntax, &req.path, Some(&old), &new);
     if !rejected(&syntax) {
         atomic_write(&path, new.as_bytes(), Some(meta.permissions())).map_err(io)?;
     }
-    Ok(EditResponse { replacements: count as u64, syntax })
+    Ok(EditResponse { replacements: spans.len() as u64, syntax, line: Some(spans[0].line), tolerance })
 }
 
 /// Replace `dest` with `data`: write a temporary file next to it, then

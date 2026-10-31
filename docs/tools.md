@@ -108,6 +108,38 @@ An answer is at most 40 KiB and a query takes at most 30 s. The planner
 holds `fs.*` in the default setup, so it holds `fs.git` too, and it offers
 the tool only when it does and `MOLT_GIT` is on.
 
+## How `edit_file` finds the text
+
+`edit_file` replaces `old_string` in a file (`fs.edit`). It looks for it in
+three steps, and the first that finds it decides (#261):
+
+1. exactly;
+2. with `\r\n` and `\n` taken as the same, so text copied with LF line
+   endings finds its place in a CRLF file;
+3. also ignoring spaces and tabs at the ends of lines.
+
+Indentation is never ignored: spaces where the file has tabs do not match.
+Whatever the step, `new_string` gets the line ending of the line the match
+starts on, so a CRLF file stays CRLF. The result says the line the change
+starts on and, when it did not match exactly, what was ignored.
+
+Without `replace_all`, the text must occur once in the step that finds it.
+When it occurs more often, the error lists the line each occurrence starts
+on with its anchor, `LINE:HASH`, where the hash is the first four hex digits
+of the SHA-256 of the line without its line ending and trailing whitespace.
+Passing one as `anchor` picks that occurrence; an anchor whose line has
+changed since is refused, with what the line reads now.
+
+When the text is found nowhere, the error names the file's version (the
+first twelve hex digits of its SHA-256) and shows up to two windows of the
+file most like `old_string`, with their line numbers, anchors and text as
+it is now, and the first line that differs (or that they differ only in
+whitespace, such as tabs against spaces). The model can correct its call
+from that alone, so the planner does not tell it to read the file again;
+when nothing is like it, it does. On a file too large to compare every
+window (over 400,000 line comparisons), only windows that share a line with
+`old_string` are scored.
+
 ## Adding a tool of your own
 
 A tool is served by a service you run: a program that connects to the bus

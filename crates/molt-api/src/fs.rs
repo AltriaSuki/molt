@@ -93,8 +93,21 @@ pub struct WriteResponse {
     pub syntax: Option<SyntaxReport>,
 }
 
-/// Replace exact text in a file. Without `replace_all`, `old` must occur
-/// exactly once; zero or several matches are an `invalid` error.
+/// Replace text in a file. Without `replace_all`, `old` must occur exactly
+/// once; zero or several matches are an `invalid` error.
+///
+/// `old` is looked for in three steps, and the first that finds it decides
+/// (#261): exactly; then with `\r\n` and `\n` taken as the same; then also
+/// ignoring whitespace at the ends of lines ([`Tolerance`]). Indentation is
+/// never ignored. Several matches in the step that finds it are refused, with
+/// the line each starts on and its [`Anchor`]. Whatever the step, the line
+/// endings of `new` are made those of the line the match starts on, so a
+/// CRLF file stays CRLF.
+///
+/// When nothing matches, the error names the file's version (the first
+/// twelve hex digits of its content's SHA-256) and, when some are close, the lines most like
+/// `old`, with their numbers, anchors and text as they are now, and the
+/// first line that differs; such a message contains [`EDIT_SHOWS_LINES`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditRequest {
     pub workspace: String,
@@ -106,6 +119,11 @@ pub struct EditRequest {
     /// Whether to look for syntax errors the edit introduces. Default: off.
     #[serde(default, skip_serializing_if = "SyntaxCheck::is_off")]
     pub syntax: SyntaxCheck,
+    /// The line the match must start on, and optionally that line's hash:
+    /// picks one of several matches, and refuses the edit when the line has
+    /// changed. Not with `replace_all`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Anchor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,7 +132,67 @@ pub struct EditResponse {
     /// Syntax errors the edit introduced, when the request asked and there were any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub syntax: Option<SyntaxReport>,
+    /// The line the first replacement starts on, 1-based, in the file as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    /// What `old` was matched ignoring, when it was not matched exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tolerance: Option<Tolerance>,
 }
+
+/// What an edit's `old` was matched ignoring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tolerance {
+    /// `\r\n` against `\n`.
+    LineEndings,
+    /// Line endings, and spaces and tabs at the ends of lines.
+    TrailingWhitespace,
+}
+
+/// A line of a file, as `LINE` or `LINE:HASH`: its 1-based number and,
+/// optionally, the hash of its text: the first four hex digits of the
+/// SHA-256 of the line without its line ending and trailing whitespace, so a
+/// line keeps its hash when only those change. Edit errors show the anchors
+/// of the lines they name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Anchor {
+    pub line: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+}
+
+impl Anchor {
+    /// `42` or `42:1a2b`.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let bad = || format!("anchor {text:?} is not LINE or LINE:HASH, such as 42 or 42:1a2b");
+        let (line, hash) = match text.trim().split_once(':') {
+            Some((line, hash)) => (line, Some(hash.trim())),
+            None => (text.trim(), None),
+        };
+        let line: u64 = line.trim().parse().map_err(|_| bad())?;
+        if line == 0 {
+            return Err(format!("anchor {text:?} names line 0; lines start at 1"));
+        }
+        match hash {
+            Some(h) if h.is_empty() || !h.bytes().all(|b| b.is_ascii_hexdigit()) => Err(bad()),
+            hash => Ok(Self { line, hash: hash.map(str::to_ascii_lowercase) }),
+        }
+    }
+}
+
+impl std::fmt::Display for Anchor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.hash {
+            Some(hash) => write!(f, "{}:{hash}", self.line),
+            None => write!(f, "{}", self.line),
+        }
+    }
+}
+
+/// In an edit error, this says the message shows the file's current lines
+/// near `old`, so there is no need to read the file again to correct it.
+pub const EDIT_SHOWS_LINES: &str = "without reading the file again";
 
 /// What a write or edit does about syntax errors it would introduce. Files
 /// in a language the service cannot parse are never checked, and neither is

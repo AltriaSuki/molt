@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use molt_api::fs::{
     ChangeKind, DiffResponse, EditResponse, FilesChanged, ForkResponse, ListResponse, MergeResponse, ReadResponse,
-    SearchResponse, WriteResponse,
+    SearchResponse, Tolerance, WriteResponse, EDIT_SHOWS_LINES,
 };
 use molt_proto::{ErrorCode, RemoteError};
 use molt_tools::{Fs, Roots};
@@ -277,12 +277,12 @@ async fn edit_needs_one_match_unless_replace_all() {
     fs::set_permissions(env.ws.join("f.rs"), fs::Permissions::from_mode(0o700)).unwrap();
     let edit = |old: &str, new: &str, all: bool| json!({ "workspace": "ws", "path": "f.rs", "old": old, "new": new, "replace_all": all });
 
-    assert_eq!(env.ok("edit", edit("let b", "let bee", false)).await, json!({ "replacements": 1 }));
+    assert_eq!(env.ok("edit", edit("let b", "let bee", false)).await, json!({ "replacements": 1, "line": 2 }));
     assert_eq!(fs::read_to_string(env.ws.join("f.rs")).unwrap(), "let a = 1;\nlet bee = 1;\nlet c = 1;\n");
     assert_eq!(fs::metadata(env.ws.join("f.rs")).unwrap().permissions().mode() & 0o777, 0o700);
 
     let msg = env.invalid("edit", edit("let z", "let y", false)).await;
-    assert_eq!(msg, "old text not found in f.rs");
+    assert!(msg.starts_with("old text not found in f.rs (version "), "{msg}");
     let msg = env.invalid("edit", edit("= 1;", "= 2;", false)).await;
     assert!(msg.contains("3 times") && msg.contains("replace_all"), "{msg}");
     env.invalid("edit", edit("", "x", false)).await;
@@ -290,8 +290,136 @@ async fn edit_needs_one_match_unless_replace_all() {
     let msg = env.invalid("edit", json!({ "workspace": "ws", "path": "g.rs", "old": "a", "new": "b" })).await;
     assert!(msg.contains("does not exist"), "{msg}");
 
-    assert_eq!(env.ok("edit", edit("= 1;", "= 2;", true)).await, json!({ "replacements": 3 }));
+    assert_eq!(env.ok("edit", edit("= 1;", "= 2;", true)).await, json!({ "replacements": 3, "line": 1 }));
     assert_eq!(fs::read_to_string(env.ws.join("f.rs")).unwrap(), "let a = 2;\nlet bee = 2;\nlet c = 2;\n");
+}
+
+#[tokio::test]
+async fn lf_old_text_edits_a_crlf_file_once_and_keeps_its_crlf_line_endings() {
+    let env = Env::new();
+    let file = "fn main() {\r\n    let 名字 = \"世界\";\r\n    println!(\"你好，{名字}\");\r\n}\r\n";
+    Env::put(&env.ws, &[("src/main.rs", file)]);
+    let edit = |old: &str, new: &str| json!({ "workspace": "ws", "path": "src/main.rs", "old": old, "new": new });
+    let reply = |v: Value| serde_json::from_value::<EditResponse>(v).unwrap();
+
+    let r = reply(
+        env.ok(
+            "edit",
+            edit("    let 名字 = \"世界\";\n    println!", "    let 名字 = \"世界\";\n    let n = 1;\n    println!"),
+        )
+        .await,
+    );
+    assert_eq!((r.replacements, r.line, r.tolerance), (1, Some(2), Some(Tolerance::LineEndings)));
+    let now = fs::read_to_string(env.ws.join("src/main.rs")).unwrap();
+    assert_eq!(
+        now,
+        "fn main() {\r\n    let 名字 = \"世界\";\r\n    let n = 1;\r\n    println!(\"你好，{名字}\");\r\n}\r\n"
+    );
+    assert!(!now.replace("\r\n", "").contains('\n'), "no bare LF was written: {now:?}");
+
+    // An exact match in a CRLF file gets CRLF too.
+    let r = reply(env.ok("edit", edit("let n = 1;", "let n = 1;\nlet m = 2;")).await);
+    assert_eq!(r.tolerance, None);
+    assert!(fs::read_to_string(env.ws.join("src/main.rs")).unwrap().contains("let n = 1;\r\nlet m = 2;\r\n"));
+
+    // Matching only ignoring line endings in several places is refused, with each place's line and anchor.
+    Env::put(&env.ws, &[("dup.txt", "start\r\nx = 1\r\ny = 2\r\nmid\r\nx = 1\r\ny = 2\r\n")]);
+    let dup = json!({ "workspace": "ws", "path": "dup.txt", "old": "x = 1\ny = 2\n", "new": "x = 3\n" });
+    let msg = env.invalid("edit", dup.clone()).await;
+    let a2 = format!("2:{}", hash("x = 1"));
+    assert!(msg.contains("2 times") && msg.contains("ignoring line endings"), "{msg}");
+    assert!(msg.contains(&format!("lines 2 (anchor {a2}), 5 (anchor 5:")), "{msg}");
+    assert!(msg.contains(EDIT_SHOWS_LINES), "{msg}");
+    // The anchor from the error picks one of them.
+    let mut pick = dup.clone();
+    pick["anchor"] = json!({ "line": 5, "hash": hash("x = 1") });
+    let r = reply(env.ok("edit", pick).await);
+    assert_eq!((r.line, r.replacements), (Some(5), 1));
+    assert_eq!(fs::read_to_string(env.ws.join("dup.txt")).unwrap(), "start\r\nx = 1\r\ny = 2\r\nmid\r\nx = 3\r\n");
+    // A stale anchor is refused and says what the line reads now; one off the matches names them.
+    let mut stale = dup.clone();
+    stale["anchor"] = json!({ "line": 5, "hash": hash("x = 1") });
+    let msg = env.invalid("edit", stale).await;
+    assert!(msg.contains("line 5 has changed and now reads `x = 3`"), "{msg}");
+    let mut off = dup.clone();
+    off["anchor"] = json!({ "line": 3 });
+    let msg = env.invalid("edit", off).await;
+    assert!(msg.contains(&format!("starting on line 2 (anchor {a2}), not on line 3")), "{msg}");
+    let mut all = dup;
+    all["anchor"] = json!({ "line": 2 });
+    all["replace_all"] = json!(true);
+    assert!(env.invalid("edit", all).await.contains("leave it out to set replace_all"));
+}
+
+#[tokio::test]
+async fn trailing_whitespace_is_tolerated_but_spaces_for_tabs_get_the_closest_lines_instead() {
+    let env = Env::new();
+    let go = "package main\n\nfunc add(a, b int) int {  \n\treturn a + b\t\n}\n\nfunc sub(a, b int) int {\n\treturn a - b\n}\n";
+    Env::put(&env.ws, &[("main.go", go)]);
+    let edit = |old: &str, new: &str| json!({ "workspace": "ws", "path": "main.go", "old": old, "new": new });
+    let reply = |v: Value| serde_json::from_value::<EditResponse>(v).unwrap();
+
+    let r = reply(
+        env.ok(
+            "edit",
+            edit("func add(a, b int) int {\n\treturn a + b\n}\n", "func add(a, b int) int {\n\treturn b + a\n}\n"),
+        )
+        .await,
+    );
+    assert_eq!((r.line, r.tolerance), (Some(3), Some(Tolerance::TrailingWhitespace)));
+    assert!(fs::read_to_string(env.ws.join("main.go"))
+        .unwrap()
+        .contains("func add(a, b int) int {\n\treturn b + a\n}\n\n"));
+
+    // Spaces where the file has a tab: not matched, but the error shows the lines as they are.
+    let before = fs::read_to_string(env.ws.join("main.go")).unwrap();
+    let msg = env.invalid("edit", edit("func sub(a, b int) int {\n    return a - b\n}", "x")).await;
+    assert!(msg.contains(&format!("(version {})", version(&before))), "{msg}");
+    assert!(msg.contains(&format!("lines 7-9 (100% alike, anchor 7:{})", hash("func sub(a, b int) int {"))), "{msg}");
+    assert!(msg.contains("```\nfunc sub(a, b int) int {\n\treturn a - b\n}\n```"), "{msg}");
+    assert!(msg.contains("Lines 7-9 differ from the old text only in whitespace: the file indents them with tabs, the old text with spaces"), "{msg}");
+    assert!(msg.contains(EDIT_SHOWS_LINES), "{msg}");
+    assert_eq!(fs::read_to_string(env.ws.join("main.go")).unwrap(), before, "nothing was written");
+}
+
+#[tokio::test]
+async fn an_old_text_one_line_off_gets_the_closest_lines_and_the_line_that_differs() {
+    let env = Env::new();
+    let mut py = String::from("# 订单处理\n");
+    for i in 0..30 {
+        py.push_str(&format!(
+            "def step_{i}(order):\n    \"\"\"第 {i} 步\"\"\"\n    order.log(\"step {i}\")\n    return order\n\n"
+        ));
+    }
+    Env::put(&env.ws, &[("orders.py", py.as_str())]);
+    // The model remembered line 3 of step 17 wrong.
+    let wrong = "def step_17(order):\n    \"\"\"第 17 步\"\"\"\n    order.log(\"step 71\")\n    return order\n";
+    let msg =
+        env.invalid("edit", json!({ "workspace": "ws", "path": "orders.py", "old": wrong, "new": "pass\n" })).await;
+    let first = 2 + 17 * 5;
+    assert!(msg.contains(&format!("lines {first}-{}", first + 3)), "{msg}");
+    assert!(msg.contains(&format!("anchor {first}:{}", hash("def step_17(order):"))), "{msg}");
+    assert!(
+        msg.contains(&format!(
+            "Line {} differs: the file has `    order.log(\"step 17\")` where the old text has `    order.log(\"step 71\")`",
+            first + 2
+        )),
+        "{msg}"
+    );
+    // The model corrects old_string from the error alone: no read in between.
+    let shown = msg.split("```\n").nth(1).unwrap().split("\n```").next().unwrap();
+    let r: EditResponse = serde_json::from_value(
+        env.ok("edit", json!({ "workspace": "ws", "path": "orders.py", "old": shown, "new": "def step_17(order):\n    return order" }))
+            .await,
+    )
+    .unwrap();
+    assert_eq!((r.line, r.tolerance), (Some(first as u64), None));
+
+    // Nothing like it at all.
+    let msg = env
+        .invalid("edit", json!({ "workspace": "ws", "path": "orders.py", "old": "SELECT * FROM t;", "new": "x" }))
+        .await;
+    assert!(msg.ends_with("and no lines in it are like it") && !msg.contains(EDIT_SHOWS_LINES), "{msg}");
 }
 
 #[tokio::test]
@@ -334,7 +462,7 @@ async fn writes_and_edits_report_the_syntax_errors_they_introduce_and_reject_mod
     assert_eq!(r.syntax, None);
     assert_eq!(fs::read_to_string(env.ws.join("notes.txt")).unwrap(), "((");
     let off = json!({ "workspace": "ws", "path": "app.py", "old": "return x", "new": "return (x" });
-    assert_eq!(env.ok("edit", off).await, json!({ "replacements": 1 }));
+    assert_eq!(env.ok("edit", off).await, json!({ "replacements": 1, "line": 2 }));
 }
 
 /// The process's peak resident memory, in bytes.
@@ -1040,4 +1168,16 @@ async fn bad_requests_are_invalid() {
     assert!(msg.contains("does not exist"), "{msg}");
     // The full method name is accepted too.
     env.ok("fs.list", json!({ "workspace": "ws" })).await;
+}
+
+/// An anchor's hash of `line`, as `fs.edit` computes it.
+fn hash(line: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(line.trim_end().as_bytes())[..2])
+}
+
+/// The version `fs.edit` errors name.
+fn version(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(content.as_bytes())[..6])
 }

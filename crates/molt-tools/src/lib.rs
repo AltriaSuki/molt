@@ -14,6 +14,7 @@ mod error;
 mod files;
 mod fork;
 mod git;
+mod matching;
 mod paths;
 mod process;
 pub mod sandbox;
