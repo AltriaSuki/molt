@@ -206,7 +206,7 @@ impl ServiceSection {
         self.launch_env_from(|name| std::env::var(name).ok())
     }
 
-    fn launch_env_from(&self, var: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    pub(crate) fn launch_env_from(&self, var: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
         let passed = self
             .pass_env
             .iter()
@@ -256,7 +256,8 @@ pub struct Config {
     pub improve: crate::improve::Gate,
 }
 
-/// `[models]`: which model each role's calls go to (#169).
+/// `[models]`: the user's endpoints, and which model each role's calls go
+/// to (#169).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelsSection {
@@ -265,11 +266,17 @@ pub struct ModelsSection {
     /// `MOLT_ROLE_MODELS` (see `molt_api::model::role_models`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub roles: BTreeMap<String, String>,
+    /// Endpoints by name, each with its protocol, base URL, the variable
+    /// that holds its key and the models it serves; a call names one of
+    /// them `NAME/MODEL`. The gateway gets them as `MOLT_ENDPOINTS`, and
+    /// each `key_env`, which no other service may be given.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub endpoints: BTreeMap<String, molt_gateway::provider::Endpoint>,
 }
 
 impl ModelsSection {
     fn is_empty(&self) -> bool {
-        self.roles.is_empty()
+        self.roles.is_empty() && self.endpoints.is_empty()
     }
 }
 
@@ -376,6 +383,7 @@ const GATEWAY_ENV: &[&str] = &[
     "MOLT_MODEL_PRICES",
     "MOLT_PRICES_FILE",
     "MOLT_MODELS_FILE",
+    "MOLT_ENDPOINTS",
     "XDG_DATA_HOME",
 ];
 
@@ -454,6 +462,7 @@ impl Config {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut config = Self::parse(&text).with_context(|| format!("parsing {}", path.display()))?;
         config.route_roles(&|name| std::env::var(name).ok())?;
+        config.route_endpoints(&|name| std::env::var(name).ok())?;
         Ok(config)
     }
 
@@ -472,6 +481,9 @@ impl Config {
         if !config.models.roles.is_empty() {
             molt_api::model::role_models(&serde_json::to_string(&config.models.roles)?)
                 .map_err(|e| anyhow::anyhow!("[models.roles]: {e}"))?;
+        }
+        for (name, endpoint) in &config.models.endpoints {
+            endpoint.check(name).map_err(|e| anyhow::anyhow!("[models.endpoints.{name}]: {e}"))?;
         }
         for (name, profile) in &config.profiles {
             profile.validate().with_context(|| format!("in profile {name}"))?;
@@ -785,6 +797,75 @@ impl Config {
         Ok(())
     }
 
+    /// The named endpoints the gateway is started with: those of its own
+    /// `env`, else of the environment (`var`), else `[models.endpoints]`.
+    fn endpoints(
+        &self,
+        var: &dyn Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<BTreeMap<String, molt_gateway::provider::Endpoint>> {
+        let env = molt_gateway::provider::ENDPOINTS_VAR;
+        let set = self
+            .service("model")
+            .and_then(|m| m.env.get(env).cloned())
+            .or_else(|| var(env))
+            .filter(|v| !v.trim().is_empty());
+        match set {
+            Some(text) => molt_gateway::provider::parse_endpoints(&text).map_err(anyhow::Error::msg),
+            None => Ok(self.models.endpoints.clone()),
+        }
+    }
+
+    /// The variables that hold the named endpoints' keys.
+    pub fn endpoint_keys(&self, var: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Vec<String>> {
+        let mut keys: Vec<String> = self.endpoints(var)?.into_values().map(|e| e.key_env).collect();
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
+    }
+
+    /// Give the gateway `[models.endpoints]` as `MOLT_ENDPOINTS`, unless the
+    /// environment (`var`) or its own `env` sets it, and each endpoint's
+    /// `key_env` to pass; then [`Config::check_endpoint_keys`].
+    pub fn route_endpoints(&mut self, var: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<()> {
+        let env = molt_gateway::provider::ENDPOINTS_VAR;
+        let keys = self.endpoint_keys(var)?;
+        let routed = (!self.models.endpoints.is_empty() && var(env).is_none_or(|v| v.trim().is_empty()))
+            .then(|| serde_json::to_string(&self.models.endpoints))
+            .transpose()?;
+        let Some(model) = self.service_mut("model") else { return Ok(()) };
+        if let Some(routed) = routed {
+            model.env.entry(env.into()).or_insert(routed);
+        }
+        for key in keys {
+            if !model.pass_env.contains(&key) {
+                model.pass_env.push(key);
+            }
+        }
+        self.check_endpoint_keys(var)
+    }
+
+    /// Refuse to give a named endpoint's key to any service but the
+    /// gateway: it is the only one that holds keys.
+    pub fn check_endpoint_keys(&self, var: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<()> {
+        let keys = self.endpoint_keys(var)?;
+        for svc in self.services.iter().filter(|s| s.name.as_str() != "model") {
+            if let Some(key) = keys.iter().find(|k| svc.env.contains_key(*k) || svc.pass_env.contains(k)) {
+                anyhow::bail!(
+                    "service {} is given {key}, the key of a named endpoint: only the model gateway may hold it",
+                    svc.name
+                );
+            }
+        }
+        for (name, server) in &self.mcp {
+            if let Some(key) = keys.iter().find(|k| server.env.contains_key(*k) || server.pass_env.contains(k)) {
+                anyhow::bail!(
+                    "MCP server {name} is given {key}, the key of a named endpoint: only the model gateway may hold it"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn socket_dir(&self) -> PathBuf {
         self.kernel.data_dir.join("sock")
     }
@@ -1008,6 +1089,19 @@ mod tests {
         }
         assert_eq!(cfg.service("echo").unwrap().isolation, Isolation::Sandbox);
         assert!(cfg.services.iter().filter(|s| s.name.as_str() != "echo").all(|s| s.isolation == Isolation::Native));
+    }
+
+    #[test]
+    fn the_examples_commented_endpoint_parses_once_uncommented() {
+        let text = include_str!("../../../molt.example.toml");
+        let start = text.find("# [models.endpoints.glm]").unwrap();
+        let block = text[start..].split("\n\n").next().unwrap();
+        let uncommented: String =
+            block.lines().map(|l| l.trim_start_matches('#').trim_start()).collect::<Vec<_>>().join("\n");
+        let cfg = Config::parse(&uncommented).unwrap();
+        let glm = &cfg.models.endpoints["glm"];
+        assert_eq!(glm.key_env, "GLM_API_KEY");
+        assert!(!glm.models["glm-4.6"].output_schema);
     }
 
     #[test]

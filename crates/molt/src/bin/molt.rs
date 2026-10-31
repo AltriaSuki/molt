@@ -2115,8 +2115,11 @@ async fn models_cmd(cmd: ModelsCmd) -> anyhow::Result<ExitCode> {
     use molt_gateway::catalog::{finding, Catalog};
     use molt_gateway::probe::{self, Records};
 
-    // The gateway's own variables, from this environment, as `molt prices` reads them.
-    let var = |name: &str| std::env::var(name).ok();
+    // The gateway's own variables, as the default setup starts it here: what the user config sets for it
+    // (its `[[service]] model` env, `[models.endpoints]`), else this environment.
+    let workspace = std::env::current_dir()?;
+    let set = molt::agent::gateway_env(&workspace)?;
+    let var = |name: &str| set.get(name).cloned().or_else(|| std::env::var(name).ok());
     let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
     let ago = |ms: u64| {
         let days = now_ms.saturating_sub(u128::from(ms)) / 86_400_000;
@@ -2146,6 +2149,12 @@ async fn models_cmd(cmd: ModelsCmd) -> anyhow::Result<ExitCode> {
             if !catalog.declared.is_empty() {
                 println!("declared OpenAI models: {}", catalog.declared.join(", "));
             }
+            if !catalog.endpoints.is_empty() {
+                println!("endpoints:");
+                for line in &catalog.endpoints {
+                    println!("  {line}");
+                }
+            }
             match probe::records_path(var) {
                 Some(path) if !catalog.probed.models.is_empty() => {
                     println!("probed, in {}:", path.display());
@@ -2159,7 +2168,10 @@ async fn models_cmd(cmd: ModelsCmd) -> anyhow::Result<ExitCode> {
         ModelsCmd::Show { model: Some(model) } => {
             let catalog = Catalog::from_vars(var)?;
             let entry = catalog.entry(&model).map_err(|e| anyhow::anyhow!("{model}: {}", e.message))?;
-            println!("{model}: {}/{} at {}", entry.provider, entry.model, entry.base_url);
+            match &entry.endpoint {
+                Some(name) => println!("{model}: {} on endpoint {name} at {}", entry.model, entry.base_url),
+                None => println!("{model}: {}/{} at {}", entry.provider, entry.model, entry.base_url),
+            }
             println!("  {}", entry.known);
             match &entry.probed {
                 Some(p) => println!("  probed: {}", found(p)),
@@ -2177,15 +2189,14 @@ async fn models_cmd(cmd: ModelsCmd) -> anyhow::Result<ExitCode> {
             }
         }
         ModelsCmd::Probe { model, yes } => {
-            let gateway = molt_gateway::Gateway::new(probe::probing(molt_gateway::Config::from_env()?))?;
+            let gateway = molt_gateway::Gateway::new(probe::probing(molt_gateway::Config::from_vars(var)?))?;
             let plan = gateway.probe_plan(&model).map_err(|e| anyhow::anyhow!("{model}: {}", e.message))?;
             let path =
                 probe::records_path(var).context("neither XDG_DATA_HOME nor HOME is set; set MOLT_MODELS_FILE")?;
             eprintln!(
-                "Probing {}/{} at {} makes up to {} calls, one at a time, with no retries and at most {} output \
+                "Probing {} at {} makes up to {} calls, one at a time, with no retries and at most {} output \
                  tokens each. They are billed as usual:",
-                plan.provider,
-                plan.model,
+                plan.qualified(),
                 plan.base_url,
                 plan.checks.len(),
                 probe::MAX_TOKENS

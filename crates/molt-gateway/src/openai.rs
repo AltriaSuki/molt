@@ -10,18 +10,19 @@ use serde_json::{json, Value};
 use crate::api::Message;
 use crate::body::Call;
 use crate::probe::Probed;
-use crate::provider::invalid;
+use crate::provider::{invalid, Route};
 use crate::Config;
 
 /// `probed` is what `molt models probe` found on this endpoint: a feature
 /// it found missing is refused as an undeclared one is.
 pub(crate) fn build(
     cfg: &Config,
-    model: &str,
+    route: &Route,
     req: CompleteRequest,
     probed: Option<&Probed>,
 ) -> Result<Call, RemoteError> {
-    let mut caps = cfg.providers.capabilities(model)?;
+    let model = route.model.as_str();
+    let mut caps = cfg.providers.openai_capabilities(route)?;
     if let Some(p) = probed {
         caps.tools &= p.tools != Some(false);
         caps.output_schema &= p.output_schema != Some(false);

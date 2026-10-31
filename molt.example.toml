@@ -39,7 +39,7 @@ pass_env = [
   "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
   "MOLT_MODEL", "MOLT_EFFORT", "MOLT_MAX_TOKENS",
   "MOLT_MODEL_TIMEOUT_S", "MOLT_MODEL_RETRIES", "MOLT_MODEL_CONCURRENCY", "MOLT_FALLBACKS",
-  "MOLT_MODEL_PRICES", "MOLT_PRICES_FILE", "MOLT_MODELS_FILE", "XDG_DATA_HOME",
+  "MOLT_MODEL_PRICES", "MOLT_PRICES_FILE", "MOLT_MODELS_FILE", "MOLT_ENDPOINTS", "XDG_DATA_HOME",
 ]
 
 # Files and commands, confined to --root. Forks go to --scratch: replace
@@ -135,6 +135,30 @@ requests = [
   { target = "memory.symbols", budget = { calls = 10000000 } },
   { target = "memory.fork_symbols", budget = { calls = 10000000 } },
 ]
+
+# Endpoints of your own, by name; a call names a model on one NAME/MODEL, as
+# in --model glm/glm-4.6 or a role's model in [models.roles] below. protocol is
+# "anthropic" (Messages compatible), "chat_completions" or "responses" (OpenAI);
+# base_url has no /v1; key_env names the variable that holds the key, which
+# only the gateway is given (auth: "x-api-key" by default for anthropic,
+# "bearer" otherwise). Only the models declared are called there, with what
+# they declare: tools, streaming, output_schema, efforts, max_output, and the
+# optional context window and price in dollars per million tokens. The gateway
+# gets them as MOLT_ENDPOINTS (JSON), which, when set in the environment, is
+# used instead. `molt models show` lists them; `molt models probe glm/glm-4.6`
+# checks one.
+# [models.endpoints.glm]
+# protocol = "anthropic"
+# base_url = "https://open.bigmodel.cn/api/anthropic"
+# key_env = "GLM_API_KEY"
+#
+# [models.endpoints.glm.models."glm-4.6"]
+# tools = true
+# streaming = true
+# output_schema = false
+# max_output = 32000
+# context = 200000
+# price = { input = 0.6, output = 2.2 }
 
 # The model each role's calls go to when its declaration names none; the
 # attempts keep the run's (--model). Roles: designer, vetter, reviewer, judge,

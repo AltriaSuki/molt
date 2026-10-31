@@ -70,6 +70,8 @@ pub fn configure(opts: Options) -> anyhow::Result<(Config, String, Option<Projec
     agent::deps_cache(&mut cfg, &opts.deps_cache)?;
     agent::environments(&mut cfg)?;
     agent::mcp(&mut cfg)?;
+    // `--pass-env` and the MCP bridges come after the config: neither may be given an endpoint's key.
+    cfg.check_endpoint_keys(&|name| std::env::var(name).ok())?;
     agent::allow_web(&mut cfg, &opts.allow_web)?;
     if let Some(resolver) = &opts.web_resolver {
         cfg.web_resolver(resolver)?;

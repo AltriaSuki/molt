@@ -576,6 +576,7 @@ fn molt_in(server: &MockServer, workspace: &Path, data: &Path) -> tokio::process
         "MOLT_MEMORY_MODEL_TIMEOUT_S",
         "MOLT_ROLE_MODELS",
         "MOLT_MODELS_FILE",
+        "MOLT_ENDPOINTS",
     ] {
         cmd.env_remove(var);
     }
@@ -1323,6 +1324,122 @@ async fn the_reviewers_calls_go_to_the_model_role_models_name_through_molt_do() 
     assert!(!reviewer.is_empty(), "the result was reviewed");
     assert!(reviewer.iter().all(|b| b["model"] == "claude-haiku-4-5"), "{reviewer:?}");
     assert!(!others.is_empty() && others.iter().all(|b| b["model"] == MODEL), "the attempts keep the run's model");
+}
+
+/// A named endpoint of the user's: it answers as `inner` does, for its own
+/// key only.
+struct Keyed<R> {
+    key: &'static str,
+    inner: R,
+}
+
+impl<R: Respond> Respond for Keyed<R> {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        if req.headers.get("x-api-key").and_then(|v| v.to_str().ok()) != Some(self.key) {
+            return ResponseTemplate::new(401).set_body_json(error("authentication_error", "invalid x-api-key"));
+        }
+        let mut req = req.clone();
+        req.headers.insert("x-api-key", API_KEY.parse().unwrap());
+        self.inner.respond(&req)
+    }
+}
+
+/// A user config holding `text`, in `home`, for `XDG_CONFIG_HOME`.
+fn user_config(home: &Path, text: &str) -> PathBuf {
+    let dir = home.join("config");
+    std::fs::create_dir_all(dir.join("molt")).unwrap();
+    std::fs::write(dir.join("molt/config.toml"), text).unwrap();
+    dir
+}
+
+/// `[models.endpoints.NAME]` on `server`, with one model.
+fn named_endpoint(name: &str, server: &MockServer, key_env: &str, model: &str, extra: &str) -> String {
+    format!(
+        "[models.endpoints.{name}]\nprotocol = \"anthropic\"\nbase_url = \"{}\"\nkey_env = \"{key_env}\"\n\n\
+         [models.endpoints.{name}.models.\"{model}\"]\ntools = true\nstreaming = true\noutput_schema = true\n\
+         max_output = 8192\n{extra}\n",
+        server.uri()
+    )
+}
+
+#[tokio::test]
+async fn a_reviewer_routed_to_a_named_endpoint_is_called_there_with_its_key_and_nothing_else_gets_it() {
+    let server = fake_api(Fake::Greets).await;
+    let cheap = MockServer::start().await;
+    let keyed = Keyed { key: "cheap-key", inner: FakeApi(Fake::Greets) };
+    Mock::given(method("POST")).and(path("/v1/messages")).respond_with(keyed).mount(&cheap).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let endpoint =
+        named_endpoint("cheap", &cheap, "CHEAP_API_KEY", "claude-haiku-4-5", "price = { input = 1, output = 5 }");
+    let config =
+        user_config(home.path(), &format!("{endpoint}\n[models.roles]\nreviewer = \"cheap/claude-haiku-4-5\"\n"));
+    // The check fails if the endpoint's key reached the commands the agent runs.
+    let check = format!("test -z \"${{CHEAP_API_KEY-}}\" && {CHECK}");
+    let args = ["--check", &check, "--attempts", "1", "--no-memory"];
+    let cmd = molt_do(&server, workspace.path(), data.path(), &args)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("CHEAP_API_KEY", "cheap-key")
+        .output();
+    let out = tokio::time::timeout(RUN_LIMIT, cmd).await.expect("molt do hung").unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let reviews = |b: &Value| b["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_REVIEW));
+    let reviewer = cheap.received_requests().await.unwrap();
+    assert!(!reviewer.is_empty(), "the result was reviewed on the named endpoint");
+    for req in &reviewer {
+        let body: Value = req.body_json().unwrap();
+        assert!(reviews(&body) && body["model"] == "claude-haiku-4-5", "{body}");
+        assert_eq!(req.headers["x-api-key"].to_str().unwrap(), "cheap-key");
+    }
+    let others = server.received_requests().await.unwrap();
+    assert!(!others.is_empty());
+    for req in &others {
+        let body: Value = req.body_json().unwrap();
+        assert!(!reviews(&body) && body["model"] == MODEL, "the attempts keep the run's model: {body}");
+        assert!(!String::from_utf8_lossy(&req.body).contains("cheap-key") && req.headers["x-api-key"] == API_KEY);
+    }
+}
+
+#[tokio::test]
+async fn molt_models_probe_reaches_a_named_endpoint_of_the_user_config_by_name() {
+    let server = MockServer::start().await;
+    let keyed = Keyed { key: "glm-key", inner: ThirdParty };
+    Mock::given(method("POST")).and(path("/v1/messages")).respond_with(keyed).mount(&server).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let endpoint = named_endpoint("glm", &server, "GLM_API_KEY", "glm-4.6", "efforts = [\"low\"]\ncontext = 200000");
+    let config = user_config(home.path(), &endpoint);
+    let molt = |args: &[&str]| {
+        let mut cmd = molt_in(&server, workspace.path(), data.path());
+        cmd.args(args).env("XDG_CONFIG_HOME", &config).env("GLM_API_KEY", "glm-key");
+        cmd.output()
+    };
+    let out =
+        tokio::time::timeout(RUN_LIMIT, molt(&["models", "probe", "glm/glm-4.6", "--yes"])).await.unwrap().unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stderr.contains(&format!("Probing glm/glm-4.6 at {}", server.uri())), "{stderr}");
+    let sent = server.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 4);
+    assert!(sent.iter().all(|r| r.headers["x-api-key"] == "glm-key"), "each call has the endpoint's own key");
+    let records = molt_gateway::probe::Records::load(&data.path().join("user-data/molt/models.json")).unwrap();
+    let p = &records.models[0];
+    assert_eq!((p.model.as_str(), p.base_url.as_str()), ("glm-4.6", server.uri().as_str()));
+    assert_eq!((p.output_schema, p.effort), (Some(false), Some(false)));
+
+    let out = molt(&["models", "show"]).await.unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("glm: anthropic at {}, key in GLM_API_KEY (set): glm/glm-4.6", server.uri())),
+        "{stdout}"
+    );
+    let out = molt(&["models", "show", "glm/glm-4.6"]).await.unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("glm-4.6 on endpoint glm at") && stdout.contains("a context of 200000 tokens"), "{stdout}");
+    assert!(stdout.contains("probed: tools yes, streaming yes, output_schema no, effort no"), "{stdout}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 4, "show calls nothing");
 }
 
 /// An Anthropic-compatible endpoint that calls tools and streams, but

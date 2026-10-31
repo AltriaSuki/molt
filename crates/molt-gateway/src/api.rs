@@ -13,7 +13,7 @@ use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::provider::Provider;
+use crate::provider::{Auth, Endpoint, EndpointProtocol, Provider};
 use crate::stream::{Accumulator, Decoder};
 use crate::Config;
 
@@ -189,9 +189,9 @@ pub(crate) struct Observer<'a> {
 
 /// The settings an error message names, so it can say what to fix.
 struct Names {
-    base_url: &'static str,
+    base_url: String,
     path: &'static str,
-    credential: &'static str,
+    credential: String,
 }
 
 /// The protocol one call speaks.
@@ -267,9 +267,9 @@ impl Api {
         Ok(Self {
             provider: Provider::Anthropic,
             names: Names {
-                base_url: "ANTHROPIC_BASE_URL",
+                base_url: "ANTHROPIC_BASE_URL".into(),
                 path: "/v1/messages",
-                credential: "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN",
+                credential: "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN".into(),
             },
             doubled_v1: ends_in_v1(&cfg.base_url),
             http,
@@ -309,11 +309,68 @@ impl Api {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         Ok(Self {
             provider: Provider::Openai,
-            names: Names { base_url: "OPENAI_BASE_URL", path: "/v1/chat/completions", credential: "OPENAI_API_KEY" },
+            names: Names {
+                base_url: "OPENAI_BASE_URL".into(),
+                path: "/v1/chat/completions",
+                credential: "OPENAI_API_KEY".into(),
+            },
             doubled_v1: ends_in_v1(&cfg.providers.openai_base_url),
             http,
             url,
             responses: Some(responses),
+            headers,
+            timeout: cfg.timeout,
+            max_retries: cfg.max_retries,
+            retry_base: cfg.retry_base,
+        })
+    }
+
+    /// A client for the user's endpoint `name`, with `key` from its
+    /// `key_env`. The endpoint is checked first (see [`Endpoint::check`]).
+    pub fn endpoint(cfg: &Config, name: &str, endpoint: &Endpoint, key: &str) -> anyhow::Result<Self> {
+        endpoint.check(name).map_err(anyhow::Error::msg)?;
+        let origin = endpoint.origin();
+        let url: Url = format!("{origin}{}", endpoint.protocol.path()).parse()?;
+        let mut builder = reqwest::Client::builder()
+            .timeout(cfg.timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .tcp_keepalive(Duration::from_secs(30))
+            .user_agent(concat!("molt-gateway/", env!("CARGO_PKG_VERSION")));
+        if is_loopback(&url) {
+            builder = builder.no_proxy();
+        }
+        let http = builder.build().context("building the HTTP client")?;
+        let invalid = || format!("endpoint {name}: the key in {} is not a valid header value", endpoint.key_env);
+        let mut headers = HeaderMap::new();
+        match endpoint.auth() {
+            Auth::XApiKey => {
+                let mut key = HeaderValue::from_str(key).with_context(invalid)?;
+                key.set_sensitive(true);
+                headers.insert("x-api-key", key);
+            }
+            Auth::Bearer => {
+                let mut key = HeaderValue::from_str(&format!("Bearer {key}")).with_context(invalid)?;
+                key.set_sensitive(true);
+                headers.insert(reqwest::header::AUTHORIZATION, key);
+            }
+        }
+        if endpoint.protocol == EndpointProtocol::Anthropic {
+            headers.insert("anthropic-version", HeaderValue::from_static(API_VERSION));
+        }
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        // Each OpenAI protocol has its own endpoint, so both URLs are the one path.
+        let responses = (endpoint.protocol == EndpointProtocol::Responses).then(|| url.clone());
+        Ok(Self {
+            provider: endpoint.protocol.provider(),
+            names: Names {
+                base_url: format!("endpoint {name}'s base_url"),
+                path: endpoint.protocol.path(),
+                credential: format!("{} (endpoint {name}'s key_env)", endpoint.key_env),
+            },
+            doubled_v1: false,
+            http,
+            url,
+            responses,
             headers,
             timeout: cfg.timeout,
             max_retries: cfg.max_retries,
@@ -579,7 +636,7 @@ fn transport(e: reqwest::Error) -> Failure {
 }
 
 /// A base URL whose path already ends in `/v1`, to which `/v1/...` is added.
-fn ends_in_v1(base_url: &str) -> bool {
+pub(crate) fn ends_in_v1(base_url: &str) -> bool {
     base_url.trim_end_matches('/').to_ascii_lowercase().ends_with("/v1")
 }
 
@@ -597,7 +654,7 @@ fn backoff(base: Duration, retry: u32) -> Duration {
     Duration::from_secs_f64((exp * rand::random_range(0.75..=1.25)).min(cap))
 }
 
-fn is_loopback(url: &Url) -> bool {
+pub(crate) fn is_loopback(url: &Url) -> bool {
     let Some(host) = url.host_str() else { return false };
     if host.eq_ignore_ascii_case("localhost") {
         return true;
