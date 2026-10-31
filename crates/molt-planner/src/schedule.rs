@@ -16,6 +16,12 @@
 //!   next model up (`escalate`, an escalation), or, at the top or with the
 //!   escalation cap reached, on the same model with another approach
 //!   (`retry`). Either is told what the failed attempts did.
+//! - **A failure no new attempt can fix** (#228): an attempt that ended on
+//!   something missing from the environment, or out of disk or memory, holds
+//!   back every new attempt, since each would meet the same; one the model
+//!   endpoint refused (a credential, a model name) holds back new attempts on
+//!   that model, and escalates to the next model up when there is one. A
+//!   code failure (a compiler error, a failing test) goes on as above.
 //! - **Nothing new starts** once an attempt passed, the run was stopped, the
 //!   budget is spent, the run's attempts are all started, or what is left of
 //!   the budget is unknown or less than a new attempt is assumed to cost
@@ -29,7 +35,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use molt_api::model::attempt_name;
-use molt_api::planner::{AttemptStatus, BudgetState, PriceAssumption, ScheduleAction, Scheduling, ADAPTIVE_POLICY};
+use molt_api::planner::{
+    AttemptStatus, BudgetState, Failure, FailureAction, PriceAssumption, ScheduleAction, Scheduling, ADAPTIVE_POLICY,
+};
 
 use crate::checkpoint::SavedAttempt;
 
@@ -58,6 +66,8 @@ pub(crate) enum Evidence {
         status: AttemptStatus,
         cost_usd: f64,
         note: String,
+        /// What kind of failure ended it, when the planner could tell.
+        failure: Option<Failure>,
     },
 }
 
@@ -120,6 +130,11 @@ pub(crate) struct Adaptive {
     failures: Vec<String>,
     /// Attempts whose lack of progress was acted on (or held) once already.
     stuck: BTreeSet<u32>,
+    /// Models (`None`: the run's) whose endpoint refused an attempt in a way
+    /// only the user can fix: no new attempt starts on them.
+    refused: BTreeSet<Option<String>>,
+    /// The evidence of each classified failure, and the first attempt it ended.
+    seen: BTreeMap<String, u32>,
 }
 
 impl Adaptive {
@@ -168,6 +183,8 @@ impl Adaptive {
             costs: BTreeMap::new(),
             failures: Vec::new(),
             stuck: BTreeSet::new(),
+            refused: BTreeSet::new(),
+            seen: BTreeMap::new(),
         };
         (schedule, note)
     }
@@ -184,7 +201,7 @@ impl Adaptive {
                 self.rung = Some(self.rung.map_or(at, |r| r.max(at)));
             }
             match &saved.end {
-                Some(end) => self.ended(saved.index, end.status, saved.cost_usd, &end.note),
+                Some(end) => self.ended(saved.index, end.status, saved.cost_usd, &end.note, end.failure.as_ref()),
                 // Left as it was for a retry: it does not go on.
                 None if retry => {}
                 None => {
@@ -226,9 +243,9 @@ impl Adaptive {
     /// starts, if any.
     pub fn decide(&mut self, evidence: Evidence, view: &View) -> Option<(Option<Launch>, Scheduling)> {
         match evidence {
-            Evidence::Ended { attempt, status, cost_usd, note } => {
+            Evidence::Ended { attempt, status, cost_usd, note, failure } => {
                 let was_running = self.running.contains(&attempt);
-                self.ended(attempt, status, cost_usd, &note);
+                self.ended(attempt, status, cost_usd, &note, failure.as_ref());
                 let failed = matches!(status, AttemptStatus::Failed | AttemptStatus::Error);
                 // Another attempt is still going, or it ended with the run (cancelled), or one has passed.
                 if !was_running || !failed || view.won || !self.running.is_empty() {
@@ -237,6 +254,39 @@ impl Adaptive {
                 let how = if status == AttemptStatus::Error { "erred" } else { "failed" };
                 let why = format!("{} {how}: {}", attempt_name(attempt), first_line(&note));
                 let up = self.next_rung();
+                if let Some(f) = failure.as_ref().filter(|f| f.needs_user()) {
+                    let on = self.model_of(attempt).or_else(|| self.run_model.clone());
+                    let price = self.price(view, on.as_deref());
+                    if f.action != FailureAction::FixConfig {
+                        let why = format!(
+                            "{} {how} on the {}, not the code ({}): another attempt would meet the same, so \
+                             nothing starts: provide what is missing, then retry the run",
+                            attempt_name(attempt),
+                            f.class.name(),
+                            f.evidence
+                        );
+                        return Some((
+                            None,
+                            self.decision(ScheduleAction::Hold, None, Some(attempt), why, price, view),
+                        ));
+                    }
+                    if up.is_none() || self.escalations >= self.max_escalations {
+                        let model = on.as_deref().unwrap_or("the run's model");
+                        let why = format!(
+                            "{why}; the model endpoint refused it ({}), and a new attempt on {model} would be refused \
+                             the same way, so nothing starts: fix the configuration, then retry the run",
+                            f.evidence
+                        );
+                        return Some((
+                            None,
+                            self.decision(ScheduleAction::Hold, None, Some(attempt), why, price, view),
+                        ));
+                    }
+                    let model = up.map(|r| self.ladder[r].clone());
+                    let why =
+                        format!("{why}; the model endpoint refused it, so the next attempt runs on the next model up");
+                    return Some(self.gated(ScheduleAction::Escalate, attempt, model, why, view));
+                }
                 if up.is_some() && self.escalations < self.max_escalations {
                     let model = up.map(|r| self.ladder[r].clone());
                     let why = format!("{why}; the next attempt runs on the next model up");
@@ -292,14 +342,34 @@ impl Adaptive {
         }
     }
 
-    fn ended(&mut self, attempt: u32, status: AttemptStatus, cost_usd: f64, note: &str) {
+    fn ended(&mut self, attempt: u32, status: AttemptStatus, cost_usd: f64, note: &str, failure: Option<&Failure>) {
         self.running.remove(&attempt);
         self.costs.insert(attempt, cost_usd);
         if matches!(status, AttemptStatus::Failed | AttemptStatus::Error) {
-            let on = match self.models.get(&attempt).cloned().flatten().or_else(|| self.run_model.clone()) {
+            let model = self.models.get(&attempt).cloned().flatten();
+            if failure.is_some_and(|f| f.action == FailureAction::FixConfig) {
+                self.refused.insert(model.clone());
+            }
+            let on = match model.or_else(|| self.run_model.clone()) {
                 Some(m) => format!(" (on {m})"),
                 None => String::new(),
             };
+            // The same classified failure again is said once, not once for each attempt it ended.
+            let known =
+                failure.filter(|f| !f.evidence.is_empty() && f.class != molt_api::planner::FailureClass::Unknown);
+            if let Some(f) = known {
+                if let Some(first) = self.seen.get(&f.evidence) {
+                    let same = format!(
+                        "- {}{on}: {}: the same as {}",
+                        attempt_name(attempt),
+                        status_name(status),
+                        attempt_name(*first)
+                    );
+                    self.failures.push(same);
+                    return;
+                }
+                self.seen.insert(f.evidence.clone(), attempt);
+            }
             let note: String = note.chars().take(PRIOR_NOTE).collect();
             let note = note.replace("</earlier_attempts", "<\\/earlier_attempts");
             self.failures.push(format!("- {}{on}: {}: {}", attempt_name(attempt), status_name(status), note.trim()));
@@ -325,20 +395,27 @@ impl Adaptive {
         view: &View,
     ) -> (Option<Launch>, Scheduling) {
         let price = self.price(view, model.as_deref());
-        let held = view.stopped.clone().or_else(|| self.used_up()).or_else(|| match view.budget.remaining_usd {
-            None => Some(format!(
-                "the cost of {} calls is not known, so neither is what is left of the budget",
-                view.budget.unknown_calls
-            )),
-            Some(left) if left <= 0.0 || price.estimate_usd.is_some_and(|e| left < e) => Some(format!(
-                "${left:.2} of the budget is left after holding ${:.2} back for {} calls in flight, less than the \
-                 ${:.2} a new attempt is assumed to cost",
-                view.budget.reserved_usd,
-                view.budget.in_flight_calls,
-                price.estimate_usd.unwrap_or(0.0)
-            )),
-            Some(_) => None,
+        let refused = (model.is_some() && self.refused.contains(&model)).then(|| {
+            format!(
+                "the model endpoint already refused {} in a way only the user can fix",
+                model.as_deref().unwrap_or("")
+            )
         });
+        let held =
+            view.stopped.clone().or(refused).or_else(|| self.used_up()).or_else(|| match view.budget.remaining_usd {
+                None => Some(format!(
+                    "the cost of {} calls is not known, so neither is what is left of the budget",
+                    view.budget.unknown_calls
+                )),
+                Some(left) if left <= 0.0 || price.estimate_usd.is_some_and(|e| left < e) => Some(format!(
+                    "${left:.2} of the budget is left after holding ${:.2} back for {} calls in flight, less than the \
+                 ${:.2} a new attempt is assumed to cost",
+                    view.budget.reserved_usd,
+                    view.budget.in_flight_calls,
+                    price.estimate_usd.unwrap_or(0.0)
+                )),
+                Some(_) => None,
+            });
         match held {
             Some(held) => {
                 let why = format!("{why}, but nothing starts: {held}");
@@ -472,7 +549,125 @@ mod tests {
     }
 
     fn failed(attempt: u32, cost_usd: f64) -> Evidence {
-        Evidence::Ended { attempt, status: AttemptStatus::Failed, cost_usd, note: "the done-check still failed".into() }
+        Evidence::Ended {
+            attempt,
+            status: AttemptStatus::Failed,
+            cost_usd,
+            note: "the done-check still failed".into(),
+            failure: None,
+        }
+    }
+
+    fn classified(
+        attempt: u32,
+        status: AttemptStatus,
+        class: FailureClass,
+        action: FailureAction,
+        evidence: &str,
+    ) -> Evidence {
+        let failure = Failure {
+            class,
+            source: molt_api::planner::FailureSource::Check,
+            action,
+            evidence: evidence.into(),
+            exit_code: None,
+        };
+        Evidence::Ended {
+            attempt,
+            status,
+            cost_usd: 0.25,
+            note: format!("it failed: {evidence}"),
+            failure: Some(failure),
+        }
+    }
+
+    use molt_api::planner::FailureClass;
+
+    #[test]
+    fn a_missing_dependency_holds_back_every_new_attempt_and_a_retry_of_the_run_starts_one() {
+        let (mut s, _) = Adaptive::new(&models(&["haiku", "sonnet"]), 2, None, None, false, 3);
+        s.start(&view(Some(9.0)));
+        let env = || {
+            classified(
+                0,
+                AttemptStatus::Failed,
+                FailureClass::Environment,
+                FailureAction::FixEnvironment,
+                "sh: 1: pytest: not found",
+            )
+        };
+        let (launch, d) = s.decide(env(), &view(Some(9.0))).unwrap();
+        assert!(launch.is_none(), "neither a bigger model nor another approach installs pytest");
+        assert_eq!((d.action, d.after), (ScheduleAction::Hold, Some(0)));
+        assert!(d.reason.contains("the environment, not the code (sh: 1: pytest: not found)"), "{}", d.reason);
+        assert!(d.reason.contains("retry the run"), "{}", d.reason);
+        assert_eq!(s.escalations(), 0);
+
+        // The user installed it and retries the run: the checkpoint's failure does not stop that.
+        let (mut s, _) = Adaptive::new(&models(&["haiku", "sonnet"]), 2, None, None, false, 3);
+        let failure = match env() {
+            Evidence::Ended { failure, .. } => failure,
+            _ => None,
+        };
+        let end = serde_json::json!({ "status": "failed", "note": "it failed", "failure": failure });
+        let saved: SavedAttempt =
+            serde_json::from_value(serde_json::json!({ "index": 0, "model": "haiku", "end": end })).unwrap();
+        assert_eq!(saved.end.as_ref().unwrap().failure, failure, "the class survives the checkpoint");
+        s.restore(&[saved], 0, true);
+        let (launch, d) = s.start(&view(Some(9.0))).unwrap();
+        assert_eq!((d.action, launch.unwrap().index), (ScheduleAction::Start, 1));
+    }
+
+    #[test]
+    fn a_rejected_credential_is_not_retried_on_the_same_model_but_may_escalate_past_it() {
+        let auth = |attempt| {
+            classified(
+                attempt,
+                AttemptStatus::Error,
+                FailureClass::Endpoint,
+                FailureAction::FixConfig,
+                "Denied: the Messages API returned 401: authentication_error: invalid x-api-key",
+            )
+        };
+        // No ladder: every attempt would be on the same model and the same credential.
+        let (mut s, _) = Adaptive::new(&[], 2, None, Some("sonnet"), false, 3);
+        s.start(&view(Some(9.0)));
+        let (launch, d) = s.decide(auth(0), &view(Some(9.0))).unwrap();
+        assert!(launch.is_none());
+        assert_eq!(d.action, ScheduleAction::Hold);
+        assert!(d.reason.contains("a new attempt on sonnet would be refused the same way"), "{}", d.reason);
+
+        // With a model up the ladder, which may be another endpoint: one escalation, and never back down.
+        let (mut s, _) = Adaptive::new(&models(&["haiku", "sonnet"]), 2, None, None, false, 4);
+        s.start(&view(Some(9.0)));
+        let (launch, d) = s.decide(auth(0), &view(Some(9.0))).unwrap();
+        assert_eq!((d.action, launch.unwrap().model.as_deref()), (ScheduleAction::Escalate, Some("sonnet")));
+        let (launch, d) = s.decide(auth(1), &view(Some(9.0))).unwrap();
+        assert!(launch.is_none() && d.action == ScheduleAction::Hold, "{}", d.reason);
+        assert!(d.reason.contains("on sonnet would be refused"), "{}", d.reason);
+    }
+
+    #[test]
+    fn a_compiler_error_still_gets_another_attempt_and_a_repeated_failure_is_told_once() {
+        let rustc = |attempt| {
+            classified(
+                attempt,
+                AttemptStatus::Failed,
+                FailureClass::Code,
+                FailureAction::FixCode,
+                "error[E0308]: mismatched types",
+            )
+        };
+        let (mut s, _) = Adaptive::new(&models(&["haiku", "sonnet"]), 2, None, None, false, 3);
+        s.start(&view(Some(9.0)));
+        let (launch, d) = s.decide(rustc(0), &view(Some(9.0))).unwrap();
+        assert_eq!(d.action, ScheduleAction::Escalate);
+        assert!(launch.unwrap().prior.unwrap().contains("it failed: error[E0308]"));
+        let (launch, d) = s.decide(rustc(1), &view(Some(9.0))).unwrap();
+        assert_eq!(d.action, ScheduleAction::Retry);
+        let prior = launch.unwrap().prior.unwrap();
+        assert_eq!(prior.matches("error[E0308]").count(), 1, "{prior}");
+        assert!(prior.contains("- attempt 2 (on sonnet): failed: the same as attempt 1"), "{prior}");
     }
 
     #[test]

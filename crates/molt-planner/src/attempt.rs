@@ -1,12 +1,13 @@
 //! One attempt: an agent loop in its own fork of the workspace, verified by
 //! the done-check whenever the model says it is done.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
 use molt_api::model::{attempt_name, tool_result, user_blocks, user_text, Role, ToolUse, STOP_MAX_TOKENS};
 use molt_api::planner::tools::{DisputeCheck, DISPUTE_CHECK, EXPLORE};
-use molt_api::planner::{AttemptReport, AttemptStatus, CheckDispute, Criterion, Finding};
+use molt_api::planner::{AttemptReport, AttemptStatus, CheckDispute, Criterion, Failure, FailureSource, Finding};
 use molt_api::progress::Progress;
 use molt_api::shell;
 use molt_proto::tool::ToolRole;
@@ -20,7 +21,7 @@ use crate::control;
 use crate::ctx::{Conversation, Ctx, Spend};
 use crate::schedule::{Signal, TOOL_ERROR_TURNS};
 use crate::tools::{self, Actor};
-use crate::{explore, git, judge, process, prompts};
+use crate::{explore, failure, git, judge, process, prompts};
 
 /// Bytes of check output kept in a failed attempt's note.
 const NOTE_TAIL: usize = 2000;
@@ -70,6 +71,7 @@ impl Finished {
             note: end.note.clone(),
             requirements: saved.requirements,
             dispute: end.dispute.clone(),
+            failure: end.failure.clone(),
         };
         Self {
             report,
@@ -92,6 +94,7 @@ impl Finished {
             note,
             requirements: 0,
             dispute: None,
+            failure: None,
         };
         Self { report, fork: None, summary: String::new(), findings: Vec::new(), conversation: Vec::new() }
     }
@@ -101,17 +104,24 @@ struct End {
     status: AttemptStatus,
     note: String,
     dispute: Option<CheckDispute>,
+    /// What kind of failure it was, when it was one the planner could tell;
+    /// boxed, as most ends have none.
+    failure: Option<Box<Failure>>,
 }
 
 impl End {
     fn new(status: AttemptStatus, note: impl Into<String>) -> Self {
-        Self { status, note: note.into(), dispute: None }
+        Self { status, note: note.into(), dispute: None, failure: None }
+    }
+
+    fn failed(note: impl Into<String>, failure: Option<Failure>) -> Self {
+        Self { failure: failure.map(Box::new), ..Self::new(AttemptStatus::Failed, note) }
     }
 
     /// Stopped on its own dispute of the check: not a failure of the attempt.
     fn disputed(dispute: CheckDispute) -> Self {
         let note = format!("disputed the check, which asserts {}, against the task", dispute.assertion);
-        Self { status: AttemptStatus::Cancelled, note, dispute: Some(dispute) }
+        Self { status: AttemptStatus::Cancelled, note, dispute: Some(dispute), failure: None }
     }
 
     fn error(note: impl Into<String>) -> Self {
@@ -129,7 +139,10 @@ impl From<Stop> for End {
             Stop::Cancelled => Self::cancelled(),
             Stop::Budget => Self::new(AttemptStatus::Cancelled, "budget exhausted"),
             Stop::OutOfTurns => Self::new(AttemptStatus::Failed, "ran out of turns"),
-            Stop::Model(e) => Self::error(format!("model call failed: {e}")),
+            Stop::Model(e) => {
+                let failure = Some(Box::new(failure::of_model(&e)));
+                Self { failure, ..Self::error(format!("model call failed: {e}")) }
+            }
             Stop::Refused => Self::error("the model declined"),
         }
     }
@@ -163,7 +176,9 @@ pub(crate) async fn run(
         read_only: ctx.workflow.read_only(),
         conversation: Vec::new(),
         last_failure: None,
+        last_blocker: None,
         failing_turns: 0,
+        repeats: HashMap::new(),
     };
     if let Some(saved) = &resume {
         attempt.meter = Meter {
@@ -178,9 +193,9 @@ pub(crate) async fn run(
         attempt.version = saved.requirements;
     }
     attempt.check = attempt.check_at(attempt.version);
-    let (status, note, summary, dispute) = match attempt.work(resume).await {
-        Ok(summary) => (AttemptStatus::Passed, String::new(), summary, None),
-        Err(end) => (end.status, end.note, String::new(), end.dispute),
+    let (status, note, summary, dispute, failure) = match attempt.work(resume).await {
+        Ok(summary) => (AttemptStatus::Passed, String::new(), summary, None, None),
+        Err(end) => (end.status, end.note, String::new(), end.dispute, end.failure.map(|f| *f)),
     };
     // However it ended, nothing it started runs on.
     if let Some(fork) = attempt.fork.as_deref().filter(|_| attempt.processes()) {
@@ -204,6 +219,7 @@ pub(crate) async fn run(
                 summary: summary.clone(),
                 findings: findings.clone(),
                 dispute: dispute.clone(),
+                failure: failure.clone(),
             });
         }
     });
@@ -219,6 +235,7 @@ pub(crate) async fn run(
         note,
         requirements: attempt.version,
         dispute,
+        failure,
     };
     let conversation = if status == AttemptStatus::Passed { attempt.conversation } else { Vec::new() };
     Finished { report, fork: attempt.fork, summary, findings, conversation }
@@ -250,8 +267,14 @@ struct Attempt {
     conversation: Vec<Value>,
     /// The output of its last failed check run, to tell a repeat.
     last_failure: Option<String>,
+    /// The evidence of its last check run that failed for a reason no change
+    /// to the code can fix (see [`Failure::needs_user`]), to tell a repeat.
+    last_blocker: Option<String>,
     /// Turns in a row whose tool calls all failed.
     failing_turns: u32,
+    /// How often each failed tool call, with the same input and the same
+    /// error, was made: a repeat is told it is one.
+    repeats: HashMap<u64, u32>,
 }
 
 impl Attempt {
@@ -457,6 +480,7 @@ impl Attempt {
                         // What its explorer spent is the attempt's too; the run already counts it.
                         self.meter.spend.absorb(&explored);
                         self.count_errors(&results);
+                        let results = self.mark_repeats(&calls, results);
                         conv.push(user_blocks(results));
                         self.save(&conv);
                         continue;
@@ -565,6 +589,28 @@ impl Attempt {
             let output = prompts::output_tail(&ran, NOTE_TAIL);
             let repeated = self.last_failure.as_ref() == Some(&output);
             self.last_failure = Some(output);
+            let failed = if refused.is_some() { None } else { failure::of_command(&ran, FailureSource::Check) };
+            let blocker = failed.as_ref().filter(|f| f.needs_user()).map(|f| f.evidence.clone());
+            // Twice the same thing the code cannot change: a third run would meet it again.
+            let blocked = blocker.is_some() && blocker == self.last_blocker;
+            self.last_blocker = blocker;
+            if let Some(f) = failed.as_ref().filter(|_| blocked) {
+                ctx.note(format!(
+                    "{}: its done-check failed twice for the same reason in the {}, not the code: {}",
+                    attempt_name(self.index),
+                    f.class.name(),
+                    f.evidence
+                ))
+                .await;
+                let note = format!(
+                    "the done-check failed the same way twice ({}), for a reason in the {}, not the code: {}\n{}",
+                    prompts::ending(&ran),
+                    f.class.name(),
+                    f.evidence,
+                    prompts::output_tail(&ran, NOTE_TAIL)
+                );
+                return Err(End::failed(note, failed));
+            }
             if self.check_runs >= ctx.max_check_rounds {
                 let note = match refused {
                     Some(reason) => format!("the done-check passed, but a check.after hook refused it: {reason}"),
@@ -574,7 +620,7 @@ impl Attempt {
                         prompts::output_tail(&ran, NOTE_TAIL)
                     ),
                 };
-                return Err(End::new(AttemptStatus::Failed, note));
+                return Err(End::failed(note, failed));
             }
             self.signal(Signal::CheckFailed { attempt: self.index, repeated });
             asked = false;
@@ -584,7 +630,13 @@ impl Attempt {
                      {reason}\n\nFix that, then reply when you are done.",
                     check.command
                 ),
-                None => prompts::check_failed(&check.command, &ran),
+                None => {
+                    let mut feedback = prompts::check_failed(&check.command, &ran);
+                    if let Some(f) = failed.as_ref().filter(|f| f.needs_user() && !ran.offline_failure) {
+                        feedback.push_str(&prompts::blocked(f));
+                    }
+                    feedback
+                }
             };
             conv.push(user_text(format!("{feedback}{}", hooked.context_text(crate::hooks::Event::CheckAfter))));
             self.save(&conv);
@@ -608,6 +660,24 @@ impl Attempt {
             self.signal(Signal::ToolErrors { attempt: self.index, turns: self.failing_turns });
             self.failing_turns = 0;
         }
+    }
+
+    /// Tell the model when a call failed exactly as the same call did
+    /// before: repeating it unchanged will not help.
+    fn mark_repeats(&mut self, calls: &[ToolUse], mut results: Vec<Value>) -> Vec<Value> {
+        use std::hash::{Hash, Hasher};
+        for result in results.iter_mut().filter(|r| r["is_error"] == true) {
+            let Some(call) = calls.iter().find(|c| result["tool_use_id"] == c.id.as_str()) else { continue };
+            let Some(text) = result["content"].as_str() else { continue };
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            (&call.name, call.input.to_string(), text).hash(&mut hash);
+            let seen = self.repeats.entry(hash.finish()).or_default();
+            *seen += 1;
+            if *seen > 1 {
+                result["content"] = Value::String(format!("{text}{}", prompts::repeated_failure(*seen)));
+            }
+        }
+        results
     }
 
     /// The first well-formed dispute_check among `calls`, when the attempt

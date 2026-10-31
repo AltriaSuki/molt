@@ -146,6 +146,9 @@ pub struct SavedEnd {
     /// It stopped because it disputed the check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispute: Option<CheckDispute>,
+    /// What kind of failure ended it, when the planner could tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<molt_api::planner::Failure>,
 }
 
 impl Saved {
