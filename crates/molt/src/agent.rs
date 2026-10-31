@@ -123,12 +123,27 @@ pub fn resolve_config(
         );
     }
     install_hooks(&mut cfg)?;
+    install_promoted_prompts(&mut cfg, &|name| std::env::var(name).ok())?;
     require_services(&cfg).context("the user config leaves the agent unable to run tasks")?;
     crate::lock::create_private_dir(&data_dir)?;
     let canonical = data_dir.canonicalize().with_context(|| format!("data dir {}", data_dir.display()))?;
     outside(workspace, &canonical)?;
     anyhow::ensure!(canonical == data_dir, "the data dir {} moved while molt started", data_dir.display());
     Ok(cfg)
+}
+
+/// Hand the planner the prompt versions `molt improve` promoted
+/// (`docs/improve.md`), which it speaks with where the user's prompt pack
+/// has no file of its own. They come from the user's improvement registry
+/// only, never from a project.
+fn install_promoted_prompts(cfg: &mut Config, var: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<()> {
+    let env = molt_planner::pack::MODULES_ENV;
+    let Some(planner) = cfg.service_mut("planner").filter(|p| !p.env.contains_key(env)) else { return Ok(()) };
+    let modules = crate::improve::live_prompts(var)?;
+    if !modules.is_empty() {
+        planner.env.insert(env.into(), serde_json::to_string(&modules)?);
+    }
+    Ok(())
 }
 
 /// Hand the planner the config's lifecycle hooks, once they are checked.
@@ -466,7 +481,7 @@ pub fn missing_dependencies(workspace: &Path, cargo: bool) -> Vec<String> {
 }
 
 /// The directory of the running executable, where the services are.
-fn bin_dir() -> anyhow::Result<PathBuf> {
+pub(crate) fn bin_dir() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe().context("finding the molt executable")?;
     Ok(exe.parent().context("the molt executable has no parent directory")?.to_path_buf())
 }
@@ -1016,6 +1031,7 @@ pub async fn call_memory(cfg: &Config, target: &str, payload: Value) -> anyhow::
         profiles: cfg.profiles.clone(),
         mcp: Default::default(),
         models: cfg.models.clone(),
+        improve: cfg.improve.clone(),
     };
     let running = crate::start(&alone).await?;
     let result = async {

@@ -47,11 +47,11 @@ pub fn for_workspace(workspace: &Path, var: &dyn Fn(&str) -> Option<String>) -> 
     Ok(Some(dir))
 }
 
-/// What `molt prompts list` prints: each prompt, built-in or the pack's,
-/// with its version and, for a protected one, whether it is in effect;
-/// then the pack's roles and workflows.
-pub fn list(dir: Option<&Path>) -> anyhow::Result<String> {
-    let pack = load(dir)?;
+/// What `molt prompts list` prints: each prompt, built-in, the pack's or
+/// one `molt improve` promoted, with its version and, for a protected one,
+/// whether it is in effect; then the pack's roles and workflows.
+pub fn list(dir: Option<&Path>, promoted: Vec<pack::PromptModule>) -> anyhow::Result<String> {
+    let pack = load(dir)?.with_modules(promoted)?;
     let mut out = match dir {
         Some(dir) => format!("prompt pack: {}\n", dir.display()),
         None => "prompt pack: none (the built-in prompts only)\n".to_owned(),
@@ -61,8 +61,15 @@ pub fn list(dir: Option<&Path>) -> anyhow::Result<String> {
     for name in names {
         let (text, source) = pack.text(name).expect("listed prompts exist");
         let hash = pack::sha256(text);
-        let mut line =
-            format!("{name:<12} {}  {}", &hash[..12], if source == Source::User { "yours" } else { "built-in" });
+        let mut line = format!(
+            "{name:<12} {}  {}",
+            &hash[..12],
+            match source {
+                Source::User => "yours",
+                Source::Registry => "promoted by molt improve",
+                Source::Builtin => "built-in",
+            }
+        );
         if pack::protected(name) && source == Source::User {
             line.push_str(match pack.promoted.get(name) {
                 Some(p) if p.sha256 == hash => ", promoted",
@@ -85,11 +92,16 @@ pub fn list(dir: Option<&Path>) -> anyhow::Result<String> {
     Ok(out)
 }
 
-/// The text of prompt `name`: the pack's file, else the built-in; with
+/// The text of prompt `name`: the pack's file, else the promoted one, else the built-in; with
 /// `builtin`, the built-in. A protected prompt's file is shown whether or
 /// not it is promoted (`list` says which).
-pub fn show(dir: Option<&Path>, name: &str, builtin: bool) -> anyhow::Result<String> {
-    let pack = if builtin { Pack::default() } else { load(dir)? };
+pub fn show(
+    dir: Option<&Path>,
+    promoted: Vec<pack::PromptModule>,
+    name: &str,
+    builtin: bool,
+) -> anyhow::Result<String> {
+    let pack = if builtin { Pack::default() } else { load(dir)?.with_modules(promoted)? };
     let (text, _) = pack.text(name).with_context(|| {
         let names: Vec<&str> = pack::BUILTIN.iter().map(|(n, _)| *n).collect();
         format!("there is no prompt {name:?}; the built-in ones are {}", names.join(", "))
@@ -183,7 +195,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path();
         std::fs::write(dir.join("reviewer.md"), "Review strictly.\n").unwrap();
-        let listed = list(Some(dir)).unwrap();
+        let listed = list(Some(dir), Vec::new()).unwrap();
         assert!(listed.contains("reviewer") && listed.contains("not promoted"), "{listed}");
 
         let mut out = Vec::new();
@@ -202,11 +214,14 @@ mod tests {
         assert!(shown.contains("Review strictly.") && shown.contains("guards what results are accepted"), "{shown}");
         let pack = Pack::load(dir).unwrap();
         assert!(pack.is_promoted("reviewer", "Review strictly."));
-        assert!(list(Some(dir)).unwrap().contains("reviewer") && list(Some(dir)).unwrap().contains("promoted"));
+        assert!(
+            list(Some(dir), Vec::new()).unwrap().contains("reviewer")
+                && list(Some(dir), Vec::new()).unwrap().contains("promoted")
+        );
 
         // An edit undoes it until the next promotion.
         std::fs::write(dir.join("reviewer.md"), "Review leniently.\n").unwrap();
-        assert!(list(Some(dir)).unwrap().contains("changed since its promotion"));
+        assert!(list(Some(dir), Vec::new()).unwrap().contains("changed since its promotion"));
         assert!(promote(dir, "missing", &mut Vec::new(), &mut |_| Ok("missing".into())).is_err());
     }
 
@@ -214,9 +229,14 @@ mod tests {
     fn show_prints_the_text_in_effect_or_the_built_in() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("judge.md"), "Judge.\n").unwrap();
-        assert_eq!(show(Some(root.path()), "judge", false).unwrap(), "Judge.\n");
-        assert!(show(Some(root.path()), "judge", true).unwrap().starts_with("You judge the result of a task"));
-        assert!(show(None, "nothing", false).is_err());
-        assert_eq!(show(None, "attempt", false).unwrap(), format!("{}\n", pack::builtin("attempt").unwrap()));
+        assert_eq!(show(Some(root.path()), Vec::new(), "judge", false).unwrap(), "Judge.\n");
+        assert!(show(Some(root.path()), Vec::new(), "judge", true)
+            .unwrap()
+            .starts_with("You judge the result of a task"));
+        assert!(show(None, Vec::new(), "nothing", false).is_err());
+        assert_eq!(
+            show(None, Vec::new(), "attempt", false).unwrap(),
+            format!("{}\n", pack::builtin("attempt").unwrap())
+        );
     }
 }

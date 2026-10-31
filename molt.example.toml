@@ -169,6 +169,21 @@ requests = [
 # explorer = "haiku"
 # memory = "haiku"
 
+# The gate `molt improve run` promotes an improved planner prompt through
+# (docs/improve.md); these are the defaults. Only your configuration sets
+# them: the improver, a sandboxed candidate, reaches none of this, nor the
+# tasks, their hidden tests or the held-out set. The prompt versions, the
+# decisions and the promotions are kept in $MOLT_IMPROVE_DIR (default
+# ~/.local/share/molt/improve; `none` makes `molt do` use none of them).
+# [improve]
+# max_regressions = 0     # tasks the candidate may pass less often than the live version
+# min_gain = 1            # more runs, over both sets, it must pass
+# min_heldout_gain = 0    # more runs of the held-out set it must pass
+# max_cost_ratio = 1.5    # the most it may cost, as a multiple of the live version's
+# trials = 1              # runs of each version on each task
+# options = []            # `molt do` options of every run, such as ["--attempts", "1"]
+# model = "sonnet"        # the improver's model; default: the gateway's
+
 # When the interface's confirm mode stops for you; these are the defaults.
 # [confirm]
 # max_lines = 300

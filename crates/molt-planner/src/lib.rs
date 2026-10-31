@@ -223,6 +223,7 @@ impl Config {
     /// | `MOLT_SYNTAX_CHECK` | `report`; or `reject`, or `off` |
     /// | `MOLT_ROUTE_MODEL` | unset: the run's model picks the workflow of a run that names `auto` |
     /// | `MOLT_PROMPTS_DIR` | unset: the built-in prompts; else the prompt pack to read ([`pack::Pack::load`]) |
+    /// | `MOLT_PROMPT_MODULES_JSON` | unset: none; else the promoted prompt versions, under the pack's files ([`pack::Pack::with_modules`]) |
     /// | `MOLT_SKILLS_DIR` | unset: no user skills; else the directory of the user's skills ([`skills`]) |
     /// | `MOLT_EXTENSION_SKILLS` | unset: none; else the extension packs' skill directories, as a `PATH`-style list ([`skills`]) |
     /// | `MOLT_COMPACT` | `record`: Molt's own record of the turns a conversation leaves out; `model` also has the `compactor` write notes on them ([`compact`]) |
@@ -280,10 +281,15 @@ impl Config {
             .context("MOLT_TOOLS_JSON is not a list of tool declarations")?
             .unwrap_or_default();
         validate_tools(&tools)?;
-        let pack = match get(pack::PROMPTS_ENV) {
+        let mut pack = match get(pack::PROMPTS_ENV) {
             Some(dir) => pack::Pack::load(std::path::Path::new(&dir))?,
             None => pack::Pack::default(),
         };
+        if let Some(json) = get(pack::MODULES_ENV) {
+            let modules = serde_json::from_str(&json)
+                .with_context(|| format!("{} is not a list of prompt modules", pack::MODULES_ENV))?;
+            pack = pack.with_modules(modules)?;
+        }
         Ok(Self {
             hooks,
             extension_skills: get(skills::EXTENSION_SKILLS_ENV)

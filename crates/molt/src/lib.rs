@@ -10,6 +10,7 @@ pub mod confine;
 pub mod doctor;
 pub mod extensions;
 pub mod git;
+pub mod improve;
 pub mod layers;
 mod lock;
 pub mod project;
