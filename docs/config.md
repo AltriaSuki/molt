@@ -217,6 +217,12 @@ It answers with how it ends and what it prints:
 - any other exit, a timeout, or an answer that does not read is a failure:
   a `blocking` hook's failure denies, any other's is noted and passed over.
 
+A hook written for Claude Code can keep Claude Code's names with
+`dialect = "claude-code"`: its `matcher`, `tool_name` and `tool_input` use
+`Edit`, `Write`, `Read`, `Bash`, `Grep`, `WebFetch` and `file_path`, and
+`hook_event_name` `PreToolUse`, `PostToolUse` and `UserPromptSubmit`
+([extensions.md](extensions.md#claude-code-plugins)).
+
 The hooks of an event run one after another in the order you wrote them,
 each told what those before it changed; the first deny ends it. What an
 event's hook cannot do (a `run.end` hook's deny, say) is noted as ignored.

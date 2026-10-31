@@ -236,8 +236,39 @@ follows its `rev`, and `add NAME` follows the registry's current entry.
 are; commands with the front matter Molt reads; stdio servers of `.mcp.json`
 with `${CLAUDE_PLUGIN_ROOT}` mapped, `"${X}"` for a variable `X` as
 `pass_env`, and no network. HTTP servers, variables built from others,
-nested commands, hooks and agents are left out and said so. The written
+nested commands and agents are left out and said so. The written
 manifest is shown and approved as any other.
+
+Hooks (`hooks/hooks.json`, and `plugin.json`'s `hooks` as files or
+inline) are imported on the events that mean the same in Molt:
+`PreToolUse`, `PostToolUse` and `UserPromptSubmit`. Two things kept them
+out before, and each is met without widening what a hook may do:
+
+- **Names.** A Claude Code hook matches and reads `Edit` with `file_path`,
+  not `edit_file` with `path`. `molt_planner::hooks::Dialect`, a new
+  optional `dialect` of a `[[hooks]]` entry (`"molt"` by default, absent
+  when serialized), makes the hook see Claude Code's names: its `matcher`
+  is matched against Claude Code's name of the tool, `tool_name`,
+  `tool_input` and `hook_event_name` are told in its names, and an
+  `updatedInput` is read back into Molt's before the tool parses it. Tools
+  with no counterpart keep Molt's names. The importer sets it on every
+  hook it writes.
+- **Scripts.** A hook runs in the workspace's sandbox, which does not see
+  the pack, so `${CLAUDE_PLUGIN_ROOT}/hooks/x.sh` cannot run. A command
+  that is only one script of the plugin, run by its `#!` line or a named
+  `sh`, `bash`, `zsh`, `python3`, `python` or `node`, becomes that
+  interpreter with the script's text as its program (`-c`, `-e`). The
+  approved grant then holds the hook's code itself, which is the rule for
+  any pack's hook. A script that names the plugin's directory or locates
+  files beside itself (`$0`, `BASH_SOURCE`, `__file__`, `__dirname`,
+  `import.meta`) is left out, as is a command that does more.
+
+`type = "prompt"` hooks, matchers on MCP tools (Claude Code names a
+plugin's servers `mcp__plugin_…`), events with no counterpart (`Stop`,
+`SubagentStop`, `SessionStart`, `SessionEnd`, `Notification`,
+`PreCompact`) and hooks beyond Molt's 32 are left out and said so.
+Imported hooks are not `blocking`, as in Claude Code a failing hook other
+than exit 2 is passed over; a missing `timeout` is Claude Code's 60 s.
 
 ## Compatibility
 
@@ -264,7 +295,11 @@ own.
   `extensions::tests::installing_lists_every_power_and_records_the_approval_only_on_yes`).
 - A disabled pack's tools are not offered in a run (the same test).
 - A Claude Code plugin with commands and skills is imported
-  (`extensions::tests::a_claude_code_plugin_with_commands_skills_and_a_server_is_imported`).
+  (`extensions::tests::a_claude_code_plugin_with_commands_skills_and_a_server_is_imported`),
+  and so are its hooks that Molt can run, their scripts in the approved
+  grant, in Claude Code's names
+  (`extensions::tests::a_claude_code_plugins_hooks_are_imported_with_their_scripts_and_the_rest_left_out_with_why`;
+  `hooks::tests::a_claude_code_hook_sees_and_answers_in_claude_codes_tool_names_and_inputs`).
 - An update asking for more is approved again; a changed or over-reaching
   installed pack stops the start; path traversal and links install nothing
   (`extensions::tests`).
@@ -304,8 +339,9 @@ own.
   prompts need RFC 0003's promotion to cover a pack's protected prompts.
 - A pack's service with the network, or with mounts beyond the pack's
   directory: a candidate has neither today.
-- Importing Claude Code hooks (their tool names and `${CLAUDE_PLUGIN_ROOT}`
-  scripts do not carry over to Molt's sandboxed hooks) and agents (roles).
+- Importing Claude Code agents (roles, RFC 0003), hooks on events Molt
+  has no counterpart of, and hook scripts that need files beside them
+  (that would take a hook sandbox that sees the pack).
 - Comparing a server's `calls` numerically, so that fewer calls is not a
   new line.
 - Evaluating a pack on the benchmark before enabling it.
