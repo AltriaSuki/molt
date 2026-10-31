@@ -692,6 +692,7 @@ impl Ctx {
             role: Some(conv.role),
             prompt: conv.prompt.clone(),
             attempt: conv.attempt,
+            cache_points: conv.cache_points(),
         };
         if let Some(prompt) = &conv.prompt {
             let mut spoke = self.spoke.lock().unwrap_or_else(PoisonError::into_inner);

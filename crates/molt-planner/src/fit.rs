@@ -2,23 +2,31 @@
 //! input (its context window less the reply's `max_tokens`) and the bus's
 //! frame, which carries the whole serialized request.
 //!
-//! Before each call the conversation is measured. Over either limit, its
-//! oldest turns are left out at a whole round trip, so no `tool_use` loses
-//! its result and no assistant turn is changed (their thinking blocks are
-//! signed). A record of what those turns did is added to the first message,
-//! as data ([`crate::compact`]); the first message itself (the task, the
-//! check, the project's context) is never cut. A result too big to fit even alone is cut down,
-//! saying so. The whole conversation stays in the audit log either way.
+//! Before each call the conversation is measured. Over either limit (the
+//! high-water mark), its oldest turns are left out at a whole round trip
+//! down to half the limits (the low-water mark), in one go, so the calls
+//! until the next fit send the same prefix. No `tool_use` loses its result
+//! and no assistant turn is changed (their thinking blocks are signed). A
+//! result too big to fit even alone is cut down, saying so. The whole
+//! conversation stays in the audit log either way.
+//!
+//! The first message (the task, the check, the project's context) is never
+//! changed. A record of what the left-out turns did ([`crate::compact`]) goes
+//! in a checkpoint of its own after it: an assistant turn that says the
+//! record follows, then a user turn that holds it, as data. Providers cache a
+//! request by its prefix (system, tools, then the messages in order), so the
+//! first message stays cached through every fit, and the checkpoint from one
+//! fit to the next. [`Conversation::cache_points`] names both for the gateway.
 
-use molt_api::model::{text_block, Usage};
-use serde_json::Value;
+use molt_api::model::{text_block, user_blocks, Usage};
+use serde_json::{json, Value};
 
 use crate::compact::Compacted;
 use crate::ctx::Conversation;
 
 /// Bytes per token assumed for text not yet measured by the model. Low, so
 /// the estimate errs high: code and non-English text take more tokens.
-const BYTES_PER_TOKEN: u64 = 3;
+pub(crate) const BYTES_PER_TOKEN: u64 = 3;
 /// Room kept in a frame for the envelope around the request.
 const FRAME_SLACK: usize = 64 * 1024;
 /// Most of the record of left-out turns, in bytes.
@@ -27,6 +35,13 @@ const MAX_RECORD: usize = 24 * 1024;
 const PART: usize = 400;
 /// Opens the record; a record from an earlier fit is found by it.
 pub(crate) const RECORD_TAG: &str = "<earlier_turns>";
+/// The assistant turn that opens the checkpoint, before the record. Fixed,
+/// so a checkpoint is found by it and its bytes never change.
+pub(crate) const CHECKPOINT: &str =
+    "Earlier turns of this conversation were left out to make room. I go on from Molt's record of them, which follows.";
+/// What a fit leaves, as a share of the limits: low, so the calls after it
+/// go on with the same prefix for a while before the next.
+const LOW_WATER: u64 = 2;
 
 /// What one model call can take.
 #[derive(Clone, Copy, Debug)]
@@ -117,25 +132,29 @@ impl Conversation {
         self.tokens() <= limits.tokens && self.bytes() <= limits.bytes
     }
 
-    /// Make the next request fit `limits`, leaving out the oldest turns down
-    /// to half the limits so this does not repeat every turn. `None` when it
-    /// already fits; an error saying which limit it is when it cannot fit.
+    /// Make the next request fit `limits`. Over them, the oldest turns are
+    /// left out down to the low-water mark, so this does not repeat every
+    /// turn. `None` when it already fits; an error saying which limit it is
+    /// when it cannot fit.
     pub fn fit(&mut self, limits: Limits) -> Result<Option<Fitted>, String> {
         if self.fits(limits) {
             return Ok(None);
         }
         let before = self.tokens();
-        let half = Limits { tokens: limits.tokens / 2, bytes: limits.bytes / 2 };
+        let low = Limits { tokens: limits.tokens / LOW_WATER, bytes: limits.bytes / LOW_WATER as usize };
         let mut left_out = 0;
-        // The tail kept starts at an assistant turn, after the first message.
+        let head = self.head();
+        // The tail kept starts at an assistant turn, after the first message and the checkpoint.
         let starts: Vec<usize> =
-            (1..self.messages.len()).filter(|&i| self.messages[i]["role"] == "assistant").collect();
+            (head..self.messages.len()).filter(|&i| self.messages[i]["role"] == "assistant").collect();
         if let Some(&last) = starts.last() {
             // The record's standing state is not counted in MAX_RECORD: it is never cut.
             let standing = self.standing.as_ref().map_or(0, String::len) + self.budget.as_ref().map_or(0, String::len);
             let fixed = self.system.len()
                 + self.tools.iter().map(size).sum::<usize>()
                 + size(&self.messages[0])
+                + CHECKPOINT.len()
+                + 128
                 + MAX_RECORD
                 + standing;
             let mut tail: usize = self.messages[last..].iter().map(size).sum();
@@ -144,14 +163,14 @@ impl Conversation {
             for &start in starts.iter().rev().skip(1) {
                 let more: usize = self.messages[start..cut].iter().map(size).sum();
                 let total = fixed + tail + more;
-                if total > half.bytes || tokens_of(total) > half.tokens {
+                if total > low.bytes || tokens_of(total) > low.tokens {
                     break;
                 }
                 tail += more;
                 cut = start;
             }
-            if cut > 1 {
-                let dropped: Vec<Value> = self.messages.drain(1..cut).collect();
+            if cut > head {
+                let dropped: Vec<Value> = self.messages.drain(head..cut).collect();
                 left_out = dropped.len();
                 self.add_record(&dropped);
                 self.known = None;
@@ -188,17 +207,45 @@ impl Conversation {
         }
     }
 
+    /// Messages before the turns a fit may leave out: the first, and the
+    /// checkpoint after it once there is one.
+    fn head(&self) -> usize {
+        if self.checkpoint().is_some() {
+            3
+        } else {
+            1
+        }
+    }
+
+    /// The record the checkpoint holds, when the conversation has one.
+    pub fn checkpoint(&self) -> Option<&str> {
+        let ack = self.messages.get(1)?;
+        let said = ack["content"].as_array().and_then(|b| b.first()).and_then(|b| b["text"].as_str());
+        if ack["role"] != "assistant" || said != Some(CHECKPOINT) {
+            return None;
+        }
+        let record = self.messages.get(2)?;
+        let text = record["content"].as_array().and_then(|b| b.first()).and_then(|b| b["text"].as_str())?;
+        (record["role"] == "user" && text.starts_with(RECORD_TAG)).then_some(text)
+    }
+
+    /// The messages a provider should cache the request up to, as indexes:
+    /// the first message, which never changes, and the checkpoint's record,
+    /// which changes only at a fit.
+    pub fn cache_points(&self) -> Vec<usize> {
+        let mut points = vec![0];
+        if self.checkpoint().is_some() {
+            points.push(2);
+        }
+        points
+    }
+
     /// Take `dropped` into what the conversation keeps of its left-out
-    /// turns, and write its record into the first message.
+    /// turns, and write its record into the checkpoint.
     fn add_record(&mut self, dropped: &[Value]) {
         if self.compacted.is_none() {
-            // A record an older planner wrote, with no items behind it: its lines go on.
-            let old = self.messages[0]["content"]
-                .as_array()
-                .and_then(|b| b.last())
-                .and_then(|b| b["text"].as_str())
-                .filter(|t| t.starts_with(RECORD_TAG))
-                .map(Compacted::from_record);
+            // A record with no items behind it, from a conversation this one goes on from: its lines go on.
+            let old = self.checkpoint().map(Compacted::from_record).or_else(|| self.legacy_record());
             self.compacted = Some(old.unwrap_or_default());
         }
         if let Some(compacted) = &mut self.compacted {
@@ -207,20 +254,35 @@ impl Conversation {
         self.write_record();
     }
 
-    /// Write the record of the left-out turns as the first message's last
-    /// block, in place of the one an earlier fit wrote.
+    /// A record an older planner wrote as the first message's last block,
+    /// taken out of it: the one time the first message changes, so that it
+    /// stays the same from then on.
+    fn legacy_record(&mut self) -> Option<Compacted> {
+        let blocks = self.messages[0]["content"].as_array_mut()?;
+        let text = blocks.last().and_then(|b| b["text"].as_str()).filter(|t| t.starts_with(RECORD_TAG))?;
+        let old = Compacted::from_record(text);
+        blocks.pop();
+        Some(old)
+    }
+
+    /// Write the record of the left-out turns into the checkpoint after the
+    /// first message, in place of the one an earlier fit wrote. The first
+    /// message is left as it is.
     pub fn write_record(&mut self) {
         let Some(compacted) = &self.compacted else { return };
         let record = compacted.render(self.recall, self.standing.as_deref(), self.budget.as_deref(), MAX_RECORD);
-        let first = &mut self.messages[0];
-        if let Value::String(text) = &first["content"] {
-            first["content"] = Value::Array(vec![text_block(text.clone())]);
+        if self.checkpoint().is_some() {
+            self.messages[2] = user_blocks(vec![text_block(record)]);
+        } else {
+            // A record an older planner wrote in the first message: its lines are already in the items.
+            self.legacy_record();
+            // The turns after the checkpoint start at an assistant turn, as a fit leaves them.
+            if self.messages.get(1).is_some_and(|m| m["role"] != "assistant") {
+                return;
+            }
+            let ack = json!({ "role": "assistant", "content": [text_block(CHECKPOINT)] });
+            self.messages.splice(1..1, [ack, user_blocks(vec![text_block(record)])]);
         }
-        let Some(blocks) = first["content"].as_array_mut() else { return };
-        if blocks.last().and_then(|b| b["text"].as_str()).is_some_and(|t| t.starts_with(RECORD_TAG)) {
-            blocks.pop();
-        }
-        blocks.push(text_block(record));
         self.known = None;
     }
 
@@ -336,6 +398,102 @@ mod tests {
         alternate && paired
     }
 
+    /// How many messages hold a record of earlier turns.
+    fn records(conv: &Conversation) -> usize {
+        conv.messages.iter().filter(|m| m.to_string().contains(RECORD_TAG)).count()
+    }
+
+    fn digest(v: &Value) -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(serde_json::to_vec(v).unwrap()))
+    }
+
+    /// A provider's prompt cache, as the Messages API keeps it: an entry for
+    /// the request's prefix up to each cache point, read back when a later
+    /// request starts with the same bytes.
+    #[derive(Default)]
+    struct PrefixCache(std::collections::HashSet<String>);
+
+    impl PrefixCache {
+        /// Send `conv`'s next request: the longest prefix at one of its
+        /// cache points that an earlier request cached, in messages; then
+        /// cache its own prefixes.
+        fn send(&mut self, conv: &Conversation) -> usize {
+            let prefix = |n: usize| {
+                let head = json!([conv.system.as_ref(), conv.tools.as_ref(), &conv.messages[..n]]);
+                digest(&head)
+            };
+            let points: Vec<usize> = conv.cache_points().into_iter().map(|p| p + 1).collect();
+            let hit = points.iter().copied().filter(|&n| self.0.contains(&prefix(n))).max().unwrap_or(0);
+            self.0.extend(points.into_iter().map(prefix));
+            hit
+        }
+    }
+
+    #[test]
+    fn the_first_message_never_changes_however_often_turns_are_left_out() {
+        let mut conv = conversation(0, "");
+        let first = digest(&conv.messages[0]);
+        let limits = Limits { tokens: 30_000, bytes: 1 << 20 };
+        let mut cache = PrefixCache::default();
+        let (mut fits, mut since) = (0, 0);
+        for n in 0..400 {
+            let fitted = conv.fit(limits).unwrap();
+            let hit = cache.send(&conv);
+            if fitted.is_some_and(|f| f.left_out > 0) {
+                fits += 1;
+                since = 0;
+                // Right after a fit: the system, the tools and the first message are still cached.
+                assert!(hit >= 1, "turn {n}: {hit}");
+            } else if fits > 0 && since > 0 {
+                // Between fits: the checkpoint too.
+                assert_eq!(hit, 3, "turn {n}");
+            }
+            since += 1;
+            assert_eq!(digest(&conv.messages[0]), first, "turn {n}");
+            assert!(valid(&conv), "turn {n}");
+            assert!(records(&conv) <= 1);
+            conv.push(assistant(&format!("t{n}"), &format!("turn {n}")));
+            conv.push(user_blocks(vec![tool_result(&format!("t{n}"), "r".repeat(3000), false)]));
+        }
+        assert!(fits >= 3, "{fits}");
+        assert_eq!(conv.cache_points(), [0, 2]);
+        // Each fit leaves out down to the low-water mark, so many calls go by between two.
+        assert!(400 / fits >= 10, "{fits} fits");
+        // Every left-out turn keeps its id and line, and the newest their whole text, for earlier_result.
+        let compacted = conv.compacted.as_ref().unwrap();
+        assert_eq!(compacted.items.len() as u32, compacted.next);
+        assert_eq!(compacted.items[0].line, "You wrote: turn 0");
+        assert!(compacted.items.last().unwrap().body.is_some());
+    }
+
+    #[test]
+    fn a_record_an_older_planner_wrote_in_the_first_message_moves_to_the_checkpoint_once() {
+        let mut conv = conversation(40, &"r".repeat(3000));
+        let old = format!("{RECORD_TAG}\nEarlier turns were left out.\n\n- You wrote: turn -1\n</earlier_turns>");
+        conv.messages[0] = user_blocks(vec![text_block("<task>\nDo it.\n</task>"), text_block(old)]);
+        conv.fit(Limits { tokens: 30_000, bytes: 1 << 20 }).unwrap().unwrap();
+        assert_eq!(conv.messages[0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(records(&conv), 1);
+        assert!(conv.checkpoint().unwrap().contains("- You wrote: turn -1"));
+        assert!(valid(&conv));
+
+        // A conversation that goes on from one with a checkpoint keeps its lines, and has one checkpoint.
+        let mut next = conversation(0, "");
+        next.messages = conv.messages.clone();
+        next.compacted = None;
+        for n in 100..140 {
+            next.push(assistant(&format!("t{n}"), &format!("turn {n}")));
+            next.push(user_blocks(vec![tool_result(&format!("t{n}"), "r".repeat(3000), false)]));
+        }
+        next.fit(Limits { tokens: 30_000, bytes: 1 << 20 }).unwrap().unwrap();
+        assert_eq!(records(&next), 1);
+        let legacy = &next.compacted.as_ref().unwrap().legacy;
+        assert!(legacy.iter().any(|l| l == "- You wrote: turn -1"), "{legacy:?}");
+        assert!(legacy.iter().any(|l| l == "- [E1] You wrote: turn 0"), "{legacy:?}");
+        assert!(valid(&next));
+    }
+
     #[test]
     fn a_conversation_that_fits_is_left_alone() {
         let mut conv = conversation(5, "ok");
@@ -347,16 +505,17 @@ mod tests {
     #[test]
     fn the_oldest_turns_are_left_out_at_a_round_trip_with_a_record() {
         let mut conv = conversation(40, &"r".repeat(3000));
-        let first = conv.messages[0]["content"][0].clone();
+        let first = conv.messages[0].clone();
         let last = conv.messages[conv.messages.len() - 2..].to_vec();
         let limits = Limits { tokens: 30_000, bytes: 1 << 20 };
         let fitted = conv.fit(limits).unwrap().unwrap();
         assert!(fitted.left_out > 0 && fitted.left_out.is_multiple_of(2) && fitted.cut == 0, "{fitted:?}");
         assert!(conv.tokens() <= limits.tokens / 2 + 1000, "{}", conv.tokens());
         assert!(valid(&conv));
-        // The first message is kept whole, with the record after it.
-        assert_eq!(conv.messages[0]["content"][0], first);
-        let record = conv.messages[0]["content"][1]["text"].as_str().unwrap();
+        // The first message is kept as it was, with the record in a checkpoint after it.
+        assert_eq!(conv.messages[0], first);
+        assert_eq!(conv.messages[1]["content"][0]["text"], CHECKPOINT);
+        let record = conv.checkpoint().unwrap();
         assert!(record.starts_with(RECORD_TAG) && record.ends_with("</earlier_turns>"), "{record}");
         assert!(
             record.contains("- [E1] You wrote: turn 0")
@@ -373,9 +532,9 @@ mod tests {
             conv.push(user_blocks(vec![tool_result(&format!("t{n}"), "r".repeat(3000), false)]));
         }
         conv.fit(limits).unwrap().unwrap();
-        let blocks = conv.messages[0]["content"].as_array().unwrap();
-        assert_eq!(blocks.len(), 2, "one record");
-        let record = blocks[1]["text"].as_str().unwrap();
+        assert_eq!(conv.messages[0], first);
+        assert_eq!(records(&conv), 1, "one record");
+        let record = conv.checkpoint().unwrap();
         // Kept to its size by leaving out its oldest lines, saying so.
         assert!(record.len() <= MAX_RECORD + 100 && record.contains("You wrote: turn 41"), "{record}");
         assert!(
@@ -396,7 +555,7 @@ mod tests {
         conv.standing = Some("- The done-check is `make`.".into());
         let limits = Limits { tokens: 30_000, bytes: 1 << 20 };
         conv.fit(limits).unwrap().unwrap();
-        let record = |conv: &Conversation| conv.messages[0]["content"][1]["text"].as_str().unwrap().to_owned();
+        let record = |conv: &Conversation| conv.checkpoint().unwrap().to_owned();
         assert!(record(&conv).contains("- The done-check is `make`."));
         conv.standing = Some("- The done-check is `make test`.".into());
         for n in 40..80 {
@@ -406,7 +565,7 @@ mod tests {
         conv.fit(limits).unwrap().unwrap();
         let text = record(&conv);
         assert!(text.contains("- The done-check is `make test`.") && !text.contains("`make`."), "{text}");
-        assert_eq!(conv.messages[0]["content"].as_array().unwrap().len(), 2, "one record");
+        assert_eq!(records(&conv), 1, "one record");
     }
 
     #[test]

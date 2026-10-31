@@ -425,10 +425,18 @@ conversation stays in the audit log. When even that cannot fit, the attempt
 ends with an error that names the limit, the model's input or the transport
 frame.
 
-What the left-out turns did goes into a record at the end of the first
-message, after the task and the check, which are never cut. The record is
-rebuilt at every fit, at most 24 KiB besides its first section, in this
-order:
+What the left-out turns did goes into a record of its own, a checkpoint
+right after the first message: an assistant turn that says the record
+follows, then a user turn that holds it. The first message (the task, the
+check and the project's context) is never cut or changed, so a provider's
+prompt cache, which reads the system prompt, the tools and the messages in
+order, keeps it through every fit. The gateway asks the Messages API to
+cache up to the first message and up to the checkpoint. A fit starts only
+when the next call would not fit, and then leaves turns out until the
+conversation is down to half of what the model takes, so the calls after it
+send the same checkpoint and turns and read them from the cache until the
+next fit. The record is rebuilt at each fit, at most 24 KiB besides its
+first section, in this order:
 
 - **What holds now**, from the run's own state rather than from the turns:
   the user's requirements as of the version the attempt works to, the
@@ -464,7 +472,9 @@ attempt's notes on them: the changes that stand, the decisions and the
 evidence they rest on, what failed and why, the open questions and the next
 step, merged with its notes so far. It is one model call per fit, with the
 attempt's model unless the compactor's role names one; it is shown the task
-and up to 48 KiB of the left-out items as data, and is not previewed. What
+and up to 48 KiB of the left-out items as data (less when the model it
+calls takes less: the call stays within a quarter of that model's input),
+and is not previewed. What
 it costs counts toward the run and the attempt, as every call does, and it
 is not made once the run's budget is spent. When it fails, declines or does
 not submit notes, the notes stay as they were and Molt's own record stands,
