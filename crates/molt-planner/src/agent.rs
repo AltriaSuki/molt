@@ -60,7 +60,11 @@ pub(crate) async fn turn(
     if conv.recall {
         conv.budget = Some(budget_line(ctx, meter.turns, max_turns));
     }
-    let limits = ctx.limits();
+    // The limits of the model this call goes to, which may not be the run's.
+    let model = ctx.model_of(conv);
+    ctx.learn(&model).await;
+    ctx.note_guess(&model).await;
+    let limits = ctx.limits_of(&model);
     let before = conv.compacted.as_ref().map_or(0, |c| c.next);
     match conv.fit(limits) {
         Ok(None) => {}

@@ -1,11 +1,12 @@
 //! What every part of one run shares: the bus, the limits, the spend so far,
 //! the forks still alive, and typed helpers for the calls a run makes.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use molt_api::fs;
-use molt_api::model::{self, CompleteRequest, CompleteResponse, Effort, Role, Usage};
+use molt_api::model::{self, CompleteRequest, CompleteResponse, Effort, LimitsRequest, LimitsResponse, Role, Usage};
 use molt_api::planner::RunRequest;
 use molt_api::progress::{self, Progress};
 use molt_api::role::PromptUse;
@@ -92,6 +93,20 @@ pub(crate) fn refused(error: &RemoteError) -> bool {
     matches!(error.code, ErrorCode::Denied | ErrorCode::Invalid)
 }
 
+/// What the gateway says calls to one model can take: asked once, before
+/// the first call to it, and corrected by what its replies report.
+#[derive(Clone, Copy, Debug, Default)]
+struct Known {
+    /// The gateway was asked, or cannot be.
+    asked: bool,
+    context: Option<u32>,
+    max_output: Option<u32>,
+    /// The run was told the window is a guess, so it is told once.
+    guess_noted: bool,
+    /// The run was told a reply's window differs from what was used.
+    differs_noted: bool,
+}
+
 #[derive(Default)]
 struct WebHealth {
     failures: u32,
@@ -171,9 +186,9 @@ pub(crate) struct Ctx {
     /// Each role that has made a model call and its prompt, in the order
     /// they first did.
     spoke: Arc<Mutex<Vec<PromptUse>>>,
-    /// The run's model's context window, as the gateway last reported it
-    /// (#106); 0 until it does.
-    reported_context: Arc<std::sync::atomic::AtomicU32>,
+    /// What each model called in the run can take, by the name calls give
+    /// it (`None`: the gateway's default), shared by every part of the run.
+    models: Arc<Mutex<HashMap<Option<String>, Known>>>,
     /// Where an attempt of an adaptive run reports what the schedule decides
     /// on (see [`crate::schedule`]); `None` in a fixed run.
     pub signals: Option<tokio::sync::mpsc::UnboundedSender<crate::schedule::Signal>>,
@@ -347,7 +362,7 @@ impl Ctx {
             continues: req.continues.clone().map(Arc::new),
             base: None,
             spoke: Arc::default(),
-            reported_context: Arc::default(),
+            models: Arc::default(),
             signals: None,
             prior: None,
         }
@@ -396,17 +411,111 @@ impl Ctx {
         }
     }
 
-    /// What one model call of this run can take.
-    /// `MOLT_CONTEXT_TOKENS` wins, then what the gateway's configuration
-    /// declares for the run's model, then a guess from its name.
-    pub fn limits(&self) -> Limits {
-        let reported = self.reported_context.load(std::sync::atomic::Ordering::Relaxed);
+    /// The model `conv`'s calls go to: its own, its role's, else the run's.
+    pub fn model_of(&self, conv: &Conversation) -> Option<String> {
+        conv.model.clone().or_else(|| self.cfg.role_models.get(&conv.role).cloned()).or_else(|| self.model.clone())
+    }
+
+    fn known(&self, model: &Option<String>) -> Known {
+        self.models.lock().unwrap_or_else(PoisonError::into_inner).get(model).copied().unwrap_or_default()
+    }
+
+    /// Ask the gateway, once for each model, what a call to `model` can
+    /// take, so that even the first call to it is fitted to that model and
+    /// not to the run's. A gateway that cannot say (an older one, or a
+    /// planner without the capability) leaves it to the setting or the guess.
+    pub async fn learn(&self, model: &Option<String>) {
+        if self.known(model).asked {
+            return;
+        }
+        let mut answer = LimitsResponse::default();
+        if self.bus.holds(model::LIMITS) {
+            let req = LimitsRequest { model: model.clone() };
+            match self.call::<LimitsResponse>(model::LIMITS, req, Budget::new(0, FILE_MS, 0)).await {
+                Ok(limits) => answer = limits,
+                // Another part of the run asks again: this one was stopped, not answered.
+                Err(e) if e.code == ErrorCode::Cancelled => return,
+                Err(e) => {
+                    tracing::debug!(run = %self.trace, ?model, error = %e, "the gateway did not say the model's limits")
+                }
+            }
+        }
+        let mut models = self.models.lock().unwrap_or_else(PoisonError::into_inner);
+        let known = models.entry(model.clone()).or_default();
+        known.asked = true;
+        // A reply may have reported its window while this was asked; the reply's stands.
+        known.context = known.context.or(answer.context_tokens.filter(|&n| n > 0));
+        known.max_output = known.max_output.or(answer.max_output_tokens.filter(|&n| n > 0));
+    }
+
+    /// The `max_tokens` a call to `model` asks for: `MOLT_MAX_TOKENS`,
+    /// lowered to the most the gateway says the model writes, so the room
+    /// kept for the reply is what the reply can take and no more.
+    pub fn output_of(&self, model: &Option<String>) -> u32 {
+        self.known(model).max_output.map_or(self.cfg.max_tokens, |cap| cap.min(self.cfg.max_tokens))
+    }
+
+    /// What one call to `model` can take (see [`Ctx::learn`]): its context
+    /// window less [`Ctx::output_of`]. `MOLT_CONTEXT_TOKENS` wins, then what
+    /// the gateway's configuration declares for that model, then a guess
+    /// from its name.
+    pub fn limits_of(&self, model: &Option<String>) -> Limits {
         let context = self
             .cfg
             .context_tokens
-            .or((reported > 0).then_some(reported))
-            .unwrap_or_else(|| Limits::context_of(self.model.as_deref()));
-        Limits::new(context, self.cfg.max_tokens, self.cfg.frame_bytes)
+            .or(self.known(model).context)
+            .unwrap_or_else(|| Limits::context_of(model.as_deref()));
+        Limits::new(context, self.output_of(model), self.cfg.frame_bytes)
+    }
+
+    /// Tell the run once when `model`'s window is only guessed, and not from
+    /// a name it knows: what is assumed, and how to say otherwise.
+    pub async fn note_guess(&self, model: &Option<String>) {
+        if self.cfg.context_tokens.is_some() || !Limits::guessed(model.as_deref()) {
+            return;
+        }
+        {
+            let mut models = self.models.lock().unwrap_or_else(PoisonError::into_inner);
+            let known = models.entry(model.clone()).or_default();
+            if known.context.is_some() || std::mem::replace(&mut known.guess_noted, true) {
+                return;
+            }
+        }
+        let name = model.as_deref().unwrap_or("the default model");
+        let assumed = Limits::context_of(model.as_deref());
+        tracing::info!(run = %self.trace, model = name, assumed, "the model's context window is not declared");
+        self.note(format!(
+            "{name}: its context window is not declared, so its conversations are fitted to {assumed} tokens; declare \
+             `context` for it where its endpoint is configured, or set MOLT_CONTEXT_TOKENS"
+        ))
+        .await;
+    }
+
+    /// What `model`'s reply says its window is: it stands from now on. When
+    /// it differs from what the call was fitted to, the run is told once.
+    async fn reported(&self, model: &Option<String>, context: u32) {
+        let differs = {
+            let mut models = self.models.lock().unwrap_or_else(PoisonError::into_inner);
+            let known = models.entry(model.clone()).or_default();
+            let used = self.cfg.context_tokens.or(known.context);
+            known.context = Some(context);
+            match used.filter(|&used| used != context) {
+                Some(used) if !std::mem::replace(&mut known.differs_noted, true) => Some(used),
+                _ => None,
+            }
+        };
+        let Some(used) = differs else { return };
+        let name = model.as_deref().unwrap_or("the default model");
+        let message = if self.cfg.context_tokens.is_some() {
+            format!(
+                "{name}: MOLT_CONTEXT_TOKENS sets a {used}-token context window, but the gateway declares {context}; \
+                 {used} is used"
+            )
+        } else {
+            format!("{name}: the gateway reported a {context}-token context window, not {used}; {context} is used from now on")
+        };
+        tracing::warn!(run = %self.trace, model = name, used, reported = context, "{message}");
+        self.note(message).await;
     }
 
     /// What the first message of every conversation starts with: the
@@ -431,8 +540,8 @@ impl Ctx {
     }
 
     /// The context of an attempt an adaptive run starts: on `model` when
-    /// it names one, which then counts as the run's model for its window,
-    /// reporting to `signals`, and told `prior`.
+    /// it names one, which then counts as the run's model, reporting to
+    /// `signals`, and told `prior`.
     pub fn attempt_scope(
         &self,
         cancel: CancellationToken,
@@ -444,7 +553,6 @@ impl Ctx {
         scoped.cancel = cancel;
         if let Some(model) = model.filter(|m| *m != self.model) {
             scoped.model = model;
-            scoped.reported_context = Arc::default();
         }
         scoped.signals = Some(signals);
         scoped.prior = prior;
@@ -569,16 +677,15 @@ impl Ctx {
     /// own task: the gateway bills it whether or not the caller still waits,
     /// so a caller that stops waiting leaves it pending until the reply lands.
     pub async fn complete(self: &Arc<Self>, conv: &Conversation, turn: u32) -> Result<CompleteResponse, RemoteError> {
+        let model = self.model_of(conv);
+        self.learn(&model).await;
+        let max_tokens = self.output_of(&model);
         let req = CompleteRequest {
-            model: conv
-                .model
-                .clone()
-                .or_else(|| self.cfg.role_models.get(&conv.role).cloned())
-                .or_else(|| self.model.clone()),
+            model: model.clone(),
             system: Some(conv.system.to_string()),
             messages: conv.messages.clone(),
             tools: conv.tools.as_ref().clone(),
-            max_tokens: Some(self.cfg.max_tokens),
+            max_tokens: Some(max_tokens),
             effort: conv.effort.or(self.effort),
             output_schema: None,
             stream: self.stream.then_some(model::StreamContext { attempt: conv.attempt, turn }),
@@ -592,10 +699,8 @@ impl Ctx {
                 spoke.push(prompt.clone());
             }
         }
-        // Only the run's own model's window bounds the run's conversations.
-        let runs_model = req.model == self.model;
         let ms = u64::try_from(self.cfg.model_timeout.as_millis()).unwrap_or(u64::MAX);
-        let budget = Budget::new(self.cfg.max_tokens.into(), ms, 0);
+        let budget = Budget::new(max_tokens.into(), ms, 0);
         self.tally.send_modify(|t| t.pending += 1);
         self.save(|s| s.open_calls += 1);
         let busy = self.control.busy(format!("{}: a model call", conv.speaker()));
@@ -603,9 +708,6 @@ impl Ctx {
         let call = tokio::spawn(async move {
             let resp = ctx.call::<CompleteResponse>(model::COMPLETE, req, budget).await;
             drop(busy);
-            if let Some(context) = resp.as_ref().ok().and_then(|r| r.context_tokens).filter(|_| runs_model) {
-                ctx.reported_context.store(context, std::sync::atomic::Ordering::Relaxed);
-            }
             ctx.tally.send_modify(|t| {
                 t.pending -= 1;
                 match &resp {
@@ -623,6 +725,10 @@ impl Ctx {
             });
             if ctx.over_budget() && !ctx.cancel.is_cancelled() {
                 ctx.run_cancel.cancel();
+            }
+            // Each model's own reply bounds the conversations that call it.
+            if let Some(context) = resp.as_ref().ok().and_then(|r| r.context_tokens).filter(|&n| n > 0) {
+                ctx.reported(&model, context).await;
             }
             resp
         });

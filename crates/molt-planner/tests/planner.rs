@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use molt_api::fs::{self, Change, ChangeKind};
 use molt_api::memory;
-use molt_api::model::{CompleteRequest, CompleteResponse, Role, Usage};
+use molt_api::model::{self, CompleteRequest, CompleteResponse, Role, Usage};
 use molt_api::planner::{
     AttemptStatus, CheckSpec, Constraint, Control, ControlRequest, ControlResponse, Criterion, Earlier, Outcome,
     Requirement, Review, RunRequest, RunResponse, RunState, Select, Verdict, Verification,
@@ -78,6 +78,10 @@ struct State {
     yields: bool,
     /// Paths `fs.read` refuses as the real one refuses a link that leads out of the workspace.
     escapes: Vec<String>,
+    /// The gateway answers `model.limits` from this, by the model a call
+    /// names (`""`: none), and refuses a model it does not hold; `None`: an
+    /// older gateway, and a planner that does not hold the method.
+    limits: Option<BTreeMap<String, model::LimitsResponse>>,
     calls: Vec<Call>,
     requests: Vec<CompleteRequest>,
     events: Vec<Progress>,
@@ -156,6 +160,7 @@ impl Fake {
             cancels_models: false,
             yields: false,
             escapes: Vec::new(),
+            limits: None,
             calls: Vec::new(),
             requests: Vec::new(),
             events: Vec::new(),
@@ -457,6 +462,16 @@ impl Bus for Fake {
                 Ok(serde_json::to_value((self.shell)(&r.command, &snapshot)).unwrap())
             }
             t if t.starts_with("memory.") => self.memory(t, payload),
+            model::LIMITS => {
+                let r: model::LimitsRequest = parse(payload);
+                let st = self.state.lock().unwrap();
+                let Some(limits) = &st.limits else {
+                    return Err(RemoteError { code: ErrorCode::Denied, message: "no capability".into() });
+                };
+                let named = r.model.unwrap_or_default();
+                let known = limits.get(&named).ok_or_else(|| invalid(format!("unknown model {named}")))?;
+                Ok(serde_json::to_value(known).unwrap())
+            }
             molt_api::web::FETCH => {
                 if !self.state.lock().unwrap().web {
                     // As the kernel refuses a call without a capability.
@@ -513,7 +528,9 @@ impl Bus for Fake {
 
     fn holds(&self, target: &str) -> bool {
         let st = self.state.lock().unwrap();
-        (target == molt_api::web::FETCH && st.web) || st.held.iter().any(|h| h == target)
+        (target == molt_api::web::FETCH && st.web)
+            || (target == model::LIMITS && st.limits.is_some())
+            || st.held.iter().any(|h| h == target)
     }
 
     async fn publish(&self, topic: &str, payload: Value) {
@@ -2287,6 +2304,185 @@ async fn a_conversation_that_cannot_fit_says_which_limit() {
     assert_eq!(resp.outcome, Outcome::Failed);
     assert!(resp.attempts[0].note.contains("transport frame limit"), "{}", resp.attempts[0].note);
     assert!(fake.requests().is_empty(), "nothing too big is sent");
+}
+
+// --- Each call fitted to the model it goes to (#231) ---------------------------
+
+fn limits(route: &str, context: Option<u32>, output: Option<u32>) -> model::LimitsResponse {
+    model::LimitsResponse { route: route.into(), context_tokens: context, max_output_tokens: output }
+}
+
+#[tokio::test]
+async fn a_small_reviewer_after_a_large_attempt_gets_requests_fitted_to_its_own_window_from_its_first_call() {
+    let big: String = (0..1500).map(|i| format!("line {i}: “quoted” é\n")).collect();
+    let reviewer_turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fake = Fake::new(
+        move |req: &CompleteRequest| {
+            let sent = serde_json::to_vec(&req.messages).unwrap().len() + serde_json::to_vec(&req.tools).unwrap().len();
+            let mut reply = if is_reviewer(req) {
+                match reviewer_turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    n if n < 10 => use_tools(req, &[("read_file", json!({ "path": "big.txt" }))]),
+                    _ => submit_review(req, "approve", &[]),
+                }
+            } else {
+                // The attempt reads the big file too, on a model with room for all of it.
+                match turn(req) {
+                    1..=8 => use_tools(req, &[("read_file", json!({ "path": "big.txt" }))]),
+                    9 => write_hello(req, "hi\n"),
+                    _ => done("Wrote hello.txt."),
+                }
+            };
+            reply.resp.as_mut().unwrap().usage.input_tokens = (sent / 4) as u64;
+            reply
+        },
+        hello_check,
+    );
+    fake.set(|st| {
+        st.workspace.insert("big.txt".into(), big);
+        st.limits = Some(BTreeMap::from([
+            ("large".to_owned(), limits("anthropic/large", Some(2_000_000), Some(64_000))),
+            ("small/s".to_owned(), limits("small/s", Some(40_000), Some(500))),
+        ]));
+    });
+    let cfg = Config { role_models: model::role_models(r#"{"reviewer":"small/s"}"#).unwrap(), ..config() };
+    let req = RunRequest { review: true, model: Some("large".into()), ..request(Some("check"), 1) };
+    let resp = run_with(&fake, cfg, req).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert!(resp.applied, "{}", resp.summary);
+
+    let requests = fake.requests();
+    let (reviewer, attempt): (Vec<&CompleteRequest>, Vec<&CompleteRequest>) =
+        requests.iter().partition(|r| is_reviewer(r));
+    assert_eq!(reviewer.len(), 11);
+    // The attempt's conversation fit its own model: nothing of it was left out.
+    assert!(attempt.iter().all(|r| record_of(r).is_none() && r.max_tokens == Some(1000)));
+    assert!(
+        attempt.iter().any(|r| serde_json::to_vec(r).unwrap().len() / 4 > 40_000),
+        "the attempt grew past the reviewer's window"
+    );
+    // Every reviewer request, its first included, fits the reviewer's window
+    // less the 500 tokens its model writes at most.
+    for req in &reviewer {
+        assert!(well_formed(req), "{:?}", req.messages);
+        assert_eq!(req.max_tokens, Some(500));
+        let bytes = serde_json::to_vec(req).unwrap().len();
+        assert!(bytes / 4 <= 40_000 - 500, "{bytes}");
+    }
+    assert!(reviewer.iter().any(|r| record_of(r).is_some()), "the reviewer's conversation was fitted");
+    // Asked once for each model, billed as nothing; the run's budget counts every call, whichever model made it.
+    let asked: Vec<Value> = fake.calls_to(model::LIMITS).into_iter().map(|c| c.payload["model"].clone()).collect();
+    assert_eq!(asked, [json!("large"), json!("small/s")]);
+    assert!(fake.calls_to(model::LIMITS).iter().all(|c| c.budget.tokens == 0));
+    assert!(close(resp.cost_usd, requests.len() as f64 * 0.125), "{}", resp.cost_usd);
+    assert_eq!(resp.uncounted_calls, 0);
+}
+
+/// `n` provided tools for attempts, on `wide.t0`, `wide.t1`, ..., each with
+/// an input schema of about 15 KB.
+fn wide_tools(n: usize) -> Vec<molt_proto::tool::ProvidedTool> {
+    let tools: Vec<Value> = (0..n)
+        .map(|i| {
+            json!({
+                "service": "wide",
+                "name": format!("t{i}"),
+                "description": "A tool with a large input schema.",
+                "input_schema": { "type": "object", "properties": { "p": { "type": "string", "description": "x".repeat(15_000) } } },
+                "target": format!("wide.t{i}"),
+                "read_only": true,
+                "roles": ["attempt"],
+            })
+        })
+        .collect();
+    serde_json::from_value(Value::Array(tools)).unwrap()
+}
+
+#[tokio::test]
+async fn a_first_request_with_large_tool_schemas_keeps_room_only_for_the_output_its_model_can_write() {
+    for (n, fits) in [(4, true), (10, false)] {
+        let fake = Fake::new(
+            |req| match turn(req) {
+                1 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            },
+            hello_check,
+        );
+        fake.set(|st| {
+            st.held = (0..n).map(|i| format!("wide.t{i}")).collect();
+            st.limits = Some(BTreeMap::from([("small/s".to_owned(), limits("small/s", Some(40_000), Some(4_000)))]));
+        });
+        // MOLT_MAX_TOKENS asks for 32,000, more than the model writes: only its 4,000 are kept for the reply.
+        let cfg = Config { tools: wide_tools(n), max_tokens: 32_000, ..config() };
+        let req = RunRequest { model: Some("small/s".into()), ..request(Some("check"), 1) };
+        let resp = run_with(&fake, cfg, req).await;
+        let requests = fake.requests();
+        if fits {
+            assert_eq!(resp.outcome, Outcome::Passed, "{n}: {}", resp.summary);
+            assert_eq!(requests[0].tools.len(), 6 + n + 1, "{n}: every tool is offered");
+            assert!(requests.iter().all(|r| r.max_tokens == Some(4_000)), "{n}");
+            let budgets: Vec<u64> = fake.calls_to(model::COMPLETE).iter().map(|c| c.budget.tokens).collect();
+            assert!(budgets.iter().all(|&t| t == 4_000), "{n}: {budgets:?}");
+        } else {
+            // Its schemas alone are over the window: nothing is sent, and the error says which limit.
+            assert_eq!(resp.outcome, Outcome::Failed, "{n}");
+            assert!(requests.is_empty(), "{n}: nothing too big is sent");
+            let note = &resp.attempts[0].note;
+            assert!(note.contains("input tokens") && note.contains("over the 36000"), "{n}: {note}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_undeclared_window_is_said_once_and_a_reply_that_differs_from_the_setting_is_recorded() {
+    let model = |req: &CompleteRequest| {
+        let mut reply = match turn(req) {
+            1 => use_tools(req, &[("read_file", json!({ "path": "README.md" }))]),
+            2 => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        };
+        reply.resp.as_mut().unwrap().context_tokens = Some(50_000);
+        reply
+    };
+    // An older gateway that cannot say: the guess is named, once, with how to declare the window.
+    let fake = Fake::new(
+        move |req| {
+            let mut reply = model(req);
+            reply.resp.as_mut().unwrap().context_tokens = None;
+            reply
+        },
+        hello_check,
+    );
+    let req = RunRequest { model: Some("mystery".into()), ..request(Some("check"), 1) };
+    let resp = run_with(&fake, config(), req.clone()).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    let guessed: Vec<String> = notes(&fake).into_iter().filter(|n| n.contains("not declared")).collect();
+    assert_eq!(guessed.len(), 1, "{guessed:?}");
+    assert!(guessed[0].starts_with("mystery: ") && guessed[0].contains("128000 tokens"), "{}", guessed[0]);
+    assert!(guessed[0].contains("declare `context`") && guessed[0].contains("MOLT_CONTEXT_TOKENS"), "{}", guessed[0]);
+    assert!(fake.calls_to(model::LIMITS).is_empty(), "a planner without the method does not ask");
+
+    // A gateway that declares 50,000 while MOLT_CONTEXT_TOKENS says 40,000: the setting stands, and the difference is said once.
+    let fake = Fake::new(model, hello_check);
+    fake.set(|st| st.limits = Some(BTreeMap::from([("mystery".to_owned(), limits("anthropic/mystery", None, None))])));
+    let cfg = Config { context_tokens: Some(40_000), ..config() };
+    let resp = run_with(&fake, cfg, req.clone()).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    let said = notes(&fake);
+    assert!(!said.iter().any(|n| n.contains("not declared")), "{said:?}");
+    let differs: Vec<&String> = said.iter().filter(|n| n.contains("MOLT_CONTEXT_TOKENS sets")).collect();
+    assert_eq!(differs.len(), 1, "{said:?}");
+    assert!(differs[0].contains("40000") && differs[0].contains("declares 50000"), "{}", differs[0]);
+
+    // What the gateway says before the first call stands for that call; a reply that says otherwise wins after it.
+    let fake = Fake::new(model, hello_check);
+    fake.set(|st| {
+        st.limits = Some(BTreeMap::from([("mystery".to_owned(), limits("anthropic/mystery", Some(60_000), None))]))
+    });
+    let resp = run_with(&fake, config(), req).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    let said = notes(&fake);
+    assert!(!said.iter().any(|n| n.contains("not declared")), "{said:?}");
+    let reported = said.iter().filter(|n| n.contains("reported a 50000-token context window, not 60000")).count();
+    assert_eq!(reported, 1, "{said:?}");
 }
 
 // --- What a conversation keeps of the turns it leaves out (#108) ---------------

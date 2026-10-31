@@ -27,9 +27,11 @@ and no effort parameter. Other OpenAI models require an explicit
 `protocol` is `chat_completions` (the default) or `responses`; a declaration
 must name the protocol the model's endpoint actually implements, and declaring
 a built-in model replaces its built-in capabilities. `context`, when given, is
-the model's context window in tokens, the reply included: every reply carries
-it, and the planner fits the run's conversations to it instead of guessing
-from the model's name (`MOLT_CONTEXT_TOKENS` still wins). Unsupported requested
+the model's context window in tokens, the reply included: the gateway says it
+(and `max_output`) to the planner before the first call to that model
+(`model.limits`) and every reply carries it, so the planner fits each call to
+the model it goes to instead of guessing from the model's name
+(`MOLT_CONTEXT_TOKENS` still wins). Unsupported requested
 capabilities fail before HTTP, including effort on Haiku rather than silently
 dropping it. A protocol is never switched because an endpoint returned an
 error.
