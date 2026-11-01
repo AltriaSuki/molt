@@ -475,7 +475,7 @@ impl Attempt {
                         &ctx.control.upto(self.version),
                     );
                     conv.messages = earlier;
-                    conv.push(prompts::continued_message(&ctx.task, first));
+                    conv.push(prompts::continued_message(&ctx.task, first, self.read_only));
                 }
                 (fork, conv)
             }
