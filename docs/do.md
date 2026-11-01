@@ -65,6 +65,38 @@ concern or reject. Only an approved result is merged; otherwise it is kept in
 its fork and the findings are printed. Unverified results (`--no-check`) and
 empty changes are not reviewed.
 
+### Review probes
+
+In `verify`, the reviewer may also run up to four probes: shell commands of
+its own that test the change where the check may not reach, such as boundary
+inputs, input cut short or split across reads, a cancelled operation,
+recovery after an error, state left behind, or concurrent use. Each probe
+runs in the sandbox, in a fresh copy of the winner's fork made for it and
+dropped when it ends, with the check's time limit. Whatever a probe writes,
+the winner's files stay as they were.
+
+A probe passes when it exits 0. One that exits non-zero, is killed or times
+out has failed: it makes the review at least a concern, whatever the reviewer
+concluded, so the result is kept in its fork and not applied. Its finding
+names the command, what it tests and how its output ends. A probe that could
+not run (no copy, a refused command, a dependency it could not download
+without network) counts for nothing either way.
+
+The report and `--json` keep the three kinds of evidence apart. The check
+passing is the result's outcome. In `review.details`, `rules` holds what the
+fixed rules found and `findings` what the reviewer read in the change.
+`probes` lists every probe with its command, its purpose, `passed`, `failed`
+or `not_run`, its exit code, whether it timed out, the end of its output and
+how long it took. Every probe's `shell.run` is in the audit log, and the run
+notes each one, as in ``review probe 2 of 4: `sh probe.sh` failed (exit 1)``.
+
+The probes are the planner's: the reviewer's system prompt is still the one
+`promoted.toml` guards (see [prompts.md](prompts.md)), the rule that a failed
+probe holds the change back is in code, and an attempt can change neither. A
+workflow sets how many probes its reviewer gets with `review.probes`, 0 to
+16; `0` offers none (see RFC 0001). `quick` and other `rules_only` reviews ask
+no reviewer, so they run none.
+
 With `--select wait:<seconds>` or `--select all`, attempts go on after the
 first one passes, and when more than one passes they are compared on what can
 be audited, never on a model's opinion of its own work: first whether the

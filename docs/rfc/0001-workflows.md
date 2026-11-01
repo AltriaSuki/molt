@@ -87,6 +87,14 @@ document written before them still reads the same; a planner that does not
 know them refuses a document that uses them, as it refuses any unknown
 parameter.
 
+`review.probes` (#262), optional in the same way, is how many probes the
+reviewer may run, 0 to 16: commands of its own, each in the sandbox in a
+fresh copy of the winner that is dropped when it ends (see
+[do.md](../do.md#review-probes)). Without it the planner's default, 4,
+applies; `0` offers none. It cannot be combined with `rules_only`, which asks
+no reviewer. Every probe is in `review.details.probes` of the reply, and one
+that fails makes the review at least `concern`.
+
 `attempts.explore: true` (#42), optional in the same way, offers the
 attempts `explore`: a question to a sub-agent, seated as the `explorer`
 role, that only reads their fork and returns its conclusion alone (see

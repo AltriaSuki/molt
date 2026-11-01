@@ -4,13 +4,20 @@
 //!
 //! The reviewer is on the evaluation side: nothing an attempt writes reaches
 //! its prompt except the diff, quoted as data, and it can change nothing.
+//!
+//! Where the workflow lets it, the reviewer may also run probes (#262):
+//! commands of its own, each in the sandbox in a fresh copy of the winner's
+//! fork that is dropped when the command ends, so the winner is never
+//! written. A probe that fails is measured evidence, kept apart from the
+//! fixed rules and the reviewer's own findings, and it makes the review a
+//! concern whatever the reviewer's verdict.
 
 use std::sync::Arc;
 
 use molt_api::fs::{Change, ChangeKind};
-use molt_api::model::{tool_result, user_blocks, user_text, Role, ToolUse, STOP_MAX_TOKENS};
-use molt_api::planner::tools::{SubmitReview, SUBMIT_REVIEW};
-use molt_api::planner::{CheckSpec, Requirement, Review, ReviewDetails, Verdict};
+use molt_api::model::{text_block, tool_result, user_blocks, user_text, Role, ToolUse, STOP_MAX_TOKENS};
+use molt_api::planner::tools::{RunProbe, SubmitReview, PROBE, SUBMIT_REVIEW};
+use molt_api::planner::{CheckSpec, Probe, ProbeResult, Requirement, Review, ReviewDetails, Verdict};
 use molt_proto::tool::ToolRole;
 use serde_json::Value;
 
@@ -23,6 +30,10 @@ use crate::tools::{self, Actor};
 const MAX_TURNS: u32 = 15;
 /// Bytes of the diff in the reviewer's first message; it can read the rest.
 const MAX_DIFF: usize = 60_000;
+/// Bytes of a probe's output kept as its evidence and shown to the reviewer.
+const PROBE_OUTPUT: usize = 2_000;
+/// Bytes of a failed probe's output quoted in its finding.
+const FINDING_OUTPUT: usize = 300;
 
 /// What a reviewer needs to know about the winner.
 pub(crate) struct Winner<'a> {
@@ -50,7 +61,8 @@ pub(crate) async fn review(ctx: &Arc<Ctx>, winner: &Winner<'_>) -> Review {
     let mut findings = rules(&winner.check.files, winner.changes, winner.patch);
     let mut verdict = if findings.is_empty() { Verdict::Approve } else { Verdict::Concern };
     let mut details = ReviewDetails { rules: findings.clone(), ..ReviewDetails::default() };
-    match model(ctx, winner, &findings).await {
+    let mut probes = Vec::new();
+    match model(ctx, winner, &findings, &mut probes).await {
         Ok(submit) => {
             verdict = verdict.max(submit.verdict);
             details.reviewer = Some(submit.verdict);
@@ -65,6 +77,13 @@ pub(crate) async fn review(ctx: &Arc<Ctx>, winner: &Winner<'_>) -> Review {
             findings.push(format!("The reviewer did not finish: {why}."));
         }
     }
+    // What a probe measured stands whatever the reviewer concluded from it.
+    let failed: Vec<String> = probes.iter().filter(|p| p.result == ProbeResult::Failed).map(probe_finding).collect();
+    if !failed.is_empty() {
+        verdict = verdict.max(Verdict::Concern);
+        findings.extend(failed);
+    }
+    details.probes = probes;
     let name = match verdict {
         Verdict::Approve => "approve",
         Verdict::Concern => "concern",
@@ -178,11 +197,21 @@ fn added_lines(patch: &str) -> impl Iterator<Item = (&str, &str)> {
     })
 }
 
-/// The reviewer model's verdict, or why it gave none.
-async fn model(ctx: &Arc<Ctx>, winner: &Winner<'_>, rules: &[String]) -> Result<SubmitReview, String> {
+/// The reviewer model's verdict, or why it gave none. Every probe it ran
+/// goes into `probes`, also when it gives none.
+async fn model(
+    ctx: &Arc<Ctx>,
+    winner: &Winner<'_>,
+    rules: &[String],
+    probes: &mut Vec<Probe>,
+) -> Result<SubmitReview, String> {
     let patch = clip(winner.patch.to_owned(), MAX_DIFF);
     let truncated = winner.truncated || patch.len() < winner.patch.len();
-    let first = prompts::reviewer_first_message(
+    let seat = ctx.seats().reviewer;
+    // A role seated as reviewer that is not allowed `probe` is told nothing of probes.
+    let allowed = ctx.workflow.stages.review.map_or(0, |r| r.probes());
+    let allowed = if seat.allows(PROBE) { allowed } else { 0 };
+    let mut first = prompts::reviewer_first_message(
         &ctx.task,
         &winner.check.command,
         &winner.check.files,
@@ -191,8 +220,11 @@ async fn model(ctx: &Arc<Ctx>, winner: &Winner<'_>, rules: &[String]) -> Result<
         truncated,
         winner.requirements,
     );
-    let seat = ctx.seats().reviewer;
-    let mut conv = Conversation::seated(&seat, "", prompts::reviewer_tools(&ctx.tools), first, Role::Reviewer, None);
+    if let (true, Some(blocks)) = (allowed > 0, first["content"].as_array_mut()) {
+        blocks.push(text_block(prompts::probe_paragraph(allowed)));
+    }
+    let tools = prompts::reviewer_tools(&ctx.tools, allowed);
+    let mut conv = Conversation::seated(&seat, "", tools, first, Role::Reviewer, None);
     let max_turns = seat.max_turns.unwrap_or(MAX_TURNS);
     let mut meter = Meter::default();
     // The winner is decided; only the run's own end stops its review.
@@ -224,29 +256,172 @@ async fn model(ctx: &Arc<Ctx>, winner: &Winner<'_>, rules: &[String]) -> Result<
                 return Ok(submit);
             }
         }
-        conv.push(user_blocks(answers(ctx, winner.fork, &calls, cut_off).await));
+        let probing = Probing { fork: winner.fork, allowed, probes };
+        conv.push(user_blocks(answers(ctx, &calls, cut_off, probing).await));
     }
 }
 
+/// Where a reviewer's probes copy from, how many it may run and those it ran.
+struct Probing<'a, 'p> {
+    fork: &'a str,
+    allowed: u32,
+    probes: &'p mut Vec<Probe>,
+}
+
 /// Results for a reviewer turn's calls, in order: reads run in the fork,
-/// anything else is refused without running.
-async fn answers(ctx: &Arc<Ctx>, fork: &str, calls: &[ToolUse], cut_off: Option<&str>) -> Vec<Value> {
+/// probes each in a copy of it, one after another; anything else is
+/// refused without running.
+async fn answers(ctx: &Arc<Ctx>, calls: &[ToolUse], cut_off: Option<&str>, probing: Probing<'_, '_>) -> Vec<Value> {
+    let fork = probing.fork;
     let reads: Vec<ToolUse> =
         calls.iter().filter(|c| ctx.tools.offers(ToolRole::Reviewer, true, &c.name)).cloned().collect();
     let mut read_results = tools::execute(ctx, fork, &reads, cut_off, Actor::Reviewer).await.into_iter();
-    calls
-        .iter()
-        .map(|call| {
-            if ctx.tools.offers(ToolRole::Reviewer, true, &call.name) {
-                read_results.next().unwrap_or_else(|| tool_result(&call.id, "The tool failed unexpectedly.", true))
-            } else if call.name == SUBMIT_REVIEW {
-                let msg = "Invalid input for submit_review: give verdict (approve, concern or reject) and findings.";
-                tool_result(&call.id, msg, true)
-            } else {
-                tool_result(&call.id, format!("The reviewer cannot use {}: it only reads.", call.name), true)
-            }
-        })
-        .collect()
+    let mut results = Vec::with_capacity(calls.len());
+    for call in calls {
+        let result = if ctx.tools.offers(ToolRole::Reviewer, true, &call.name) {
+            read_results.next().unwrap_or_else(|| tool_result(&call.id, "The tool failed unexpectedly.", true))
+        } else if call.name == SUBMIT_REVIEW {
+            let msg = "Invalid input for submit_review: give verdict (approve, concern or reject) and findings.";
+            tool_result(&call.id, msg, true)
+        } else if call.name == PROBE && probing.allowed > 0 {
+            probe_call(ctx, call, cut_off, fork, probing.allowed, probing.probes).await
+        } else {
+            tool_result(&call.id, format!("The reviewer cannot use {}: it only reads.", call.name), true)
+        };
+        results.push(result);
+    }
+    results
+}
+
+/// The result of one `probe` call: refused when its input was cut off or
+/// is invalid, or when the review's probes are used up; else run.
+async fn probe_call(
+    ctx: &Arc<Ctx>,
+    call: &ToolUse,
+    cut_off: Option<&str>,
+    fork: &str,
+    allowed: u32,
+    probes: &mut Vec<Probe>,
+) -> Value {
+    if cut_off == Some(call.id.as_str()) {
+        return tool_result(&call.id, "The probe was cut off by the output limit and did not run.", true);
+    }
+    let Ok(input) = serde_json::from_value::<RunProbe>(call.input.clone()) else {
+        return tool_result(&call.id, "Invalid input for probe: give command and purpose.", true);
+    };
+    if input.command.trim().is_empty() {
+        return tool_result(&call.id, "Invalid input for probe: the command is empty.", true);
+    }
+    let used = u32::try_from(probes.len()).unwrap_or(u32::MAX);
+    if used >= allowed {
+        let msg = format!("No probe left: this review's {allowed} are used. Finish with submit_review.");
+        return tool_result(&call.id, msg, true);
+    }
+    let probe = run_probe(ctx, fork, input).await;
+    let number = used + 1;
+    let left = allowed - number;
+    let command = prompts::head(probe.command.lines().next().unwrap_or(""), 120);
+    ctx.note(format!("review probe {number} of {allowed}: `{command}` {}", outcome(&probe))).await;
+    tracing::info!(run = %ctx.trace, probe = number, result = ?probe.result, "ran a review probe");
+    let mut text = format!("The probe {}.", outcome(&probe));
+    if probe.result == ProbeResult::Failed {
+        text.push_str(" It is reported as a defect, with its command and output.");
+    }
+    text.push_str(&format!(" {left} of {allowed} probes left."));
+    if !probe.output.is_empty() {
+        text.push_str(&format!("\n{}", probe.output));
+    }
+    let not_run = probe.result == ProbeResult::NotRun;
+    probes.push(probe);
+    tool_result(&call.id, text, not_run)
+}
+
+/// Run `input` in a fresh copy of `fork`, which is dropped once it ends:
+/// whatever the command writes, `fork` stays as it was.
+async fn run_probe(ctx: &Arc<Ctx>, fork: &str, input: RunProbe) -> Probe {
+    let mut probe = Probe {
+        command: input.command,
+        purpose: input.purpose.trim().to_owned(),
+        result: ProbeResult::NotRun,
+        exit_code: None,
+        timed_out: false,
+        output: String::new(),
+        duration_ms: 0,
+    };
+    if ctx.run_cancel.is_cancelled() {
+        probe.output = "the run was stopped".into();
+        return probe;
+    }
+    let copy = match ctx.fork_from(fork).await {
+        Ok(copy) => copy,
+        Err(e) => {
+            probe.output = format!("no copy of the change could be made: {}", e.message);
+            return probe;
+        }
+    };
+    let timeout_ms = u64::try_from(ctx.cfg.check_timeout.as_millis()).unwrap_or(u64::MAX);
+    let ran = tools::run_command(ctx, &copy, &probe.command, timeout_ms).await;
+    ctx.drop_fork(&copy).await;
+    let ran = match ran {
+        Ok(ran) => ran,
+        Err(e) => {
+            probe.output = format!("the command was refused: {}", e.message);
+            return probe;
+        }
+    };
+    probe.exit_code = ran.exit_code;
+    probe.timed_out = ran.timed_out;
+    probe.duration_ms = ran.duration_ms;
+    probe.output = prompts::output_tail(&ran, PROBE_OUTPUT);
+    probe.result = if ran.cancelled {
+        probe.output = format!("the command was cancelled\n{}", probe.output).trim_end().to_owned();
+        ProbeResult::NotRun
+    } else if ran.exit_code == Some(0) && !ran.timed_out {
+        ProbeResult::Passed
+    } else if ran.offline_failure {
+        // It shows the sandbox has no network, not how the change behaves.
+        probe.output = format!("it needed a dependency it could not download without network\n{}", probe.output)
+            .trim_end()
+            .to_owned();
+        ProbeResult::NotRun
+    } else {
+        ProbeResult::Failed
+    };
+    probe
+}
+
+/// What a probe came to, in a few words: `passed (exit 0)`.
+fn outcome(probe: &Probe) -> String {
+    let how = if probe.timed_out {
+        "timed out".to_owned()
+    } else {
+        match probe.exit_code {
+            Some(code) => format!("exit {code}"),
+            None => "killed by a signal".to_owned(),
+        }
+    };
+    match probe.result {
+        ProbeResult::Passed => format!("passed ({how})"),
+        ProbeResult::Failed => format!("failed ({how})"),
+        ProbeResult::NotRun => format!("did not run: {}", probe.output.lines().next().unwrap_or("no reason given")),
+    }
+}
+
+/// The finding a failed probe adds to the review: its command, what it
+/// tests and how its output ends.
+fn probe_finding(probe: &Probe) -> String {
+    let mut finding = format!("A probe {}: `{}`", outcome(probe), probe.command.trim());
+    if !probe.purpose.is_empty() {
+        finding.push_str(&format!(", which tests: {}", probe.purpose.trim_end_matches('.')));
+    }
+    finding.push('.');
+    let output = probe.output.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !output.is_empty() {
+        let end = prompts::tail(&output, FINDING_OUTPUT);
+        let cut = if end.len() < output.len() { "..." } else { "" };
+        finding.push_str(&format!(" Its output ends: {cut}{end}"));
+    }
+    finding
 }
 
 #[cfg(test)]

@@ -19,10 +19,12 @@ use molt_api::fs::{ChangeKind, DROP, FORK, MERGE, WRITE};
 use molt_api::memory::SUBMIT_NOTES;
 use molt_api::model::COMPLETE;
 use molt_api::planner::tools::{
-    DISPUTE_CHECK, LIST_FILES, RUN, SUBMIT_CHECK, SUBMIT_JUDGEMENT, SUBMIT_REVIEW, SUBMIT_ROUTE, SUBMIT_VETTING,
+    DISPUTE_CHECK, LIST_FILES, PROBE, RUN, SUBMIT_CHECK, SUBMIT_JUDGEMENT, SUBMIT_REVIEW, SUBMIT_ROUTE, SUBMIT_VETTING,
     WRITE_FILE,
 };
-use molt_api::planner::{AttemptStatus, CheckSpec, Outcome, RunRequest, RunResponse, Schedule, RUN as PLANNER_RUN};
+use molt_api::planner::{
+    AttemptStatus, CheckSpec, Outcome, ProbeResult, RunRequest, RunResponse, Schedule, Verdict, RUN as PLANNER_RUN,
+};
 use molt_api::progress::Progress;
 use molt_api::shell::RUN as RUN_CHECK;
 use molt_kernel::audit::AuditEvent;
@@ -77,6 +79,8 @@ enum Fake {
     /// Attempts greet only on a model whose id has this in it; on any other
     /// they write the wrong word.
     GreetsOn(&'static str),
+    /// Attempts greet; the reviewer runs this probe, then approves.
+    Probes(&'static str),
 }
 
 #[derive(Debug, PartialEq)]
@@ -121,6 +125,14 @@ impl Respond for FakeApi {
         }
         // The reviewer of a passing result approves it.
         if body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == SUBMIT_REVIEW)) {
+            if let (Fake::Probes(command), 1) = (&self.0, n) {
+                let input = json!({ "command": command, "purpose": "the greeting survives a rewrite" });
+                let content = vec![
+                    json!({ "type": "thinking", "thinking": "", "signature": signature(n) }),
+                    tool_use(n, PROBE, input),
+                ];
+                return message(n, model, content, "tool_use", stream);
+            }
             let input = json!({ "verdict": "approve", "findings": [] });
             let content = vec![
                 json!({ "type": "thinking", "thinking": "", "signature": signature(n) }),
@@ -675,6 +687,65 @@ async fn a_given_check_passes_and_the_result_is_applied() {
         assert!(requests.contains(&(Some("planner".into()), method.into())), "{method}: {requests:?}");
     }
     assert!(requests.iter().any(|(_, to)| to == PLANNER_RUN), "{requests:?}");
+}
+
+/// Prints the tree and every file's hash of the directory it runs in.
+const TREE: &str = "find . | LC_ALL=C sort; find . -type f | LC_ALL=C sort | xargs sha256sum";
+
+#[tokio::test]
+async fn a_reviewers_probe_writes_only_its_own_copy_and_its_failure_keeps_the_winner_unchanged() {
+    // The probe records the copy as it got it, then overwrites, deletes and
+    // leaves build output, and fails.
+    const PROBE_COMMAND: &str = "find . | LC_ALL=C sort; find . -type f | LC_ALL=C sort | xargs sha256sum; \
+         echo broken > greeting.txt; rm README.txt; mkdir -p target/debug; echo x > target/debug/probe.o; \
+         echo junk > probe-artifact.txt; echo 'greeting lost' >&2; exit 3";
+    let server = fake_api(Fake::Probes(PROBE_COMMAND)).await;
+    let setup = Setup::new(&server);
+    let (resp, events) = setup.run(setup.request(Some(CHECK), 1)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{resp:#?}");
+
+    let review = resp.review.clone().expect("reviewed");
+    assert_eq!(review.verdict, Verdict::Concern, "{review:#?}");
+    let details = review.details.clone().unwrap();
+    assert_eq!(details.reviewer, Some(Verdict::Approve));
+    let [probe] = details.probes.as_slice() else { panic!("one probe: {details:#?}") };
+    assert_eq!((probe.result, probe.exit_code, probe.timed_out), (ProbeResult::Failed, Some(3), false), "{probe:#?}");
+    assert!(review.findings.iter().any(|f| f.starts_with("A probe failed (exit 3)") && f.contains("greeting lost")));
+
+    // Held back, kept in the winner's fork, which is exactly what the probe's copy started from.
+    assert!(!resp.applied, "{resp:#?}");
+    assert_eq!(setup.file("greeting.txt"), None);
+    let kept = PathBuf::from(resp.fork.clone().expect("kept"));
+    let before = probe.output.strip_prefix("stdout:\n").unwrap().split("stderr:").next().unwrap();
+    let tree = std::process::Command::new("sh").args(["-c", TREE]).current_dir(&kept).output().unwrap();
+    let after = String::from_utf8(tree.stdout).unwrap();
+    assert_eq!(after, before, "the winner's tree and hashes changed under review");
+    assert!(after.contains("./greeting.txt") && after.contains("./README.txt") && !after.contains("probe"), "{after}");
+    assert_eq!(std::fs::read_to_string(kept.join("greeting.txt")).unwrap(), "hello\n");
+
+    // The probe's copy is gone: only the kept fork and its own records are left.
+    let name = kept.file_name().unwrap().to_string_lossy().into_owned();
+    let left: Vec<String> = std::fs::read_dir(setup.data.path().join("work"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != ".molt" && !n.starts_with(&name))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+
+    // The probe went through the sandboxed shell service, in the audit log, and the run said how it went.
+    let audit = setup.data.path().join("audit.jsonl");
+    let entries = molt_kernel::audit::read_all(&audit).await.unwrap();
+    let probed = entries.iter().any(|e| {
+        matches!(&e.event, AuditEvent::Message { envelope }
+            if envelope.kind == Kind::Request && envelope.to.to_string() == RUN_CHECK
+                && envelope.payload["command"] == PROBE_COMMAND
+                && envelope.payload["workspace"].as_str().is_some_and(|w| w != kept.to_str().unwrap()))
+    });
+    assert!(probed, "the probe's shell.run is audited, in a workspace other than the kept fork");
+    let noted = |e: &Progress| matches!(e, Progress::Note { message, .. } if message.contains("failed (exit 3)"));
+    assert!(events.iter().any(noted), "{events:#?}");
+    assert!(molt::agent::report(&resp).contains("A probe failed (exit 3)"), "{}", molt::agent::report(&resp));
+    assert_requests_valid(&server).await;
 }
 
 #[tokio::test]

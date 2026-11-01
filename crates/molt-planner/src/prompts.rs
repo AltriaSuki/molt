@@ -298,6 +298,21 @@ pub(crate) fn reviewer_first_message(
     user_blocks(vec![text_block(text)])
 }
 
+/// What a reviewer that may run `probes` probes is told about them, in a
+/// block of its own after its first message's. It is the planner's own
+/// text, so the reviewer's system prompt stays the one `promoted.toml` guards.
+pub(crate) fn probe_paragraph(probes: u32) -> String {
+    format!(
+        "You may also run up to {probes} probes with `probe`: commands of your own that test the change where the \
+         check may not reach, such as boundary inputs, input cut short or split across reads, a cancelled \
+         operation, recovery after an error, state left behind for the next use, and concurrent use. Each runs in \
+         the sandbox in a fresh copy of the change, dropped when it ends, so the change itself stays as it is. A \
+         probe that exits non-zero, is killed or times out is a measured defect: it holds the change back and goes \
+         to the person with its command and output, whatever your verdict. So write each one to fail only on \
+         behavior the task rules out, and use the read tools to look around."
+    )
+}
+
 /// Extra guidance for attempt `index`, so parallel attempts explore different
 /// approaches. It goes in its own block after the task, keeping the shared
 /// part of the first message cacheable.
@@ -866,9 +881,31 @@ pub(crate) fn attempt_tools(reg: &Registry, memory: bool, web: bool, skills: boo
 }
 
 /// The reviewer's tools: reading and searching, and the read-only tools
-/// provided for reviewers, plus submit_review.
-pub(crate) fn reviewer_tools(reg: &Registry) -> Vec<Value> {
+/// provided for reviewers, with `probes` left, `probe`, then submit_review.
+pub(crate) fn reviewer_tools(reg: &Registry, probes: u32) -> Vec<Value> {
     let mut tools = reg.definitions(ToolRole::Reviewer, true, false, false, false);
+    if probes > 0 {
+        tools.push(tool(
+            t::PROBE,
+            &format!(
+                "Run a shell command in the sandbox, in a fresh copy of the changed workspace, to test behavior the \
+                 done-check may not cover. Make it exit 0 when the code behaves as the task requires and non-zero \
+                 when it shows a defect: one that exits non-zero, is killed or times out is reported as a defect with \
+                 its command and output. It may run as long as the done-check may. The copy is dropped when the \
+                 command ends: nothing it writes reaches the change or the next probe. This review may run {probes} \
+                 probes."
+            ),
+            json!({
+                "command": { "type": "string", "description": "The command, run by the shell in the copy's root." },
+                "purpose": {
+                    "type": "string",
+                    "description": "The behavior it tests, in one sentence, such as: a request split across two \
+                                    reads is still parsed.",
+                },
+            }),
+            &["command", "purpose"],
+        ));
+    }
     tools.push(tool(
         t::SUBMIT_REVIEW,
         "Submit your review. This ends your work.",
@@ -1210,7 +1247,7 @@ mod tests {
                 }
             }
             if !s {
-                lists.push(("reviewer".into(), reviewer_tools(&reg)));
+                lists.push(("reviewer".into(), reviewer_tools(&reg, 0)));
                 lists.push(("judge".into(), judge_tools(&reg)));
                 lists.push(("vetter".into(), vetter_tools(&reg)));
                 lists.push(("router".into(), route_tools()));
@@ -1309,6 +1346,22 @@ mod tests {
         assert!(text.find("<task>").unwrap() < added_at && added_at < check_at, "{text}");
         let first = reviewer_first_message("t", "make test", &[], &[], "diff", false, &[]);
         assert!(!first["content"][0]["text"].as_str().unwrap().contains("has added"));
+    }
+
+    #[test]
+    fn a_probing_reviewer_is_offered_probe_before_its_verdict_and_told_how_many_it_may_run() {
+        let reg = Registry::default();
+        let (plain, probing) = (reviewer_tools(&reg, 0), reviewer_tools(&reg, 3));
+        let names = |tools: &[Value]| tools.iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        let mut expected = names(&plain);
+        expected.insert(expected.len() - 1, t::PROBE.to_owned());
+        assert_eq!(names(&probing), expected);
+        let probe = &probing[probing.len() - 2];
+        assert!(probe["description"].as_str().unwrap().contains("may run 3 probes"), "{probe}");
+        assert_eq!(probe["input_schema"]["required"], json!(["command", "purpose"]));
+
+        let told = probe_paragraph(3);
+        assert!(told.starts_with("You may also run up to 3 probes with `probe`"), "{told}");
     }
 
     #[test]
