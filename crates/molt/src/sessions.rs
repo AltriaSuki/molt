@@ -591,12 +591,27 @@ fn take_lock(id: &str, dir: &Path) -> anyhow::Result<File> {
         .mode(0o600)
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(Busy(id.to_owned()).into()),
-        Err(TryLockError::Error(e)) => Err(e).with_context(|| format!("locking {}", path.display())),
+    // A writer that was just dropped can still hold the lock for a moment: a
+    // child this process forked at that time keeps a copy of its descriptor
+    // until it execs, and the lock goes only with the last copy. So a lock
+    // that is held is tried again for a short while before it is taken to be
+    // another client's.
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(TryLockError::WouldBlock) => return Err(Busy(id.to_owned()).into()),
+            Err(TryLockError::Error(e)) => return Err(e).with_context(|| format!("locking {}", path.display())),
+        }
     }
 }
+
+/// How long a held session lock is tried again before it is taken to be
+/// another client's.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Read session `id`'s journal: what it holds, and the length of its whole
 /// entries. Only the last line may be cut off; damage anywhere else, or an
