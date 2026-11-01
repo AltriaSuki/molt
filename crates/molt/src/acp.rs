@@ -19,6 +19,7 @@ use std::time::Duration;
 use anyhow::Context;
 use molt_api::fs::ChangeKind;
 use molt_api::model::Role;
+use molt_api::planner::tools::{TodoItem, TodoStatus};
 use molt_api::planner::{AttemptStatus, Earlier, Outcome, RunRequest, RunResponse};
 use molt_api::progress::Progress;
 use molt_api::workflow;
@@ -822,16 +823,25 @@ fn kind_of(tool: &str) -> Kind {
     }
 }
 
-/// The steps of a run's workflow, as the editor shows a plan.
+/// The steps of a run's workflow, as the editor shows a plan, then the
+/// steps of each attempt's own list (#264).
 #[derive(Debug)]
 struct Plan {
     entries: Vec<PlanEntry>,
     work: usize,
     review: Option<usize>,
     apply: Option<usize>,
+    /// Each attempt's own list, as it last set it. Kept apart from the
+    /// workflow's steps: a list all completed never moves the run on.
+    todos: BTreeMap<u32, Vec<TodoItem>>,
 }
 
 impl Plan {
+    /// A plan of no steps of the workflow, for a run that was not routed.
+    fn lists_only() -> Self {
+        Self { entries: Vec::new(), work: 0, review: None, apply: None, todos: BTreeMap::new() }
+    }
+
     fn of(name: &str) -> Self {
         let mut entries = Vec::new();
         let mut step = |content: &str| {
@@ -842,7 +852,7 @@ impl Plan {
             // A workflow of the planner's own config: only what every one has.
             let work = step("Do the task");
             let apply = Some(step("Apply the result once you allow it"));
-            let mut plan = Self { entries, work, review: None, apply };
+            let mut plan = Self { entries, work, review: None, apply, todos: BTreeMap::new() };
             plan.entries[0].status = Status::InProgress;
             return plan;
         };
@@ -852,7 +862,7 @@ impl Plan {
         let work = step(if flow.read_only() { "Answer from the project" } else { "Make the change" });
         let review = flow.stages.review.is_some().then(|| step("Review the result"));
         let apply = (!flow.read_only()).then(|| step("Apply the result once you allow it"));
-        let mut plan = Self { entries, work, review, apply };
+        let mut plan = Self { entries, work, review, apply, todos: BTreeMap::new() };
         plan.entries[0].status = Status::InProgress;
         plan
     }
@@ -884,7 +894,26 @@ impl Plan {
     }
 
     fn update(&self) -> Update {
-        Update::Plan { entries: self.entries.clone() }
+        let mut entries = self.entries.clone();
+        let several = self.todos.len() > 1;
+        for (attempt, items) in &self.todos {
+            for item in items {
+                let (status, dropped) = match item.status {
+                    TodoStatus::Pending => (Status::Pending, false),
+                    TodoStatus::InProgress => (Status::InProgress, false),
+                    TodoStatus::Completed => (Status::Completed, false),
+                    // A plan entry is pending, in progress or completed: a dropped step says so in its words.
+                    TodoStatus::Cancelled => (Status::Completed, true),
+                };
+                let mut content =
+                    if several { format!("Attempt {}: {}", attempt + 1, item.content) } else { item.content.clone() };
+                if dropped {
+                    content.push_str(" (dropped)");
+                }
+                entries.push(PlanEntry { content, priority: "low", status });
+            }
+        }
+        Update::Plan { entries }
     }
 }
 
@@ -1020,8 +1049,21 @@ impl View {
                     locations: Vec::new(),
                 });
             }
+            Progress::Todo { attempt, items, .. } => {
+                let plan = self.plan.get_or_insert_with(Plan::lists_only);
+                plan.todos.insert(*attempt, items.clone());
+                out.push(plan.update());
+            }
             Progress::AttemptFinished { attempt, status, .. } => {
                 self.close(*attempt, Status::Completed, &mut out);
+                // The list of an attempt that did not pass no longer says what the run does.
+                if *status != AttemptStatus::Passed {
+                    if let Some(plan) = self.plan.as_mut() {
+                        if plan.todos.remove(attempt).is_some() {
+                            out.push(plan.update());
+                        }
+                    }
+                }
                 let said = match status {
                     AttemptStatus::Passed => "is done",
                     AttemptStatus::Failed => "did not pass",
@@ -1741,6 +1783,53 @@ mod tests {
             }],
             "a stop ends what is still going as failed"
         );
+    }
+
+    #[test]
+    fn each_attempts_own_list_follows_the_workflows_steps_and_never_moves_them_on() {
+        let trace = TraceId::from_raw("trace_1");
+        let mut view = View::new(&trace, "/w");
+        let entries = |updates: &[Update]| -> Vec<(String, Status, &'static str)> {
+            let Some(Update::Plan { entries }) = updates.iter().rfind(|u| matches!(u, Update::Plan { .. })) else {
+                panic!("{updates:?}")
+            };
+            entries.iter().map(|e| (e.content.clone(), e.status, e.priority)).collect()
+        };
+        // A run that was not routed has only the lists.
+        let alone = View::new(&trace, "/w").event(&progress(json!({"event": "todo", "run": "trace_1", "attempt": 0,
+            "items": [{"content": "read the lexer", "status": "in_progress"}]})));
+        assert_eq!(entries(&alone), [("read the lexer".to_owned(), Status::InProgress, "low")]);
+
+        view.event(&progress(json!({"event": "routed", "run": "trace_1", "workflow": "quick"})));
+        let listed = view.event(&progress(json!({"event": "todo", "run": "trace_1", "attempt": 0, "items": [
+            {"content": "read the lexer", "status": "completed"},
+            {"content": "fix it", "status": "completed"},
+            {"content": "old idea", "status": "cancelled"},
+        ]})));
+        let workflow = entries(&listed).len() - 3;
+        let shown = entries(&listed);
+        assert_eq!(
+            shown[workflow..],
+            [
+                ("read the lexer".to_owned(), Status::Completed, "low"),
+                ("fix it".to_owned(), Status::Completed, "low"),
+                ("old idea (dropped)".to_owned(), Status::Completed, "low"),
+            ]
+        );
+        // Every step of the list done: the workflow is where it was.
+        assert!(shown[..workflow].iter().skip(1).all(|(_, status, _)| *status == Status::Pending), "{shown:?}");
+        let second = view.event(&progress(json!({"event": "todo", "run": "trace_1", "attempt": 1,
+            "items": [{"content": "try the parser", "status": "pending"}]})));
+        let shown = entries(&second);
+        assert_eq!(shown[workflow].0, "Attempt 1: read the lexer", "with two lists, each says whose");
+        assert_eq!(shown.last().unwrap().0, "Attempt 2: try the parser");
+        // The list of an attempt that did not pass goes; one that passed stays.
+        let failed = view
+            .event(&progress(json!({"event": "attempt_finished", "run": "trace_1", "attempt": 0, "status": "failed"})));
+        assert_eq!(entries(&failed)[workflow..], [("try the parser".to_owned(), Status::Pending, "low")]);
+        let passed = view
+            .event(&progress(json!({"event": "attempt_finished", "run": "trace_1", "attempt": 1, "status": "passed"})));
+        assert!(!passed.iter().any(|u| matches!(u, Update::Plan { .. })), "{passed:?}");
     }
 
     #[test]

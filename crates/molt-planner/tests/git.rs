@@ -301,12 +301,12 @@ async fn git_is_offered_only_when_turned_on_and_held_and_then_before_explore() {
     unheld.state.lock().unwrap().held = false;
     assert_eq!(run(&unheld, config(true), request()).await.outcome, Outcome::Passed);
 
-    // On and held: after the process tools, and explore stays last.
+    // On and held: after the process tools, and explore stays last but the attempt's own list.
     let offered = Fake::new(|req| {
         let names = tool_names(req);
         let at = |name: &str| names.iter().position(|n| n == name).unwrap_or_else(|| panic!("{name}: {names:?}"));
         assert_eq!(at("git"), at("stop_process") + 1, "{names:?}");
-        assert_eq!(at("explore"), names.len() - 1, "{names:?}");
+        assert_eq!((at("explore"), at("todo")), (names.len() - 2, names.len() - 1), "{names:?}");
         match turn(req) {
             1 => calls(req, &[("write_file", json!({ "path": "calc.py", "content": GOOD }))]),
             _ => done("Done."),

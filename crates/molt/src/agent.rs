@@ -1298,6 +1298,21 @@ pub fn scheduled_line(d: &molt_api::planner::Scheduling) -> String {
     )
 }
 
+/// An attempt's own list of steps as one line: how many are completed, and
+/// the one under way. It is the model's account, not a check result.
+pub fn todo_line(items: &[molt_api::planner::tools::TodoItem]) -> String {
+    use molt_api::planner::tools::TodoStatus;
+    if items.is_empty() {
+        return "its list of steps is empty".to_owned();
+    }
+    let done = items.iter().filter(|i| i.status == TodoStatus::Completed).count();
+    let mut line = format!("its list: {done}/{} steps completed", items.len());
+    if let Some(now) = items.iter().find(|i| i.status == TodoStatus::InProgress) {
+        line.push_str(&format!("; now: {}", now.content));
+    }
+    line
+}
+
 /// One short line for the terminal, made [`printable`].
 pub fn describe(event: &Progress) -> String {
     printable(&match event {
@@ -1358,6 +1373,7 @@ pub fn describe(event: &Progress) -> String {
         Progress::Planned { steps, edited, .. } => planned_line(steps, *edited),
         Progress::Step { step, steps, goal, .. } => step_line(*step, *steps, goal),
         Progress::Scheduled { decision, .. } => scheduled_line(decision),
+        Progress::Todo { attempt, items, .. } => format!("{}: {}", attempt_name(*attempt), todo_line(items)),
         Progress::Required { requirement, .. } => requirement_line(requirement),
         Progress::Adopted { attempt, version, turn, .. } => {
             format!("{}: follows requirements v{version} from turn {turn}", attempt_name(*attempt))
@@ -1944,6 +1960,17 @@ mod tests {
         let fs = shared.service_mut("fs").unwrap().exec.as_mut().unwrap();
         fs.args[4] = data.join("../elsewhere").to_str().unwrap().to_owned();
         assert!(RunForks::before(&shared).is_none());
+    }
+
+    #[test]
+    fn an_attempts_own_list_is_one_line_of_what_it_says_it_completed() {
+        use molt_api::planner::tools::{TodoItem, TodoStatus};
+        let item = |content: &str, status| TodoItem { content: content.into(), status };
+        let items = vec![item("read", TodoStatus::Completed), item("fix", TodoStatus::InProgress)];
+        let event = Progress::Todo { run: "r".into(), attempt: 0, items };
+        assert_eq!(describe(&event), "attempt 1: its list: 1/2 steps completed; now: fix");
+        let empty = Progress::Todo { run: "r".into(), attempt: 1, items: vec![] };
+        assert_eq!(describe(&empty), "attempt 2: its list of steps is empty");
     }
 
     #[test]

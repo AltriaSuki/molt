@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+use super::app::todo_lines;
 use super::app::{
     memory_lines, App, ChangeStep, Input, MemoryEdit, MemoryView, Mode, Phase, Prompt, Screen, SessionState, Task,
 };
@@ -581,10 +582,14 @@ fn draw_lanes(frame: &mut Frame, area: Rect, app: &App) {
             if let Some(retry) = lane.retry.as_ref().filter(|_| lane.status.is_none()) {
                 preview.push(Line::from(span(text::fit(&retry.line(), usize::from(inner.width)), Tone::Warn)));
             }
-            let history_height = usize::from(inner.height).saturating_sub(preview.len());
+            // The attempt's own list stays at the top, in at most half the lane, however much scrolls under it.
+            let left = usize::from(inner.height).saturating_sub(preview.len());
+            let todos = todo_lines(&lane.todos, left / 2);
+            let history_height = left.saturating_sub(todos.len());
             let lines = wrap_all(&lane.lines, inner.width);
             let skip = lines.len().saturating_sub(history_height);
-            let mut shown = lines[skip..].to_vec();
+            let mut shown = todos;
+            shown.extend(lines[skip..].iter().cloned());
             shown.extend(preview);
             frame.render_widget(Paragraph::new(shown), inner);
         }

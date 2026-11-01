@@ -1710,8 +1710,8 @@ async fn memory_gives_every_conversation_the_project_context_and_its_tools() {
     assert_eq!(run(&plain, request(Some("check"), 1)).await.outcome, Outcome::Passed);
     let first = &plain.requests()[0];
     assert!(first.messages[0]["content"][0]["text"].as_str().unwrap().starts_with("<task>"));
-    // The file and shell tools, and dispute_check for an attempt run against a check.
-    assert_eq!(first.tools.len(), 7);
+    // The file and shell tools, dispute_check for an attempt run against a check, and todo.
+    assert_eq!(first.tools.len(), 8);
     assert_eq!(plain.calls_to("memory.recall").len(), 1, "asked once, then left alone");
     assert!(plain.calls_to("memory.index").is_empty() && plain.calls_to("memory.map").is_empty());
 
@@ -1727,7 +1727,7 @@ async fn memory_gives_every_conversation_the_project_context_and_its_tools() {
     assert_eq!(run(&hung, request(Some("check"), 1)).await.outcome, Outcome::Passed);
     assert_eq!(hung.calls().iter().filter(|c| c.target.starts_with("memory.")).count(), 1);
     assert_eq!(hung.calls_to("memory.recall")[0].budget.ms, 10_000);
-    assert_eq!(hung.requests()[0].tools.len(), 7);
+    assert_eq!(hung.requests()[0].tools.len(), 8);
     assert!(hung.events().iter().any(|e| matches!(e, Progress::Note { message, .. }
         if message == "running without memory: memory.recall did not answer")));
 }
@@ -2413,7 +2413,7 @@ async fn a_first_request_with_large_tool_schemas_keeps_room_only_for_the_output_
         let requests = fake.requests();
         if fits {
             assert_eq!(resp.outcome, Outcome::Passed, "{n}: {}", resp.summary);
-            assert_eq!(requests[0].tools.len(), 6 + n + 1, "{n}: every tool is offered");
+            assert_eq!(requests[0].tools.len(), 6 + n + 2, "{n}: every tool is offered");
             assert!(requests.iter().all(|r| r.max_tokens == Some(4_000)), "{n}");
             let budgets: Vec<u64> = fake.calls_to(model::COMPLETE).iter().map(|c| c.budget.tokens).collect();
             assert!(budgets.iter().all(|&t| t == 4_000), "{n}: {budgets:?}");
@@ -4515,7 +4515,8 @@ async fn an_attempt_that_disputes_the_check_ends_the_run_with_the_dispute_not_a_
     assert!(fake.forks_alive().is_empty());
     // Only attempts run against a check are offered the tool.
     let attempt = fake.requests().into_iter().find(|r| attempt_of(r) == 0).unwrap();
-    assert_eq!(attempt.tools.last().unwrap()["name"], "dispute_check");
+    let last: Vec<&Value> = attempt.tools.iter().rev().take(2).map(|t| &t["name"]).collect();
+    assert_eq!(last, ["todo", "dispute_check"], "dispute_check, then the attempt's own list");
     let system = attempt.system.as_deref().unwrap();
     assert!(system.contains("call dispute_check") && system.contains("do not bend the code to it"), "{system}");
 }
@@ -4570,6 +4571,7 @@ async fn a_dispute_saved_in_a_checkpoint_is_reported_after_the_resume() {
         findings: vec![],
         dispute: Some(disputed.clone()),
         failure: None,
+        branch: None,
     });
     // Saved and read back as JSON, as a resume does; an end without a dispute reads as before.
     std::fs::write(state.path().join("trace_test.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
@@ -5079,13 +5081,13 @@ async fn a_tool_a_service_declares_is_offered_only_when_the_planner_holds_its_me
         let offered = names(&requests[0]);
         let builtins = ["read_file", "write_file", "edit_file", "list_files", "search", "run"];
         if held {
-            // After the built-ins, in the order declared, and before the attempt's own dispute_check.
+            // After the built-ins, in the order declared, and before the attempt's own dispute_check and todo.
             assert_eq!(offered[..6], builtins);
-            assert_eq!(offered[6..], ["lint", "deploy", "dispute_check"]);
+            assert_eq!(offered[6..], ["lint", "deploy", "dispute_check", "todo"]);
             assert_eq!(requests[0].tools[6], provided_tools()[0].decl.definition());
         } else {
             assert_eq!(offered[..6], builtins);
-            assert_eq!(offered[6..], ["dispute_check"]);
+            assert_eq!(offered[6..], ["dispute_check", "todo"]);
         }
         let results = requests[1].messages[2]["content"].as_array().unwrap().clone();
         let text = |i: usize| results[i]["content"].as_str().unwrap().to_owned();
@@ -5570,7 +5572,8 @@ async fn an_explorer_seated_by_the_pack_reads_but_cannot_write_or_run_and_only_i
 
     // The attempt's conversation holds the conclusion, never what the explorer read.
     let attempt = attempt_requests(&fake);
-    assert_eq!(*tool_names(&attempt[0]).last().unwrap(), "explore");
+    let names = tool_names(&attempt[0]);
+    assert_eq!(names[names.len() - 2..], ["explore", "todo"]);
     for req in &attempt {
         let sent = serde_json::to_string(&req.messages).unwrap();
         assert!(!sent.contains("SECRET-BODY") && !sent.contains("not available: explore"), "{sent}");
@@ -5899,6 +5902,7 @@ async fn calls_of_unknown_cost_leave_the_budget_unknown_and_hold_back_escalation
         findings: vec![],
         dispute: None,
         failure: None,
+        branch: None,
     });
     std::fs::write(state.path().join("trace_test.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
 
@@ -6129,4 +6133,221 @@ async fn a_check_the_host_cannot_start_names_the_resource_and_no_attempt_starts_
     assert!(resp.summary.contains("The machine's resources, not the code, stopped attempt 1"), "{}", resp.summary);
     assert!(resp.summary.contains("short of host resources: processes"), "{}", resp.summary);
     assert!(!resp.summary.contains("model endpoint"), "{}", resp.summary);
+}
+
+// --- An attempt's own list, and what a failed attempt leaves (#264) ----------
+
+use molt_api::planner::tools::{TodoItem, TodoStatus};
+
+fn todo(req: &CompleteRequest, items: &[(&str, &str)]) -> Reply {
+    let items: Vec<Value> = items.iter().map(|(c, s)| json!({ "content": c, "status": s })).collect();
+    use_tools(req, &[("todo", json!({ "items": items }))])
+}
+
+/// Each list the run's attempts set, in order, as (attempt, list).
+fn todo_events(fake: &Fake) -> Vec<(u32, Vec<TodoItem>)> {
+    fake.events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Progress::Todo { attempt, items, .. } => Some((attempt, items)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_long_attempt_keeps_its_latest_list_in_what_holds_now_through_several_compactions() {
+    let model = scripted(|n, req| {
+        sized(
+            req,
+            match n {
+                1 => todo(req, &[("read the notes", "in_progress"), ("write hello.txt", "pending")]),
+                2..=9 => use_tools(req, &[("read_file", json!({ "path": "big.txt" }))]),
+                10 => todo(req, &[("read the notes", "completed"), ("write hello.txt", "in_progress")]),
+                11..=20 => use_tools(req, &[("read_file", json!({ "path": "big.txt" }))]),
+                21 => {
+                    // Both calls that set the list are left out by now; the record still has the latest list.
+                    let calls = req.messages[3..].iter().any(|m| m.to_string().contains(r#""name":"todo""#));
+                    assert!(!calls, "a todo call is still in the conversation");
+                    let record = record_of(req).expect("turns were left out");
+                    let holds = record.split("What holds now").nth(1).unwrap();
+                    assert!(
+                        holds.contains(
+                            "- Your own list of steps, as you last set it with todo. It is your record: only the \
+                             done-check says whether the task is done.\n  - [completed] read the notes\n  - \
+                             [in_progress] write hello.txt"
+                        ),
+                        "{record}"
+                    );
+                    assert!(!record.contains("[in_progress] read the notes"), "{record}");
+                    write_hello(req, "hi\n")
+                }
+                _ => done("Wrote hello.txt."),
+            },
+        )
+    });
+    let fake = Fake::new(model, hello_check);
+    with_notes_and_big(&fake);
+    let resp = run_with(&fake, small(), request(Some("check"), 1)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    let fits = fake
+        .events()
+        .iter()
+        .filter(|e| matches!(e, Progress::Note { message, .. } if message.contains("earlier messages left out")))
+        .count();
+    assert!(fits >= 2, "{fits}");
+    // The interface and ACP are sent each list whole, the latest last.
+    let lists = todo_events(&fake);
+    assert_eq!(lists.len(), 2, "{lists:?}");
+    let item = |content: &str, status| TodoItem { content: content.into(), status };
+    assert_eq!(
+        lists[1],
+        (0, vec![item("read the notes", TodoStatus::Completed), item("write hello.txt", TodoStatus::InProgress)])
+    );
+    // Setting the list ran nothing and changed nothing.
+    assert_eq!(fake.calls_to(fs::WRITE).len(), 1);
+    assert!(fake.requests().iter().all(well_formed));
+}
+
+#[tokio::test]
+async fn a_list_all_completed_does_not_pass_an_attempt_whose_check_fails() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => todo(req, &[("write hello.txt", "completed"), ("check it", "completed")]),
+            2 => {
+                let told = last_text(req);
+                assert!(told.contains("2 of 2 steps completed") && told.contains("only when the done-check passes"));
+                write_hello(req, "bye\n")
+            }
+            _ => done("Every step is completed."),
+        },
+        hello_check,
+    );
+    let req = RunRequest { max_check_rounds: Some(1), ..request(Some("check"), 1) };
+    let resp = run(&fake, req).await;
+    assert_eq!(resp.outcome, Outcome::Failed, "{}", resp.summary);
+    assert_eq!((resp.attempts[0].status, resp.attempts[0].check_runs), (AttemptStatus::Failed, 1));
+    assert!(resp.attempts[0].note.starts_with("the done-check still failed"), "{}", resp.attempts[0].note);
+    assert!(!fake.workspace().contains_key("hello.txt"), "nothing is applied");
+    let lists = todo_events(&fake);
+    assert!(lists[0].1.iter().all(|i| i.status == TodoStatus::Completed));
+}
+
+#[tokio::test]
+async fn a_resumed_attempt_keeps_its_list_and_says_it_again() {
+    let model = scripted(|n, req| match n {
+        1 => todo(req, &[("write hello.txt", "in_progress")]),
+        2 => use_tools(req, &[("read_file", json!({ "path": "README.md" }))]),
+        3 => write_hello(req, "hi\n"),
+        _ => done("Wrote hello.txt."),
+    });
+    let fake = Fake::new(model, hello_check);
+    let state = tempfile::tempdir().unwrap();
+    let cfg = Config { state_dir: Some(state.path().into()), ..config() };
+    let req = RunRequest { checkpoint: true, budget_usd: Some(2.0 * 0.125), ..request(Some("check"), 1) };
+    let first = run_with(&fake, cfg.clone(), req).await;
+    assert_eq!(first.checkpoint.as_deref(), Some("trace_test"), "{}", first.summary);
+    let saved = molt_planner::checkpoint::load(state.path(), "trace_test").unwrap();
+    let kept = vec![TodoItem { content: "write hello.txt".into(), status: TodoStatus::InProgress }];
+    assert_eq!(saved.attempts[0].todos, kept);
+
+    let resp = run_with(&fake, cfg, resume("trace_test", false)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    // Once when it was set, and once more when the attempt went on.
+    let lists = todo_events(&fake);
+    assert_eq!(lists, [(0, kept.clone()), (0, kept)]);
+}
+
+#[tokio::test]
+async fn a_later_attempt_is_told_what_an_earlier_one_tried_changed_and_why_it_failed() {
+    let fake = Fake::new(
+        |req| match (model_of(req), turn(req)) {
+            ("haiku", 1) => todo(req, &[("say bye in hello.txt", "completed"), ("run the tests", "pending")]),
+            ("haiku", 2) => use_tools(
+                req,
+                &[
+                    ("write_file", json!({ "path": "hello.txt", "content": "bye\n" })),
+                    ("edit_file", json!({ "path": "missing.rs", "old_string": "a", "new_string": "b" })),
+                ],
+            ),
+            ("haiku", _) => done("Said bye."),
+            ("sonnet", 1) => {
+                let first = req.messages[0]["content"].as_array().unwrap();
+                let told =
+                    first.iter().filter_map(|b| b["text"].as_str()).find(|t| t.starts_with("<earlier_attempts>"));
+                let told = told.expect("the escalated attempt is told what the failed one did");
+                for part in [
+                    "- attempt 1 (on haiku): failed: the done-check still failed (exit code 1):",
+                    "  What it tried: say bye in hello.txt (completed)",
+                    "  Files it changed: hello.txt (added)",
+                    "  Tool calls that failed: edit_file missing.rs: ",
+                    "  The end of its last failed check:\n    stderr:",
+                    "expected hi, got Some(\"bye\\n\")",
+                    "  Steps it left undone: run the tests",
+                    "do not make a change that already failed again",
+                ] {
+                    assert!(told.contains(part), "{part:?} is not in:\n{told}");
+                }
+                write_hello(req, "hi\n")
+            }
+            _ => done("Done."),
+        },
+        hello_check,
+    );
+    let req = RunRequest { max_check_rounds: Some(1), ..request(Some("check"), 3) };
+    let resp = run_with(&fake, adaptive(&["haiku", "sonnet"]), req).await;
+    assert_eq!((resp.outcome, resp.winner), (Outcome::Passed, Some(1)), "{}", resp.summary);
+    assert!(fake.requests().iter().any(|r| model_of(r) == "sonnet"));
+    assert_eq!(fake.workspace()["hello.txt"], "hi\n");
+}
+
+#[tokio::test]
+async fn a_retried_run_tells_its_new_attempt_the_branch_the_checkpoint_kept() {
+    let fake = Fake::new(
+        |req| match turn(req) {
+            1 => {
+                let first = req.messages[0]["content"].to_string();
+                assert!(first.contains("- attempt 1 (on haiku): failed: the done-check still failed"), "{first}");
+                assert!(first.contains("Files it changed: src/lexer.rs (modified)"), "{first}");
+                assert!(first.contains("Tool calls that failed: run cargo test: exit code 101"), "{first}");
+                write_hello(req, "hi\n")
+            }
+            _ => done("Done."),
+        },
+        hello_check,
+    );
+    let state = tempfile::tempdir().unwrap();
+    let cfg = Config { state_dir: Some(state.path().into()), ..adaptive(&["haiku", "sonnet"]) };
+    // A stopped run whose first attempt failed, as the checkpoint keeps it, read back as JSON.
+    let req = RunRequest { max_check_rounds: Some(1), checkpoint: true, ..request(Some("check"), 3) };
+    let mut saved = molt_planner::checkpoint::Saved::new("trace_test", req);
+    saved.settled = true;
+    saved.check = Some(molt_planner::checkpoint::SavedCheck {
+        command: "check".into(),
+        files: vec![],
+        designed: false,
+        suite: None,
+    });
+    let attempt = saved.attempt(0);
+    attempt.model = Some("haiku".into());
+    let branch = molt_planner::branch::Branch {
+        changed: Some(vec!["src/lexer.rs (modified)".into()]),
+        errors: vec!["run cargo test: exit code 101".into()],
+        reason: "the done-check still failed".into(),
+        ..Default::default()
+    };
+    attempt.end = Some(molt_planner::checkpoint::SavedEnd {
+        status: AttemptStatus::Failed,
+        note: "the done-check still failed".into(),
+        summary: String::new(),
+        findings: vec![],
+        dispute: None,
+        failure: None,
+        branch: Some(Box::new(branch)),
+    });
+    std::fs::write(state.path().join("trace_test.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+
+    let resp = run_with(&fake, cfg, resume("trace_test", true)).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    assert_eq!(resp.attempts.len(), 2);
 }

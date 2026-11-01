@@ -21,8 +21,27 @@ An `ask` run gets only the ones that read. The vetter, the reviewer and the
 judge get `read_file`, `list_files` and `search`.
 
 With `MOLT_EXPLORE=on`, or a workflow that sets `attempts.explore`, the
-attempts also get `explore`, last: a question to a sub-agent that reads
-their fork and returns only its conclusion (see [explore.md](explore.md)).
+attempts also get `explore`, last but `todo`: a question to a sub-agent that
+reads their fork and returns only its conclusion (see [explore.md](explore.md)).
+
+## The attempt's own list: `todo`
+
+Attempts that change files get `todo` (#264), after every other tool. It
+calls no service and changes nothing in the fork: each call gives the whole
+list of the attempt's steps as it stands, at most 30 steps of at most 200
+bytes, each `pending`, `in_progress`, `completed` or `cancelled`, and
+replaces the list before. The attempt keeps the list in its checkpoint and
+in the "What holds now" section of the record of left-out turns
+([Long tasks](do.md#long-tasks)), so leaving turns out never loses it. Each
+list goes out as a `todo` progress event: the interface shows it at the top
+of the attempt's lane, `molt do` prints it as one line, and ACP adds its
+steps to the editor's plan after the workflow's steps.
+
+The list is the model's own account of its work. Whether the task is done is
+still the done-check's and the review's to say: an attempt whose steps are
+all `completed` and whose check fails has failed, and a list never moves the
+workflow's steps in the editor's plan. An `ask` run, which only reads, does
+not get it, nor does a role whose `tools` leave it out.
 
 ## Background processes
 

@@ -131,6 +131,12 @@ pub struct SavedAttempt {
     /// `None`: the run's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Its own list of steps, as it last set it with `todo`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todos: Vec<molt_api::planner::tools::TodoItem>,
+    /// Its last failed tool calls, for the branch it leaves if it fails.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -149,6 +155,9 @@ pub struct SavedEnd {
     /// What kind of failure ended it, when the planner could tell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<molt_api::planner::Failure>,
+    /// What it leaves the attempts after it, when it failed or erred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<Box<crate::branch::Branch>>,
 }
 
 impl Saved {
@@ -192,6 +201,8 @@ impl Saved {
                     requirements: 0,
                     dir_instructions: Default::default(),
                     model: None,
+                    todos: Vec::new(),
+                    tool_errors: Vec::new(),
                 });
                 self.attempts.len() - 1
             }

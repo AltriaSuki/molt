@@ -36,6 +36,7 @@ use apply::apply_stops;
 use check::{check_head, disputed_check, rubric_lines, tui_next_steps};
 use memory::snapshot_lines;
 pub(crate) use plan::{plan_card, PlanSteps};
+pub(crate) use progress::todo_lines;
 use progress::{bounded, lane_lines};
 use settings::task_budget;
 use viewer::{diff_viewer, review_viewer, viewer_key};
@@ -508,6 +509,8 @@ pub struct Lane {
     pub ended: Option<Instant>,
     /// The gateway is about to try one of the attempt's model calls again.
     pub retry: Option<Retrying>,
+    /// The attempt's own list of steps, as it last set it.
+    pub todos: Vec<molt_api::planner::tools::TodoItem>,
 }
 
 /// A model call the gateway is about to try again, after it failed.

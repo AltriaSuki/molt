@@ -7,6 +7,7 @@
 mod agent;
 mod ask;
 mod attempt;
+pub mod branch;
 pub mod checkpoint;
 pub mod compact;
 mod control;
@@ -34,6 +35,7 @@ pub mod schedule;
 pub mod scoped;
 mod select;
 pub mod skills;
+mod todo;
 mod tools;
 mod vet;
 

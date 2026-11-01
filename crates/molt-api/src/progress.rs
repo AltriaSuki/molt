@@ -190,6 +190,16 @@ pub enum Progress {
         #[serde(flatten)]
         decision: Scheduling,
     },
+    /// Attempt `attempt` set its own list of steps with `todo` (#264), or a
+    /// resumed attempt still has it: the whole list, which replaces the one
+    /// before. It is the model's own account of its work, not a result: a
+    /// list all completed says nothing about whether the check passed. New:
+    /// an older reader does not know it.
+    Todo {
+        run: String,
+        attempt: u32,
+        items: Vec<crate::planner::tools::TodoItem>,
+    },
     /// Output of a streamed `shell.run`, whose trace id `run` is: whole
     /// lines where it can, in the order read, numbered from 0 so a gap
     /// shows. `cut` is the last event of a command whose output went past
@@ -234,6 +244,7 @@ impl Progress {
             | Self::Planned { run, .. }
             | Self::Step { run, .. }
             | Self::Scheduled { run, .. }
+            | Self::Todo { run, .. }
             | Self::Output { run, .. } => run,
         }
     }
@@ -333,6 +344,24 @@ mod tests {
         let old: crate::planner::RunRequest = serde_json::from_str(r#"{"task":"t","workspace":"/w"}"#).unwrap();
         assert_eq!(old.schedule, None);
         assert_eq!("adaptive".parse::<crate::planner::Schedule>(), Ok(crate::planner::Schedule::Adaptive));
+    }
+
+    #[test]
+    fn a_todo_list_reads_back_whole_with_each_status_in_snake_case() {
+        use crate::planner::tools::{TodoItem, TodoStatus};
+        let item = |content: &str, status| TodoItem { content: content.into(), status };
+        let event = Progress::Todo {
+            run: "r".into(),
+            attempt: 1,
+            items: vec![item("read the lexer", TodoStatus::Completed), item("fix it", TodoStatus::InProgress)],
+        };
+        let text = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            text,
+            r#"{"event":"todo","run":"r","attempt":1,"items":[{"content":"read the lexer","status":"completed"},{"content":"fix it","status":"in_progress"}]}"#
+        );
+        assert_eq!(serde_json::from_str::<Progress>(&text).unwrap(), event);
+        assert_eq!(event.run(), "r");
     }
 
     #[test]

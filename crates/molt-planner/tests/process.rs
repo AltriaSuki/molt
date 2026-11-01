@@ -420,7 +420,8 @@ async fn the_process_tools_are_offered_only_when_turned_on_and_held() {
     // On and held: after the other built-ins, in a fixed order.
     let offered = Fake::new(|req| {
         let names = tool_names(req);
-        assert_eq!(names[names.len() - 4..], PROCESS_TOOLS, "{names:?}");
+        assert_eq!(names[names.len() - 5..names.len() - 1], PROCESS_TOOLS, "{names:?}");
+        assert_eq!(names.last().map(String::as_str), Some("todo"), "{names:?}");
         match turn(req) {
             1 => calls(req, &[("write_file", json!({ "path": "hello.txt", "content": "hi\n" }))]),
             _ => done("Done."),
