@@ -680,6 +680,48 @@ pub struct ReviewDetails {
     pub findings: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The commands the reviewer ran against throwaway copies of the change,
+    /// each with what it measured (#262): evidence of the change's behavior,
+    /// apart from the check it passed and from what was read in the diff.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<Probe>,
+}
+
+/// One probe of a review: a command the reviewer wrote to test a path the
+/// check may miss (a boundary input, a cut or cancelled input, recovery
+/// after an error, concurrent use), run in the sandbox in a copy of the
+/// winner's fork that is dropped once it ends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Probe {
+    pub command: String,
+    /// What it tests, as the reviewer put it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub purpose: String,
+    pub result: ProbeResult,
+    /// `None` when it was killed by a signal, timed out or did not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timed_out: bool,
+    /// The end of what it printed, or why it did not run.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output: String,
+    #[serde(default)]
+    pub duration_ms: u64,
+}
+
+/// What a [`Probe`] measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeResult {
+    /// It exited 0: the code behaved as the probe expects.
+    Passed,
+    /// It exited non-zero, was killed or timed out: it shows a defect, and
+    /// the review is at least a concern.
+    Failed,
+    /// It could not be run (no copy, a refused command, a dependency it
+    /// could not download, the run stopped): it shows nothing either way.
+    NotRun,
 }
 
 /// What kind of failure stopped a command, a tool call or a model call, as
@@ -1006,6 +1048,9 @@ pub mod tools {
     pub const SUBMIT_CHECK: &str = "submit_check";
     /// Offered only to the reviewer: its verdict.
     pub const SUBMIT_REVIEW: &str = "submit_review";
+    /// Offered only to the reviewer of a workflow whose review probes: run
+    /// a command in a throwaway copy of the change (#262).
+    pub const PROBE: &str = "probe";
     /// Offered only to the judge of a rubric: its finding on each criterion.
     pub const SUBMIT_JUDGEMENT: &str = "submit_judgement";
     /// Offered only to the vetter of a designed check: where the check
@@ -1297,6 +1342,13 @@ pub mod tools {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RunProbe {
+        pub command: String,
+        #[serde(default)]
+        pub purpose: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SubmitReview {
         pub verdict: super::Verdict,
         #[serde(default)]
@@ -1312,6 +1364,28 @@ mod tests {
         let review: super::Review = serde_json::from_value(wire.clone()).unwrap();
         assert!(review.details.is_none());
         assert_eq!(serde_json::to_value(review).unwrap(), wire);
+    }
+
+    #[test]
+    fn review_details_without_probes_read_and_write_as_before() {
+        let wire = serde_json::json!({"rules": [], "reviewer": "approve", "findings": []});
+        let details: super::ReviewDetails = serde_json::from_value(wire.clone()).unwrap();
+        assert!(details.probes.is_empty());
+        assert_eq!(serde_json::to_value(&details).unwrap(), wire);
+        let probe = super::Probe {
+            command: "printf 'GET' | ./server".into(),
+            purpose: String::new(),
+            result: super::ProbeResult::NotRun,
+            exit_code: None,
+            timed_out: false,
+            output: String::new(),
+            duration_ms: 0,
+        };
+        let with = super::ReviewDetails { probes: vec![probe], ..details };
+        assert_eq!(
+            serde_json::to_value(&with).unwrap()["probes"],
+            serde_json::json!([{ "command": "printf 'GET' | ./server", "result": "not_run", "duration_ms": 0 }])
+        );
     }
 
     use super::*;

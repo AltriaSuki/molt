@@ -120,6 +120,30 @@ pub struct Review {
     /// one they question is kept.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rules_only: bool,
+    /// How many probes the reviewer may run, 0 to [`MAX_PROBES`]: commands
+    /// of its own, each in the sandbox in a throwaway copy of the winner,
+    /// that test what the check may miss (#262). 0 offers none. `None`: the
+    /// planner's [`DEFAULT_PROBES`]. Not with `rules_only`, which asks no
+    /// reviewer. New in #262: optional, so every document written before it
+    /// reads the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probes: Option<u32>,
+}
+
+/// The probes a reviewer may run when the workflow does not say.
+pub const DEFAULT_PROBES: u32 = 4;
+/// The most probes a workflow may give a reviewer.
+pub const MAX_PROBES: u32 = 16;
+
+impl Review {
+    /// How many probes its reviewer may run: none when only the fixed rules review.
+    pub fn probes(&self) -> u32 {
+        if self.rules_only {
+            0
+        } else {
+            self.probes.unwrap_or(DEFAULT_PROBES)
+        }
+    }
 }
 
 impl Workflow {
@@ -169,7 +193,7 @@ impl Workflow {
             stages: Stages {
                 context: Some(Stage {}),
                 attempts: Some(Attempts { count: Some(1), read_only: false, explore: false }),
-                review: Some(Review { rules_only: true }),
+                review: Some(Review { rules_only: true, probes: None }),
                 deliver: Some(Stage {}),
                 ..Stages::default()
             },
@@ -235,6 +259,20 @@ impl Workflow {
             };
             if unused {
                 return Some(format!("workflow {name:?} seats a role in {slot:?}, which none of its stages uses"));
+            }
+        }
+        if let Some(review) = s.review {
+            match review.probes {
+                Some(n) if n > 0 && review.rules_only => {
+                    return Some(format!(
+                        "workflow {name:?}: review.rules_only asks no reviewer, so no one runs its probes: leave out \
+                         review.probes"
+                    ));
+                }
+                Some(n) if n > MAX_PROBES => {
+                    return Some(format!("workflow {name:?}: review.probes must be 0 to {MAX_PROBES}, not {n}"));
+                }
+                _ => {}
             }
         }
         if let Some(share) = self.stages.design.and_then(|d| d.budget_share) {
@@ -334,6 +372,23 @@ mod tests {
             }
             assert!(w.problem().is_some_and(|p| p.contains("only reads")), "{stage}");
         }
+        let mut probing_rules = Workflow::quick();
+        probing_rules.stages.review = Some(Review { rules_only: true, probes: Some(2) });
+        assert!(probing_rules.problem().is_some_and(|p| p.contains("review.probes")));
+        let mut too_many = Workflow::verify();
+        too_many.stages.review = Some(Review { rules_only: false, probes: Some(MAX_PROBES + 1) });
+        assert!(too_many.problem().is_some_and(|p| p.contains("review.probes must be 0 to")));
+        let mut none = Workflow::verify();
+        none.stages.review = Some(Review { rules_only: false, probes: Some(0) });
+        assert!(none.problem().is_none() && none.stages.review.unwrap().probes() == 0);
+        assert_eq!(Workflow::verify().stages.review.unwrap().probes(), DEFAULT_PROBES);
+        assert_eq!(Workflow::quick().stages.review.unwrap().probes(), 0);
+        let wire = serde_json::json!({ "schema": 1, "name": "v", "stages": {
+            "attempts": {}, "review": { "probes": 2 }, "deliver": {}
+        } });
+        let probing: Workflow = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(probing.stages.review.unwrap().probes(), 2);
+        assert_eq!(serde_json::to_value(&probing).unwrap(), wire);
         let mut many = Workflow::quick();
         many.stages.attempts = Some(Attempts { count: Some(9), ..Attempts::default() });
         assert!(many.problem().is_some_and(|p| p.contains("attempts.count")));
