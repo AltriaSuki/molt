@@ -64,6 +64,49 @@ session closes unless the client applies it, keeps it (`result.keep`, or
 `keep` on `session.close`), or discards it. A client that goes away without
 closing its session leaves every fork its session made.
 
+## Sessions that stay
+
+A conversation can outlive the client and the server: a **stored session**
+([RFC 0006](rfc/0006-sessions.md)). A client makes one with
+`sessions.new` or picks one up with `sessions.load`. From then on, its
+connection's tasks go into the session's journal:
+
+- the task, before the planner is asked;
+- the reply, with its cost, and the attempt's conversation with its tool
+  results;
+- an attempt's questions and the answers given;
+- whether a result was applied, kept or discarded.
+
+Each entry is on disk before the request it records is answered.
+
+```python
+session = call("sessions.new", {"title": "parser work"})["session"]
+# ... tasks as above; the next day, from any client:
+session = call("sessions.load", {"id": session["id"]})["session"]
+print(len(session["earlier"]), "tasks,", session["spent"])
+```
+
+- A task that names no `earlier` of its own is told of the session's
+  answered tasks, and its runs are grouped under the session's id in
+  `molt runs --session`.
+- Closing the session, a client that goes away, or a server that is killed
+  leaves the stored session as it was. Results it still waits on stay in
+  their forks.
+- Loading it starts nothing and calls no model. A task that never got its
+  reply is listed as `unanswered`, and what it spent is unknown. One that
+  kept a checkpoint is in `runs.list`, to resume if you choose.
+- One client holds a session at a time. Another's `sessions.load` is
+  refused with `BUSY` until it lets go.
+- `sessions.list` lists the workspace's sessions, and names any it cannot
+  read. `sessions.archive` archives one (`restore` brings it back), and
+  `sessions.delete` removes it.
+- `sessions.new` with `import` starts from what the interface saved of its
+  last session in the workspace, which is only its earlier tasks'
+  summaries. The loaded session says so.
+
+The sessions are in `sessions/` in the data dir. A damaged journal, or one a
+newer molt wrote, is refused with the line and why, and is left as it is.
+
 ## Who can use it
 
 - The socket has mode 0600 and the data dir molt makes is private (0700).
