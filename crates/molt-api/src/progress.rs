@@ -155,11 +155,17 @@ pub enum Progress {
     /// The planner picked `workflow` for a run that named
     /// [`crate::workflow::AUTO`], before anything else ran. `reason` is
     /// short, and empty when the pick was not the model's (it failed, say).
+    /// `cost_usd` is what the pick's own model calls cost, which the run's
+    /// cost already counts; `None` when a call's cost is not known (or an
+    /// older planner sent it), never zero for unknown. New: an older
+    /// reader does not know it.
     Routed {
         run: String,
         workflow: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
     },
     /// The steps the plan `run` goes by, before the first starts
     /// (`planner.plan`, #47): as the step designer wrote them, or as a

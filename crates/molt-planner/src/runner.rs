@@ -335,13 +335,26 @@ fn routes(req: &RunRequest, cfg: &Config) -> Result<Option<Vec<&'static str>>, R
 async fn pick(ctx: &mut Ctx, req: &RunRequest, candidates: &[&'static str]) -> &'static str {
     // The pick is a model call of the run: it counts against its budget like any other.
     let probe = Arc::new(ctx.clone());
-    let routed = crate::route::route(&probe, candidates, req.check.as_deref()).await;
+    let routed = crate::route::route(&probe, candidates, req).await;
     drop(probe);
     let picked = workflow(&ctx.cfg, Some(routed.workflow)).unwrap_or_else(|_| Workflow::verify());
     ctx.workflow = Arc::new(picked);
-    tracing::info!(run = %ctx.trace, workflow = routed.workflow, reason = %routed.reason, "picked a workflow");
-    ctx.progress(Progress::Routed { run: ctx.run_id(), workflow: routed.workflow.to_owned(), reason: routed.reason })
-        .await;
+    tracing::info!(
+        run = %ctx.trace,
+        workflow = routed.workflow,
+        reason = %routed.reason,
+        cost_usd = ?routed.cost_usd,
+        earlier = req.earlier.len(),
+        goes_on = req.continues.is_some(),
+        "picked a workflow"
+    );
+    ctx.progress(Progress::Routed {
+        run: ctx.run_id(),
+        workflow: routed.workflow.to_owned(),
+        reason: routed.reason,
+        cost_usd: routed.cost_usd,
+    })
+    .await;
     routed.workflow
 }
 
