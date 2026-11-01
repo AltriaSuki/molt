@@ -202,6 +202,9 @@ pub(super) fn apply_stops(resp: &RunResponse, rules: &ConfirmSection) -> Vec<Str
             if details.error.is_some() {
                 sources.push("reviewer did not finish".into());
             }
+            if let Some(probe) = details.probes.iter().find(|p| p.result == molt_api::planner::ProbeResult::Failed) {
+                sources.push(format!("probe failed: {}", text::fit(&clean_line(&probe.command), 60)));
+            }
         }
         stops.push(if sources.is_empty() { label.into() } else { format!("{label} ({})", sources.join("; ")) });
     }
@@ -275,6 +278,7 @@ mod tests {
                 app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(resp)) });
                 let reason = app.task.as_ref().unwrap().stops.join("; ");
                 assert!(reason.contains("rule: src/parser.rs") && reason.contains("reviewer approved"), "{reason}");
+                assert!(!reason.contains("probe"), "{reason}");
             }
             app.update(key(KeyCode::PageUp));
             assert_eq!(app.scroll, 10);
@@ -443,6 +447,27 @@ mod tests {
         let review = |verdict| Some(molt_api::planner::Review { verdict, findings: vec![], details: None });
         assert_eq!(apply_stop(RunResponse { review: review(Verdict::Reject), ..ok() }), ["review rejected"]);
         assert_eq!(apply_stop(RunResponse { review: review(Verdict::Concern), ..ok() }), ["review questioned"]);
+        let probe = |result| molt_api::planner::Probe {
+            command: "printf 'GE' | ./server".into(),
+            purpose: String::new(),
+            result,
+            exit_code: Some(1),
+            timed_out: false,
+            output: String::new(),
+            duration_ms: 1,
+        };
+        use molt_api::planner::ProbeResult::{Failed, Passed};
+        let details = molt_api::planner::ReviewDetails {
+            reviewer: Some(Verdict::Approve),
+            probes: vec![probe(Passed), probe(Failed)],
+            ..Default::default()
+        };
+        let review =
+            Some(molt_api::planner::Review { verdict: Verdict::Concern, findings: vec![], details: Some(details) });
+        assert_eq!(
+            apply_stop(RunResponse { review, ..ok() }),
+            ["review questioned (reviewer approved; probe failed: printf 'GE' | ./server)"]
+        );
     }
 
     #[test]

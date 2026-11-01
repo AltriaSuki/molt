@@ -86,10 +86,21 @@ attempts are not offered the question at all.
 The tasks you give one after another make a conversation: each new task is
 told what the last five asked, how they ended, what they said and which
 files they changed, and whether those changes are in the workspace. Every
-task still has its own check and budget. `/new` starts a new conversation.
-`/continue TASK` goes further: the new task gets the last one's whole
-conversation with the model (its oldest turns left out when it does not fit),
-and works in its result's fork while that result is kept.
+task still has its own check and budget. A task you type goes on from the
+last one: it gets the last task's whole conversation with the model (its
+oldest turns left out when it does not fit), and works in its result's fork
+while that result is kept, so "do the second one" or "why this way?" means
+what it meant a moment ago. The log says so under the task
+(`goes on from the last task · /new starts a new conversation`). `/new`
+starts a new conversation. `/continue TASK` does what plain input does, and
+says so when there is nothing to go on from. `/ask`, `/quick` and
+`/verify TASK` go on the same way; `/verify` alone runs the last task again
+from the workspace, not on top of its result. Queued tasks and the steps of
+a plan start from the workspace, told of the earlier tasks only. An answer
+that changes nothing leaves a kept result where it was: the next task still
+goes on from it, and nothing of it is applied again. After a restart the
+earlier tasks are told again, but the conversation itself is not saved, so
+the first task goes on from their summaries only.
 
 Not every task needs the whole pipeline. Before a task starts, one small
 model call picks how much it gets, and the log says so first (`◆ handled as
@@ -101,6 +112,20 @@ look at; `verify` is everything above. With a check set the pick is never
 `ask`. `/ask`, `/quick` and `/verify` run a task through that workflow without
 a pick, and `/verify` alone runs the last task again through the full one.
 The pick's model is the planner's `MOLT_ROUTE_MODEL`, by default the task's.
+For a task that goes on from others, the pick also reads what the earlier tasks
+asked, how each ended, a short part of what each answer said and the files
+it changed (bounded, and marked as data), and whether a kept result is what
+the task builds on; it never reads the conversation itself. Only the task
+you typed says what to do: a question about work already done, a task that
+says to change nothing yet ("only discuss"), and one whose "that one" the
+conversation does not settle are meant to be `ask`, which changes nothing
+and, going on from a conversation, asks which one you mean rather than
+guess. A change an earlier answer proposed is not made until you ask for
+it. These are what the pick is told, not rules a model cannot break; a
+`/check` you set still rules out `ask` for every task, so use `/ask` to
+talk while one is set. The `◆` line ends with what the pick cost
+(`· pick $0.002`), which the task's cost already counts, or says it is not
+known.
 
 The log keeps everything a task reports, in full; PgUp and PgDn scroll it,
 and Ctrl+Home and Ctrl+End (or Home and End with an empty input) jump to its

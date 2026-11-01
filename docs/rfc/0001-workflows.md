@@ -87,6 +87,14 @@ document written before them still reads the same; a planner that does not
 know them refuses a document that uses them, as it refuses any unknown
 parameter.
 
+`review.probes` (#262), optional in the same way, is how many probes the
+reviewer may run, 0 to 16: commands of its own, each in the sandbox in a
+fresh copy of the winner that is dropped when it ends (see
+[do.md](../do.md#review-probes)). Without it the planner's default, 4,
+applies; `0` offers none. It cannot be combined with `rules_only`, which asks
+no reviewer. Every probe is in `review.details.probes` of the reply, and one
+that fails makes the review at least `concern`.
+
 `attempts.explore: true` (#42), optional in the same way, offers the
 attempts `explore`: a question to a sub-agent, seated as the `explorer`
 role, that only reads their fork and returns its conclusion alone (see
@@ -174,12 +182,19 @@ through the same workflow.
 
 `auto` is not a workflow but a name a request may give in its place. The
 planner then picks one of `ask`, `quick` and `verify` with one model call on
-the task alone (one tool, `submit_route`; the model is the planner's
+the task (one tool, `submit_route`; the model is the planner's
 `route_model`, `MOLT_ROUTE_MODEL`, or the run's), counted in the run's cost
-like any other call. Only workflows the request validates under are offered,
+like any other call. A request with `earlier` tasks or `continues` also
+gives the pick a bounded view of that conversation (#217): the latest six
+earlier tasks, how each ended, a cut of what each said and of the paths it
+changed, and whether the task builds on a kept result. The pick never reads
+the conversation itself, so compacting it changes nothing the pick sees.
+Only workflows the request validates under are offered,
 so with a check or a rubric `ask` is never one, and with a `select` other
 than `first` only `verify` is. The pick is published as a `routed` progress
-event before anything else runs, and the reply's `workflow` names it. A pick
+event before anything else runs, with the reason and what the pick's calls
+cost (`cost_usd`, left out when one's cost is unknown), and the reply's
+`workflow` names it. A pick
 that fails, does not come, or names a workflow that was not offered is the
 heaviest offered: routing never makes a run lighter by failing. A request
 that names a workflow is never routed, so naming `verify` is how a person

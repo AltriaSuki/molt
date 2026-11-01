@@ -81,7 +81,16 @@ impl App {
         })
     }
 
+    /// Start `line`: as an answer or a constraint while a task runs, and
+    /// otherwise as the next task of the conversation, going on from the
+    /// last one (#217).
     pub(super) fn submit_task(&mut self, line: String) -> Vec<Action> {
+        self.submit_from(line, true)
+    }
+
+    /// [`Self::submit_task`]; `goes_on` false starts the task from the
+    /// workspace, told of the earlier tasks only.
+    fn submit_from(&mut self, line: String, goes_on: bool) -> Vec<Action> {
         if self.fork_operations > 0 || self.git_busy {
             self.flash = Some("wait for the current apply, discard or commit".into());
             self.input = Input::with(&line);
@@ -111,7 +120,8 @@ impl App {
             self.input = Input::with(&line);
             return Vec::new();
         }
-        self.start_task(line, self.mode, self.settings.clone())
+        let continues = self.continuation.clone().filter(|_| goes_on);
+        self.start_task_with(line, self.mode, self.settings.clone(), continues)
     }
 
     pub(super) fn start_task(&mut self, line: String, mode: Mode, settings: Settings) -> Vec<Action> {
@@ -161,6 +171,10 @@ impl App {
 
         self.gap();
         self.echo(&line);
+        if let Some(c) = &req.continues {
+            let what = if c.fork.is_some() { "the last task and its kept result" } else { "the last task" };
+            self.push(Line::from(span(format!("  goes on from {what} · /new starts a new conversation"), Tone::Dim)));
+        }
         let mut task = Task::new(trace.clone(), req, Phase::Running, mode, settings.clone());
         self.last_run = Some(trace.to_string());
         let action = if let Some(check) = &settings.check {
@@ -195,21 +209,24 @@ impl App {
             self.flash = Some(format!("a task is waiting; /{name} starts a new task once it is done"));
             return Vec::new();
         }
-        let task = match (task.is_empty(), self.earlier.last()) {
-            (false, _) => task.to_owned(),
-            (true, Some(last)) if name == workflow::VERIFY => last.task.clone(),
+        // `/verify` alone runs the last task again from the workspace, rather than on top of its result.
+        let (task, goes_on) = match (task.is_empty(), self.earlier.last()) {
+            (false, _) => (task.to_owned(), true),
+            (true, Some(last)) if name == workflow::VERIFY => (last.task.clone(), false),
             (true, _) => {
                 self.flash = Some(format!("/{name} TASK: the task to run with workflow {name}"));
                 return Vec::new();
             }
         };
         let saved = self.settings.workflow.replace(name.to_owned());
-        let actions = self.submit_task(task);
+        let actions = self.submit_from(task, goes_on);
         self.settings.workflow = saved;
         actions
     }
 
-    /// Start `task` going on from the last finished one.
+    /// Start `task` going on from the last finished one: what plain input
+    /// does, kept for those who name it, and refused when there is nothing
+    /// to go on from.
     pub(super) fn continue_task(&mut self, task: &str) -> Vec<Action> {
         if self.task.is_some() {
             self.flash = Some("a task is waiting; /continue goes on from it once it is done".into());
@@ -676,9 +693,15 @@ mod tests {
         let actions = type_in(&mut app, "add a comment to main");
         let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
         assert_eq!(req.workflow.as_deref(), Some("auto"), "the planner picks the workflow");
-        let routed = Progress::Routed { run: trace.to_string(), workflow: "quick".into(), reason: "a comment".into() };
+        let routed = Progress::Routed {
+            run: trace.to_string(),
+            workflow: "quick".into(),
+            reason: "a comment".into(),
+            cost_usd: Some(0.0021),
+        };
         app.update(Msg::Progress(routed));
-        assert!(log(&app).contains("handled as quick (a comment) · /verify for the full workflow"), "{}", log(&app));
+        let said = "handled as quick (a comment) · /verify for the full workflow · pick $0.002";
+        assert!(log(&app).contains(said), "{}", log(&app));
         assert_eq!(app.task.as_ref().unwrap().req.workflow.as_deref(), Some("quick"));
         let done = RunResponse { workflow: Some("quick".into()), ..passed(true, None) };
         let actions = app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(done)) });
@@ -742,5 +765,105 @@ mod tests {
 
         type_in(&mut app, "/new");
         assert!(app.continuation.is_none());
+    }
+
+    #[test]
+    fn plain_input_goes_on_from_the_last_task_and_new_or_a_bare_verify_starts_afresh() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.mode = Mode::Plan;
+        let actions = type_in(&mut app, "解释登录实现");
+        let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.continues, None, "the first task has nothing to go on from");
+        let kept = RunResponse { conversation: conversation(), ..passed(false, Some("/fork/first")) };
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(kept)) });
+        assert_eq!(app.kept, ["/fork/first"]);
+
+        // No /continue: the follow-up has the whole conversation and works on the kept result.
+        let actions = type_in(&mut app, "这个为什么更合适？");
+        let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(req.workflow.as_deref(), Some("auto"));
+        assert_eq!(
+            req.continues,
+            Some(Continuation { conversation: conversation(), fork: Some("/fork/first".into()) })
+        );
+        assert_eq!(req.earlier.len(), 1);
+        assert!(
+            log(&app).contains("goes on from the last task and its kept result · /new starts a new conversation"),
+            "{}",
+            log(&app)
+        );
+
+        // Answered without a change: the kept result is still what the next task goes on from, and nothing is applied.
+        let mut said = conversation();
+        said.push(serde_json::json!({ "role": "assistant", "content": [{ "type": "text", "text": "Because." }] }));
+        let answer = RunResponse {
+            outcome: Outcome::Unverified,
+            check: None,
+            changes: vec![],
+            patch: String::new(),
+            workflow: Some("ask".into()),
+            conversation: said.clone(),
+            ..passed(false, None)
+        };
+        let actions = app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(answer)) });
+        assert!(actions.iter().all(|a| !matches!(a, Action::Apply { .. })), "{actions:?}");
+        assert_eq!(app.kept, ["/fork/first"]);
+        assert_eq!(app.continuation, Some(Continuation { conversation: said, fork: Some("/fork/first".into()) }));
+
+        // `/verify` alone runs the last task again from the workspace.
+        let actions = type_in(&mut app, "/verify");
+        let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!((req.task.as_str(), req.workflow.as_deref()), ("这个为什么更合适？", Some("verify")));
+        assert_eq!(req.continues, None);
+        let done = RunResponse { conversation: conversation(), ..passed(false, Some("/fork/again")) };
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(done)) });
+
+        type_in(&mut app, "/new");
+        let actions = type_in(&mut app, "something else");
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert!(req.continues.is_none() && req.earlier.is_empty(), "{req:?}");
+        assert!(!log(&app).ends_with("/new starts a new conversation"), "{}", log(&app));
+    }
+
+    #[test]
+    fn a_follow_up_keeps_the_check_and_workflow_given_also_after_the_session_is_picked_up_again() {
+        let mut app = App::new("/w", None);
+        up(&mut app);
+        app.mode = Mode::Auto;
+        app.settings.check = Some("cargo test".into());
+        let actions = type_in(&mut app, "fix the parser");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let done = RunResponse { conversation: conversation(), ..passed(true, None) };
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(done)) });
+
+        let actions = type_in(&mut app, "now the other case too");
+        let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!((req.check.as_deref(), req.workflow.as_deref()), (Some("cargo test"), Some("auto")));
+        assert_eq!(req.continues, Some(Continuation { conversation: conversation(), fork: None }));
+        let done = RunResponse { conversation: conversation(), ..passed(true, None) };
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(done)) });
+
+        // A workflow named for the task is that workflow, going on all the same.
+        let actions = type_in(&mut app, "/verify and a test for it");
+        let [Action::Run { req, trace }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!((req.workflow.as_deref(), req.check.as_deref()), (Some("verify"), Some("cargo test")));
+        assert!(req.continues.is_some());
+        let done = RunResponse { conversation: conversation(), ..passed(true, None) };
+        app.update(Msg::Ran { trace: trace.clone(), result: Box::new(Ok(done)) });
+
+        // Picked up by a new interface: the earlier tasks and the check are there, and the pick reads them.
+        let saved = app.snapshot();
+        let mut again = App::new("/w", None);
+        up(&mut again);
+        again.mode = Mode::Auto;
+        again.settings = app.settings.clone();
+        again.restore_session(saved);
+        let actions = type_in(&mut again, "and the docs");
+        let [Action::Run { req, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!((req.check.as_deref(), req.workflow.as_deref()), (Some("cargo test"), Some("auto")));
+        let tasks: Vec<&str> = req.earlier.iter().map(|e| e.task.as_str()).collect();
+        assert_eq!(tasks, ["fix the parser", "now the other case too", "and a test for it"]);
+        assert_eq!(req.continues, None, "the conversation itself is not saved; its summaries are");
     }
 }

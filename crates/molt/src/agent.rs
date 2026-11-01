@@ -2205,7 +2205,8 @@ mod tests {
         assert!(report(&resp).starts_with("outcome: unverified answer\nverification: none\n"), "{}", report(&resp));
         let quick = RunResponse { workflow: Some("quick".into()), ..resp };
         assert!(report(&quick).starts_with("outcome: unverified\n"));
-        let event = Progress::Routed { run: "r".into(), workflow: "quick".into(), reason: "a comment".into() };
+        let event =
+            Progress::Routed { run: "r".into(), workflow: "quick".into(), reason: "a comment".into(), cost_usd: None };
         assert_eq!(describe(&event), "handled as quick (a comment) · --workflow verify for the full workflow");
         assert_eq!(routed_line("verify", "", "/verify"), "handled as verify");
     }

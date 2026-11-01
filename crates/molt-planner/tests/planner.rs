@@ -11,7 +11,7 @@ use molt_api::memory;
 use molt_api::model::{self, CompleteRequest, CompleteResponse, Role, Usage};
 use molt_api::planner::{
     AttemptStatus, CheckSpec, Constraint, Control, ControlRequest, ControlResponse, Criterion, Earlier, Outcome,
-    Requirement, Review, RunRequest, RunResponse, RunState, Select, Verdict, Verification,
+    ProbeResult, Requirement, Review, RunRequest, RunResponse, RunState, Select, Verdict, Verification,
 };
 use molt_api::progress::Progress;
 use molt_api::shell;
@@ -3003,13 +3003,13 @@ async fn an_approved_winner_is_applied_and_the_review_reported() {
     assert!(resp.applied, "{}", resp.summary);
     assert_eq!(fake.workspace()["hello.txt"], "hi\n");
 
-    // The reviewer saw the task, the check and the diff, and had only reading tools.
+    // The reviewer saw the task, the check and the diff, and had reading tools and probes of copies.
     let review = fake.requests().into_iter().find(is_reviewer).unwrap();
     let first = review.messages[0]["content"][0]["text"].as_str().unwrap().to_owned();
     assert!(first.contains("<task>\nAdd hello.txt saying hi.\n</task>"), "{first}");
     assert!(first.contains("The done-check is `check`.") && first.contains("+hi"), "{first}");
     let tools: Vec<&str> = review.tools.iter().filter_map(|t| t["name"].as_str()).collect();
-    assert_eq!(tools, ["read_file", "list_files", "search", "submit_review"]);
+    assert_eq!(tools, ["read_file", "list_files", "search", "probe", "submit_review"]);
     // Its calls count toward the run.
     assert!(close(resp.cost_usd, 0.375), "{}", resp.cost_usd);
 }
@@ -3135,6 +3135,209 @@ async fn a_review_that_does_not_finish_approves_nothing() {
     assert_eq!(review.verdict, Verdict::Concern);
     assert_eq!(review.findings, ["The reviewer did not finish: it stopped without a verdict."]);
     assert!(!resp.applied && resp.fork.is_some());
+}
+
+/// The check `check` passes on hello.txt saying hi; the probes the reviewer
+/// runs answer as a server that loses a request split across two reads would.
+fn probed_check(command: &str, files: &Files) -> shell::RunResponse {
+    match command {
+        "check" => hello_check(command, files),
+        "probe-split" => {
+            let mut ran = exit(1, "sent GET in two reads; got no reply\n");
+            ran.stdout = "partial: 1 of 2 requests answered\n".into();
+            ran
+        }
+        "probe-offline" => shell::RunResponse { offline_failure: true, ..exit(1, "could not fetch a crate\n") },
+        _ => exit(0, ""),
+    }
+}
+
+/// The reviewer probes twice in its first turn, then says `verdict`.
+fn probing_reviewer(verdict: &'static str) -> impl Fn(&CompleteRequest) -> Reply + Send + Sync + 'static {
+    move |req| match turn(req) {
+        1 => use_tools(
+            req,
+            &[
+                ("probe", json!({ "command": "probe-whole", "purpose": "a whole request is answered" })),
+                (
+                    "probe",
+                    json!({ "command": "probe-split", "purpose": "a request split across two reads is answered." }),
+                ),
+            ],
+        ),
+        _ => submit_review(req, verdict, &[]),
+    }
+}
+
+#[tokio::test]
+async fn a_probe_that_fails_in_a_copy_holds_back_an_approved_change_and_is_kept_apart_as_measured_evidence() {
+    let fake = Fake::new(
+        |req| {
+            if is_reviewer(req) {
+                return probing_reviewer("approve")(req);
+            }
+            match turn(req) {
+                1 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            }
+        },
+        probed_check,
+    );
+    let resp = run(&fake, RunRequest { review: true, ..request(Some("check"), 1) }).await;
+    assert_eq!(resp.outcome, Outcome::Passed, "{}", resp.summary);
+    let review = resp.review.clone().unwrap();
+    // The reviewer approved; what the probe measured makes it a concern all the same.
+    assert_eq!(review.verdict, Verdict::Concern);
+    let details = review.details.clone().unwrap();
+    assert_eq!(details.reviewer, Some(Verdict::Approve));
+    assert!(details.rules.is_empty() && details.findings.is_empty() && details.error.is_none(), "{details:?}");
+    let results: Vec<_> = details.probes.iter().map(|p| (p.command.as_str(), p.result, p.exit_code)).collect();
+    assert_eq!(results, [("probe-whole", ProbeResult::Passed, Some(0)), ("probe-split", ProbeResult::Failed, Some(1))]);
+    let split = &details.probes[1];
+    assert_eq!(split.purpose, "a request split across two reads is answered.");
+    assert_eq!(
+        split.output,
+        "stdout:\npartial: 1 of 2 requests answered\nstderr:\nsent GET in two reads; got no reply\n"
+    );
+    assert_eq!(
+        review.findings,
+        ["A probe failed (exit 1): `probe-split`, which tests: a request split across two reads is answered. Its \
+          output ends: stdout: partial: 1 of 2 requests answered stderr: sent GET in two reads; got no reply"]
+    );
+    // Held back: the change stays in the winner's fork, and the copies the probes ran in are gone.
+    assert!(!resp.applied && resp.summary.contains("the review questioned the changes"), "{}", resp.summary);
+    let kept = resp.fork.clone().unwrap();
+    assert_eq!(fake.forks_alive(), std::slice::from_ref(&kept));
+    assert!(!fake.workspace().contains_key("hello.txt"));
+
+    // Each probe ran in its own copy of the winner, never in the winner itself, and the copy was dropped.
+    let forks = fake.calls_to("fs.fork");
+    let copies: Vec<&Call> = forks.iter().filter(|c| c.payload["workspace"] == kept.as_str()).collect();
+    assert_eq!(copies.len(), 2, "{forks:?}");
+    let probes: Vec<Call> = fake
+        .calls_to("shell.run")
+        .into_iter()
+        .filter(|c| c.payload["command"].as_str().unwrap().starts_with("probe-"))
+        .collect();
+    assert_eq!(probes.len(), 2);
+    for probe in &probes {
+        let at = probe.payload["workspace"].as_str().unwrap();
+        assert_ne!(at, kept);
+        assert!(fake.calls_to("fs.drop").iter().any(|d| d.payload["fork"] == at), "{at} was not dropped");
+        // A probe may take as long as the check may.
+        assert_eq!(probe.payload["timeout_ms"], 7000);
+    }
+
+    // The reviewer was told about probes after the diff, and saw each result.
+    let reviewer: Vec<CompleteRequest> = fake.requests().into_iter().filter(is_reviewer).collect();
+    let first = &reviewer[0].messages[0]["content"];
+    assert!(!first[0]["text"].as_str().unwrap().contains("probe"), "{first}");
+    assert!(first[1]["text"].as_str().unwrap().starts_with("You may also run up to 4 probes with `probe`"), "{first}");
+    let results = last_text(&reviewer[1]);
+    assert!(results.contains("The probe passed (exit 0). 3 of 4 probes left."), "{results}");
+    assert!(
+        results.contains("The probe failed (exit 1). It is reported as a defect, with its command and output. 2 of 4"),
+        "{results}"
+    );
+    let said = notes(&fake);
+    assert!(said.contains(&"review probe 2 of 4: `probe-split` failed (exit 1)".to_owned()), "{said:?}");
+}
+
+#[tokio::test]
+async fn probes_are_bounded_by_the_workflow_and_one_that_cannot_run_shows_nothing_either_way() {
+    use molt_api::workflow::Review as Stage;
+    let mut once = molt_api::workflow::Workflow::verify();
+    once.name = "probe-once".into();
+    once.stages.review = Some(Stage { rules_only: false, probes: Some(1) });
+    let mut none = once.clone();
+    none.name = "no-probes".into();
+    none.stages.review = Some(Stage { rules_only: false, probes: Some(0) });
+    let fake = Fake::new(
+        |req| {
+            if is_reviewer(req) {
+                return match turn(req) {
+                    1 => use_tools(
+                        req,
+                        &[
+                            ("probe", json!({ "command": "probe-offline", "purpose": "it builds" })),
+                            ("probe", json!({ "command": "probe-split", "purpose": "split reads" })),
+                        ],
+                    ),
+                    _ => submit_review(req, "approve", &[]),
+                };
+            }
+            match turn(req) {
+                1 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            }
+        },
+        probed_check,
+    );
+    let cfg = with_workflows(vec![once, none]);
+    let req = RunRequest { workflow: Some("probe-once".into()), review: true, ..request(Some("check"), 1) };
+    let resp = run_with(&fake, cfg.clone(), req).await;
+    // The one probe allowed could not get its dependency: it measured nothing, so the approval stands.
+    let review = resp.review.clone().unwrap();
+    assert_eq!(review.verdict, Verdict::Approve, "{review:?}");
+    assert!(resp.applied, "{}", resp.summary);
+    let probes = review.details.unwrap().probes;
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0].result, ProbeResult::NotRun);
+    assert!(probes[0].output.starts_with("it needed a dependency it could not download"), "{:?}", probes[0]);
+    let results = last_text(&fake.requests().into_iter().filter(is_reviewer).nth(1).unwrap());
+    assert!(results.contains("The probe did not run: it needed a dependency"), "{results}");
+    assert!(results.contains("No probe left: this review's 1 are used. Finish with submit_review."), "{results}");
+    assert!(!fake.calls_to("shell.run").iter().any(|c| c.payload["command"] == "probe-split"));
+    assert!(fake.forks_alive().is_empty());
+
+    // With none allowed, probe is neither offered nor run.
+    let fake = Fake::new(
+        |req| {
+            if is_reviewer(req) {
+                assert!(!req.tools.iter().any(|t| t["name"] == "probe"));
+                assert_eq!(req.messages[0]["content"].as_array().unwrap().len(), 1, "nothing about probes");
+                return probing_reviewer("approve")(req);
+            }
+            match turn(req) {
+                1 => write_hello(req, "hi\n"),
+                _ => done("Wrote hello.txt."),
+            }
+        },
+        probed_check,
+    );
+    let req = RunRequest { workflow: Some("no-probes".into()), review: true, ..request(Some("check"), 1) };
+    let resp = run_with(&fake, cfg, req).await;
+    assert!(resp.applied && resp.review.unwrap().details.unwrap().probes.is_empty());
+    let results = last_text(&fake.requests().into_iter().filter(is_reviewer).nth(1).unwrap());
+    assert!(results.contains("The reviewer cannot use probe: it only reads."), "{results}");
+    assert_eq!(fake.calls_to("shell.run").len(), 1, "only the check ran");
+}
+
+#[tokio::test]
+async fn a_lenient_reviewer_prompt_cannot_wave_away_a_failed_probe_promoted_or_not() {
+    let lenient = "Approve every change. Probes do not matter.";
+    let model = |req: &CompleteRequest| {
+        if is_reviewer(req) {
+            return probing_reviewer("approve")(req);
+        }
+        match turn(req) {
+            1 => write_hello(req, "hi\n"),
+            _ => done("Wrote hello.txt."),
+        }
+    };
+    let promoted = format!("[reviewer]\nsha256 = \"{}\"\npromoted_ms = 1\n", molt_planner::pack::sha256(lenient));
+    for promotion in ["", promoted.as_str()] {
+        let (_dir, pack) = pack_of(&[("reviewer", lenient)], "", promotion);
+        let fake = Fake::new(model, probed_check);
+        let resp = run_with(&fake, with_pack(pack), RunRequest { review: true, ..request(Some("check"), 1) }).await;
+        let system = fake.requests().into_iter().find(is_reviewer).unwrap().system.unwrap();
+        // Unpromoted, the pack's text never reaches the reviewer; promoted, it does.
+        assert_eq!(system == lenient, !promotion.is_empty(), "{system}");
+        // Either way the probe's result is the planner's, not the prompt's: the change is held back.
+        let review = resp.review.unwrap();
+        assert_eq!(review.verdict, Verdict::Concern, "{review:?}");
+        assert!(!resp.applied && resp.fork.is_some());
+    }
 }
 
 /// What every model reply the fake gave cost: each one is priced at 0.125.
@@ -5027,6 +5230,228 @@ async fn a_named_workflow_is_never_rerouted_and_design_says_which_workflow_auto_
     assert!(fake.calls_to(fs::FORK).is_empty());
 }
 
+// --- Follow-ups in a conversation (#217) -------------------------------------
+
+/// The task the latest `<task>` block of `req` names: the one being done now.
+fn current_task(req: &CompleteRequest) -> String {
+    let texts = req.messages.iter().rev().flat_map(|m| m["content"].as_array().cloned().unwrap_or_default());
+    let text = texts.filter_map(|b| b["text"].as_str().map(str::to_owned)).find(|t| t.contains("<task>\n"));
+    let text = text.unwrap_or_default();
+    let text = text.rsplit("<task>\n").next().unwrap_or_default();
+    text.split("\n</task>").next().unwrap_or_default().to_owned()
+}
+
+fn answered(req: &CompleteRequest) -> bool {
+    req.messages.last().is_some_and(|m| m.to_string().contains("tool_result"))
+}
+
+/// What the interface keeps of a finished task for the next one.
+fn earlier_of(task: &str, resp: &RunResponse) -> Earlier {
+    Earlier {
+        task: task.into(),
+        outcome: resp.outcome,
+        summary: resp.summary.clone(),
+        changes: resp.changes.iter().map(|c| c.path.clone()).collect(),
+        applied: resp.applied,
+    }
+}
+
+const EXPLAIN: &str = "解释一下登录是怎么实现的";
+const COMPARE: &str = "比较两种改法";
+const DISCUSS: &str = "先别改，只讨论：第二种会让前端变复杂吗？";
+const BACKEND: &str = "就按第二种做，先只实现后端";
+const WHY: &str = "为什么这样实现？";
+const SECOND: &str = "方案二：改用 JWT，由后端签发和校验。";
+
+#[tokio::test]
+async fn a_discussion_goes_on_without_continue_writes_nothing_and_the_second_option_is_built_from_it() {
+    let routers = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = routers.clone();
+    let fake = Fake::new(
+        move |req| {
+            assert!(!is_designer(req) && !is_reviewer(req), "nothing here designs or reviews");
+            let task = current_task(req);
+            if is_router(req) {
+                seen.lock().unwrap().push(last_text(req));
+                // The scripted pick stands in for a model that read the conversation.
+                return submit_route(req, if task == BACKEND { "quick" } else { "ask" });
+            }
+            match task.as_str() {
+                EXPLAIN => done("登录在 src/auth.rs：先校验密码，再发会话 cookie。"),
+                COMPARE => done(&format!("方案一：继续用会话 cookie。{SECOND}")),
+                DISCUSS => done("前端只需存 token，变化不大。"),
+                BACKEND if answered(req) => done("在 src/auth/jwt.rs 实现了签发和校验。"),
+                BACKEND => {
+                    let sent = req.messages.iter().map(|m| m.to_string()).collect::<String>();
+                    assert!(sent.contains(SECOND), "the attempt has the discussion that says what the second is");
+                    use_tools(req, &[("write_file", json!({ "path": "src/auth/jwt.rs", "content": "// jwt\n" }))])
+                }
+                WHY => done("因为方案二让后端不再保存会话。"),
+                other => panic!("no such step: {other:?}"),
+            }
+        },
+        |_, _| panic!("no command runs"),
+    );
+    let mut earlier = Vec::new();
+    let mut continues = None;
+    let mut replies = Vec::new();
+    for task in [EXPLAIN, COMPARE, DISCUSS, BACKEND, WHY] {
+        // What the interface sends for plain input: the earlier tasks, and the last conversation to go on from.
+        let req = RunRequest {
+            workflow: Some("auto".into()),
+            earlier: earlier.clone(),
+            continues: continues.clone(),
+            ..RunRequest { task: task.into(), ..request(None, 2) }
+        };
+        let resp = run(&fake, req).await;
+        if task == DISCUSS {
+            assert!(fake.calls_to(fs::FORK).is_empty() && fake.calls_to(fs::WRITE).is_empty(), "talk writes nothing");
+        }
+        earlier.push(earlier_of(task, &resp));
+        continues = Some(molt_api::planner::Continuation { conversation: resp.conversation.clone(), fork: None });
+        replies.push(resp);
+    }
+    assert_eq!(routed(&fake), ["ask", "ask", "ask", "quick", "ask"]);
+    let backend = &replies[3];
+    assert!(backend.applied, "{}", backend.summary);
+    let paths: Vec<&str> = backend.changes.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(paths, ["src/auth/jwt.rs"], "only the backend, as asked");
+
+    // Asked why afterwards: answered in the workspace, nothing designed, forked or applied again.
+    let why = &replies[4];
+    assert_eq!(why.workflow.as_deref(), Some("ask"));
+    assert!(!why.applied && why.changes.is_empty() && why.fork.is_none());
+    assert_eq!(fake.calls_to(fs::FORK).len(), 1, "only the change had a fork");
+    assert_eq!(fake.calls_to(fs::WRITE).len(), 1);
+    assert_eq!(fake.workspace().get("src/auth/jwt.rs").map(String::as_str), Some("// jwt\n"));
+
+    let routers = routers.lock().unwrap();
+    assert!(!routers[0].contains("<conversation>"), "the first task has no conversation: {}", routers[0]);
+    let picking = &routers[3];
+    for part in [
+        "<conversation>",
+        &format!("2. <task>{COMPARE}</task>"),
+        &format!("What it said: 方案一：继续用会话 cookie。{SECOND}"),
+        &format!("3. <task>{DISCUSS}</task>"),
+        "This task goes on from the last one's conversation.",
+        "a change an earlier answer proposed is not asked for unless this message asks for it",
+        "When the message says to change nothing yet",
+        "pick ask, so that the answer can ask which one is meant",
+        &format!("<task>\n{BACKEND}\n</task>"),
+    ] {
+        assert!(picking.contains(part), "{part:?} is not in:\n{picking}");
+    }
+    assert!(
+        routers[4].contains("its changes are in the workspace: src/auth/jwt.rs."),
+        "the pick after the change knows it is in the workspace: {}",
+        routers[4]
+    );
+}
+
+#[tokio::test]
+async fn a_follow_up_with_a_check_is_never_routed_to_ask_and_a_vague_one_is_told_to_ask_which() {
+    let fake = Fake::new(
+        |req| {
+            if is_router(req) {
+                let offered = last_text(req);
+                assert!(offered.contains("The workflows you may pick: quick, verify."), "{offered}");
+                assert!(offered.contains("The user gave the done-check `check`"), "{offered}");
+                assert!(offered.contains("<conversation>") && !offered.contains("pick ask"), "{offered}");
+                return submit_route(req, "quick");
+            }
+            if answered(req) {
+                done("Wrote hello.txt.")
+            } else {
+                write_hello(req, "hi\n")
+            }
+        },
+        hello_check,
+    );
+    let earlier = vec![Earlier {
+        task: "compare two ways".into(),
+        outcome: Outcome::Unverified,
+        summary: "One, or two.".into(),
+        changes: vec![],
+        applied: false,
+    }];
+    let req = RunRequest { workflow: Some("auto".into()), earlier: earlier.clone(), ..request(Some("check"), 1) };
+    let resp = run(&fake, req).await;
+    assert_eq!((resp.workflow.as_deref(), resp.outcome), (Some("quick"), Outcome::Passed), "{}", resp.summary);
+
+    // An answer that goes on from the conversation is told to ask rather than guess.
+    let fake = Fake::new(
+        |req| {
+            let opening = last_text(req);
+            assert!(opening.contains("ask the user which one, rather than guessing"), "{opening}");
+            done("Do you mean the first or the second?")
+        },
+        |_, _| panic!("no command"),
+    );
+    let first = vec![json!({ "role": "user", "content": [{ "type": "text", "text": "compare two ways" }] })];
+    let req = RunRequest {
+        workflow: Some("ask".into()),
+        earlier,
+        continues: Some(molt_api::planner::Continuation { conversation: first, fork: None }),
+        ..RunRequest { task: "do that one".into(), ..request(None, 1) }
+    };
+    let resp = run(&fake, req).await;
+    assert_eq!(resp.summary, "Do you mean the first or the second?");
+}
+
+#[tokio::test]
+async fn the_pick_reads_a_bounded_view_of_a_long_conversation_and_never_the_conversation_itself() {
+    let fake = Fake::new(
+        |req| {
+            if is_router(req) {
+                assert_eq!(req.messages.len(), 1, "one message, however long the conversation it goes on from");
+                return submit_route(req, "ask");
+            }
+            done("Answered.")
+        },
+        |_, _| panic!("no command"),
+    );
+    // Ten tasks with long summaries in Chinese, so that each cut falls inside a character.
+    let earlier: Vec<Earlier> = (1..=10)
+        .map(|i| Earlier {
+            task: format!("任务 {i}"),
+            outcome: Outcome::Passed,
+            summary: format!("决定 {i}：{}", "很长的说明。".repeat(400)),
+            changes: (0..30).map(|p| format!("src/{i}/{p}.rs")).collect(),
+            applied: i % 2 == 0,
+        })
+        .collect();
+    // A conversation far larger than the pick could read; the planner fits it for the answer.
+    let long = "x".repeat(20_000);
+    let conversation: Vec<Value> = (0..40)
+        .map(|i| {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            json!({ "role": role, "content": [{ "type": "text", "text": long }] })
+        })
+        .collect();
+    let req = RunRequest {
+        workflow: Some("auto".into()),
+        earlier,
+        continues: Some(molt_api::planner::Continuation { conversation, fork: Some("/fork/kept".into()) }),
+        ..RunRequest { task: "那第二个呢？".into(), ..request(None, 1) }
+    };
+    let resp = run(&fake, req).await;
+    assert_eq!(resp.workflow.as_deref(), Some("ask"), "{}", resp.summary);
+    let routers: Vec<CompleteRequest> = fake.requests().into_iter().filter(is_router).collect();
+    let text = last_text(&routers[0]);
+    assert!(text.len() < 24_000, "bounded: {} bytes", text.len());
+    assert!(text.contains("(4 earlier tasks are left out.)") && !text.contains("<task>任务 4</task>"), "{text}");
+    assert!(text.contains("10. <task>任务 10</task>\nit passed its done-check; its changes are in the workspace: "));
+    assert!(text.contains("src/10/9.rs, …."), "ten paths, then a mark that there are more");
+    assert!(text.contains("What it said: 决定 10："), "the decision survives however the conversation was cut");
+    assert!(text.contains("and from its result, which is kept apart and not applied."), "{text}");
+    assert!(!text.contains(&long[..100]), "the conversation itself is not the pick's to read");
+    assert!(
+        matches!(fake.events()[0], Progress::Routed { cost_usd: Some(c), .. } if close(c, 0.125)),
+        "the pick says what it cost: {:?}",
+        fake.events()[0]
+    );
+}
+
 // --- Tools services provide (RFC 0002) ----------------------------------------
 
 /// A read-only `lint` on `lint.check` for attempts, designers and reviewers,
@@ -5187,7 +5612,7 @@ async fn the_designer_and_the_reviewer_are_offered_only_the_read_only_tools_serv
     // The designer keeps the built-ins it writes its check with.
     assert!(designer.contains(&"write_file".into()) && designer.contains(&"run".into()), "{designer:?}");
     assert_eq!(of(is_vetter), ["read_file", "list_files", "search", "lint", "submit_vetting"]);
-    assert_eq!(of(is_reviewer), ["read_file", "list_files", "search", "lint", "submit_review"]);
+    assert_eq!(of(is_reviewer), ["read_file", "list_files", "search", "lint", "probe", "submit_review"]);
     let attempt = of(|r| !is_designer(r) && !is_vetter(r) && !is_reviewer(r));
     assert!(attempt.contains(&"lint".into()) && attempt.contains(&"deploy".into()), "{attempt:?}");
 
