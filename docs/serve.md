@@ -93,8 +93,16 @@ print(len(session["earlier"]), "tasks,", session["spent"])
   leaves the stored session as it was. Results it still waits on stay in
   their forks.
 - Loading it starts nothing and calls no model. A task that never got its
-  reply is listed as `unanswered`, and what it spent is unknown. One that
+  reply is listed as `unanswered`, and nothing runs it again. One that
   kept a checkpoint is in `runs.list`, to resume if you choose.
+- `spent` is added up from the session's runs as the audit log settles them
+  ([runs.md](runs.md#how-a-cost-is-settled)), the same as `molt runs
+  --session` shows: a task with no reply is counted from its model calls in
+  the log, with each call of no known cost counted in `uncounted_calls`,
+  and a model answer that came late is counted once. `settled_ms` says when
+  the log last settled one of its runs. The journal is not changed; a run
+  the log does not have counts as the journal says, and one with no reply
+  and no call in the log stays in `unsettled_runs`.
 - One client holds a session at a time. Another's `sessions.load` is
   refused with `BUSY` until it lets go.
 - `sessions.list` lists the workspace's sessions, and names any it cannot

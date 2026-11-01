@@ -474,6 +474,7 @@ mod tests {
             learning: None,
             resumable: false,
             summary: String::new(),
+            settlement: None,
             at: 0,
         };
         assert_eq!(type_in(&mut app, "/runs"), [Action::RunHistory]);

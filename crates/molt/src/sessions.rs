@@ -216,6 +216,24 @@ pub struct Loaded {
     /// Each result's fork, and the place in `earlier` of the task it answered.
     #[serde(skip)]
     result_of: BTreeMap<String, usize>,
+    /// What an import brought of the spend, which names no run.
+    #[serde(skip)]
+    imported: Spent,
+    /// What each task's run spent, as the journal says, in the order the session first named them.
+    #[serde(skip)]
+    costs: Vec<(String, RunCost)>,
+    /// What the audit log settles of each run's cost (`runs::Settlement`), where it does.
+    #[serde(skip)]
+    audited: BTreeMap<String, (RunCost, u64)>,
+}
+
+/// What one run of a session spent.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct RunCost {
+    usd: f64,
+    uncounted_calls: u32,
+    /// It never said what it spent.
+    unsettled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -252,11 +270,17 @@ pub struct Pending {
 pub struct Spent {
     /// The sum of the costs that are known.
     pub known_usd: f64,
-    /// Calls of answered tasks whose cost is not known.
+    /// Calls whose cost is not known: of answered tasks, and of tasks the
+    /// audit log counts from their calls.
     pub uncounted_calls: u32,
     /// Tasks that never said what they spent: failed, cut off or running.
-    /// A reply settles its task; a failure does not.
+    /// A reply settles its task; a failure does not, unless the audit log
+    /// has every call of its run to count instead.
     pub unsettled_runs: u32,
+    /// When the audit log last settled what a run of the session spent, in
+    /// milliseconds since the epoch; `None` when it settled none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_ms: Option<u64>,
 }
 
 impl Spent {
@@ -277,11 +301,11 @@ impl Loaded {
             }
             Entry::Imported(imported) => {
                 self.earlier.extend(imported.earlier.iter().cloned());
-                self.spent.known_usd += imported.spent_usd;
-                self.spent.uncounted_calls = self.spent.uncounted_calls.saturating_add(imported.uncounted_calls);
-                self.spent.unsettled_runs = self.spent.unsettled_runs.saturating_add(imported.uncounted_stops);
+                self.imported.known_usd += imported.spent_usd;
+                self.imported.uncounted_calls = self.imported.uncounted_calls.saturating_add(imported.uncounted_calls);
+                self.imported.unsettled_runs = self.imported.unsettled_runs.saturating_add(imported.uncounted_stops);
                 if let Some(active) = &imported.active {
-                    self.spent.unsettled_runs = self.spent.unsettled_runs.saturating_add(1);
+                    self.cost_of(&active.run).unsettled = true;
                     self.unanswered.push(Unanswered {
                         run: active.run.clone(),
                         task: active.task.clone(),
@@ -300,16 +324,20 @@ impl Loaded {
             }
             Entry::Task { run, task } => {
                 // Unknown until its reply says what it spent.
-                self.spent.unsettled_runs = self.spent.unsettled_runs.saturating_add(1);
+                self.cost_of(run).unsettled = true;
                 self.unanswered.push(Unanswered { run: run.clone(), task: task.clone(), checkpointed: false })
             }
             Entry::Reply(reply) => {
-                if self.settle(&reply.run) {
-                    self.spent.unsettled_runs = self.spent.unsettled_runs.saturating_sub(1);
+                let settled = self.settle(&reply.run);
+                let cost = self.cost_of(&reply.run);
+                if settled {
+                    cost.unsettled = false;
                 }
+                cost.usd += reply.cost_usd;
+                cost.uncounted_calls = cost.uncounted_calls.saturating_add(reply.uncounted_calls);
+                // The reply is newer than what the log settled of the run before it.
+                self.audited.remove(&reply.run);
                 self.earlier.push(reply.earlier.clone());
-                self.spent.known_usd += reply.cost_usd;
-                self.spent.uncounted_calls = self.spent.uncounted_calls.saturating_add(reply.uncounted_calls);
                 if let Some(fork) = &reply.fork {
                     self.result_of.insert(fork.clone(), self.earlier.len() - 1);
                     self.results.push(Pending { run: reply.run.clone(), fork: fork.clone(), gone: false });
@@ -346,6 +374,56 @@ impl Loaded {
             Entry::Restored => self.archived = false,
         }
         self.entries.push(record.clone());
+        self.add_up();
+    }
+
+    /// What the journal says run `run` spent, made when the session first names it.
+    fn cost_of(&mut self, run: &str) -> &mut RunCost {
+        let i = match self.costs.iter().position(|(r, _)| r == run) {
+            Some(i) => i,
+            None => {
+                self.costs.push((run.to_owned(), RunCost::default()));
+                self.costs.len() - 1
+            }
+        };
+        &mut self.costs[i].1
+    }
+
+    /// Settle the session's runs from what the audit log has of them
+    /// (`runs::list`): a run the log settles counts as the log has it, a
+    /// late answer once; one it does not is counted as the journal says.
+    /// A run the log only counts from its calls, because no reply said,
+    /// is taken so only while the journal has no reply of it either.
+    pub fn settle_from(&mut self, runs: &[crate::runs::Run]) {
+        self.audited.clear();
+        for (id, journal) in &self.costs {
+            let Some(run) = runs.iter().find(|r| &r.run == id) else { continue };
+            let (Some(usd), Some(settled)) = (run.cost_usd, &run.settlement) else { continue };
+            if settled.from == crate::runs::CostFrom::Calls && !journal.unsettled {
+                continue;
+            }
+            let cost = RunCost { usd, uncounted_calls: run.uncounted_calls, unsettled: false };
+            self.audited.insert(id.clone(), (cost, settled.updated_ms));
+        }
+        self.add_up();
+    }
+
+    /// `spent` from the import, each run's cost and what the log settled of them.
+    fn add_up(&mut self) {
+        let mut spent = Spent { settled_ms: None, ..self.imported.clone() };
+        for (run, journal) in &self.costs {
+            let cost = match self.audited.get(run) {
+                Some((cost, ms)) => {
+                    spent.settled_ms = spent.settled_ms.max(Some(*ms));
+                    cost
+                }
+                None => journal,
+            };
+            spent.known_usd += cost.usd;
+            spent.uncounted_calls = spent.uncounted_calls.saturating_add(cost.uncounted_calls);
+            spent.unsettled_runs = spent.unsettled_runs.saturating_add(u32::from(cost.unsettled));
+        }
+        self.spent = spent;
     }
 
     /// The task of `run` has its answer: it is no longer unanswered, nor are
@@ -370,9 +448,17 @@ impl Loaded {
             }
         }
         if !self.unanswered.is_empty() {
+            let counted = self.unanswered.iter().filter(|u| self.audited.contains_key(&u.run)).count();
+            let spent = match counted {
+                0 => "what they did and spent is unknown",
+                n if n == self.unanswered.len() => {
+                    "what they did is unknown, and what they spent is counted from their calls in the audit log"
+                }
+                _ => "what they did is unknown, and what they spent is counted from the audit log only for some",
+            };
             self.notes.push(format!(
-                "{} task(s) never got their reply, so what they did and spent is unknown and nothing runs them again; \
-                 one that kept a checkpoint is in runs.list",
+                "{} task(s) never got their reply, so {spent}; nothing runs them again, and one that kept a \
+                 checkpoint is in runs.list",
                 self.unanswered.len()
             ));
         }
@@ -419,6 +505,17 @@ impl Sessions {
         Self { dir: data_dir.join(DIR) }
     }
 
+    /// The runs of the data dir, as `molt runs` lists them, to settle the
+    /// sessions' costs from; none when the audit log cannot be read, and
+    /// then the journal's costs stand as they are.
+    fn runs(&self) -> Vec<crate::runs::Run> {
+        let Some(data_dir) = self.dir.parent() else { return Vec::new() };
+        crate::runs::list(data_dir).unwrap_or_else(|e| {
+            tracing::warn!("the sessions' costs are not settled from the audit log: {e:#}");
+            Vec::new()
+        })
+    }
+
     fn path(&self, id: &str) -> anyhow::Result<PathBuf> {
         ensure!(valid_id(id), "{id:?} is not a session id: they look like sess_ and 16 hex digits");
         Ok(self.dir.join(id))
@@ -439,6 +536,7 @@ impl Sessions {
     pub fn load(&self, id: &str) -> anyhow::Result<Loaded> {
         let dir = self.path(id)?;
         let (mut loaded, _) = read(id, &dir)?;
+        loaded.settle_from(&self.runs());
         loaded.look_around();
         Ok(loaded)
     }
@@ -449,6 +547,7 @@ impl Sessions {
         let dir = self.path(id)?;
         let lock = take_lock(id, &dir)?;
         let (mut loaded, good) = read(id, &dir)?;
+        loaded.settle_from(&self.runs());
         loaded.look_around();
         let writer = Writer::with_lock(id.to_owned(), &dir, loaded, good, lock)?;
         writer.file.set_len(good).context("dropping the line a crash cut off")?;
@@ -458,6 +557,7 @@ impl Sessions {
     /// The sessions of `workspace`, the newest first, damaged ones included with why.
     pub fn list(&self, workspace: &str) -> Vec<Listed> {
         let Ok(dirs) = std::fs::read_dir(&self.dir) else { return Vec::new() };
+        let runs = self.runs();
         let mut listed = Vec::new();
         for dir in dirs.flatten() {
             let id = dir.file_name().to_string_lossy().into_owned();
@@ -466,14 +566,17 @@ impl Sessions {
             }
             let item = match read(&id, &dir.path()) {
                 Ok((loaded, _)) if loaded.workspace != workspace => continue,
-                Ok((loaded, _)) => Listed {
+                Ok((mut loaded, _)) => Listed {
+                    spent: {
+                        loaded.settle_from(&runs);
+                        loaded.spent.clone()
+                    },
                     tasks: loaded.entries.iter().filter(|r| matches!(r.entry, Entry::Task { .. })).count(),
                     id,
                     title: loaded.title,
                     created_ms: loaded.created_ms,
                     updated_ms: loaded.updated_ms,
                     archived: loaded.archived,
-                    spent: loaded.spent,
                     problem: None,
                 },
                 Err(e) => {
@@ -831,6 +934,108 @@ mod tests {
         assert!(sessions.list("/elsewhere").is_empty());
     }
 
+    #[tokio::test]
+    async fn a_sessions_total_is_its_runs_as_the_audit_log_settles_them_with_a_late_answer_counted_once() {
+        use molt_kernel::audit::{AuditEvent, AuditLog};
+        use molt_proto::{CapId, Envelope, ErrorCode, ServiceId, TraceId};
+        let data = tempfile::tempdir().unwrap();
+        let sessions = Sessions::new(data.path());
+        let mut writer = sessions.create(WS, None).unwrap();
+        let id = writer.id().to_owned();
+        let (done, cut) = (TraceId::random(), TraceId::random());
+
+        let log = AuditLog::open(data.path().join("audit.jsonl"), false).await.unwrap();
+        let from = |e: &mut Envelope, service: &str| e.from = Some(ServiceId::new(service).unwrap());
+        let message = |envelope: Envelope| AuditEvent::Message { envelope };
+        let planner = |started: bool| {
+            let service = ServiceId::new("planner").unwrap();
+            if started {
+                AuditEvent::ServiceStarted { service, pid: Some(1) }
+            } else {
+                AuditEvent::ServiceExited { service, status: "killed".into() }
+            }
+        };
+        let ask = |trace: &TraceId, to: &str, payload: Value| {
+            let mut e = Envelope::request(trace.clone(), to.parse().unwrap(), CapId::random(), payload);
+            from(&mut e, if to == "model.complete" { "planner" } else { "serve" });
+            e
+        };
+        let usage = json!({ "input_tokens": 3, "output_tokens": 2 });
+        let answer = |call: &Envelope, cost: f64| {
+            let mut e = call.reply(json!({ "id": "m", "model": "m", "content": [], "usage": usage, "cost_usd": cost }));
+            from(&mut e, "model");
+            e
+        };
+        log.append(planner(true)).await.unwrap();
+
+        // The first task's run says it spent 0.5 and that one call is not known: the kernel stopped waiting for it.
+        writer.append(Entry::Task { run: done.to_string(), task: "one".into() }).unwrap();
+        let run = ask(&done, "planner.run", json!({ "task": "one", "workspace": WS, "session": id }));
+        log.append(message(run.clone())).await.unwrap();
+        let (quick, slow) = (ask(&done, "model.complete", json!({})), ask(&done, "model.complete", json!({})));
+        log.append(message(quick.clone())).await.unwrap();
+        log.append(message(slow.clone())).await.unwrap();
+        log.append(message(answer(&quick, 0.5))).await.unwrap();
+        let mut stopped = slow.error_reply(ErrorCode::Timeout, "no answer in time");
+        stopped.payload["settlement"] = json!({ "request_id": slow.id, "cost_usd": null, "usage": null });
+        stopped.from = Some(ServiceId::kernel());
+        log.append(message(stopped)).await.unwrap();
+        let mut said = run.reply(json!({ "outcome": "passed", "summary": "did one", "changes": [], "patch": "",
+            "applied": true, "attempts": [], "usage": {}, "cost_usd": 0.5, "uncounted_calls": 1 }));
+        from(&mut said, "planner");
+        log.append(message(said)).await.unwrap();
+        writer.append(reply(&done.to_string(), "one", None, 0.5, 1)).unwrap();
+
+        // The second task's planner is killed after one call; its reply never comes.
+        writer.append(Entry::Task { run: cut.to_string(), task: "two".into() }).unwrap();
+        log.append(message(ask(&cut, "planner.run", json!({ "task": "two", "workspace": WS, "session": id }))))
+            .await
+            .unwrap();
+        let (counted, lost) = (ask(&cut, "model.complete", json!({})), ask(&cut, "model.complete", json!({})));
+        log.append(message(counted.clone())).await.unwrap();
+        log.append(message(lost)).await.unwrap();
+        log.append(message(answer(&counted, 0.125))).await.unwrap();
+        log.append(planner(false)).await.unwrap();
+        drop(writer);
+
+        let before = sessions.load(&id).unwrap();
+        assert!((before.spent.known_usd - 0.625).abs() < 1e-9, "{:?}", before.spent);
+        assert_eq!(
+            (before.spent.uncounted_calls, before.spent.unsettled_runs),
+            (2, 0),
+            "the cut-off run's lost call and the first's timed-out one are unknown, not free"
+        );
+        assert!(
+            before.notes.iter().any(|n| n.contains("counted from their calls in the audit log")),
+            "{:?}",
+            before.notes
+        );
+
+        // The late answer is audited after molt stopped; loading again, or holding it, counts it once.
+        log.append(message(answer(&slow, 0.25))).await.unwrap();
+        log.append(message(answer(&slow, 0.25))).await.unwrap();
+        log.close().await;
+        let runs = crate::runs::list(data.path()).unwrap();
+        let grouped = crate::runs::sessions(runs.clone());
+        for loaded in
+            [sessions.load(&id).unwrap(), sessions.load(&id).unwrap(), sessions.open(&id).unwrap().loaded().clone()]
+        {
+            assert!((loaded.spent.known_usd - 0.875).abs() < 1e-9, "{:?}", loaded.spent);
+            assert_eq!((loaded.spent.uncounted_calls, loaded.spent.unsettled_runs), (1, 0));
+            assert_eq!(loaded.spent.settled_ms, grouped[0].settled_ms, "settled when the runs list says");
+            assert!(
+                (loaded.spent.known_usd - grouped[0].cost_usd).abs() < 1e-9,
+                "the same total as `molt runs --session`"
+            );
+        }
+        let listed = sessions.list(WS);
+        assert!((listed[0].spent.known_usd - 0.875).abs() < 1e-9);
+        let journal = std::fs::read_to_string(journal(&sessions, &id)).unwrap();
+        assert_eq!(journal.matches("\"cost_usd\":0.5").count(), 1, "the journal's reply is as it was");
+        let shown: Vec<_> = runs.iter().map(|r| (r.cost_usd, r.uncounted_calls)).collect();
+        assert_eq!(shown, [(Some(0.75), 0), (Some(0.125), 1)]);
+    }
+
     #[test]
     fn a_line_a_crash_cut_off_is_left_out_and_everything_confirmed_before_it_stays() {
         let data = tempfile::tempdir().unwrap();
@@ -981,7 +1186,7 @@ mod tests {
         );
         assert_eq!(
             loaded.spent,
-            Spent { known_usd: 0.5, uncounted_calls: 1, unsettled_runs: 3 },
+            Spent { known_usd: 0.5, uncounted_calls: 1, unsettled_runs: 3, settled_ms: None },
             "unknown stays unknown"
         );
         assert!(
