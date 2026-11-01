@@ -5230,6 +5230,228 @@ async fn a_named_workflow_is_never_rerouted_and_design_says_which_workflow_auto_
     assert!(fake.calls_to(fs::FORK).is_empty());
 }
 
+// --- Follow-ups in a conversation (#217) -------------------------------------
+
+/// The task the latest `<task>` block of `req` names: the one being done now.
+fn current_task(req: &CompleteRequest) -> String {
+    let texts = req.messages.iter().rev().flat_map(|m| m["content"].as_array().cloned().unwrap_or_default());
+    let text = texts.filter_map(|b| b["text"].as_str().map(str::to_owned)).find(|t| t.contains("<task>\n"));
+    let text = text.unwrap_or_default();
+    let text = text.rsplit("<task>\n").next().unwrap_or_default();
+    text.split("\n</task>").next().unwrap_or_default().to_owned()
+}
+
+fn answered(req: &CompleteRequest) -> bool {
+    req.messages.last().is_some_and(|m| m.to_string().contains("tool_result"))
+}
+
+/// What the interface keeps of a finished task for the next one.
+fn earlier_of(task: &str, resp: &RunResponse) -> Earlier {
+    Earlier {
+        task: task.into(),
+        outcome: resp.outcome,
+        summary: resp.summary.clone(),
+        changes: resp.changes.iter().map(|c| c.path.clone()).collect(),
+        applied: resp.applied,
+    }
+}
+
+const EXPLAIN: &str = "解释一下登录是怎么实现的";
+const COMPARE: &str = "比较两种改法";
+const DISCUSS: &str = "先别改，只讨论：第二种会让前端变复杂吗？";
+const BACKEND: &str = "就按第二种做，先只实现后端";
+const WHY: &str = "为什么这样实现？";
+const SECOND: &str = "方案二：改用 JWT，由后端签发和校验。";
+
+#[tokio::test]
+async fn a_discussion_goes_on_without_continue_writes_nothing_and_the_second_option_is_built_from_it() {
+    let routers = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = routers.clone();
+    let fake = Fake::new(
+        move |req| {
+            assert!(!is_designer(req) && !is_reviewer(req), "nothing here designs or reviews");
+            let task = current_task(req);
+            if is_router(req) {
+                seen.lock().unwrap().push(last_text(req));
+                // The scripted pick stands in for a model that read the conversation.
+                return submit_route(req, if task == BACKEND { "quick" } else { "ask" });
+            }
+            match task.as_str() {
+                EXPLAIN => done("登录在 src/auth.rs：先校验密码，再发会话 cookie。"),
+                COMPARE => done(&format!("方案一：继续用会话 cookie。{SECOND}")),
+                DISCUSS => done("前端只需存 token，变化不大。"),
+                BACKEND if answered(req) => done("在 src/auth/jwt.rs 实现了签发和校验。"),
+                BACKEND => {
+                    let sent = req.messages.iter().map(|m| m.to_string()).collect::<String>();
+                    assert!(sent.contains(SECOND), "the attempt has the discussion that says what the second is");
+                    use_tools(req, &[("write_file", json!({ "path": "src/auth/jwt.rs", "content": "// jwt\n" }))])
+                }
+                WHY => done("因为方案二让后端不再保存会话。"),
+                other => panic!("no such step: {other:?}"),
+            }
+        },
+        |_, _| panic!("no command runs"),
+    );
+    let mut earlier = Vec::new();
+    let mut continues = None;
+    let mut replies = Vec::new();
+    for task in [EXPLAIN, COMPARE, DISCUSS, BACKEND, WHY] {
+        // What the interface sends for plain input: the earlier tasks, and the last conversation to go on from.
+        let req = RunRequest {
+            workflow: Some("auto".into()),
+            earlier: earlier.clone(),
+            continues: continues.clone(),
+            ..RunRequest { task: task.into(), ..request(None, 2) }
+        };
+        let resp = run(&fake, req).await;
+        if task == DISCUSS {
+            assert!(fake.calls_to(fs::FORK).is_empty() && fake.calls_to(fs::WRITE).is_empty(), "talk writes nothing");
+        }
+        earlier.push(earlier_of(task, &resp));
+        continues = Some(molt_api::planner::Continuation { conversation: resp.conversation.clone(), fork: None });
+        replies.push(resp);
+    }
+    assert_eq!(routed(&fake), ["ask", "ask", "ask", "quick", "ask"]);
+    let backend = &replies[3];
+    assert!(backend.applied, "{}", backend.summary);
+    let paths: Vec<&str> = backend.changes.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(paths, ["src/auth/jwt.rs"], "only the backend, as asked");
+
+    // Asked why afterwards: answered in the workspace, nothing designed, forked or applied again.
+    let why = &replies[4];
+    assert_eq!(why.workflow.as_deref(), Some("ask"));
+    assert!(!why.applied && why.changes.is_empty() && why.fork.is_none());
+    assert_eq!(fake.calls_to(fs::FORK).len(), 1, "only the change had a fork");
+    assert_eq!(fake.calls_to(fs::WRITE).len(), 1);
+    assert_eq!(fake.workspace().get("src/auth/jwt.rs").map(String::as_str), Some("// jwt\n"));
+
+    let routers = routers.lock().unwrap();
+    assert!(!routers[0].contains("<conversation>"), "the first task has no conversation: {}", routers[0]);
+    let picking = &routers[3];
+    for part in [
+        "<conversation>",
+        &format!("2. <task>{COMPARE}</task>"),
+        &format!("What it said: 方案一：继续用会话 cookie。{SECOND}"),
+        &format!("3. <task>{DISCUSS}</task>"),
+        "This task goes on from the last one's conversation.",
+        "a change an earlier answer proposed is not asked for unless this message asks for it",
+        "When the message says to change nothing yet",
+        "pick ask, so that the answer can ask which one is meant",
+        &format!("<task>\n{BACKEND}\n</task>"),
+    ] {
+        assert!(picking.contains(part), "{part:?} is not in:\n{picking}");
+    }
+    assert!(
+        routers[4].contains("its changes are in the workspace: src/auth/jwt.rs."),
+        "the pick after the change knows it is in the workspace: {}",
+        routers[4]
+    );
+}
+
+#[tokio::test]
+async fn a_follow_up_with_a_check_is_never_routed_to_ask_and_a_vague_one_is_told_to_ask_which() {
+    let fake = Fake::new(
+        |req| {
+            if is_router(req) {
+                let offered = last_text(req);
+                assert!(offered.contains("The workflows you may pick: quick, verify."), "{offered}");
+                assert!(offered.contains("The user gave the done-check `check`"), "{offered}");
+                assert!(offered.contains("<conversation>") && !offered.contains("pick ask"), "{offered}");
+                return submit_route(req, "quick");
+            }
+            if answered(req) {
+                done("Wrote hello.txt.")
+            } else {
+                write_hello(req, "hi\n")
+            }
+        },
+        hello_check,
+    );
+    let earlier = vec![Earlier {
+        task: "compare two ways".into(),
+        outcome: Outcome::Unverified,
+        summary: "One, or two.".into(),
+        changes: vec![],
+        applied: false,
+    }];
+    let req = RunRequest { workflow: Some("auto".into()), earlier: earlier.clone(), ..request(Some("check"), 1) };
+    let resp = run(&fake, req).await;
+    assert_eq!((resp.workflow.as_deref(), resp.outcome), (Some("quick"), Outcome::Passed), "{}", resp.summary);
+
+    // An answer that goes on from the conversation is told to ask rather than guess.
+    let fake = Fake::new(
+        |req| {
+            let opening = last_text(req);
+            assert!(opening.contains("ask the user which one, rather than guessing"), "{opening}");
+            done("Do you mean the first or the second?")
+        },
+        |_, _| panic!("no command"),
+    );
+    let first = vec![json!({ "role": "user", "content": [{ "type": "text", "text": "compare two ways" }] })];
+    let req = RunRequest {
+        workflow: Some("ask".into()),
+        earlier,
+        continues: Some(molt_api::planner::Continuation { conversation: first, fork: None }),
+        ..RunRequest { task: "do that one".into(), ..request(None, 1) }
+    };
+    let resp = run(&fake, req).await;
+    assert_eq!(resp.summary, "Do you mean the first or the second?");
+}
+
+#[tokio::test]
+async fn the_pick_reads_a_bounded_view_of_a_long_conversation_and_never_the_conversation_itself() {
+    let fake = Fake::new(
+        |req| {
+            if is_router(req) {
+                assert_eq!(req.messages.len(), 1, "one message, however long the conversation it goes on from");
+                return submit_route(req, "ask");
+            }
+            done("Answered.")
+        },
+        |_, _| panic!("no command"),
+    );
+    // Ten tasks with long summaries in Chinese, so that each cut falls inside a character.
+    let earlier: Vec<Earlier> = (1..=10)
+        .map(|i| Earlier {
+            task: format!("任务 {i}"),
+            outcome: Outcome::Passed,
+            summary: format!("决定 {i}：{}", "很长的说明。".repeat(400)),
+            changes: (0..30).map(|p| format!("src/{i}/{p}.rs")).collect(),
+            applied: i % 2 == 0,
+        })
+        .collect();
+    // A conversation far larger than the pick could read; the planner fits it for the answer.
+    let long = "x".repeat(20_000);
+    let conversation: Vec<Value> = (0..40)
+        .map(|i| {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            json!({ "role": role, "content": [{ "type": "text", "text": long }] })
+        })
+        .collect();
+    let req = RunRequest {
+        workflow: Some("auto".into()),
+        earlier,
+        continues: Some(molt_api::planner::Continuation { conversation, fork: Some("/fork/kept".into()) }),
+        ..RunRequest { task: "那第二个呢？".into(), ..request(None, 1) }
+    };
+    let resp = run(&fake, req).await;
+    assert_eq!(resp.workflow.as_deref(), Some("ask"), "{}", resp.summary);
+    let routers: Vec<CompleteRequest> = fake.requests().into_iter().filter(is_router).collect();
+    let text = last_text(&routers[0]);
+    assert!(text.len() < 24_000, "bounded: {} bytes", text.len());
+    assert!(text.contains("(4 earlier tasks are left out.)") && !text.contains("<task>任务 4</task>"), "{text}");
+    assert!(text.contains("10. <task>任务 10</task>\nit passed its done-check; its changes are in the workspace: "));
+    assert!(text.contains("src/10/9.rs, …."), "ten paths, then a mark that there are more");
+    assert!(text.contains("What it said: 决定 10："), "the decision survives however the conversation was cut");
+    assert!(text.contains("and from its result, which is kept apart and not applied."), "{text}");
+    assert!(!text.contains(&long[..100]), "the conversation itself is not the pick's to read");
+    assert!(
+        matches!(fake.events()[0], Progress::Routed { cost_usd: Some(c), .. } if close(c, 0.125)),
+        "the pick says what it cost: {:?}",
+        fake.events()[0]
+    );
+}
+
 // --- Tools services provide (RFC 0002) ----------------------------------------
 
 /// A read-only `lint` on `lint.check` for attempts, designers and reviewers,

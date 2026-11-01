@@ -11,9 +11,15 @@ impl App {
         match event {
             // A command's output; [`App::command_output`] takes it.
             Progress::Output { .. } => {}
-            Progress::Routed { workflow, reason, .. } => {
+            Progress::Routed { workflow, reason, cost_usd, .. } => {
                 task.req.workflow = Some(workflow.clone());
-                let line = agent::routed_line(&workflow, &reason, "/verify");
+                let mut line = agent::routed_line(&workflow, &reason, "/verify");
+                // The run's cost counts it already; this says what the pick itself took.
+                match cost_usd {
+                    Some(usd) if usd > 0.0 => line.push_str(&format!(" · pick ${usd:.3}")),
+                    Some(_) => {}
+                    None => line.push_str(" · pick cost unknown"),
+                }
                 self.log.push(Line::from(vec![span("◆ ", Tone::Shell), span(clean_line(&line), Tone::Dim)]));
             }
             Progress::Planned { steps, edited, .. } => {
@@ -308,10 +314,16 @@ impl App {
             self.kept_entries.retain(|entry| entry.fork != kept);
             self.kept_changes.push(crate::tui::kept::Change::Remove(kept));
         }
-        self.continuation = (!resp.conversation.is_empty()).then(|| Continuation {
-            conversation: resp.conversation.clone(),
-            fork: resp.fork.clone().filter(|_| !resp.applied && !resp.changes.is_empty()),
-        });
+        // A task that changed nothing (an answer, say) leaves the kept result it went on from where it was:
+        // the next task still goes on from it, and nothing of it is applied again.
+        let went_on = task.req.continues.as_ref().and_then(|c| c.fork.clone()).filter(|_| !resp.applied);
+        let fork = match resp.fork.clone().filter(|_| !resp.applied && !resp.changes.is_empty()) {
+            Some(fork) => Some(fork),
+            None if resp.changes.is_empty() => went_on,
+            None => None,
+        };
+        self.continuation =
+            (!resp.conversation.is_empty()).then(|| Continuation { conversation: resp.conversation.clone(), fork });
         let learns = workflow::builtin(resp.workflow.as_deref().or(Some(workflow::VERIFY)))
             .is_none_or(|w| w.stages.learn.is_some());
         self.uncounted_calls = self.uncounted_calls.saturating_add(resp.uncounted_calls.saturating_sub(counted_calls));
