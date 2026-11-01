@@ -239,6 +239,7 @@ async fn resume_run(
                     findings: Vec::new(),
                     dispute: None,
                     failure: None,
+                    branch: None,
                 };
                 ctx.save(|s| s.attempt(attempt.index).end = Some(end.clone()));
                 slots.push(Slot::Done(Finished::saved(attempt, &end)));
@@ -883,6 +884,7 @@ async fn race(
                 cost_usd: report.cost_usd,
                 note: report.note.clone(),
                 failure: report.failure.clone(),
+                branch: done.branch.clone(),
             };
             let decided = schedule.decide(ended, &view(ctx, &cancel, !passed.is_empty(), before));
             scheduled(ctx, &mut racers, schedule, decided).await;

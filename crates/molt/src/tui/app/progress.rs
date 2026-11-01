@@ -1,5 +1,6 @@
 //! What a running task reports, its attempts' lanes, and its result.
 use super::*;
+use molt_api::planner::tools::{TodoItem, TodoStatus};
 
 impl App {
     pub(super) fn progress(&mut self, event: Progress) {
@@ -212,6 +213,18 @@ impl App {
             Progress::Required { requirement, .. } => {
                 task.version = task.version.max(requirement.version);
                 task.asked.retain(|(q, _)| Some(*q) != requirement.constraint.answers);
+            }
+            Progress::Todo { attempt, items, .. } => {
+                if attempt >= task.req.attempts || attempt >= 8 {
+                    return;
+                }
+                if !task.lanes.iter().any(|l| l.index == attempt) {
+                    task.lanes.push(Lane::new(attempt, None));
+                    task.lanes.sort_by_key(|l| l.index);
+                }
+                let lane = lane(task, attempt).expect("the lane was created");
+                lane.todos =
+                    items.into_iter().map(|i| TodoItem { content: scrub(&i.content, &self.secrets), ..i }).collect();
             }
             Progress::Adopted { attempt, version, .. } => {
                 if let Some(lane) = lane(task, attempt) {
@@ -513,6 +526,7 @@ impl Lane {
             started: Instant::now(),
             ended: None,
             retry: None,
+            todos: Vec::new(),
         }
     }
 
@@ -541,8 +555,48 @@ pub(super) fn lane_lines(lanes: &[Lane]) -> Vec<Line<'static>> {
             span(format!("attempt {} · tool calls", lane.index + 1), Tone::Shell),
             span(format!(" · {} · {}", text::duration(lane.elapsed()), lane.spend.label()), Tone::Dim),
         ]));
+        lines.extend(todo_lines(&lane.todos, usize::MAX));
         lines.extend(lane.lines.iter().cloned());
         lines.push(Line::default());
+    }
+    lines
+}
+
+/// An attempt's own list of steps, a head line and then a line for each,
+/// at most `max` lines in all: those under way and still to do go first
+/// when not all fit. The head says it is the model's list, which a check
+/// result never is.
+pub(crate) fn todo_lines(items: &[TodoItem], max: usize) -> Vec<Line<'static>> {
+    if items.is_empty() || max == 0 {
+        return Vec::new();
+    }
+    let done = items.iter().filter(|i| i.status == TodoStatus::Completed).count();
+    let mut lines = vec![Line::from(span(
+        format!("   its list · {done}/{} completed (not a check result)", items.len()),
+        Tone::Dim,
+    ))];
+    let rank = |s: TodoStatus| match s {
+        TodoStatus::InProgress => 0,
+        TodoStatus::Pending => 1,
+        TodoStatus::Completed => 2,
+        TodoStatus::Cancelled => 3,
+    };
+    let room = max - 1;
+    let mut shown: Vec<usize> = (0..items.len()).collect();
+    if shown.len() > room {
+        shown.sort_by_key(|&i| (rank(items[i].status), i));
+        shown.truncate(room);
+        shown.sort_unstable();
+    }
+    for i in shown {
+        let item = &items[i];
+        let (mark, tone) = match item.status {
+            TodoStatus::Completed => ("✓", Tone::Ok),
+            TodoStatus::InProgress => ("▸", Tone::Sea),
+            TodoStatus::Pending => ("·", Tone::Plain),
+            TodoStatus::Cancelled => ("–", Tone::Dim),
+        };
+        lines.push(Line::from(vec![span(format!("   {mark} "), tone), span(clean_line(&item.content), Tone::Plain)]));
     }
     lines
 }
@@ -723,6 +777,53 @@ mod tests {
         app.update(Msg::Ran { trace, result: Box::new(Ok(resp)) });
         assert_eq!(app.last_lanes.iter().find(|a| a.index == 1).unwrap().spend.usd, cost);
         assert!(cost > 0.0);
+    }
+
+    #[test]
+    fn a_lane_keeps_its_attempts_latest_list_at_its_top_however_many_calls_scroll_under_it() {
+        let mut app = App::new("/work/project", None);
+        up(&mut app);
+        type_in(&mut app, "/check true");
+        let actions = type_in(&mut app, "implement it");
+        let [Action::Run { trace, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        let run = trace.to_string();
+        let item = |content: &str, status| TodoItem { content: content.into(), status };
+        let list = |items| Msg::Progress(Progress::Todo { run: run.clone(), attempt: 0, items });
+        // A list can come before anything else of its attempt.
+        app.update(list(vec![item("read the lexer", TodoStatus::InProgress), item("fix it", TodoStatus::Pending)]));
+        app.update(list(vec![
+            item("read the lexer", TodoStatus::Completed),
+            item("fix it", TodoStatus::InProgress),
+            item("old idea", TodoStatus::Cancelled),
+        ]));
+        for turn in 1..=40 {
+            let detail = format!("read file{turn}.rs");
+            app.update(Msg::Progress(Progress::ToolCall {
+                run: run.clone(),
+                attempt: 0,
+                turn,
+                tool: "read_file".into(),
+                detail,
+            }));
+        }
+        assert_eq!(app.task.as_ref().unwrap().lanes[0].todos.len(), 3);
+        let rows = frame_rows(&mut app, 120);
+        let at = |needle: &str| rows.iter().position(|r| r.contains(needle));
+        let head = at("its list · 1/3 completed (not a check result)").expect("the list's head");
+        assert!(rows[head + 1].contains("✓ read the lexer") && rows[head + 2].contains("▸ fix it"), "{rows:#?}");
+        assert!(rows[head + 3].contains("– old idea"), "{rows:#?}");
+        assert!(at("[in_progress]").is_none() && at("· fix it").is_none(), "only the latest list: {rows:#?}");
+        assert!(at("read file40.rs").is_some_and(|last| last > head + 3), "the calls scroll under it: {rows:#?}");
+        assert!(at("read file1.rs ").is_none(), "{rows:#?}");
+        // The viewer of the lanes has it too.
+        let viewed = plain(&lane_lines(&app.task.as_ref().unwrap().lanes)).join("\n");
+        assert!(viewed.contains("its list · 1/3 completed") && viewed.contains("▸ fix it"), "{viewed}");
+        // Not all fit: those under way and still to do go first.
+        let mut items: Vec<TodoItem> = (0..6).map(|i| item(&format!("done {i}"), TodoStatus::Completed)).collect();
+        items.push(item("now", TodoStatus::InProgress));
+        let few = plain(&todo_lines(&items, 3));
+        assert_eq!(few.len(), 3);
+        assert!(few[1].contains("done 0") && few[2].contains("▸ now"), "{few:?}");
     }
 
     #[test]

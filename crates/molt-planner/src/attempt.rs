@@ -6,7 +6,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use molt_api::model::{attempt_name, tool_result, user_blocks, user_text, Role, ToolUse, STOP_MAX_TOKENS};
-use molt_api::planner::tools::{DisputeCheck, DISPUTE_CHECK, EXPLORE};
+use molt_api::planner::tools::{DisputeCheck, TodoItem, DISPUTE_CHECK, EXPLORE, TODO};
 use molt_api::planner::{AttemptReport, AttemptStatus, CheckDispute, Criterion, Failure, FailureSource, Finding};
 use molt_api::progress::Progress;
 use molt_api::shell;
@@ -15,13 +15,14 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{self, Meter, Stop};
+use crate::branch::Branch;
 use crate::checkpoint::{SavedAttempt, SavedEnd};
 use crate::compact::{self, Compacted};
 use crate::control;
 use crate::ctx::{Conversation, Ctx, Spend};
 use crate::schedule::{Signal, TOOL_ERROR_TURNS};
 use crate::tools::{self, Actor};
-use crate::{explore, failure, git, judge, process, prompts};
+use crate::{branch, explore, failure, git, judge, process, prompts, todo};
 
 /// Bytes of check output kept in a failed attempt's note.
 const NOTE_TAIL: usize = 2000;
@@ -56,6 +57,8 @@ pub(crate) struct Finished {
     /// Its conversation with the model, when it passed, for a task that
     /// goes on from it.
     pub conversation: Vec<Value>,
+    /// What it leaves the attempts after it, when it failed or erred.
+    pub branch: Option<Box<Branch>>,
 }
 
 impl Finished {
@@ -79,6 +82,7 @@ impl Finished {
             summary: end.summary.clone(),
             findings: end.findings.clone(),
             conversation: saved.messages.clone(),
+            branch: end.branch.clone(),
         }
     }
 
@@ -96,7 +100,16 @@ impl Finished {
             dispute: None,
             failure: None,
         };
-        Self { report, fork: None, summary: String::new(), findings: Vec::new(), conversation: Vec::new() }
+        let mut branch = Branch::default();
+        branch.set_reason(&report.note);
+        Self {
+            report,
+            fork: None,
+            summary: String::new(),
+            findings: Vec::new(),
+            conversation: Vec::new(),
+            branch: Some(Box::new(branch)),
+        }
     }
 }
 
@@ -179,6 +192,9 @@ pub(crate) async fn run(
         last_blocker: None,
         failing_turns: 0,
         repeats: HashMap::new(),
+        todos: Vec::new(),
+        tool_errors: Vec::new(),
+        said: String::new(),
     };
     if let Some(saved) = &resume {
         attempt.meter = Meter {
@@ -191,6 +207,8 @@ pub(crate) async fn run(
         attempt.web_tools = saved.web_tools;
         attempt.skill_tools = saved.skill_tools;
         attempt.version = saved.requirements;
+        attempt.todos = saved.todos.clone();
+        attempt.tool_errors = saved.tool_errors.clone();
     }
     attempt.check = attempt.check_at(attempt.version);
     let (status, note, summary, dispute, failure) = match attempt.work(resume).await {
@@ -205,6 +223,10 @@ pub(crate) async fn run(
     let resumable = status == AttemptStatus::Cancelled && ctx.run_cancel.is_cancelled() && dispute.is_none();
     let (meter, check_runs, version) = (attempt.meter, attempt.check_runs, attempt.version);
     let findings = if status == AttemptStatus::Passed { std::mem::take(&mut attempt.findings) } else { Vec::new() };
+    let branch = match status {
+        AttemptStatus::Failed | AttemptStatus::Error => Some(Box::new(attempt.branch(&note).await)),
+        AttemptStatus::Passed | AttemptStatus::Cancelled => None,
+    };
     ctx.save(|s| {
         let saved = s.attempt(index);
         saved.requirements = version;
@@ -220,6 +242,7 @@ pub(crate) async fn run(
                 findings: findings.clone(),
                 dispute: dispute.clone(),
                 failure: failure.clone(),
+                branch: branch.clone(),
             });
         }
     });
@@ -238,7 +261,7 @@ pub(crate) async fn run(
         failure,
     };
     let conversation = if status == AttemptStatus::Passed { attempt.conversation } else { Vec::new() };
-    Finished { report, fork: attempt.fork, summary, findings, conversation }
+    Finished { report, fork: attempt.fork, summary, findings, conversation, branch }
 }
 
 struct Attempt {
@@ -275,6 +298,12 @@ struct Attempt {
     /// How often each failed tool call, with the same input and the same
     /// error, was made: a repeat is told it is one.
     repeats: HashMap<u64, u32>,
+    /// Its own list of steps, as it last set it with `todo`.
+    todos: Vec<TodoItem>,
+    /// Its last failed tool calls, each different, oldest first.
+    tool_errors: Vec<String>,
+    /// Its last words to the user, for the branch it leaves if it fails.
+    said: String,
 }
 
 impl Attempt {
@@ -368,6 +397,8 @@ impl Attempt {
         let tools = if self.reads_outputs() { crate::output::with_outputs(tools) } else { tools };
         // Last, after ask_user: without it the list is what it was.
         let tools = if self.explores() { explore::with_explore(tools) } else { tools };
+        // The attempt's own list after every other tool, so the lists before it stay as they were.
+        let tools = if self.keeps_todo() { todo::with_todo(tools) } else { tools };
         // A final reply the model gave before the run stopped, still to be checked.
         let mut given = None;
         let (fork, mut conv) = match resume {
@@ -383,6 +414,10 @@ impl Attempt {
                 conv.messages = saved.messages;
                 conv.known = saved.known;
                 conv.compacted = saved.compacted.map(|c| *c);
+                if !self.todos.is_empty() {
+                    let items = self.todos.clone();
+                    ctx.progress(Progress::Todo { run: ctx.run_id(), attempt: self.index, items }).await;
+                }
                 given = self.resume_point(&mut conv).await;
                 (fork, conv)
             }
@@ -474,13 +509,15 @@ impl Attempt {
                                 .await;
                             return Err(End::disputed(dispute));
                         }
+                        let listed = self.set_todos(&calls, cut_off, &mut conv).await;
                         let actor = Actor::Attempt { index: self.index, turn: self.meter.turns };
                         let compacted = conv.compacted.as_ref();
                         let (results, explored) =
-                            self.or_cancel(self.execute(&fork, &calls, cut_off, actor, compacted)).await?;
+                            self.or_cancel(self.execute(&fork, &calls, cut_off, actor, compacted, listed)).await?;
                         // What its explorer spent is the attempt's too; the run already counts it.
                         self.meter.spend.absorb(&explored);
                         self.count_errors(&results);
+                        self.keep_errors(&calls, &results);
                         let results = self.mark_repeats(&calls, results);
                         conv.push(user_blocks(results));
                         self.save(&conv);
@@ -488,6 +525,7 @@ impl Attempt {
                     }
                     let text = resp.text();
                     if !text.is_empty() {
+                        self.said.clone_from(&text);
                         reply.push(text);
                     }
                     if resp.stop_reason.as_deref() == Some(STOP_MAX_TOKENS) {
@@ -666,6 +704,87 @@ impl Attempt {
         }
     }
 
+    /// Keep the turn's failed tool calls for the branch the attempt leaves
+    /// if it fails: the last few, each different, a repeat moved last.
+    fn keep_errors(&mut self, calls: &[ToolUse], results: &[Value]) {
+        for result in results.iter().filter(|r| r["is_error"] == true) {
+            let Some(call) = calls.iter().find(|c| result["tool_use_id"] == c.id.as_str()) else { continue };
+            let text = result["content"].as_str().unwrap_or("it failed");
+            let line = branch::error_line(&call.name, &call.input, text);
+            self.tool_errors.retain(|e| *e != line);
+            self.tool_errors.push(line);
+        }
+        let over = self.tool_errors.len().saturating_sub(branch::MAX_ERRORS);
+        self.tool_errors.drain(..over);
+    }
+
+    /// Take the turn's `todo` calls, in order, the last that is well formed
+    /// setting the list: their results, by call id. A list that is set goes
+    /// into the conversation's standing state, and out as progress.
+    async fn set_todos(
+        &mut self,
+        calls: &[ToolUse],
+        cut_off: Option<&str>,
+        conv: &mut Conversation,
+    ) -> HashMap<String, Value> {
+        let mut results = HashMap::new();
+        if !self.keeps_todo() {
+            return results;
+        }
+        let mut set = false;
+        for call in calls.iter().filter(|c| c.name == TODO) {
+            let result = if cut_off == Some(call.id.as_str()) {
+                tool_result(&call.id, prompts::CUT_OFF, true)
+            } else {
+                match todo::parse(call) {
+                    Ok(items) => {
+                        self.todos = items;
+                        set = true;
+                        tool_result(&call.id, todo::result_text(&self.todos), false)
+                    }
+                    Err(why) => tool_result(&call.id, why, true),
+                }
+            };
+            results.insert(call.id.clone(), result);
+        }
+        if set {
+            self.stand(conv);
+            let ctx = &self.ctx;
+            let items = self.todos.clone();
+            ctx.progress(Progress::Todo { run: ctx.run_id(), attempt: self.index, items }).await;
+        }
+        results
+    }
+
+    /// What the attempt leaves the attempts after it, having ended on `note`.
+    async fn branch(&self, note: &str) -> Branch {
+        let mut b = Branch::default();
+        b.set_reason(note);
+        let steps = self
+            .todos
+            .iter()
+            .filter(|i| i.status != molt_api::planner::tools::TodoStatus::Pending)
+            .map(|i| format!("{} ({})", i.content, i.status.name()))
+            .collect();
+        b.set_approach(steps, &self.said);
+        b.set_unfinished(todo::unfinished(&self.todos));
+        b.errors = self.tool_errors.clone();
+        if let Some(output) = &self.last_failure {
+            b.set_check(output);
+        }
+        match self.fork.as_deref() {
+            // It got no fork, or only read: it changed nothing.
+            None => b.changed = Some(Vec::new()),
+            Some(fork) => match self.ctx.diff(fork).await {
+                Ok(diff) => b.set_changed(&diff),
+                Err(e) => {
+                    tracing::warn!(run = %self.ctx.trace, attempt = self.index, error = %e, "could not list the fork's changes");
+                }
+            },
+        }
+        b
+    }
+
     /// Tell the model when a call failed exactly as the same call did
     /// before: repeating it unchanged will not help.
     fn mark_repeats(&mut self, calls: &[ToolUse], mut results: Vec<Value>) -> Vec<Value> {
@@ -739,6 +858,11 @@ impl Attempt {
         !self.read_only && self.ctx.outputs && self.ctx.seats().attempt.allows(molt_api::planner::tools::READ_OUTPUT)
     }
 
+    /// It is offered `todo`: it changes files, and its role may have the tool.
+    fn keeps_todo(&self) -> bool {
+        !self.read_only && self.ctx.seats().attempt.allows(TODO)
+    }
+
     /// It is offered `explore`: its workflow explores, it changes files,
     /// and its role may have the tool.
     fn explores(&self) -> bool {
@@ -758,6 +882,7 @@ impl Attempt {
         cut_off: Option<&str>,
         actor: Actor,
         compacted: Option<&Compacted>,
+        mut listed: HashMap<String, Value>,
     ) -> (Vec<Value>, Spend) {
         let explores = self.explores();
         let is_dispute = |c: &ToolUse| self.check.is_some() && c.name == DISPUTE_CHECK;
@@ -774,7 +899,9 @@ impl Attempt {
         };
         let others: Vec<ToolUse> = calls
             .iter()
-            .filter(|c| !is_dispute(c) && !is_explore(c) && !is_earlier(c) && !refused(c))
+            .filter(|c| {
+                !listed.contains_key(&c.id) && !is_dispute(c) && !is_explore(c) && !is_earlier(c) && !refused(c)
+            })
             .cloned()
             .collect();
         let mut results = tools::execute(&self.ctx, fork, &others, cut_off, actor).await.into_iter();
@@ -815,6 +942,9 @@ impl Attempt {
         let results = calls
             .iter()
             .map(|call| {
+                if let Some(result) = listed.remove(&call.id) {
+                    return result;
+                }
                 if is_earlier(call) {
                     return earlier
                         .next()
@@ -912,8 +1042,12 @@ impl Attempt {
     fn stand(&self, conv: &mut Conversation) {
         let added = self.ctx.control.upto(self.version);
         let protected = self.ctx.control.protected(self.version);
-        conv.standing =
-            Some(prompts::standing(self.version, &added, &protected, self.check.as_ref().map(|c| c.command.as_str())));
+        let mut standing =
+            prompts::standing(self.version, &added, &protected, self.check.as_ref().map(|c| c.command.as_str()));
+        if !self.todos.is_empty() {
+            standing.push_str(&format!("\n{}\n{}", prompts::TODO_STANDING, todo::lines(&self.todos)));
+        }
+        conv.standing = Some(standing);
     }
 
     /// Save the attempt as it stands in the run's checkpoint.
@@ -927,6 +1061,7 @@ impl Attempt {
             self.check_runs,
             self.version,
         );
+        let (todos, tool_errors) = (self.todos.clone(), self.tool_errors.clone());
         self.ctx.save(|s| {
             let saved = s.attempt(self.index);
             saved.requirements = version;
@@ -942,6 +1077,8 @@ impl Attempt {
             saved.usage = meter.spend.usage;
             saved.cost_usd = meter.spend.cost_usd;
             saved.dir_instructions = self.ctx.dir_instructions.saved(self.index);
+            saved.todos = todos;
+            saved.tool_errors = tool_errors;
         });
     }
 

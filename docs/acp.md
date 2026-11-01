@@ -75,7 +75,11 @@ gets its data dir as `molt` would give it (`~/.cache/molt/<name>-<hash>`).
   `memory_model` and `stream`.
 - **While it runs**, the editor shows:
   - the workflow's steps as a plan (design the check, make the change,
-    review, apply), each marked as it starts and ends;
+    review, apply), each marked as it starts and ends, followed by the steps
+    of each attempt's own list ([`todo`](tools.md#the-attempts-own-list-todo)),
+    as it last set it: a step it dropped reads `(dropped)`, and with more than
+    one list each step names its attempt. The list of an attempt that did not
+    pass is taken off. A list all completed never marks a workflow step done;
   - each tool call of the attempts (`read`, `write`, `run`, ...), with the
     file it touches, marked done when the next one starts;
   - each run of the check, passed or failed with the end of its output;

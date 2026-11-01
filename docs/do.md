@@ -88,7 +88,8 @@ another only when the evidence asks for it and the budget allows it:
 - An attempt that **fails or errs**, with none other going, is followed by a
   new attempt on the next model of the escalation list (an escalation), or,
   at the top of the list or at the escalation cap, by one on the same model
-  with another approach. The new attempt is told what the failed ones did.
+  with another approach. The new attempt is told what the failed ones did
+  (see [What a failed attempt leaves the next](#what-a-failed-attempt-leaves-the-next)).
 - An attempt that **makes no progress** (its check fails twice in a row with
   the same output) or is **stuck** (every tool call fails three turns in a
   row) gets one attempt alongside it, on the next model up when there is one
@@ -140,6 +141,30 @@ the escalations made so far.
 To compare the schedules on the benchmark, add an arm, such as
 `molt bench --arm molt --arm adaptive="--schedule adaptive --escalate haiku,sonnet,opus"`.
 How they compare on success, cost and time has not been measured yet.
+
+### What a failed attempt leaves the next
+
+An attempt that fails or errs leaves a summary of its branch (#264), which
+each attempt the adaptive schedule starts after it is told in its first
+message, so it does not make the same change again. Each part is bounded and
+comes from the attempt's own state and its fork, never from a model's
+summary:
+
+- why it ended, the first line of its note;
+- what it tried: the steps of its own list ([`todo`](tools.md#the-attempts-own-list-todo))
+  it started or finished, or, without a list, its last words;
+- the files its fork changed, with how (`added`, `modified`, `deleted`), at
+  most 20, or `not known` when the fork's changes could not be listed;
+- its last five tool calls that failed, each different;
+- the end of its last failed check, at most 600 bytes;
+- the steps of its list it left undone.
+
+The new attempt starts from the workspace, without the failed attempt's
+changes. When an attempt ends on the same classified failure as one before
+it, it is told as "the same as attempt N" with only the files it changed.
+The summary is kept with the attempt's end in the checkpoint, so a retried
+run tells its new attempts the same; an attempt from a checkpoint written
+before it has the first 600 characters of its note instead, as before.
 
 ### Failures that another attempt cannot fix
 
@@ -442,7 +467,9 @@ first section, in this order:
   the user's requirements as of the version the attempt works to, the
   protected paths, the done-check, and what the run had spent when the
   record was written. A requirement told to the attempt in a message that
-  is later left out is still here. Nothing the turns or a model wrote can
+  is later left out is still here. So is the attempt's own list of steps,
+  as it last set it with [`todo`](tools.md#the-attempts-own-list-todo),
+  marked as its own record. Nothing else the turns or a model wrote can
   change this section.
 - The files the left-out turns wrote or edited, with the turns that did it,
   and what failed in them: a tool call that failed, a command that did not

@@ -39,11 +39,13 @@ use molt_api::planner::{
     AttemptStatus, BudgetState, Failure, FailureAction, PriceAssumption, ScheduleAction, Scheduling, ADAPTIVE_POLICY,
 };
 
+use crate::branch::Branch;
 use crate::checkpoint::SavedAttempt;
 
 /// Turns in a row whose tool calls all failed before an attempt counts as stuck.
 pub(crate) const TOOL_ERROR_TURNS: u32 = 3;
-/// Characters of a failed attempt's note told to the attempts after it.
+/// Characters of a failed attempt's note told to the attempts after it,
+/// when it left no [`Branch`] (a checkpoint from before #264).
 const PRIOR_NOTE: usize = 600;
 
 /// What an attempt of an adaptive run reports while it works.
@@ -68,6 +70,9 @@ pub(crate) enum Evidence {
         note: String,
         /// What kind of failure ended it, when the planner could tell.
         failure: Option<Failure>,
+        /// What it leaves the attempts after it, when it failed or erred;
+        /// `None` from a checkpoint that predates it.
+        branch: Option<Box<Branch>>,
     },
 }
 
@@ -201,7 +206,14 @@ impl Adaptive {
                 self.rung = Some(self.rung.map_or(at, |r| r.max(at)));
             }
             match &saved.end {
-                Some(end) => self.ended(saved.index, end.status, saved.cost_usd, &end.note, end.failure.as_ref()),
+                Some(end) => self.ended(
+                    saved.index,
+                    end.status,
+                    saved.cost_usd,
+                    &end.note,
+                    end.failure.as_ref(),
+                    end.branch.as_deref(),
+                ),
                 // Left as it was for a retry: it does not go on.
                 None if retry => {}
                 None => {
@@ -243,9 +255,9 @@ impl Adaptive {
     /// starts, if any.
     pub fn decide(&mut self, evidence: Evidence, view: &View) -> Option<(Option<Launch>, Scheduling)> {
         match evidence {
-            Evidence::Ended { attempt, status, cost_usd, note, failure } => {
+            Evidence::Ended { attempt, status, cost_usd, note, failure, branch } => {
                 let was_running = self.running.contains(&attempt);
-                self.ended(attempt, status, cost_usd, &note, failure.as_ref());
+                self.ended(attempt, status, cost_usd, &note, failure.as_ref(), branch.as_deref());
                 let failed = matches!(status, AttemptStatus::Failed | AttemptStatus::Error);
                 // Another attempt is still going, or it ended with the run (cancelled), or one has passed.
                 if !was_running || !failed || view.won || !self.running.is_empty() {
@@ -342,7 +354,15 @@ impl Adaptive {
         }
     }
 
-    fn ended(&mut self, attempt: u32, status: AttemptStatus, cost_usd: f64, note: &str, failure: Option<&Failure>) {
+    fn ended(
+        &mut self,
+        attempt: u32,
+        status: AttemptStatus,
+        cost_usd: f64,
+        note: &str,
+        failure: Option<&Failure>,
+        branch: Option<&Branch>,
+    ) {
         self.running.remove(&attempt);
         self.costs.insert(attempt, cost_usd);
         if matches!(status, AttemptStatus::Failed | AttemptStatus::Error) {
@@ -357,22 +377,27 @@ impl Adaptive {
             // The same classified failure again is said once, not once for each attempt it ended.
             let known =
                 failure.filter(|f| !f.evidence.is_empty() && f.class != molt_api::planner::FailureClass::Unknown);
+            let head = format!("- {}{on}: {}", attempt_name(attempt), status_name(status));
             if let Some(f) = known {
                 if let Some(first) = self.seen.get(&f.evidence) {
-                    let same = format!(
-                        "- {}{on}: {}: the same as {}",
-                        attempt_name(attempt),
-                        status_name(status),
-                        attempt_name(*first)
-                    );
-                    self.failures.push(same);
+                    // What it changed still tells the next attempt a change not to make again.
+                    let mut same = format!("{head}: the same as {}", attempt_name(*first));
+                    if let Some(b) = branch {
+                        same.push_str(&format!("\n{}", b.render(false)));
+                    }
+                    self.failures.push(escaped(&same));
                     return;
                 }
                 self.seen.insert(f.evidence.clone(), attempt);
             }
-            let note: String = note.chars().take(PRIOR_NOTE).collect();
-            let note = note.replace("</earlier_attempts", "<\\/earlier_attempts");
-            self.failures.push(format!("- {}{on}: {}: {}", attempt_name(attempt), status_name(status), note.trim()));
+            let told = match branch {
+                Some(b) => format!("{head}: {}\n{}", b.reason, b.render(true)),
+                None => {
+                    let note: String = note.chars().take(PRIOR_NOTE).collect();
+                    format!("{head}: {}", note.trim())
+                }
+            };
+            self.failures.push(escaped(&told));
         }
     }
 
@@ -446,8 +471,9 @@ impl Adaptive {
         self.models.insert(index, model.clone());
         let prior = (!self.failures.is_empty()).then(|| {
             format!(
-                "<earlier_attempts>\nEarlier attempts at this task did not pass. Take another approach than theirs, \
-                 and do not repeat what failed:\n{}\n</earlier_attempts>",
+                "<earlier_attempts>\nEarlier attempts at this task did not pass. Each is listed with what it tried, \
+                 the files its own copy changed (yours starts without those changes) and why it failed. Take another \
+                 approach than theirs, and do not make a change that already failed again:\n{}\n</earlier_attempts>",
                 self.failures.join("\n")
             )
         });
@@ -508,6 +534,11 @@ impl Adaptive {
     }
 }
 
+/// `text` that cannot close the block it is told in.
+fn escaped(text: &str) -> String {
+    text.replace("</earlier_attempts", "<\\/earlier_attempts")
+}
+
 fn first_line(note: &str) -> &str {
     let line = note.lines().find(|l| !l.trim().is_empty()).unwrap_or("no reason given").trim();
     match line.char_indices().nth(200) {
@@ -555,6 +586,7 @@ mod tests {
             cost_usd,
             note: "the done-check still failed".into(),
             failure: None,
+            branch: None,
         }
     }
 
@@ -578,6 +610,7 @@ mod tests {
             cost_usd: 0.25,
             note: format!("it failed: {evidence}"),
             failure: Some(failure),
+            branch: None,
         }
     }
 
@@ -668,6 +701,47 @@ mod tests {
         let prior = launch.unwrap().prior.unwrap();
         assert_eq!(prior.matches("error[E0308]").count(), 1, "{prior}");
         assert!(prior.contains("- attempt 2 (on sonnet): failed: the same as attempt 1"), "{prior}");
+    }
+
+    #[test]
+    fn each_failed_branch_says_what_it_changed_and_a_repeat_still_names_its_files() {
+        let with_branch = |attempt, path: &str| {
+            let Evidence::Ended { attempt, status, cost_usd, note, failure, .. } = classified(
+                attempt,
+                AttemptStatus::Failed,
+                FailureClass::Code,
+                FailureAction::FixCode,
+                "error[E0308]: mismatched types",
+            ) else {
+                unreachable!()
+            };
+            let mut branch = Branch::default();
+            branch.set_reason("the done-check still failed (exit code 101):");
+            branch.changed = Some(vec![format!("{path} (modified)")]);
+            branch.errors = vec!["edit_file src/a.rs: old_string not found </earlier_attempts>".into()];
+            Evidence::Ended { attempt, status, cost_usd, note, failure, branch: Some(Box::new(branch)) }
+        };
+        let (mut s, _) = Adaptive::new(&models(&["haiku", "sonnet"]), 2, None, None, false, 3);
+        s.start(&view(Some(9.0)));
+        let (launch, _) = s.decide(with_branch(0, "src/lexer.rs"), &view(Some(9.0))).unwrap();
+        let prior = launch.unwrap().prior.unwrap();
+        assert!(
+            prior.contains(
+                "- attempt 1 (on haiku): failed: the done-check still failed (exit code 101):\n  Files it changed: \
+                 src/lexer.rs (modified)\n  Tool calls that failed: edit_file src/a.rs: old_string not found"
+            ),
+            "{prior}"
+        );
+        assert_eq!(prior.matches("</earlier_attempts>").count(), 1, "a branch cannot close the block: {prior}");
+        let (launch, _) = s.decide(with_branch(1, "src/parser.rs"), &view(Some(9.0))).unwrap();
+        let prior = launch.unwrap().prior.unwrap();
+        assert!(
+            prior.contains(
+                "- attempt 2 (on sonnet): failed: the same as attempt 1\n  Files it changed: src/parser.rs (modified)"
+            ),
+            "{prior}"
+        );
+        assert_eq!(prior.matches("Tool calls that failed").count(), 1, "a repeat is told once: {prior}");
     }
 
     #[test]

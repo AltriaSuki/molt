@@ -271,7 +271,8 @@ async fn run(fake: &Arc<Fake>, cfg: Config, req: RunRequest) -> RunResponse {
 async fn the_checks_middle_failure_is_read_by_reference_and_the_check_does_not_run_again_for_it() {
     let fake = Fake::new(|req| {
         let names = tool_names(req);
-        assert_eq!(names.last().map(String::as_str), Some("read_output"), "{names:?}");
+        // Last but the attempt's own list, which comes after every other tool.
+        assert_eq!(names[names.len() - 2..], ["read_output", "todo"], "{names:?}");
         match turn(req) {
             1 => done("Nothing to change."),
             2 => {

@@ -556,6 +556,10 @@ fn requirement_lines(requirements: &[Requirement]) -> String {
     s
 }
 
+/// Heads the attempt's own list in the standing record.
+pub(crate) const TODO_STANDING: &str = "- Your own list of steps, as you last set it with todo. It is your record: \
+                                        only the done-check says whether the task is done.";
+
 /// What holds now for an attempt, from the run's own state, for the record
 /// of its left-out turns: the user's requirements as of `version`
 /// (`added`), the `protected` paths and the done-check.

@@ -43,7 +43,10 @@ with `--config` can change these in a `[confirm]` section (`max_lines`,
    passes, each one shows the end of why it stopped, and a failed check shows
    its last lines in its box; `v` opens the whole story and `r` runs the task
    again with the same check, without designing it anew. `/lanes` shows the
-   last task's tool calls after it has ended.
+   last task's tool calls after it has ended. An attempt that keeps its own
+   list of steps ([`todo`](tools.md#the-attempts-own-list-todo)) shows the
+   latest at the top of its box, in at most half of it, with how many it
+   says it completed; that is the model's account, not a check result.
 
 Shift+Tab switches to **auto** (design the check and apply what passes) or
 **plan only** (results stay in their forks). Esc pressed twice within about

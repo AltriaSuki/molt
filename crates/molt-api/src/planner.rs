@@ -1036,6 +1036,11 @@ pub mod tools {
     /// read a page of a command's saved output, search it for a text, or
     /// follow a process's as it grows.
     pub const READ_OUTPUT: &str = "read_output";
+    /// Offered to attempts that change files (#264): set the attempt's own
+    /// list of steps and how far each is. It changes nothing outside the
+    /// attempt, and never decides whether the task is done: the done-check
+    /// and the review do.
+    pub const TODO: &str = "todo";
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ReadFile {
@@ -1241,6 +1246,40 @@ pub mod tools {
         /// How long to wait for more while the process runs on.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wait_s: Option<u64>,
+    }
+
+    /// A `todo` call: the whole list as it stands now, which replaces the
+    /// one before.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Todo {
+        pub items: Vec<TodoItem>,
+    }
+
+    /// One step of an attempt's own list.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct TodoItem {
+        pub content: String,
+        pub status: TodoStatus,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum TodoStatus {
+        Pending,
+        InProgress,
+        Completed,
+        Cancelled,
+    }
+
+    impl TodoStatus {
+        pub fn name(self) -> &'static str {
+            match self {
+                Self::Pending => "pending",
+                Self::InProgress => "in_progress",
+                Self::Completed => "completed",
+                Self::Cancelled => "cancelled",
+            }
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
