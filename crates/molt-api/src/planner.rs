@@ -1199,6 +1199,9 @@ pub mod tools {
         /// How long to wait for `ready`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub timeout_s: Option<u64>,
+        /// A TCP port the program listens on, to wait for as well.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub port: Option<u16>,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

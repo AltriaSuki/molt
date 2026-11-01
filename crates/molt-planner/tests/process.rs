@@ -59,6 +59,7 @@ fn state(id: &str, command: &str, status: ProcessStatus, output: &str) -> Value 
         exit_code: None,
         signal: None,
         ready: None,
+        listening: None,
         output: output.into(),
         offset: 0,
         next: output.len() as u64,
@@ -332,6 +333,7 @@ async fn an_attempt_serves_reads_and_stops_a_process_in_its_fork_and_nothing_run
                     ("read_process", json!({ "id": "proc_1", "wait_s": 2 })),
                     ("write_process", json!({ "id": "proc_1", "input": "reload\n" })),
                     ("start_process", json!({ "command": "watch" })),
+                    ("start_process", json!({ "command": "vite", "port": 5173, "timeout_s": 3 })),
                 ],
             )
         }
@@ -364,6 +366,9 @@ async fn an_attempt_serves_reads_and_stops_a_process_in_its_fork_and_nothing_run
     );
     // Without a ready text the service's own short wait applies.
     assert!(fake.calls_to(shell::START)[1].get("wait_ms").is_none());
+    // A port is waited for as a ready text is.
+    let vite = &fake.calls_to(shell::START)[2];
+    assert_eq!((vite["port"].as_u64(), vite["wait_ms"].as_u64()), (Some(5173), Some(3000)), "{vite}");
     assert_eq!(fake.calls_to(shell::READ)[0]["wait_ms"], 2000);
     // The watcher it left running is stopped at its final reply, before the check runs, and again at its end.
     let targets = fake.targets();
