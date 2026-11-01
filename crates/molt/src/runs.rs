@@ -11,6 +11,16 @@
 //! exits: a request the planner never answered before it went was
 //! interrupted.
 //!
+//! What a run cost is settled from the same log (see [`Settlement`]). Each
+//! `model.complete` asked under the run's trace is one call, known by its
+//! id, and its answers are folded into it once: the gateway's answer settles
+//! it, and a kernel's answer (it stopped waiting) leaves it open for a late
+//! gateway answer, which the kernel audits but never delivers. A run whose
+//! reply said what it spent costs that, plus what such late answers settled
+//! since; a run that never said costs what its calls in the log settled, and
+//! the calls with no known cost stay unknown. The run's reply in the log is
+//! never changed: `molt runs show` prints it as it was, beside the settlement.
+//!
 //! So that a listing does not read the whole log each time, the facts read
 //! from it are kept in `runs.jsonl` in the data dir, each with the place in
 //! the log it was read up to, and the next listing reads on from the last.
@@ -40,7 +50,7 @@ const LOCK: &str = "runs.lock";
 /// The audit log, in the data dir.
 const AUDIT: &str = "audit.jsonl";
 /// The index's format. An index of another one is built again.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// The most of a task the index keeps; `molt runs show` reads all of it from the log.
 const TASK_BYTES: usize = 2000;
 /// The most of a run's summary, or of an error, the index keeps.
@@ -56,6 +66,7 @@ const RUN: &str = molt_api::planner::RUN;
 const PLAN: &str = molt_api::plan::PLAN;
 const DESIGN: &str = molt_api::planner::DESIGN;
 const CONSOLIDATE: &str = molt_api::memory::CONSOLIDATE;
+const COMPLETE: &str = molt_api::model::COMPLETE;
 
 /// One run, as the log has it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -105,6 +116,10 @@ pub struct Run {
     /// What the run said it did, or why it failed: the first 500 bytes.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub summary: String,
+    /// Where `cost_usd` comes from and when it last changed; `None` while it
+    /// is not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<Settlement>,
     /// Where its first request is in the log, to read the run back from.
     #[serde(skip)]
     pub(crate) at: u64,
@@ -147,6 +162,39 @@ impl Status {
             Outcome::Judged => Status::Judged,
         }
     }
+}
+
+/// How a run's cost was settled from the log.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Settlement {
+    pub from: CostFrom,
+    /// The model calls the log has under the run's trace, a check's designed
+    /// for it included.
+    pub calls: u32,
+    /// Calls of a known cost whose answer came late, after the kernel had
+    /// stopped waiting for it: no reply of the run counted them, and their
+    /// cost is in `cost_usd` now. Each is counted once, however often the log
+    /// is read.
+    #[serde(default)]
+    pub late_calls: u32,
+    #[serde(default)]
+    pub late_usd: f64,
+    /// The run's own reply as it said it (and its designs'), before any late
+    /// answer: the known part and its uncounted calls. `None` without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replied: Option<(f64, u32)>,
+    /// When what is known of the cost last changed, in milliseconds since
+    /// the epoch: the reply, or the latest answer settled after it.
+    pub updated_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostFrom {
+    /// The run's reply, and any late answers after it.
+    Reply,
+    /// No reply said: the answers the log has to the run's model calls.
+    Calls,
 }
 
 /// Where the result went.
@@ -237,6 +285,19 @@ enum Fact {
     Answered { msg: String, ts_ms: u64, answer: Answer },
     /// The planner started or exited: what it had not answered, it never will.
     PlannerGone { ts_ms: u64 },
+    /// `model.complete` was asked for under the trace `run`, as the call `call`.
+    Called { run: String, call: String },
+    /// An answer to the model call `call`. `provisional`: the kernel's, which
+    /// it gives when it stops waiting; the gateway's answer may still come
+    /// after it. `cost_usd`: what the call cost, when the answer says.
+    Settled {
+        call: String,
+        ts_ms: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        provisional: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -320,6 +381,9 @@ pub struct Session {
     pub cost_usd: f64,
     /// Runs whose cost is not known, or only in part.
     pub unknown_cost: u32,
+    /// When what is known of its runs' costs last changed; `None` when none is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_ms: Option<u64>,
     pub runs: Vec<Run>,
 }
 
@@ -336,6 +400,7 @@ pub fn sessions(runs: Vec<Run>) -> Vec<Session> {
                     started_ms: run.started_ms,
                     cost_usd: 0.0,
                     unknown_cost: 0,
+                    settled_ms: None,
                     runs: Vec::new(),
                 });
                 out.len() - 1
@@ -348,6 +413,9 @@ pub fn sessions(runs: Vec<Run>) -> Vec<Session> {
         }
         if run.cost_usd.is_some() && run.uncounted_calls > 0 {
             session.unknown_cost += 1;
+        }
+        if let Some(settled) = &run.settlement {
+            session.settled_ms = session.settled_ms.max(Some(settled.updated_ms));
         }
         session.runs.push(run);
     }
@@ -538,20 +606,71 @@ fn append_index(path: &Path, facts: &[(Mark, Fact)], end: Mark, from: Option<Mar
 /// The facts of the log at `path` past `from`, each with the place just
 /// past its entry, and where the log ends.
 fn read_on(path: &Path, from: Option<Mark>) -> Result<(Vec<(Mark, Fact)>, Mark), AuditError> {
-    let mut facts = Vec::new();
-    let end = audit::scan_from(path, from, wanted, |entry, at, mark| {
-        if let Some(fact) = fact_of(entry, at) {
-            facts.push((mark, fact));
-        }
-    })?;
+    // A model request holds a whole conversation, taken out into blobs the
+    // log would have to read back; only its ids are wanted, so it is read
+    // from its line as it is and given the place of the next fact.
+    let called = std::cell::RefCell::new(Vec::new());
+    let facts = std::cell::RefCell::new(Vec::new());
+    let end = audit::scan_from(
+        path,
+        from,
+        |line| {
+            if !line.contains(&format!("\"to\":\"{COMPLETE}\"")) {
+                return wanted(line);
+            }
+            match model_request(line) {
+                Some(fact) => {
+                    called.borrow_mut().push(fact);
+                    false
+                }
+                None => true,
+            }
+        },
+        |entry, at, mark| {
+            let mut facts = facts.borrow_mut();
+            facts.extend(called.borrow_mut().drain(..).map(|fact| (mark, fact)));
+            if let Some(fact) = fact_of(entry, at) {
+                facts.push((mark, fact));
+            }
+        },
+    )?;
+    let mut facts = facts.into_inner();
+    facts.extend(called.into_inner().into_iter().map(|fact| (end, fact)));
     Ok((facts, end))
+}
+
+/// The call a `model.complete` request's line asks for, read without its payload.
+fn model_request(line: &str) -> Option<Fact> {
+    #[derive(Deserialize)]
+    struct Line {
+        event: Event,
+    }
+    #[derive(Deserialize)]
+    struct Event {
+        #[serde(rename = "type")]
+        kind: String,
+        #[serde(default)]
+        envelope: Option<Message>,
+    }
+    #[derive(Deserialize)]
+    struct Message {
+        id: String,
+        trace_id: String,
+        to: String,
+        kind: Kind,
+    }
+    let line: Line = serde_json::from_str(line).ok()?;
+    let message = line.event.envelope.filter(|_| line.event.kind == "message")?;
+    (message.kind == Kind::Request && message.to == COMPLETE)
+        .then_some(Fact::Called { run: message.trace_id, call: message.id })
 }
 
 /// Whether the line of an entry may say anything about runs: it is a
 /// message to or from a method that starts, designs or learns from one, or
-/// the planner starting or exiting. Replies carry the target of their request.
+/// that makes one's model calls, or the planner starting or exiting.
+/// Replies carry the target of their request.
 fn wanted(line: &str) -> bool {
-    [RUN, PLAN, DESIGN, CONSOLIDATE].iter().any(|to| line.contains(&format!("\"to\":\"{to}\"")))
+    [RUN, PLAN, DESIGN, CONSOLIDATE, COMPLETE].iter().any(|to| line.contains(&format!("\"to\":\"{to}\"")))
         || (line.contains("\"type\":\"service_") && line.contains("\"service\":\"planner\""))
 }
 
@@ -617,6 +736,12 @@ fn fact_of(entry: Entry, at: u64) -> Option<Fact> {
             }
             _ => None,
         },
+        Kind::Reply if to == COMPLETE => {
+            let call = envelope.reply_to.as_ref()?.to_string();
+            let by_kernel = envelope.from.as_ref().is_some_and(|f| f.as_str() == molt_proto::KERNEL);
+            let (provisional, cost_usd) = model_answer(&envelope, by_kernel);
+            Some(Fact::Settled { call, ts_ms, provisional, cost_usd })
+        }
         Kind::Reply => {
             let msg = envelope.reply_to.as_ref()?.to_string();
             let answer = match envelope.error() {
@@ -634,6 +759,29 @@ fn fact_of(entry: Entry, at: u64) -> Option<Fact> {
             Some(Fact::Cancelled { msg: envelope.reply_to.as_ref()?.to_string() })
         }
         _ => None,
+    }
+}
+
+/// What an answer to a model call says it cost, as the planner counts it,
+/// and whether a later answer may still settle it. A reply without complete
+/// usage or a price, a failure, or a stop is not known; a call refused
+/// before anything was billed cost nothing. The kernel's answer, when it
+/// stops waiting, is provisional: the gateway's may follow it.
+fn model_answer(envelope: &molt_proto::Envelope, by_kernel: bool) -> (bool, Option<f64>) {
+    let payload = &envelope.payload;
+    match envelope.error() {
+        Some(e) if matches!(e.code, ErrorCode::Denied | ErrorCode::Invalid) && payload.get("settlement").is_none() => {
+            (false, Some(0.0))
+        }
+        Some(_) if by_kernel => (true, None),
+        Some(_) => (false, payload.pointer("/settlement/cost_usd").and_then(Value::as_f64)),
+        None => {
+            let usage = payload.get("usage");
+            let complete = ["input_tokens", "output_tokens"]
+                .iter()
+                .all(|t| usage.and_then(|u| u.get(t)).and_then(Value::as_u64).is_some());
+            (false, payload.get("cost_usd").and_then(Value::as_f64).filter(|_| complete))
+        }
     }
 }
 
@@ -783,15 +931,62 @@ enum Waiting {
     Learn(String),
 }
 
+/// One model call of a run, as its answers in the log settle it.
+struct Call {
+    run: String,
+    /// The kernel answered first, when it stopped waiting: a gateway answer after it is late.
+    provisional_ms: Option<u64>,
+    /// The gateway's answer: what it cost when known, when it came, and whether it came late.
+    answer: Option<(Option<f64>, u64, bool)>,
+}
+
+/// What a run's model calls settled, added up in log order.
+#[derive(Clone, Copy, Default)]
+struct Ledger {
+    calls: u32,
+    /// Calls whose cost is known, and what they cost together.
+    known: u32,
+    usd: f64,
+    /// Of those, the ones that came late.
+    late: u32,
+    late_usd: f64,
+    /// The latest answer, and the latest late one.
+    last_ms: u64,
+    late_ms: u64,
+}
+
+impl Ledger {
+    fn add(&mut self, call: &Call) {
+        self.calls = self.calls.saturating_add(1);
+        if let Some(ms) = call.provisional_ms {
+            self.last_ms = self.last_ms.max(ms);
+        }
+        let Some((cost, ms, late)) = call.answer else { return };
+        self.last_ms = self.last_ms.max(ms);
+        let Some(usd) = cost else { return };
+        self.known = self.known.saturating_add(1);
+        self.usd += usd;
+        if late {
+            self.late = self.late.saturating_add(1);
+            self.late_usd += usd;
+            self.late_ms = self.late_ms.max(ms);
+        }
+    }
+}
+
 /// The runs `facts` tell of, oldest first. `live`: the services are up, so
 /// a request with no answer may still get one.
 fn fold(facts: &[Fact], live: bool) -> Vec<Run> {
     let mut runs: Vec<Run> = Vec::new();
     let mut by_id: HashMap<String, usize> = HashMap::new();
     let mut waiting: HashMap<String, Waiting> = HashMap::new();
-    // Each run's own reported cost, and what checks designed on their own cost.
-    let mut reported: HashMap<String, (f64, u32)> = HashMap::new();
-    let mut designed: HashMap<String, (f64, u32)> = HashMap::new();
+    // Each run's own reported cost, and what checks designed on their own
+    // cost, with when the latest of them said so.
+    let mut reported: HashMap<String, (f64, u32, u64)> = HashMap::new();
+    let mut designed: HashMap<String, (f64, u32, u64)> = HashMap::new();
+    // Every model call, in the order asked, by its id.
+    let mut calls: Vec<Call> = Vec::new();
+    let mut call_at: HashMap<String, usize> = HashMap::new();
     let mut ran_for: HashMap<String, u64> = HashMap::new();
     let mut answered: HashSet<String> = HashSet::new();
     for fact in facts {
@@ -817,6 +1012,7 @@ fn fold(facts: &[Fact], live: bool) -> Vec<Run> {
                         learning: None,
                         resumable: false,
                         summary: String::new(),
+                        settlement: None,
                         at: *at,
                     });
                     runs.len() - 1
@@ -861,7 +1057,7 @@ fn fold(facts: &[Fact], live: bool) -> Vec<Run> {
                             run.changed = ended.changed;
                             run.resumable = ended.resumable;
                             run.summary = ended.summary.clone();
-                            reported.insert(id, (ended.cost_usd, ended.uncounted_calls));
+                            reported.insert(id, (ended.cost_usd, ended.uncounted_calls, *ts_ms));
                         }
                         Answer::Failed { message, stopped } => {
                             let stopped = *stopped || cancelled;
@@ -878,6 +1074,7 @@ fn fold(facts: &[Fact], live: bool) -> Vec<Run> {
                     let spent = designed.entry(id).or_default();
                     spent.0 += cost_usd;
                     spent.1 = spent.1.saturating_add(*uncounted_calls);
+                    spent.2 = spent.2.max(*ts_ms);
                 }
                 (Some(Waiting::Learn(id)), answer) => {
                     let Some(&i) = by_id.get(&id) else { continue };
@@ -912,7 +1109,28 @@ fn fold(facts: &[Fact], live: bool) -> Vec<Run> {
                     Waiting::Learn(_) => true,
                 });
             }
+            Fact::Called { run, call } => {
+                // The same call read twice is still one call.
+                call_at.entry(call.clone()).or_insert_with(|| {
+                    calls.push(Call { run: run.clone(), provisional_ms: None, answer: None });
+                    calls.len() - 1
+                });
+            }
+            Fact::Settled { call, ts_ms, provisional, cost_usd } => {
+                let Some(call) = call_at.get(call).map(|&i| &mut calls[i]) else { continue };
+                if call.answer.is_some() {
+                    // Settled already: a repeated answer adds nothing.
+                } else if *provisional {
+                    call.provisional_ms.get_or_insert(*ts_ms);
+                } else {
+                    call.answer = Some((*cost_usd, *ts_ms, call.provisional_ms.is_some()));
+                }
+            }
         }
+    }
+    let mut ledgers: HashMap<&str, Ledger> = HashMap::new();
+    for call in &calls {
+        ledgers.entry(call.run.as_str()).or_default().add(call);
     }
     for waited in waiting.values() {
         if let Waiting::Run { id, .. } = waited {
@@ -922,10 +1140,35 @@ fn fold(facts: &[Fact], live: bool) -> Vec<Run> {
         }
     }
     for run in &mut runs {
-        if let Some(&(usd, calls)) = reported.get(&run.run) {
-            let (design_usd, design_calls) = designed.get(&run.run).copied().unwrap_or_default();
-            run.cost_usd = Some(usd + design_usd);
-            run.uncounted_calls = calls.saturating_add(design_calls);
+        let ledger = ledgers.get(run.run.as_str()).copied().unwrap_or_default();
+        if let Some(&(usd, uncounted, ts)) = reported.get(&run.run) {
+            // The reply counted every call it had an answer to, and a call the
+            // kernel stopped waiting for as uncounted; only a late answer is new.
+            let (design_usd, design_calls, design_ms) = designed.get(&run.run).copied().unwrap_or_default();
+            let (usd, uncounted) = (usd + design_usd, uncounted.saturating_add(design_calls));
+            run.cost_usd = Some(usd + ledger.late_usd);
+            run.uncounted_calls = uncounted.saturating_sub(ledger.late);
+            run.settlement = Some(Settlement {
+                from: CostFrom::Reply,
+                calls: ledger.calls,
+                late_calls: ledger.late,
+                late_usd: ledger.late_usd,
+                replied: Some((usd, uncounted)),
+                updated_ms: ts.max(design_ms).max(ledger.late_ms),
+            });
+        } else if run.result != Status::Running && ledger.calls > 0 {
+            // No reply said, and none will: the run's calls are all in the log,
+            // as it is written before any is delivered. One with no known cost stays unknown.
+            run.cost_usd = Some(ledger.usd);
+            run.uncounted_calls = ledger.calls - ledger.known;
+            run.settlement = Some(Settlement {
+                from: CostFrom::Calls,
+                calls: ledger.calls,
+                late_calls: ledger.late,
+                late_usd: ledger.late_usd,
+                replied: None,
+                updated_ms: if ledger.last_ms > 0 { ledger.last_ms } else { run.started_ms },
+            });
         }
         if run.result != Status::Running && answered.contains(&run.run) {
             run.duration_ms = ran_for.get(&run.run).copied();
@@ -961,6 +1204,30 @@ pub fn cost(usd: Option<f64>, uncounted_calls: u32) -> String {
     }
 }
 
+/// How a run's cost was settled, in a sentence, for `molt runs show`;
+/// `None` when it is not known.
+pub fn settled(run: &Run) -> Option<String> {
+    let s = run.settlement.as_ref()?;
+    let calls = |n: u32| if n == 1 { "1 model call".to_owned() } else { format!("{n} model calls") };
+    let mut line = match (s.from, s.replied) {
+        (CostFrom::Reply, Some((usd, uncounted))) => format!("its reply said {}", cost(Some(usd), uncounted)),
+        _ => format!(
+            "no reply said; counted from the {} the audit log has, {} of them with no known cost",
+            calls(s.calls),
+            run.uncounted_calls
+        ),
+    };
+    if s.from == CostFrom::Reply && s.late_calls > 0 {
+        line.push_str(&format!(
+            "; {} answered after the kernel stopped waiting added ${:.4}",
+            calls(s.late_calls),
+            s.late_usd
+        ));
+    }
+    line.push_str(&format!("; settled as of {} UTC", when(s.updated_ms)));
+    Some(line)
+}
+
 /// A duration as `45s`, `3m07s` or `2h05m`.
 pub fn duration(ms: Option<u64>) -> String {
     let Some(ms) = ms else { return "-".to_owned() };
@@ -991,7 +1258,7 @@ pub fn learned(learning: Option<&Learning>) -> String {
 
 /// The list as a table: a heading, and a line per run.
 pub fn table(runs: &[Run]) -> String {
-    let rows: Vec<[String; 8]> = runs
+    let rows: Vec<[String; 9]> = runs
         .iter()
         .map(|r| {
             [
@@ -999,6 +1266,7 @@ pub fn table(runs: &[Run]) -> String {
                 when(r.started_ms),
                 r.result.name().to_owned() + if r.resumable { "*" } else { "" },
                 cost(r.cost_usd, r.uncounted_calls),
+                r.settlement.as_ref().map_or_else(|| "-".to_owned(), |s| when(s.updated_ms)),
                 duration(r.duration_ms),
                 learned(r.learning.as_ref()),
                 r.applied.name().to_owned(),
@@ -1006,8 +1274,9 @@ pub fn table(runs: &[Run]) -> String {
             ]
         })
         .collect();
-    let heading = ["RUN", "STARTED (UTC)", "RESULT", "COST", "TIME", "LEARNED", "APPLIED", "TASK"].map(str::to_owned);
-    let mut widths = [0usize; 8];
+    let heading = ["RUN", "STARTED (UTC)", "RESULT", "COST", "SETTLED (UTC)", "TIME", "LEARNED", "APPLIED", "TASK"]
+        .map(str::to_owned);
+    let mut widths = [0usize; 9];
     for row in std::iter::once(&heading).chain(&rows) {
         for (w, cell) in widths.iter_mut().zip(row) {
             *w = (*w).max(cell.chars().count());
@@ -1204,6 +1473,199 @@ mod tests {
         assert_eq!((replaced[0].task.as_str(), replaced[0].result), ("elsewhere", Status::Interrupted));
     }
 
+    /// A `model.complete` the planner asks under `trace`, its conversation
+    /// large enough that the log takes it out into blobs.
+    fn model_call(trace: &TraceId) -> Envelope {
+        let mut call = request(
+            trace,
+            COMPLETE,
+            json!({ "model": "m", "messages": [{ "role": "user", "content": "x".repeat(4000) }] }),
+        );
+        call.from = Some(ServiceId::new(PLANNER).unwrap());
+        call
+    }
+
+    fn answered(cost: Option<f64>) -> Value {
+        json!({ "id": "msg", "model": "m", "content": [], "usage": { "input_tokens": 10, "output_tokens": 5 },
+                "cost_usd": cost })
+    }
+
+    /// What the kernel answers when it stops waiting for a model call.
+    fn timed_out(call: &Envelope) -> Envelope {
+        let mut reply = call.error_reply(ErrorCode::Timeout, "the model did not answer in time");
+        reply.payload["settlement"] = json!({ "request_id": call.id, "local_stopped": null,
+            "remote_cancel_confirmed": null, "usage": null, "cost_usd": null });
+        reply.from = Some(ServiceId::kernel());
+        reply
+    }
+
+    fn settled_at(data_dir: &Path, call: &Envelope) -> u64 {
+        facts(data_dir)
+            .unwrap()
+            .into_iter()
+            .find_map(|f| match f {
+                Fact::Settled { call: c, ts_ms, provisional: false, .. } if c == call.id.as_str() => Some(ts_ms),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_reply_never_came_is_costed_from_its_calls_in_the_log_and_a_lost_answer_stays_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(AUDIT);
+        let log = AuditLog::open(&path, false).await.unwrap();
+        planner(&log, true).await;
+        let run = TraceId::random();
+        let asked = request(&run, RUN, json!({ "task": "cut off", "workspace": "/w", "session": "s" }));
+        append(&log, asked.clone()).await;
+        // Four calls: one priced, one of a model without a price, one refused
+        // before anything was billed, and one the planner never got an answer to.
+        let (priced, unpriced, refused, lost) =
+            (model_call(&run), model_call(&run), model_call(&run), model_call(&run));
+        for call in [&priced, &unpriced, &refused, &lost] {
+            append(&log, call.clone()).await;
+        }
+        append(&log, reply(&priced, "model", answered(Some(0.125)))).await;
+        append(&log, reply(&unpriced, "model", answered(None))).await;
+        append(&log, reply(&refused, "model", json!({ "error": { "code": "denied", "message": "bad key" } }))).await;
+        // The interface's progress events of these calls were lost; the
+        // planner is killed before it says what the run spent.
+        planner(&log, false).await;
+        // Another run's call is not this one's.
+        let other = TraceId::random();
+        let elsewhere = model_call(&other);
+        append(&log, elsewhere.clone()).await;
+        append(&log, reply(&elsewhere, "model", answered(Some(9.0)))).await;
+        log.close().await;
+
+        let listed = list(dir.path()).unwrap();
+        assert_eq!(listed.len(), 1);
+        let cut = &listed[0];
+        assert_eq!(cut.result, Status::Interrupted);
+        assert_eq!(
+            (cut.cost_usd, cut.uncounted_calls),
+            (Some(0.125), 2),
+            "the priced call is counted, the unpriced and the lost one stay unknown, the refused one is free"
+        );
+        assert_eq!(cost(cut.cost_usd, cut.uncounted_calls), "$0.1250+?");
+        let settlement = cut.settlement.as_ref().unwrap();
+        assert_eq!(
+            (settlement.from, settlement.calls, settlement.late_calls, settlement.replied),
+            (CostFrom::Calls, 4, 0, None)
+        );
+        assert_eq!(settlement.updated_ms, settled_at(dir.path(), &refused));
+        let said = settled(cut).unwrap();
+        assert!(
+            said.contains("no reply said") && said.contains("4 model calls") && said.contains("2 of them"),
+            "{said}"
+        );
+        assert!(table(&listed).contains(&when(settlement.updated_ms)), "the list shows when it was settled");
+
+        // The session's total is the same subtotal, and still says it is one.
+        let grouped = sessions(listed.clone());
+        assert_eq!((grouped[0].cost_usd, grouped[0].unknown_cost), (0.125, 1));
+        assert_eq!(grouped[0].settled_ms, Some(settlement.updated_ms));
+
+        // A run with no model call in the log, and no reply, is not known: never free.
+        let log = AuditLog::open(&path, false).await.unwrap();
+        planner(&log, true).await;
+        let bare = request(&TraceId::random(), RUN, json!({ "task": "bare", "workspace": "/w" }));
+        append(&log, bare).await;
+        planner(&log, false).await;
+        log.close().await;
+        let listed = list(dir.path()).unwrap();
+        assert_eq!((listed[1].cost_usd, listed[1].settlement.as_ref()), (None, None));
+        assert_eq!(cost(listed[1].cost_usd, listed[1].uncounted_calls), "?");
+        assert_eq!(listed[0], *cut, "read on from the index, the first run is as it was");
+
+        // While a run is still going, its calls so far are not its cost.
+        let live = request(&TraceId::random(), RUN, json!({ "task": "going", "workspace": "/w" }));
+        let mut facts = facts(dir.path()).unwrap();
+        facts.push(fact_of_message(&live));
+        let call = model_call(&live.trace_id);
+        facts.push(Fact::Called { run: live.trace_id.to_string(), call: call.id.to_string() });
+        facts.push(Fact::Settled { call: call.id.to_string(), ts_ms: 1, provisional: false, cost_usd: Some(1.0) });
+        let going = fold(&facts, true);
+        assert_eq!((going[2].result, going[2].cost_usd), (Status::Running, None));
+    }
+
+    fn fact_of_message(envelope: &Envelope) -> Fact {
+        let entry =
+            Entry { seq: 1, ts_ms: 1, hash: String::new(), event: AuditEvent::Message { envelope: envelope.clone() } };
+        fact_of(entry, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_late_answer_settles_its_call_once_however_often_it_is_read_or_repeated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(AUDIT);
+        let log = AuditLog::open(&path, false).await.unwrap();
+        planner(&log, true).await;
+        let run = TraceId::random();
+        let asked = request(&run, RUN, json!({ "task": "slow model", "workspace": "/w" }));
+        append(&log, asked.clone()).await;
+        let (quick, slow, stopped) = (model_call(&run), model_call(&run), model_call(&run));
+        for call in [&quick, &slow, &stopped] {
+            append(&log, call.clone()).await;
+        }
+        append(&log, reply(&quick, "model", answered(Some(0.5)))).await;
+        // The kernel stops waiting for two calls; the planner counts each as uncounted.
+        append(&log, timed_out(&slow)).await;
+        append(&log, timed_out(&stopped)).await;
+        let mut said = ran("passed", 0.5, true);
+        said["uncounted_calls"] = json!(2);
+        append(&log, reply(&asked, PLANNER, said)).await;
+        log.close().await;
+        let before = list(dir.path()).unwrap();
+        assert_eq!((before[0].cost_usd, before[0].uncounted_calls), (Some(0.5), 2));
+        let replied_ms = before[0].settlement.as_ref().unwrap().updated_ms;
+
+        // The molt that ran it stops; later the gateway's answers come in,
+        // as the kernel audits a late answer without delivering it.
+        let log = AuditLog::open(&path, false).await.unwrap();
+        append(&log, reply(&slow, "model", answered(Some(0.25)))).await;
+        // The same answer again settles nothing more; a stop's answer with no usage leaves its call unknown.
+        append(&log, reply(&slow, "model", answered(Some(0.25)))).await;
+        let unknown = json!({ "error": { "code": "cancelled", "message": "local request stopped" },
+            "settlement": { "request_id": stopped.id, "local_stopped": true, "remote_cancel_confirmed": null,
+                            "usage": null, "cost_usd": null } });
+        append(&log, reply(&stopped, "model", unknown)).await;
+        log.close().await;
+
+        let after = list(dir.path()).unwrap();
+        let run = &after[0];
+        assert_eq!(
+            (run.cost_usd, run.uncounted_calls),
+            (Some(0.75), 1),
+            "the late answer is counted once, and the other call is still unknown"
+        );
+        let settlement = run.settlement.as_ref().unwrap();
+        assert_eq!(
+            (settlement.from, settlement.calls, settlement.late_calls, settlement.late_usd, settlement.replied),
+            (CostFrom::Reply, 3, 1, 0.25, Some((0.5, 2))),
+            "the reply as it was is kept beside what settled after it"
+        );
+        assert_eq!(settlement.updated_ms, settled_at(dir.path(), &slow));
+        assert!(settlement.updated_ms >= replied_ms);
+        let said = settled(run).unwrap();
+        assert!(said.contains("its reply said $0.5000+?") && said.contains("1 model call answered after"), "{said}");
+        let detail = detail(dir.path(), run.run.as_str()).unwrap();
+        assert_eq!(detail.response.as_ref().map(|r| r.cost_usd), Some(0.5), "the reply in the log is not rewritten");
+
+        // Read again, from an index deleted, or of the older version, it is the same: nothing is counted twice.
+        assert_eq!(list(dir.path()).unwrap(), after);
+        std::fs::remove_file(dir.path().join(INDEX)).unwrap();
+        assert_eq!(list(dir.path()).unwrap(), after);
+        std::fs::write(dir.path().join(INDEX), "{\"version\":1}\n").unwrap();
+        assert_eq!(list(dir.path()).unwrap(), after);
+        let mut twice = facts(dir.path()).unwrap();
+        twice.extend(
+            facts(dir.path()).unwrap().into_iter().filter(|f| matches!(f, Fact::Called { .. } | Fact::Settled { .. })),
+        );
+        assert_eq!(fold(&twice, false)[0].cost_usd, Some(0.75), "facts read twice settle once");
+    }
+
     #[test]
     fn sessions_group_runs_and_count_an_unknown_cost_apart() {
         let run = |id: &str, session: Option<&str>, ms: u64, usd: Option<f64>| Run {
@@ -1225,6 +1687,7 @@ mod tests {
             learning: None,
             resumable: false,
             summary: String::new(),
+            settlement: None,
             at: 0,
         };
         let grouped = sessions(vec![

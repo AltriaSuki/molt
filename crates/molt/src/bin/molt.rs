@@ -1826,8 +1826,9 @@ fn runs_cmd(config: Option<&Path>, args: RunsArgs) -> anyhow::Result<ExitCode> {
                 0 => String::new(),
                 n => format!(" known, {n} runs' cost not known"),
             };
+            let settled = session.settled_ms.map_or_else(String::new, |ms| format!(", settled {} UTC", runs::when(ms)));
             let heading = format!(
-                "{name} · {count} · ${:.4}{unknown} · from {} UTC",
+                "{name} · {count} · ${:.4}{unknown} · from {} UTC{settled}",
                 session.cost_usd,
                 runs::when(session.started_ms)
             );
@@ -1894,6 +1895,9 @@ fn show_run(config: Option<&Path>, id: &str, json: bool, at: &MemoryAt) -> anyho
     }
     result.push_str(&format!(", cost {}", runs::cost(run.cost_usd, run.uncounted_calls)));
     lines.push(result);
+    if let Some(settled) = runs::settled(run) {
+        lines.push(format!("  {settled}"));
+    }
     if run.resumable {
         lines.push(format!("stopped with a checkpoint: `molt resume {}` goes on with it", run.run));
     }
