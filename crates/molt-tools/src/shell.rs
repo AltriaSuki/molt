@@ -28,8 +28,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cargo_cache::CargoCache;
 use crate::error::failed;
+use crate::network::Networks;
 use crate::outputs::{self, Asker, Origin};
 use crate::resources::{self, Admission};
+use crate::sandbox::LocalNet;
 use crate::{build_dir, sandbox, Roots, SandboxPolicy};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -102,6 +104,7 @@ pub(crate) async fn run(
     groups: &Arc<Groups>,
     admission: &Admission,
     sandbox: Option<(&SandboxPolicy, Option<Arc<CargoCache>>)>,
+    networks: &Arc<Networks>,
     req: RunRequest,
     cancel: CancellationToken,
     out: Out,
@@ -113,17 +116,9 @@ pub(crate) async fn run(
     };
     // A command waiting for its turn holds nothing else, not even a build directory.
     let _turn = admission.enter(&cancel).await?;
-    // Held until the command is done, so no other command builds into its directory.
-    let (ws, build) = {
-        let (roots, ws) = (roots.clone(), req.workspace.clone());
-        tokio::task::spawn_blocking(move || {
-            let ws = roots.workspace(&ws)?;
-            let build = build_dir::acquire(&roots, &ws, cargo.as_ref())?;
-            Ok::<_, RemoteError>((ws, build))
-        })
-        .await
-        .map_err(|e| failed(format!("shell.run failed: {e}")))??
-    };
+    // Held until the command is done, so no other command builds into its
+    // directory, and the processes of its workspace stay reachable.
+    let (ws, build, net) = acquire(roots, policy, cargo, networks, &req.workspace, "shell.run").await?;
     if cancel.is_cancelled() {
         return Err(RemoteError { code: ErrorCode::Cancelled, message: "command cancelled before start".into() });
     }
@@ -138,7 +133,7 @@ pub(crate) async fn run(
     let mut tries = 0;
     let (status, timed_out, cancelled, stdout, stderr) = loop {
         tries += 1;
-        let (mut cmd, guard) = command(roots, program, policy, &ws, &build, &req.command)?;
+        let (mut cmd, guard) = command(roots, program, policy, &ws, &build, net.as_deref(), &req.command)?;
         let keep = (sink.clone(), save.clone());
         let ran = once(&mut cmd, policy, guard, groups, &cancel, req.stdin.clone(), keep, limit).await;
         let (resource, said) = match ran {
@@ -164,7 +159,7 @@ pub(crate) async fn run(
         }
     };
     let duration = started.elapsed();
-    drop(build);
+    drop((build, net));
     let status = status.map_err(|e| failed(format!("waiting for the command: {e}")))?;
     let end = OutputEnd { exit_code: status.code(), signal: status.signal(), timed_out, cancelled };
     let (stdout, out_cut, out_saved) = stdout.finish(end);
@@ -290,7 +285,8 @@ pub(crate) struct Out {
 }
 
 /// `command` under `program -c` in the canonical workspace `ws`, in the
-/// sandbox `policy` describes (keep the guard while it runs) or unconfined
+/// sandbox `policy` describes and on `net` when it has one (keep the guard
+/// while it runs) or unconfined
 /// without the service's secrets, in a process group of its own, with its
 /// output piped. Its standard input is left for the caller to set.
 pub(crate) fn command(
@@ -299,12 +295,13 @@ pub(crate) fn command(
     policy: Option<&SandboxPolicy>,
     ws: &Path,
     build: &build_dir::BuildDir,
+    net: Option<&LocalNet>,
     command: &str,
 ) -> Result<(Command, Option<sandbox::Guard>), RemoteError> {
     let (mut cmd, guard) = match policy {
         Some(policy) => {
             let (cmd, guard) =
-                policy.prepare(roots, ws, program, build).map_err(|e| failed(format!("sandbox: {e:#}")))?;
+                policy.prepare(roots, ws, program, build, net).map_err(|e| failed(format!("sandbox: {e:#}")))?;
             (cmd, Some(guard))
         }
         None => (Command::new(program), None),
@@ -321,6 +318,32 @@ pub(crate) fn command(
         }
     }
     Ok((cmd, guard))
+}
+
+/// What a command in `workspace` holds while it runs: the canonical
+/// workspace, its build directory, and the network it shares with what else
+/// runs there, if it shares one.
+pub(crate) async fn acquire(
+    roots: &Arc<Roots>,
+    policy: Option<&SandboxPolicy>,
+    cargo: Option<Arc<CargoCache>>,
+    networks: &Arc<Networks>,
+    workspace: &str,
+    method: &str,
+) -> Result<(PathBuf, build_dir::BuildDir, Option<Arc<LocalNet>>), RemoteError> {
+    let (roots, ws, networks) = (roots.clone(), workspace.to_owned(), networks.clone());
+    let policy = policy.filter(|policy| policy.shares_local_network()).cloned();
+    tokio::task::spawn_blocking(move || {
+        let ws = roots.workspace(&ws)?;
+        let build = build_dir::acquire(&roots, &ws, cargo.as_ref())?;
+        let net = match &policy {
+            Some(policy) => networks.join(policy, &ws)?,
+            None => None,
+        };
+        Ok::<_, RemoteError>((ws, build, net))
+    })
+    .await
+    .map_err(|e| failed(format!("{method} failed: {e}")))?
 }
 
 /// What package managers and network clients print when they cannot reach
@@ -696,7 +719,9 @@ mod tests {
                 stream: false,
                 stdin: None,
             };
-            run(&self.roots, &find_shell(), &self.groups, &self.admission, None, req, cancel, Out::default()).await
+            let networks = Arc::default();
+            run(&self.roots, &find_shell(), &self.groups, &self.admission, None, &networks, req, cancel, Out::default())
+                .await
         }
     }
 

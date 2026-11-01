@@ -129,6 +129,14 @@ pub struct StartRequest {
     /// maximum are set by the service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
+    /// A TCP port it listens on. It is ready once a socket listens there
+    /// in the network it runs on (with `ready` too, once both hold), and
+    /// each answer says whether one still does
+    /// ([`ProcessState::listening`]). In the sandbox without the network,
+    /// that is its workspace's own: the same port in another workspace is
+    /// another socket, which it neither takes nor reaches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,10 +204,15 @@ pub struct ProcessState {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<i32>,
-    /// Whether the start's `ready` text has appeared in its output; none
-    /// when the start gave none.
+    /// Whether the start's `ready` text has appeared in its output, and
+    /// something listened on its `port`; none when the start gave neither.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready: Option<bool>,
+    /// Whether a socket listens on the start's `port` now, in the network
+    /// it runs on: false once it ended, or when what listened went away
+    /// (a server that crashed). None when the start gave no port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listening: Option<bool>,
     pub output: String,
     /// Where `output` starts, counted in bytes of everything it printed:
     /// one read's `next` is the following read's `offset`.

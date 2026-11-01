@@ -364,3 +364,179 @@ fn a_sandbox_the_host_cannot_afford_names_the_resource_and_never_starts_unconfin
     // With what it needs again, it starts.
     Shell::with_policy(roots, ExecutionPolicy::Configured(SandboxPolicy::default())).unwrap();
 }
+
+/// What a test of the shared network (#225) needs: the sandbox, and a
+/// command that can join a network of its workspace's on this host.
+async fn shared_network_env() -> Option<Env> {
+    let env = Env::new(SandboxPolicy::default()).await?;
+    if let Err(error) = SandboxPolicy::default().probe_local_network() {
+        assert!(
+            std::env::var_os("MOLT_REQUIRE_SANDBOX_TESTS").is_none(),
+            "required shared network unavailable: {error:#}"
+        );
+        eprintln!("shared network unavailable in this executor: {error:#}");
+        return None;
+    }
+    Some(env)
+}
+
+impl Env {
+    async fn run_in(&self, fork: &str, command: &str) -> RunResponse {
+        serde_json::from_value(self.shell.handle("run", json!({"workspace": fork, "command": command})).await.unwrap())
+            .unwrap()
+    }
+
+    async fn serve(&self, fork: &str, port: u16) -> molt_api::shell::ProcessState {
+        let command = format!("exec python3 -m http.server {port} --bind 127.0.0.1");
+        let start = json!({"workspace": fork, "command": command, "port": port, "wait_ms": 10_000});
+        serde_json::from_value(self.shell.handle("start", start).await.unwrap()).unwrap()
+    }
+
+    async fn read_until_ended(&self, fork: &str, id: &str) -> molt_api::shell::ProcessState {
+        use molt_api::shell::{ProcessState, ProcessStatus};
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let read = json!({"workspace": fork, "id": id, "wait_ms": 500});
+            let state: ProcessState = serde_json::from_value(self.shell.handle("read", read).await.unwrap()).unwrap();
+            if state.status != ProcessStatus::Running || std::time::Instant::now() > until {
+                return state;
+            }
+        }
+    }
+}
+
+/// A command that fetches `path` from the server on `port` at localhost and prints it.
+fn fetch(port: u16, path: &str) -> String {
+    format!("python3 -c \"import urllib.request as u; print(u.urlopen('http://localhost:{port}/{path}', timeout=5).read().decode(), end='')\"")
+}
+
+/// A command that succeeds only when nothing accepts a connection to `host:port`.
+fn unreachable(host: &str, port: u16) -> String {
+    format!("python3 -c \"import socket\ntry: socket.create_connection(('{host}', {port}), timeout=2)\nexcept OSError as e: print(e)\nelse: raise SystemExit('reached {host}:{port}')\"")
+}
+
+#[tokio::test]
+async fn a_test_command_reaches_the_server_its_workspace_runs_and_nothing_outside_it() {
+    use molt_api::shell::{ProcessStatus, StopResponse};
+    let host = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let host_port = host.local_addr().unwrap().port();
+    let Some(env) = shared_network_env().await else { return };
+    fs::write(PathBuf::from(&env.fork).join("served.txt"), "the fork's page").unwrap();
+    let server = env.serve(&env.fork, 8000).await;
+    assert_eq!(
+        (server.status, server.ready, server.listening),
+        (ProcessStatus::Running, Some(true), Some(true)),
+        "{server:?}"
+    );
+    assert_eq!(env.shell.live_networks(), 1);
+
+    // Another command, started after it, is the test that talks to it.
+    let client = env.run(&fetch(8000, "served.txt")).await;
+    assert!(client.success(), "{}", client.stderr);
+    assert_eq!(client.stdout, "the fork's page");
+    // The host's own service and anything outside stay out of reach.
+    let host_service = env.run(&unreachable("127.0.0.1", host_port)).await;
+    assert!(host_service.success(), "{host_service:?}");
+    let outside = env.run(&unreachable("192.0.2.1", 80)).await;
+    assert!(outside.success() && outside.stdout.contains("unreachable"), "{outside:?}");
+
+    let stopped: StopResponse =
+        serde_json::from_value(env.shell.handle("stop", json!({"workspace": env.fork})).await.unwrap()).unwrap();
+    assert_eq!(stopped.stopped[0].listening, Some(false));
+    assert_eq!(env.shell.live_networks(), 0, "nothing runs in it, so it is gone");
+}
+
+#[tokio::test]
+async fn two_attempts_serve_on_the_same_port_without_conflict_and_each_reads_only_its_own() {
+    use molt_api::shell::ProcessStatus;
+    let Some(env) = shared_network_env().await else { return };
+    let files = Fs::new(env.roots.clone()).unwrap();
+    let other: ForkResponse =
+        serde_json::from_value(files.handle("fork", json!({"workspace": env.roots.root})).await.unwrap()).unwrap();
+    let forks = [env.fork.clone(), other.fork];
+    for (fork, data) in forks.iter().zip(["first attempt", "second attempt"]) {
+        fs::write(PathBuf::from(fork).join("served.txt"), data).unwrap();
+        let server = env.serve(fork, 8000).await;
+        assert_eq!((server.status, server.ready), (ProcessStatus::Running, Some(true)), "{server:?}");
+    }
+    assert_eq!(env.shell.live_networks(), 2);
+    for (fork, data) in forks.iter().zip(["first attempt", "second attempt"]) {
+        for _ in 0..3 {
+            let client = env.run_in(fork, &fetch(8000, "served.txt")).await;
+            assert!(client.success(), "{}", client.stderr);
+            assert_eq!(client.stdout, data, "an attempt read another's server");
+        }
+    }
+    for fork in &forks {
+        env.shell.handle("stop", json!({"workspace": fork})).await.unwrap();
+    }
+    assert_eq!(env.shell.live_networks(), 0);
+}
+
+#[tokio::test]
+async fn a_crash_a_cancel_and_a_removed_fork_free_the_network_and_a_new_copy_never_reaches_the_old_server() {
+    use molt_api::shell::{ProcessState, ProcessStatus};
+    let Some(env) = shared_network_env().await else { return };
+    let fork = env.fork.clone();
+    fs::write(PathBuf::from(&fork).join("served.txt"), "old copy").unwrap();
+    // Keeps the workspace's network up between the steps, so each runs on the same one.
+    let keep = json!({"workspace": fork, "command": "exec sleep 60", "wait_ms": 0});
+    let keep: ProcessState = serde_json::from_value(env.shell.handle("start", keep).await.unwrap()).unwrap();
+
+    // A server that crashes after one request: it is seen to stop listening, and its port is free again.
+    let crashing = "exec python3 -c \"import http.server as h; s = h.HTTPServer(('127.0.0.1', 8001), h.SimpleHTTPRequestHandler); s.handle_request(); raise SystemExit(3)\"";
+    let start = json!({"workspace": fork, "command": crashing, "port": 8001, "wait_ms": 10_000});
+    let server: ProcessState = serde_json::from_value(env.shell.handle("start", start).await.unwrap()).unwrap();
+    assert_eq!((server.ready, server.listening), (Some(true), Some(true)), "{server:?}");
+    assert!(env.run(&fetch(8001, "served.txt")).await.success());
+    let crashed = env.read_until_ended(&fork, &server.id).await;
+    assert_eq!((crashed.status, crashed.exit_code, crashed.listening), (ProcessStatus::Exited, Some(3), Some(false)));
+    let bind = |port: u16| format!("python3 -c \"import socket; socket.create_server(('127.0.0.1', {port}))\"");
+    let rebound = env.run(&bind(8001)).await;
+    assert!(rebound.success(), "the crashed server's port is still taken: {}", rebound.stderr);
+
+    // A start cancelled while it waits: its server is stopped, and its port is free.
+    let cancel = CancellationToken::new();
+    let start = json!({"workspace": fork, "command": "exec python3 -m http.server 8002 --bind 127.0.0.1", "ready": "never printed", "wait_ms": 30_000});
+    let (cancelled, ()) = tokio::join!(env.shell.handle_cancellable("start", start, cancel.clone()), async {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        cancel.cancel();
+    });
+    assert_eq!(cancelled.unwrap_err().code, molt_proto::ErrorCode::Cancelled);
+    let rebound = env.run(&bind(8002)).await;
+    assert!(rebound.success(), "the cancelled server's port is still taken: {}", rebound.stderr);
+    assert_eq!(env.shell.live_networks(), 1, "every step ran on the workspace's one network");
+
+    // The fork is removed and made again at its path, as a recovery would: the new copy gets a
+    // network of its own, and the old copy's server is stopped instead of answering it.
+    let old = env.serve(&fork, 8003).await;
+    assert_eq!(old.ready, Some(true), "{old:?}");
+    fs::remove_dir_all(&fork).unwrap();
+    fs::create_dir(&fork).unwrap();
+    let new_copy = env.run(&unreachable("127.0.0.1", 8003)).await;
+    assert!(new_copy.success(), "the new copy reached the old copy's server: {new_copy:?}");
+    for id in [&old.id, &keep.id] {
+        let ended = env.read_until_ended(&fork, id).await;
+        assert_eq!(ended.status, ProcessStatus::Stopped, "{ended:?}");
+    }
+    assert_eq!(env.shell.live_networks(), 0, "the old copy's network went with its processes");
+}
+
+#[test]
+fn a_command_joins_a_shared_network_the_moment_it_is_made_even_under_load() {
+    let policy = SandboxPolicy::default();
+    if let Err(error) = policy.probe() {
+        assert!(std::env::var_os("MOLT_REQUIRE_SANDBOX_TESTS").is_none(), "required sandbox unavailable: {error:#}");
+        return;
+    }
+    // Many at once, so a join that came before the holder's sandbox was set up would be seen.
+    let joins: Vec<_> = (0..16)
+        .map(|_| {
+            let policy = policy.clone();
+            std::thread::spawn(move || (0..4).try_for_each(|_| policy.probe_local_network()))
+        })
+        .collect();
+    for join in joins {
+        join.join().unwrap().unwrap();
+    }
+}

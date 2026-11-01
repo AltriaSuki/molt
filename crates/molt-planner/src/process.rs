@@ -46,9 +46,10 @@ pub(crate) fn definitions() -> Vec<Value> {
                             is stopped when you give your final reply, before your work is checked, and when your \
                             attempt ends; one runs for at most 30 minutes, and at most 4 run at once. Its input and \
                             output are pipes, not a terminal: a program that buffers its output may need a flag \
-                            such as python -u. A command run with run may not reach a process's ports, since each \
-                            runs isolated: to talk to a server, start bash as the process and run the server and \
-                            the client in it with write_process.",
+                            such as python -u. Commands you run with run reach the ports a process listens on, at \
+                            localhost, while it runs: start a server, then test it with run. Give port, the port \
+                            it listens on, to wait until it does. Nothing outside your workspace reaches them, and \
+                            another attempt's server on the same port is another server.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -60,7 +61,12 @@ pub(crate) fn definitions() -> Vec<Value> {
                     },
                     "timeout_s": {
                         "type": "integer",
-                        "description": "Seconds to wait for ready. Default 30, at most 120.",
+                        "description": "Seconds to wait for ready or port. Default 30, at most 120.",
+                    },
+                    "port": {
+                        "type": "integer",
+                        "description": "A TCP port the program listens on once it is up, to wait for: with ready \
+                                        too, until both hold.",
                     },
                 },
                 "required": ["command"],
@@ -178,9 +184,11 @@ impl Call {
             Self::Start(s) => {
                 let wait_s = s.timeout_s.unwrap_or(READY_S).clamp(1, MAX_READY_S);
                 let ready = s.ready.filter(|r| !r.is_empty());
-                // Without a ready text the service waits its own short while.
-                let wait_ms = ready.as_ref().map(|_| wait_s * 1000);
-                let req = shell::StartRequest { workspace, command: s.command, lifetime_ms: None, ready, wait_ms };
+                let port = s.port.filter(|&port| port > 0);
+                // Without a ready text or a port the service waits its own short while.
+                let wait_ms = (ready.is_some() || port.is_some()).then_some(wait_s * 1000);
+                let req =
+                    shell::StartRequest { workspace, command: s.command, lifetime_ms: None, ready, wait_ms, port };
                 let budget = Budget::new(0, wait_ms.unwrap_or(0) + CALL_MS, 0);
                 let state: ProcessState = ctx.call(shell::START, req, budget).await?;
                 Ok(format!("Started process {}.\n{}", state.id, show(&state, ctx.outputs)))
@@ -237,11 +245,21 @@ fn show(p: &ProcessState, outputs: bool) -> String {
             format!("Process {} (`{command}`) ran as long as it may ({secs} s) and was stopped.", p.id)
         }
     };
-    match p.ready {
-        Some(true) => out.push_str(" Its ready text appeared."),
-        Some(false) if p.status == ProcessStatus::Running => out.push_str(" Its ready text has not appeared yet."),
-        Some(false) => out.push_str(" Its ready text never appeared."),
-        None => {}
+    // With a port, ready means the text (if any) appeared and the port listened.
+    let running = p.status == ProcessStatus::Running;
+    match (p.ready, p.listening.is_some()) {
+        (Some(true), true) => out.push_str(" It is ready."),
+        (Some(true), false) => out.push_str(" Its ready text appeared."),
+        (Some(false), true) if running => out.push_str(" It is not ready yet."),
+        (Some(false), true) => out.push_str(" It was never ready."),
+        (Some(false), false) if running => out.push_str(" Its ready text has not appeared yet."),
+        (Some(false), false) => out.push_str(" Its ready text never appeared."),
+        (None, _) => {}
+    }
+    match p.listening {
+        Some(true) => out.push_str(" Its port is listening."),
+        Some(false) if p.status == ProcessStatus::Running => out.push_str(" Nothing listens on its port now."),
+        _ => {}
     }
     if p.omitted > 0 {
         out.push_str(&format!("\n[{} bytes of its output are not shown: they were cut or no longer kept]", p.omitted));
@@ -294,6 +312,7 @@ mod tests {
             exit_code: None,
             signal: None,
             ready: Some(true),
+            listening: None,
             output: "ready on :3000\n".into(),
             offset: 10,
             next: 25,
@@ -318,6 +337,25 @@ mod tests {
             show(&exited, false),
             "Process proc_1 (`npm run dev`) exited with code 1 after 2 s. Its ready text never appeared.\n[7 bytes of \
              its output are not shown: they were cut or no longer kept]\n(no new output)"
+        );
+        // With a port, ready is about the port too, and each state says whether it still listens.
+        let serving =
+            ProcessState { ready: Some(true), listening: Some(true), output: String::new(), ..exited.clone() };
+        let serving = ProcessState { status: ProcessStatus::Running, exit_code: None, omitted: 0, ..serving };
+        assert_eq!(
+            show(&serving, false),
+            "Process proc_1 (`npm run dev`) is running (2 s). It is ready. Its port is listening.\n(no new output)"
+        );
+        let waiting = ProcessState { ready: Some(false), listening: Some(false), ..serving.clone() };
+        assert_eq!(
+            show(&waiting, false),
+            "Process proc_1 (`npm run dev`) is running (2 s). It is not ready yet. Nothing listens on its port \
+             now.\n(no new output)"
+        );
+        let crashed = ProcessState { status: ProcessStatus::Exited, exit_code: Some(1), ..waiting };
+        assert_eq!(
+            show(&crashed, false),
+            "Process proc_1 (`npm run dev`) exited with code 1 after 2 s. It was never ready.\n(no new output)"
         );
     }
 }

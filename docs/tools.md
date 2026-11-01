@@ -34,10 +34,20 @@ were.
 
 | Tool | Calls | What it does |
 | --- | --- | --- |
-| `start_process` | `shell.start` | Starts `command` and answers with its id and what it printed so far. Given `ready`, text the program prints once it is up, it waits for it (`timeout_s`, default 30, at most 120) and says whether it appeared or the command exited first. |
+| `start_process` | `shell.start` | Starts `command` and answers with its id and what it printed so far. Given `ready`, text the program prints once it is up, it waits for it (`timeout_s`, default 30, at most 120) and says whether it appeared or the command exited first. Given `port`, it also waits until something listens on that TCP port, and every answer about the process says whether something still does. |
 | `read_process` | `shell.read` | What the process printed since the last read, standard output and error together, and whether it is still running or how it ended. `wait_s` (at most 30) waits for output when there is none yet. |
 | `write_process` | `shell.write` | Writes `input` to its standard input, at most 64 KiB; `close` closes it after. Fails once the process has ended. |
 | `stop_process` | `shell.stop` | Stops it with everything it started. Stopping it again answers the same. |
+
+In the sandbox without the network, a workspace's processes and commands
+share a network of their own (#225): a `run` command reaches a server a
+process started, at `localhost` or `127.0.0.1`, so an attempt starts its
+server and then tests it with `run`. Another attempt's fork has another
+network, so two attempts can serve on the same port without either reaching
+the other's, and no host service or outside address is reachable from it.
+The network lasts while something runs in the workspace; a fork removed and
+made again at the same path gets a new one, and its old processes are
+stopped. See [Linux command isolation](sandbox.md#a-workspaces-own-network).
 
 A process runs as `run`'s commands do: in the attempt's fork, in the same
 sandbox, with the same environment, limits and network policy, in a process
