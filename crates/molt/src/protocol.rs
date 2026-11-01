@@ -93,6 +93,17 @@ pub mod method {
         COMMAND_STOP,
     ];
 
+    pub const SESSIONS_LIST: &str = "sessions.list";
+    pub const SESSIONS_NEW: &str = "sessions.new";
+    pub const SESSIONS_LOAD: &str = "sessions.load";
+    pub const SESSIONS_ARCHIVE: &str = "sessions.archive";
+    pub const SESSIONS_DELETE: &str = "sessions.delete";
+
+    /// Methods added to version 1 after its record (RFC 0006): a client of
+    /// version 1 that does not call them works as before. Their messages are
+    /// in `testdata/protocol-v1-sessions.jsonl`.
+    pub const ADDED: [&str; 5] = [SESSIONS_LIST, SESSIONS_NEW, SESSIONS_LOAD, SESSIONS_ARCHIVE, SESSIONS_DELETE];
+
     /// The notification the server sends for each progress event.
     pub const PROGRESS: &str = "progress";
 }
@@ -448,6 +459,49 @@ pub struct Command {
     pub command: String,
 }
 
+/// `sessions.list`: the stored sessions of the server's workspace.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ListSessions {
+    /// List archived sessions too.
+    #[serde(default)]
+    pub archived: bool,
+}
+
+/// `sessions.new`: a stored session for this connection's tasks.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NewSession {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Begin it with what the interface saved of its last session in this
+    /// workspace: the earlier tasks' summaries, the spend, a task in flight
+    /// and a result that waited. The interface's file is left as it is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub import: bool,
+}
+
+/// `sessions.load` and `sessions.delete`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionId {
+    pub id: String,
+}
+
+/// `sessions.archive`: archive session `id`, or with `restore`, take it out of the archive.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveSession {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restore: bool,
+}
+
+/// What `sessions.new` and `sessions.load` answer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredSession {
+    pub session: crate::sessions::Loaded,
+    /// This connection's tasks go into it now. An archived session is only
+    /// read: restore it first.
+    pub held: bool,
+}
+
 /// An empty result or parameters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Empty {}
@@ -489,6 +543,9 @@ mod tests {
     /// types of today. A change that would break one is a new version.
     const V1: &str = include_str!("testdata/protocol-v1.jsonl");
     const V1_SHA256: &str = "89a009a3310ec608418b994f02b0e0c3680f1d58019118c5b520a0ab3aaf896c";
+    /// The methods added to version 1 since (RFC 0006), recorded the same way and never edited.
+    const ADDED: &str = include_str!("testdata/protocol-v1-sessions.jsonl");
+    const ADDED_SHA256: &str = "55e13e2097dc35353d123b26e3c3d692a3b8f6c0cdc08ba137250e1bad64f276";
 
     /// Whether `new` has everything `old` has: each field, with the same
     /// value or one that has everything it had.
@@ -551,15 +608,43 @@ mod tests {
             method::NOTES_USED => both!(UsedNotes, Vec<RecallSnapshot>),
             method::COMMAND_RUN => both!(Command, molt_api::shell::RunResponse),
             method::COMMAND_STOP => both!(Run, Empty),
+            method::SESSIONS_LIST => both!(ListSessions, Vec<crate::sessions::Listed>),
+            method::SESSIONS_NEW => both!(NewSession, StoredSession),
+            method::SESSIONS_LOAD => both!(SessionId, StoredSession),
+            method::SESSIONS_ARCHIVE => both!(ArchiveSession, Empty),
+            method::SESSIONS_DELETE => both!(SessionId, Empty),
             other => Err(format!("{other} is not a method any more")),
         }
     }
 
     #[test]
     fn every_message_of_version_1_still_reads_and_keeps_every_field() {
+        let (seen, problems) = read_record(V1);
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+        for name in method::ALL {
+            assert!(seen.iter().any(|s| s == name), "{name} has no message in testdata/protocol-v1.jsonl");
+        }
+        let sha = hex::encode(Sha256::digest(V1.as_bytes()));
+        assert_eq!(sha, V1_SHA256, "testdata/protocol-v1.jsonl is version 1 as released: add a new version instead");
+    }
+
+    #[test]
+    fn every_message_of_the_methods_added_to_version_1_still_reads_and_keeps_every_field() {
+        let (seen, problems) = read_record(ADDED);
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+        for name in method::ADDED {
+            assert!(seen.iter().any(|s| s == name), "{name} has no message in testdata/protocol-v1-sessions.jsonl");
+            assert!(!method::ALL.contains(&name), "{name} is in version 1's record already");
+        }
+        let sha = hex::encode(Sha256::digest(ADDED.as_bytes()));
+        assert_eq!(sha, ADDED_SHA256, "testdata/protocol-v1-sessions.jsonl is as released: add a new file instead");
+    }
+
+    /// The methods `record` has messages of, and each line that does not read as it was.
+    fn read_record(record: &str) -> (Vec<String>, Vec<String>) {
         let mut seen = Vec::new();
         let mut problems = Vec::new();
-        for (n, line) in V1.lines().enumerate() {
+        for (n, line) in record.lines().enumerate() {
             let entry: Value = serde_json::from_str(line).unwrap();
             let result = match (&entry["method"], &entry["notification"]) {
                 (Value::String(name), _) => {
@@ -575,12 +660,7 @@ mod tests {
                 problems.push(format!("line {}: {problem}", n + 1));
             }
         }
-        assert!(problems.is_empty(), "{}", problems.join("\n"));
-        for name in method::ALL {
-            assert!(seen.iter().any(|s| s == name), "{name} has no message in testdata/protocol-v1.jsonl");
-        }
-        let sha = hex::encode(Sha256::digest(V1.as_bytes()));
-        assert_eq!(sha, V1_SHA256, "testdata/protocol-v1.jsonl is version 1 as released: add a new version instead");
+        (seen, problems)
     }
 
     #[test]

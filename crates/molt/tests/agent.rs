@@ -4180,3 +4180,112 @@ fn a_pack_is_found_by_name_in_a_registry_and_installed_as_its_path_would_be() {
     let (_, list, _) = ext(&cwd, &["list"]);
     assert!(list.starts_with("notes 1.0.0 enabled"), "{list}");
 }
+
+/// The interface's server on a pipe, with `cfg` for `workspace`, initialized.
+async fn ui_backend(
+    cfg: &Config,
+    workspace: &Path,
+) -> (tokio::process::Child, Rpc<tokio::process::ChildStdout, tokio::process::ChildStdin>) {
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_molt"))
+        .arg("ui-backend")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut rpc = Rpc::new(child.stdout.take().unwrap(), child.stdin.take().unwrap());
+    rpc.line(&json!({"cfg": cfg, "workspace": workspace.to_str().unwrap()})).await;
+    rpc.call("initialize", json!({"protocol": 1})).await;
+    (child, rpc)
+}
+
+/// RFC 0006: a stored session holds every task, reply, decision and cost
+/// through a server killed outright and through a normal exit, the next
+/// task is told of the earlier ones, and loading it calls no model.
+#[tokio::test]
+async fn a_stored_session_survives_a_killed_server_and_a_normal_exit_and_loading_it_calls_no_model() {
+    let server = fake_api(Fake::Greets).await;
+    let setup = Setup::new(&server);
+    let workspace = setup.workspace.path().canonicalize().unwrap();
+    let task = |round: u32| format!("Write a greeting into greeting.txt (round {round}).");
+    let submit = |round: u32| {
+        let mut req = setup.request(Some(CHECK), 1);
+        (req.task, req.workspace, req.apply) = (task(round), String::new(), false);
+        json!({"trace": molt_proto::TraceId::random(), "request": req})
+    };
+
+    let (mut first, mut rpc) = ui_backend(&setup.cfg, &workspace).await;
+    let made = rpc.call("sessions.new", json!({"title": "greetings"})).await;
+    let id = made["session"]["id"].as_str().unwrap().to_owned();
+    rpc.call("session.open", json!({})).await;
+    let one = rpc.call("task.submit", submit(1)).await;
+    let kept = one["fork"].as_str().expect("kept in its fork").to_owned();
+    rpc.call("result.keep", json!({"fork": kept})).await;
+    let two = rpc.call("task.submit", submit(2)).await;
+    let waiting = two["fork"].as_str().expect("kept in its fork").to_owned();
+    // Killed outright, with a result the person has not decided on.
+    first.kill().await.unwrap();
+    drop(rpc);
+
+    let calls = server.received_requests().await.unwrap().len();
+    let (mut second, mut rpc) = ui_backend(&setup.cfg, &workspace).await;
+    let listed = rpc.call("sessions.list", json!({})).await;
+    assert_eq!((&listed[0]["id"], &listed[0]["tasks"]), (&json!(id), &json!(2)), "{listed}");
+    let loaded = rpc.call("sessions.load", json!({"id": id})).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), calls, "loading called no model");
+    assert_eq!(loaded["held"], true, "{loaded}");
+    let session = &loaded["session"];
+    let tasks: Vec<&Value> = session["earlier"].as_array().unwrap().iter().map(|e| &e["task"]).collect();
+    assert_eq!(tasks, [&json!(task(1)), &json!(task(2))], "{session}");
+    assert_eq!(session["results"].as_array().unwrap().len(), 1, "{session}");
+    assert_eq!((&session["results"][0]["fork"], &session["results"][0]["gone"]), (&json!(waiting), &json!(false)));
+    let paid = |result: &Value| result["cost_usd"].as_f64().unwrap();
+    let known = session["spent"]["known_usd"].as_f64().unwrap();
+    assert!(paid(&one) > 0.0 && (known - paid(&one) - paid(&two)).abs() < 1e-9, "{session}");
+    assert_eq!(session["spent"]["unsettled_runs"], 0, "{session}");
+    assert!(session["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["kind"] == "reply" && !e["conversation"].as_array().unwrap().is_empty()));
+
+    // The next task is told of the earlier ones; then the waiting result is applied.
+    rpc.call("session.open", json!({})).await;
+    let before = server.received_requests().await.unwrap().len();
+    let three = rpc.call("task.submit", submit(3)).await;
+    assert_eq!(three["outcome"], "passed", "{three}");
+    let told = bodies(&server).await[before..]
+        .iter()
+        .any(|b| b.to_string().contains("round 1") && b.to_string().contains("round 2"));
+    assert!(told, "the third task's model calls were told of the first two");
+    let applied = rpc.call("result.apply", json!({"fork": waiting})).await;
+    assert_eq!(applied["changes"][0]["path"], "greeting.txt", "{applied}");
+    assert_eq!(rpc.call("session.close", json!({"keep": []})).await, json!({}));
+    drop(rpc);
+    assert!(tokio::time::timeout(Duration::from_secs(15), second.wait()).await.unwrap().unwrap().success());
+
+    // After a normal exit everything is there, applied as it was.
+    let (mut third, mut rpc) = ui_backend(&setup.cfg, &workspace).await;
+    let session = rpc.call("sessions.load", json!({"id": id})).await["session"].clone();
+    let applied: Vec<&Value> = session["earlier"].as_array().unwrap().iter().map(|e| &e["applied"]).collect();
+    assert_eq!(applied, [&json!(false), &json!(true), &json!(false)], "{session}");
+    let decisions: Vec<&Value> = session["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "decided")
+        .map(|e| &e["decision"])
+        .collect();
+    assert_eq!(decisions, [&json!("kept"), &json!("applied")], "{session}");
+    let three_fork = three["fork"].as_str().unwrap();
+    assert_eq!(session["results"][0]["fork"], three_fork, "{session}");
+    assert!(Path::new(three_fork).is_dir(), "a result the session waits on outlives the close");
+    let known = session["spent"]["known_usd"].as_f64().unwrap();
+    assert!((known - paid(&one) - paid(&two) - paid(&three)).abs() < 1e-9, "{session}");
+    assert!(session["notes"].as_array().unwrap().is_empty(), "{session}");
+    rpc.call("sessions.delete", json!({"id": id})).await;
+    drop(rpc);
+    assert!(tokio::time::timeout(Duration::from_secs(15), third.wait()).await.unwrap().unwrap().success());
+    assert_requests_valid(&server).await;
+}

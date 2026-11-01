@@ -21,6 +21,7 @@ pub mod readiness;
 pub mod runs;
 pub mod serve;
 pub mod session;
+pub mod sessions;
 pub mod tui;
 
 use std::future::Future;
