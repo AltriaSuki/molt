@@ -73,6 +73,12 @@ pub fn load(store: &Store) -> anyhow::Result<Option<Saved>> {
     Ok(Some(saved))
 }
 
+/// The saved session of `workspace` under `data`, for a server session to
+/// take over (RFC 0006). The file stays: this interface still reads it.
+pub(crate) fn load_for(data: &std::path::Path, workspace: &std::path::Path) -> anyhow::Result<Option<Saved>> {
+    load(&Store::new(data, workspace)?)
+}
+
 pub fn save(store: &Store, saved: &Saved) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec(&Saved { version: VERSION, ..saved.clone() })?;
     ensure!(bytes.len() <= MAX_BYTES, "the saved session exceeds its size limit; /new starts a smaller one");

@@ -8,6 +8,11 @@
 //! is open in a server: one kernel per data dir. Whatever a client asks is
 //! what the interface could ask; the config, the workspace and the
 //! capabilities come from the server's own start, never from a client.
+//!
+//! A connection may also hold a stored session (RFC 0006): its tasks, their
+//! replies, the questions and the person's decisions go into that
+//! session's journal, each before the request it records is answered, so a
+//! later connection or process loads them again.
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
@@ -30,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 use crate::project::Project;
 use crate::protocol::{self as p, code, method, Error, Id, Notification, Response, ServerMessage};
 use crate::session::Session;
+use crate::sessions::{self, Decision, Entry, Sessions, Writer};
 use crate::{agent, Config};
 
 /// Where and how the services run: the flags `molt`, `molt ui` and `molt serve` share.
@@ -161,6 +167,8 @@ impl Server {
             commands: HashMap::new(),
             before: None,
             forks: Arc::default(),
+            stored: Sessions::new(&self.cfg.kernel.data_dir),
+            held: Arc::default(),
         };
         let end = loop {
             tokio::select! {
@@ -203,6 +211,8 @@ impl Server {
             }
         }
         reader.abort();
+        // The session is kept as it is; another connection may hold it now.
+        held(&conn.held).take();
         drop(conn);
         // The last answers are written, unless the client is not reading.
         let _ = outbox.tx.send(Out::End);
@@ -276,6 +286,38 @@ struct Work {
 /// A session that came up, or why not, for the `session.open` of that id.
 type Started = (Option<Id>, Result<Arc<Session>, String>);
 
+/// The stored session a connection holds, if any (RFC 0006).
+type Held = Arc<Mutex<Option<Writer>>>;
+
+fn held(held: &Held) -> std::sync::MutexGuard<'_, Option<Writer>> {
+    held.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Add what `entry` makes of the stored session `id` to its journal, if this
+/// connection still holds it. A failure is logged: the work it records is
+/// done, and its answer still goes to the client.
+fn record(held_session: &Held, id: &str, entry: impl FnOnce(&sessions::Loaded) -> Option<Entry>) {
+    let mut guard = held(held_session);
+    let Some(writer) = guard.as_mut().filter(|w| w.id() == id) else { return };
+    let Some(entry) = entry(writer.loaded()) else { return };
+    if let Err(e) = writer.append(entry) {
+        tracing::warn!("session {id} could not record what happened: {e:#}");
+    }
+}
+
+/// The decision on `fork`, when the fork holds one of the stored session's results.
+fn decided(fork: &str, decision: Decision, paths: Vec<String>) -> impl FnOnce(&sessions::Loaded) -> Option<Entry> + '_ {
+    move |loaded| {
+        loaded.results.iter().any(|r| r.fork == fork).then(|| Entry::Decided { fork: fork.to_owned(), decision, paths })
+    }
+}
+
+/// A refusal to hold or remove a session: another client holds it, or why not.
+fn refused(e: anyhow::Error) -> Error {
+    let busy = e.downcast_ref::<sessions::Busy>().is_some();
+    Error::new(if busy { code::BUSY } else { code::FAILED }, format!("{e:#}"))
+}
+
 struct Connection {
     server: Arc<Server>,
     /// The session of the runs this client asks for that name none.
@@ -293,6 +335,9 @@ struct Connection {
     /// The work tree as it was when the task `.0` started, for `commit.make`.
     before: Option<(String, anyhow::Result<crate::git::Before>)>,
     forks: Arc<Mutex<Forks>>,
+    /// The stored sessions of the data dir, and the one this connection holds.
+    stored: Sessions,
+    held: Held,
 }
 
 fn failed(e: impl std::fmt::Display) -> Error {
@@ -379,7 +424,7 @@ impl Connection {
                         protocol: p::VERSION,
                         server: p::Client { name: "molt".into(), version: env!("CARGO_PKG_VERSION").into() },
                         workspace: self.server.workspace.clone(),
-                        methods: method::ALL.iter().map(|m| m.to_string()).collect(),
+                        methods: method::ALL.iter().chain(&method::ADDED).map(|m| m.to_string()).collect(),
                     }),
                 );
             }
@@ -410,8 +455,19 @@ impl Connection {
             method::TASK_SUBMIT => {
                 let p::Task { trace, mut request } = params(args)?;
                 self.own(&mut request)?;
+                let stored = self.record_task(&trace, &mut request)?;
                 self.call(id, move |s, forks| async move {
-                    let resp = s.run(&request, &trace).await.map_err(|e| failed(format!("{e:#}")))?;
+                    let resp = s.run(&request, &trace).await.map_err(|e| format!("{e:#}"));
+                    if let Some((held_session, sid)) = &stored {
+                        let run = trace.to_string();
+                        record(held_session, sid, |_| {
+                            Some(match &resp {
+                                Ok(resp) => Entry::Reply(Box::new(sessions::Reply::of(&run, &request.task, resp))),
+                                Err(e) => Entry::Failed { run: run.clone(), error: e.clone() },
+                            })
+                        });
+                    }
+                    let resp = resp.map_err(failed)?;
                     if let Some(fork) = &resp.fork {
                         forks.lock().unwrap_or_else(PoisonError::into_inner).results.insert(fork.clone());
                     }
@@ -435,8 +491,23 @@ impl Connection {
             }
             method::QUESTION_ANSWER => {
                 let p::Answer { trace, question, text } = params(args)?;
-                let answer = Constraint { text, answers: Some(question), ..Default::default() };
-                self.control(id, trace, Control::Constrain(answer));
+                let answer = Constraint { text: text.clone(), answers: Some(question), ..Default::default() };
+                let stored = self.held_id().map(|sid| (self.held.clone(), sid));
+                self.call(id, move |s, _| async move {
+                    let answered =
+                        s.control(&trace, Control::Constrain(answer)).await.map_err(|e| failed(format!("{e:#}")))?;
+                    if let Some((held_session, sid)) = &stored {
+                        let run = trace.to_string();
+                        record(held_session, sid, |loaded| {
+                            loaded
+                                .questions
+                                .iter()
+                                .any(|q| q.run == run && q.question == question)
+                                .then(|| Entry::Answered { run: run.clone(), question, text })
+                        });
+                    }
+                    Ok(answered)
+                });
             }
             method::TASK_PAUSE => {
                 let p::Run { trace } = params(args)?;
@@ -460,9 +531,13 @@ impl Connection {
             }
             method::RESULT_APPLY => {
                 let p::Apply { fork, paths } = params(args)?;
+                let stored = self.held_id().map(|sid| (self.held.clone(), sid));
                 self.call(id, move |s, forks| async move {
                     let merged = s.apply_only(&fork, &paths).await.map_err(|e| failed(format!("{e:#}")))?;
                     forks.lock().unwrap_or_else(PoisonError::into_inner).results.remove(&fork);
+                    if let Some((held_session, sid)) = &stored {
+                        record(held_session, sid, decided(&fork, Decision::Applied, paths));
+                    }
                     Ok(merged)
                 });
             }
@@ -474,13 +549,20 @@ impl Connection {
             }
             method::RESULT_KEEP => {
                 let p::Fork { fork } = params(args)?;
+                if let Some(sid) = self.held_id() {
+                    record(&self.held, &sid, decided(&fork, Decision::Kept, Vec::new()));
+                }
                 self.forks.lock().unwrap_or_else(PoisonError::into_inner).kept.insert(fork);
                 self.respond(id, Ok(p::Empty {}));
             }
             method::RESULT_DISCARD => {
                 let p::Fork { fork } = params(args)?;
+                let stored = self.held_id().map(|sid| (self.held.clone(), sid));
                 self.call(id, move |s, forks| async move {
                     s.discard(&fork).await.map_err(|e| failed(format!("{e:#}")))?;
+                    if let Some((held_session, sid)) = &stored {
+                        record(held_session, sid, decided(&fork, Decision::Discarded, Vec::new()));
+                    }
                     let mut forks = forks.lock().unwrap_or_else(PoisonError::into_inner);
                     forks.results.remove(&fork);
                     forks.kept.remove(&fork);
@@ -591,6 +673,109 @@ impl Connection {
                     s.command(&command, &trace, stop).await.map_err(|e| failed(format!("{e:#}")))
                 });
             }
+            method::SESSIONS_LIST => {
+                let p::ListSessions { archived } = params(args)?;
+                let (tx, stored, workspace) = (self.tx.clone(), self.stored.clone(), self.server.workspace.clone());
+                tokio::task::spawn_blocking(move || {
+                    let mut listed = stored.list(&workspace);
+                    listed.retain(|s| archived || !s.archived);
+                    respond(&tx, id, value(Ok::<_, Error>(listed)));
+                });
+            }
+            method::SESSIONS_NEW => {
+                let p::NewSession { title, import } = params(args)?;
+                let (tx, stored, held_session) = (self.tx.clone(), self.stored.clone(), self.held.clone());
+                let (data, workspace) = (self.server.cfg.kernel.data_dir.clone(), self.server.workspace.clone());
+                tokio::task::spawn_blocking(move || {
+                    let made = (|| {
+                        let saved = match import {
+                            true => crate::tui::saved::load_for(&data, Path::new(&workspace))
+                                .context("the interface's saved session could not be read, so no session was made")?,
+                            false => None,
+                        };
+                        let mut writer = stored.create(&workspace, title)?;
+                        if let Some(saved) = saved {
+                            writer.append(Entry::Imported(sessions::imported(saved)))?;
+                        }
+                        Ok::<_, anyhow::Error>(writer)
+                    })();
+                    let result = made.map_err(|e| failed(format!("{e:#}"))).map(|writer| {
+                        let session = writer.loaded().clone();
+                        *held(&held_session) = Some(writer);
+                        p::StoredSession { session, held: true }
+                    });
+                    respond(&tx, id, value(result));
+                });
+            }
+            method::SESSIONS_LOAD => {
+                let p::SessionId { id: sid } = params(args)?;
+                if let Some(writer) = held(&self.held).as_ref().filter(|w| w.id() == sid) {
+                    self.respond(id, Ok(p::StoredSession { session: writer.loaded().clone(), held: true }));
+                    return Ok(());
+                }
+                let (tx, stored, held_session) = (self.tx.clone(), self.stored.clone(), self.held.clone());
+                let workspace = self.server.workspace.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = (|| {
+                        ours(&stored, &sid, &workspace)?;
+                        // Read first: an archived session is shown, not held.
+                        let session = stored.load(&sid).map_err(|e| failed(format!("{e:#}")))?;
+                        if session.archived {
+                            return Ok(p::StoredSession { session, held: false });
+                        }
+                        let writer = stored.open(&sid).map_err(refused)?;
+                        let session = writer.loaded().clone();
+                        *held(&held_session) = Some(writer);
+                        Ok(p::StoredSession { session, held: true })
+                    })();
+                    respond(&tx, id, value(result));
+                });
+            }
+            method::SESSIONS_ARCHIVE => {
+                let p::ArchiveSession { id: sid, restore } = params(args)?;
+                let (tx, stored, held_session) = (self.tx.clone(), self.stored.clone(), self.held.clone());
+                let workspace = self.server.workspace.clone();
+                tokio::task::spawn_blocking(move || {
+                    let entry = if restore { Entry::Restored } else { Entry::Archived };
+                    let result = (|| {
+                        let mut guard = held(&held_session);
+                        if let Some(writer) = guard.as_mut().filter(|w| w.id() == sid) {
+                            writer.append(entry).map_err(|e| failed(format!("{e:#}")))?;
+                            // An archived session takes no more tasks: this connection lets it go.
+                            if !restore {
+                                guard.take();
+                            }
+                            return Ok(p::Empty {});
+                        }
+                        drop(guard);
+                        ours(&stored, &sid, &workspace)?;
+                        let mut writer = stored.open(&sid).map_err(refused)?;
+                        if writer.loaded().archived != !restore {
+                            writer.append(entry).map_err(|e| failed(format!("{e:#}")))?;
+                        }
+                        Ok(p::Empty {})
+                    })();
+                    respond(&tx, id, value(result));
+                });
+            }
+            method::SESSIONS_DELETE => {
+                let p::SessionId { id: sid } = params(args)?;
+                let (tx, stored, held_session) = (self.tx.clone(), self.stored.clone(), self.held.clone());
+                let workspace = self.server.workspace.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = (|| {
+                        ours(&stored, &sid, &workspace)?;
+                        let mut guard = held(&held_session);
+                        if guard.as_ref().is_some_and(|w| w.id() == sid) {
+                            guard.take();
+                        }
+                        drop(guard);
+                        stored.delete(&sid).map_err(refused)?;
+                        Ok(p::Empty {})
+                    })();
+                    respond(&tx, id, value(result));
+                });
+            }
             method::COMMAND_STOP => {
                 let p::Run { trace } = params(args)?;
                 if let Some(stop) = self.commands.remove(trace.as_str()) {
@@ -623,12 +808,46 @@ impl Connection {
         }
         req.workspace = ours.clone();
         req.session = match req.session.take() {
-            None => Some(self.run_session.clone()),
+            None => Some(self.held_id().unwrap_or_else(|| self.run_session.clone())),
             Some(name) => Some(
                 crate::runs::session_name(&name).map_err(|e| Dispatch::Error(Error::new(code::INVALID_PARAMS, e)))?,
             ),
         };
         Ok(())
+    }
+
+    /// The forks of the results the stored session waits on the person for:
+    /// the session goes on after this connection, and so do they.
+    fn awaiting(&self) -> Vec<String> {
+        held(&self.held).as_ref().map_or_else(Vec::new, |w| w.loaded().results.iter().map(|r| r.fork.clone()).collect())
+    }
+
+    /// The id of the stored session this connection holds.
+    fn held_id(&self) -> Option<String> {
+        held(&self.held).as_ref().map(|w| w.id().to_owned())
+    }
+
+    /// Record the task of `trace` in the stored session this connection
+    /// holds, before the planner is asked: once the task is answered as
+    /// started, the session has it. The earlier tasks of the session are
+    /// what the request is told of, when it names none of its own.
+    fn record_task(
+        &self,
+        trace: &molt_proto::TraceId,
+        req: &mut RunRequest,
+    ) -> Result<Option<(Held, String)>, Dispatch> {
+        if self.session.is_none() {
+            return Ok(None);
+        }
+        let mut guard = held(&self.held);
+        let Some(writer) = guard.as_mut() else { return Ok(None) };
+        if req.earlier.is_empty() && req.resume.is_none() {
+            req.earlier = writer.loaded().earlier.clone();
+        }
+        writer.append(Entry::Task { run: trace.to_string(), task: req.task.clone() }).map_err(|e| {
+            Dispatch::Error(failed(format!("the session could not record the task, so it was not started: {e:#}")))
+        })?;
+        Ok(Some((self.held.clone(), writer.id().to_owned())))
     }
 
     fn open(&mut self, id: Option<Id>) {
@@ -644,10 +863,25 @@ impl Connection {
         self.starting = Some(id.clone());
         let (cfg, workspace, tx, sessions) =
             (self.server.cfg.clone(), self.server.workspace.clone(), self.tx.clone(), self.sessions.clone());
+        let held_session = self.held.clone();
         tokio::spawn(async move {
             let (events, mut progress) = mpsc::unbounded_channel();
             tokio::spawn(async move {
                 while let Some(event) = progress.recv().await {
+                    // A question of a task of the stored session waits for the person there too.
+                    if let molt_api::progress::Progress::Asked { run, question, text, options, .. } = &event {
+                        let sid = held(&held_session).as_ref().map(|w| w.id().to_owned());
+                        if let Some(sid) = sid {
+                            record(&held_session, &sid, |loaded| {
+                                loaded.unanswered.iter().any(|u| u.run == *run).then(|| Entry::Asked {
+                                    run: run.clone(),
+                                    question: *question,
+                                    text: text.clone(),
+                                    options: options.clone(),
+                                })
+                            });
+                        }
+                    }
                     let Ok(params) = serde_json::to_value(&event) else { continue };
                     let note = Notification { jsonrpc: "2.0".into(), method: method::PROGRESS.into(), params };
                     tx.send(ServerMessage::Notification(note));
@@ -718,7 +952,7 @@ impl Connection {
     async fn close(&mut self, keep: Vec<String>) {
         if let Some(session) = self.session.take() {
             let kept = std::mem::take(&mut *self.forks.lock().unwrap_or_else(PoisonError::into_inner)).kept;
-            let keep: BTreeSet<String> = keep.into_iter().chain(kept).collect();
+            let keep: BTreeSet<String> = keep.into_iter().chain(kept).chain(self.awaiting()).collect();
             session.shutdown(&keep.into_iter().collect::<Vec<_>>()).await;
             self.server.in_use.store(false, Ordering::SeqCst);
         }
@@ -738,7 +972,7 @@ impl Connection {
         };
         let kept_before: Vec<String> = {
             let mut forks = self.forks.lock().unwrap_or_else(PoisonError::into_inner);
-            std::mem::take(&mut *forks).kept.into_iter().collect()
+            std::mem::take(&mut *forks).kept.into_iter().chain(self.awaiting()).collect()
         };
         let in_use = self.server.in_use.clone();
         tokio::spawn(async move {
@@ -785,6 +1019,20 @@ impl Connection {
             in_use.store(false, Ordering::SeqCst);
             respond(&tx, id, value(Ok::<_, Error>(p::Stopped { kept, notes })));
         });
+    }
+}
+
+/// Session `id` is one of `workspace`'s: its journal's first line says so.
+fn ours(stored: &Sessions, id: &str, workspace: &str) -> Result<(), Error> {
+    match stored.workspace(id) {
+        Some(theirs) if theirs == workspace => Ok(()),
+        Some(theirs) => Err(Error::new(
+            code::INVALID_PARAMS,
+            format!("session {id} is of {theirs}, and this server works in {workspace}"),
+        )),
+        None => Err(failed(format!(
+            "there is no session {id} here, or its journal cannot be read: sessions.list says which there are"
+        ))),
     }
 }
 
@@ -1045,7 +1293,7 @@ pub(crate) mod tests {
         let hello = raw.call(3, "initialize", json!({"protocol": 1, "client": {"name": "test"}})).await;
         assert_eq!(hello["result"]["protocol"], 1);
         assert_eq!(hello["result"]["workspace"], "/w");
-        assert_eq!(hello["result"]["methods"].as_array().unwrap().len(), method::ALL.len());
+        assert_eq!(hello["result"]["methods"].as_array().unwrap().len(), method::ALL.len() + method::ADDED.len());
 
         raw.send("not json").await;
         let parse = raw.recv().await;
@@ -1072,9 +1320,13 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn the_server_takes_every_request_of_version_1_as_written() {
-        let mut raw = Raw::new("/home/me/project");
+        let data = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.kernel.data_dir = data.path().to_path_buf();
+        let mut raw = Raw::with(cfg, "/home/me/project");
         raw.call(0, "initialize", json!({"protocol": 1})).await;
-        let v1 = include_str!("testdata/protocol-v1.jsonl");
+        let v1 =
+            concat!(include_str!("testdata/protocol-v1.jsonl"), include_str!("testdata/protocol-v1-sessions.jsonl"));
         for (n, line) in v1.lines().enumerate() {
             let entry: Value = serde_json::from_str(line).unwrap();
             let Some(name) = entry["method"].as_str().filter(|m| *m != "initialize") else { continue };
@@ -1086,6 +1338,73 @@ pub(crate) mod tests {
                 "{name}: {reply}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_stored_session_is_held_by_one_client_outlives_its_connection_and_only_its_word_ends_it() {
+        let data = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        let ws = ws.to_str().unwrap();
+        let mut cfg = Config::default();
+        cfg.kernel.data_dir = data.path().to_path_buf();
+        // What the interface saved of its last session here.
+        let earlier = molt_api::planner::Earlier {
+            task: "fix parser".into(),
+            outcome: molt_api::planner::Outcome::Passed,
+            summary: "Parsed.".into(),
+            changes: vec![],
+            applied: true,
+        };
+        let saved = crate::tui::saved::Saved { earlier: vec![earlier], spent_usd: 0.5, ..Default::default() };
+        let store = crate::tui::state::Store::new(data.path(), Path::new(ws)).unwrap();
+        crate::tui::saved::save(&store, &saved).unwrap();
+
+        let mut a = Raw::with(cfg.clone(), ws);
+        let hello = a.call(1, "initialize", json!({"protocol": 1})).await;
+        assert!(hello["result"]["methods"].as_array().unwrap().contains(&json!("sessions.load")), "{hello}");
+        let made = a.call(2, "sessions.new", json!({"title": "parser work", "import": true})).await;
+        let session = &made["result"]["session"];
+        assert_eq!((&made["result"]["held"], &session["title"]), (&json!(true), &json!("parser work")), "{made}");
+        assert_eq!(
+            (&session["earlier"][0]["task"], &session["spent"]["known_usd"]),
+            (&json!("fix parser"), &json!(0.5))
+        );
+        let id = session["id"].as_str().unwrap().to_owned();
+        assert!(crate::tui::saved::load(&store).unwrap().is_some(), "the interface's own file is left");
+
+        let mut b = Raw::with(cfg.clone(), ws);
+        b.call(1, "initialize", json!({"protocol": 1})).await;
+        let busy = b.call(2, "sessions.load", json!({"id": id})).await;
+        assert_eq!(busy["error"]["code"], code::BUSY, "{busy}");
+        assert_eq!(b.call(3, "sessions.delete", json!({"id": id})).await["error"]["code"], code::BUSY);
+        let listed = b.call(4, "sessions.list", json!({})).await;
+        assert_eq!((&listed["result"][0]["id"], &listed["result"][0]["title"]), (&json!(id), &json!("parser work")));
+        let mut other = Raw::with(cfg.clone(), "/elsewhere");
+        other.call(1, "initialize", json!({"protocol": 1})).await;
+        let theirs = other.call(2, "sessions.load", json!({"id": id})).await;
+        assert_eq!(theirs["error"]["code"], code::INVALID_PARAMS, "{theirs}");
+        assert_eq!(other.call(3, "sessions.list", json!({})).await["result"], json!([]));
+
+        // The first client goes without a word: the session stays, and the next one holds it.
+        let Raw { out, input, served } = a;
+        drop((out, input));
+        served.await.unwrap().unwrap();
+        let loaded = b.call(5, "sessions.load", json!({"id": id})).await;
+        assert_eq!(loaded["result"]["held"], true, "{loaded}");
+        assert_eq!(loaded["result"]["session"]["earlier"][0]["task"], "fix parser");
+        assert!(loaded["result"]["session"]["unanswered"].as_array().unwrap().is_empty(), "loading starts nothing");
+
+        assert_eq!(b.call(6, "sessions.archive", json!({"id": id})).await["result"], json!({}));
+        assert_eq!(b.call(7, "sessions.list", json!({})).await["result"], json!([]));
+        assert_eq!(b.call(8, "sessions.list", json!({"archived": true})).await["result"][0]["archived"], true);
+        let shown = b.call(9, "sessions.load", json!({"id": id})).await;
+        assert_eq!((&shown["result"]["held"], &shown["result"]["session"]["archived"]), (&json!(false), &json!(true)));
+        b.call(10, "sessions.archive", json!({"id": id, "restore": true})).await;
+        assert_eq!(b.call(11, "sessions.load", json!({"id": id})).await["result"]["held"], true);
+        assert_eq!(b.call(12, "sessions.delete", json!({"id": id})).await["result"], json!({}));
+        assert_eq!(b.call(13, "sessions.list", json!({"archived": true})).await["result"], json!([]));
+        assert_eq!(b.call(14, "sessions.load", json!({"id": id})).await["error"]["code"], code::FAILED);
     }
 
     #[tokio::test]
